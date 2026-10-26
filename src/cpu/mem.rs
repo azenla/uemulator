@@ -153,45 +153,57 @@ impl Cpu {
         if (la as i64) >> 47 != 0 && (la as i64) >> 47 != -1 {
             return Err(Exc::gp(0));
         }
-        let vpn = la >> 12;
         let user = self.cpl == 3 && !sys;
-        let idx = (vpn as usize) & (TLB_SIZE - 1);
-        let e = self.tlb[idx];
-        if e.vpn == vpn {
-            let wp = self.cr0 & (1 << 16) != 0;
-            let ok = match acc {
-                Acc::Read => !user || e.flags & TLB_U != 0,
-                Acc::Write => {
-                    e.flags & TLB_D != 0
-                        && if user {
-                            e.flags & (TLB_U | TLB_W) == (TLB_U | TLB_W)
-                        } else {
-                            e.flags & TLB_W != 0 || !wp
-                        }
-                }
-                Acc::Exec => (!user || e.flags & TLB_U != 0) && e.flags & TLB_NX == 0,
-            };
-            if ok {
-                return Ok(e.pbase | (la & 0xfff));
-            }
+        let page = la & !0xfff;
+        let slot = ((user as usize) << TLB_BITS) | ((la >> 12) as usize & (TLB_N - 1));
+        let e = self.tlb[slot];
+        let tag = match acc {
+            Acc::Read => e.tag_r,
+            Acc::Write => e.tag_w,
+            Acc::Exec => e.tag_x,
+        };
+        if tag == page {
+            return Ok(la.wrapping_add(e.addend).wrapping_sub(self.ram_base));
         }
         let (pbase, flags) = self.walk(la, acc, user)?;
-        self.tlb[idx] = TlbEntry { vpn, pbase, flags };
+        if pbase < self.ram.len() as u64 {
+            let wp = self.cr0 & (1 << 16) != 0;
+            let mut ent = if e.tag_r == page || e.tag_w == page || e.tag_x == page {
+                e
+            } else {
+                TLB_EMPTY
+            };
+            ent.addend = (self.ram_base + pbase).wrapping_sub(page);
+            if !user || flags & TLB_U != 0 {
+                ent.tag_r = page;
+                if flags & TLB_NX == 0 {
+                    ent.tag_x = page;
+                }
+            }
+            let w_ok = flags & TLB_D != 0
+                && if user {
+                    flags & (TLB_U | TLB_W) == (TLB_U | TLB_W)
+                } else {
+                    flags & TLB_W != 0 || !wp
+                };
+            if w_ok && self.code_page[(pbase >> 12) as usize] == 0 {
+                ent.tag_w = page;
+            }
+            self.tlb[slot] = ent;
+        }
         Ok(pbase | (la & 0xfff))
     }
 
     pub fn flush_tlb(&mut self) {
         for e in self.tlb.iter_mut() {
-            e.vpn = u64::MAX;
+            *e = TLB_EMPTY;
         }
     }
 
     pub fn invlpg(&mut self, la: u64) {
-        let vpn = la >> 12;
-        let idx = (vpn as usize) & (TLB_SIZE - 1);
-        if self.tlb[idx].vpn == vpn {
-            self.tlb[idx].vpn = u64::MAX;
-        }
+        let i = (la >> 12) as usize & (TLB_N - 1);
+        self.tlb[i] = TLB_EMPTY;
+        self.tlb[TLB_N + i] = TLB_EMPTY;
     }
 
     fn phys_read(&mut self, pa: u64, size: u8) -> u64 {
@@ -227,6 +239,7 @@ impl Cpu {
     }
 
     pub fn flush_decode(&mut self) {
+        self.flushes += 1;
         self.dc_gen = self.dc_gen.wrapping_add(1);
         for p in self.code_list.drain(..) {
             self.code_page[p as usize] = 0;
@@ -238,10 +251,31 @@ impl Cpu {
         if p < self.code_page.len() && self.code_page[p] == 0 {
             self.code_page[p] = 1;
             self.code_list.push(p as u32);
+            let base = self.ram_base;
+            for e in self.tlb.iter_mut() {
+                if e.tag_w != TLB_INV
+                    && (e.tag_w.wrapping_add(e.addend).wrapping_sub(base) >> 12) as usize == p
+                {
+                    e.tag_w = TLB_INV;
+                }
+            }
         }
     }
 
     fn mem_read(&mut self, la: u64, size: u8, sys: bool) -> R<u64> {
+        let user = self.cpl == 3 && !sys;
+        let e = &self.tlb[((user as usize) << TLB_BITS) | ((la >> 12) as usize & (TLB_N - 1))];
+        if e.tag_r == la & !0xfff && (la & 0xfff) + size as u64 <= 4096 {
+            let p = la.wrapping_add(e.addend);
+            unsafe {
+                return Ok(match size {
+                    1 => *(p as *const u8) as u64,
+                    2 => (p as *const u16).read_unaligned() as u64,
+                    4 => (p as *const u32).read_unaligned() as u64,
+                    _ => (p as *const u64).read_unaligned(),
+                });
+            }
+        }
         let off = (la & 0xfff) as usize;
         if off + size as usize <= 4096 {
             let pa = self.translate(la, Acc::Read, sys)?;
@@ -256,6 +290,20 @@ impl Cpu {
     }
 
     fn mem_write(&mut self, la: u64, size: u8, val: u64, sys: bool) -> R<()> {
+        let user = self.cpl == 3 && !sys;
+        let e = &self.tlb[((user as usize) << TLB_BITS) | ((la >> 12) as usize & (TLB_N - 1))];
+        if e.tag_w == la & !0xfff && (la & 0xfff) + size as u64 <= 4096 {
+            let p = la.wrapping_add(e.addend);
+            unsafe {
+                match size {
+                    1 => *(p as *mut u8) = val as u8,
+                    2 => (p as *mut u16).write_unaligned(val as u16),
+                    4 => (p as *mut u32).write_unaligned(val as u32),
+                    _ => (p as *mut u64).write_unaligned(val),
+                }
+            }
+            return Ok(());
+        }
         let off = (la & 0xfff) as usize;
         if off + size as usize <= 4096 {
             let pa = self.translate(la, Acc::Write, sys)?;

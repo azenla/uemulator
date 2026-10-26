@@ -54,18 +54,29 @@ pub(crate) struct Dt {
     pub limit: u16,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
+#[repr(C)]
 pub(crate) struct TlbEntry {
-    pub vpn: u64,
-    pub pbase: u64,
-    pub flags: u8,
+    pub tag_r: u64,
+    pub tag_w: u64,
+    pub tag_x: u64,
+    pub addend: u64,
 }
+
+pub(crate) const TLB_INV: u64 = u64::MAX;
+pub(crate) const TLB_EMPTY: TlbEntry = TlbEntry {
+    tag_r: TLB_INV,
+    tag_w: TLB_INV,
+    tag_x: TLB_INV,
+    addend: 0,
+};
 
 pub(crate) const TLB_W: u8 = 1;
 pub(crate) const TLB_U: u8 = 2;
 pub(crate) const TLB_NX: u8 = 4;
 pub(crate) const TLB_D: u8 = 8;
-pub(crate) const TLB_SIZE: usize = 4096;
+pub(crate) const TLB_BITS: usize = 10;
+pub(crate) const TLB_N: usize = 1 << TLB_BITS;
 
 #[derive(Clone, Copy)]
 pub(crate) struct DEntry {
@@ -116,6 +127,7 @@ pub(crate) struct Cpu {
     pub halted: bool,
     pub shadow: bool,
     pub ram: Vec<u8>,
+    pub ram_base: u64,
     pub tlb: Vec<TlbEntry>,
     pub dcache: Vec<DEntry>,
     pub dc_gen: u32,
@@ -129,6 +141,7 @@ pub(crate) struct Cpu {
     pub log: Option<LogFn>,
     pub logged: std::collections::HashSet<u64>,
     pub exc_depth: u32,
+    pub flushes: u64,
     pub trace: Option<std::collections::VecDeque<u64>>,
 }
 
@@ -155,7 +168,7 @@ impl Cpu {
         seg[3] = ds;
         seg[4] = Seg::default();
         seg[5] = Seg::default();
-        Cpu {
+        let mut cpu = Cpu {
             gpr: {
                 let mut g = [0u64; 16];
                 g[6] = boot.rsi;
@@ -210,13 +223,8 @@ impl Cpu {
             halted: false,
             shadow: false,
             ram,
-            tlb: vec![
-                TlbEntry {
-                    vpn: u64::MAX,
-                    ..Default::default()
-                };
-                TLB_SIZE
-            ],
+            tlb: vec![TLB_EMPTY; 2 * TLB_N],
+            ram_base: 0,
             dcache: vec![
                 DEntry {
                     gpa: 0,
@@ -236,8 +244,11 @@ impl Cpu {
             log,
             logged: Default::default(),
             exc_depth: 0,
+            flushes: 0,
             trace: None,
-        }
+        };
+        cpu.ram_base = cpu.ram.as_ptr() as u64;
+        cpu
     }
 
     pub fn now_ns(&self) -> u64 {
@@ -352,7 +363,8 @@ impl Cpu {
 
     pub fn dump(&self) -> String {
         let mut s = format!(
-            "icount={} rip={:016x} cpl={} eflags={:x} cr0={:x} cr3={:x} cr4={:x} efer={:x}\n",
+            "flushes={} icount={} rip={:016x} cpl={} eflags={:x} cr0={:x} cr3={:x} cr4={:x} efer={:x}\n",
+            self.flushes,
             self.icount,
             self.rip,
             self.cpl,
