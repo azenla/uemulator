@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
-use super::a64::{self, Asm};
-use super::emit::{self, Addrs, Gen};
+use super::arch;
 use super::helpers;
 use crate::cpu::Cpu;
 use crate::cpu::decode::{self, DecodeErr, Insn};
@@ -25,7 +24,7 @@ pub(crate) struct Jit {
     mem: ExecMem,
     used: usize,
     pub enter: u64,
-    addrs: Addrs,
+    addrs: arch::Addrs,
     blocks: Vec<Block>,
     jc: Vec<u32>,
     page_blocks: HashMap<u64, Vec<u32>>,
@@ -47,40 +46,14 @@ impl Jit {
         }
         let mem = ExecMem::new(CODE_SIZE)?;
         let base = mem.base();
-        let mut a = Asm::new(base);
-        a.stp_pre(29, 30, a64::SP, -80);
-        a.stp_off(19, 20, a64::SP, 16);
-        a.stp_off(21, 22, a64::SP, 32);
-        a.stp_off(23, 24, a64::SP, 48);
-        a.mov(19, 0);
-        a.ldr(20, 19, std::mem::offset_of!(Cpu, tlb_cur) as u32);
-        a.br(1);
-        let exit_fail = a.here();
-        a.cmp_imm(0, 2, true);
-        a.cinc_eq(1, 1);
-        a.lsl_imm(1, 1, 8);
-        a.orr(0, 0, 1, true);
-        let exit_ok = a.here();
-        a.ldp_off(23, 24, a64::SP, 48);
-        a.ldp_off(21, 22, a64::SP, 32);
-        a.ldp_off(19, 20, a64::SP, 16);
-        a.ldp_post(29, 30, a64::SP, 80);
-        a.ret();
-        a.finish();
-        mem.write(0, &a.code);
-        let header = (a.code.len() * 4 + 63) & !63;
+        let pro = arch::prologue(base);
+        mem.write_bytes(0, &pro.code);
+        let header = (pro.code.len() + 63) & !63;
         Some(Jit {
             mem,
             used: header,
             enter: base,
-            addrs: Addrs {
-                exec: helpers::h_exec as *const () as usize as u64,
-                ld: helpers::h_ld as *const () as usize as u64,
-                st: helpers::h_st as *const () as usize as u64,
-                cond: helpers::h_cond as *const () as usize as u64,
-                exit_ok,
-                exit_fail,
-            },
+            addrs: arch::addrs(pro.exit_ok, pro.exit_fail),
             blocks: Vec::new(),
             jc: vec![0; 1 << JC_BITS],
             page_blocks: HashMap::new(),
@@ -143,7 +116,7 @@ impl Jit {
                     off += i.len as usize;
                     end_rip = rip + off as u64;
                     insns.push(i);
-                    if emit::is_term(insns.last().unwrap()) {
+                    if helpers::is_term(insns.last().unwrap()) {
                         break;
                     }
                 }
@@ -186,13 +159,11 @@ impl Jit {
         let insns: Box<[Insn]> = insns.into_boxed_slice();
         self.used = (self.used + 15) & !15;
         let code_addr = self.mem.base() + self.used as u64;
-        let mut g = Gen::new(code_addr, &self.addrs, &insns);
-        g.compile(&rips, end_rip);
-        let words = std::mem::take(&mut g.a.code);
-        self.inlined += g.inlined as u64;
+        let (code, inlined) = arch::compile_block(code_addr, &self.addrs, &insns, &rips, end_rip);
+        self.inlined += inlined as u64;
         self.total += insns.len() as u64;
-        self.mem.write(self.used, &words);
-        self.used += words.len() * 4;
+        self.mem.write_bytes(self.used, &code);
+        self.used += code.len();
         let idx = self.blocks.len() as u32;
         self.blocks.push(Block {
             rip,

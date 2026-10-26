@@ -11,7 +11,7 @@ machine.start()?;
 
 ## Non-goals (v1)
 
-SMP, ACPI/MP tables, PCI devices, virtio, disks, network, BIOS/real-mode boot, AVX/XSAVE, x87 precision beyond what Linux/glibc/busybox exercise, debugger stub, snapshots, x86_64 host JIT backend (stretch, see 06).
+SMP, ACPI/MP tables, PCI devices, virtio, disks, network, BIOS/real-mode boot, AVX/XSAVE, x87 precision beyond what Linux/glibc/busybox exercise, debugger stub, snapshots.
 
 ## Architecture
 
@@ -41,7 +41,7 @@ src/machine.rs        EmulatedMachine, MachineConfig, ExitReason, thread control
 src/console.rs        ConsoleHandle byte stream
 src/boot.rs           bzImage parsing, loader, boot_params, e820, initial page tables/GDT
 src/clock.rs          virtual clock, timer wheel
-src/sys.rs            libc FFI (mmap, MAP_JIT, pthread_jit_write_protect_np, icache flush)
+src/sys.rs            executable memory via libc / windows-sys (`jit` feature only)
 src/cpu/{mod,regs,flags,decode,tables,translate,seg,exc,fpu,sse,cpuid,msr}.rs
 src/mem/{ram,bus,tlb,mmu}.rs
 src/ir.rs             uop definitions

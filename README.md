@@ -1,6 +1,6 @@
 # uemulator
 
-Small embeddable x86_64 system emulator in Rust, modeled on QEMU TCG. It boots an unmodified Linux bzImage (no BIOS) on a serial console, using an interpreter everywhere and an aarch64 JIT when the host allows it.
+Small embeddable x86_64 system emulator in Rust, modeled on QEMU TCG. It boots an unmodified Linux bzImage (no BIOS) on a serial console, using an interpreter everywhere and a host JIT (aarch64 or x86_64; Linux, macOS, Windows) when the `jit` feature is on and the host allows it.
 
 ```rust
 use uemulator::{EmulatedMachine, MachineConfig};

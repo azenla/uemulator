@@ -162,7 +162,18 @@ pub(crate) fn jit_probe() -> bool {
     true
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn jit_probe() -> bool {
+    let Some(m) = ExecMem::new(16384) else {
+        return false;
+    };
+    m.write_bytes(0, &[0xc3]);
+    let f: extern "C" fn() = unsafe { std::mem::transmute(m.base() as usize) };
+    f();
+    true
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub(crate) fn jit_probe() -> bool {
     false
 }

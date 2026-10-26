@@ -150,46 +150,6 @@ pub(crate) struct Gen<'a> {
     pub inlined: u32,
 }
 
-pub(crate) fn is_term(i: &Insn) -> bool {
-    match i.op {
-        0x70..=0x7f
-        | 0xe0..=0xe3
-        | 0xe8
-        | 0xe9
-        | 0xeb
-        | 0xc2
-        | 0xc3
-        | 0xca
-        | 0xcb
-        | 0xcc
-        | 0xcd
-        | 0xcf
-        | 0xf4 => true,
-        0x6c..=0x6f
-        | 0xa4..=0xa7
-        | 0xaa..=0xaf
-        | 0xe4..=0xe7
-        | 0xec..=0xef
-        | 0xfa
-        | 0xfb
-        | 0x9d
-        | 0x8e
-        | 0xc8 => true,
-        0xff => matches!(i.reg & 7, 2..=5),
-        0x105..=0x107
-        | 0x10b
-        | 0x180..=0x18f
-        | 0x1a1
-        | 0x1a9
-        | 0x120..=0x123
-        | 0x130
-        | 0x100
-        | 0x101
-        | 0xffff => true,
-        _ => false,
-    }
-}
-
 impl<'a> Gen<'a> {
     pub fn new(base: u64, ad: &'a Addrs, insns: &'a [Insn]) -> Self {
         Gen {

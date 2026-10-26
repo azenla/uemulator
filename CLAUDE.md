@@ -1,6 +1,6 @@
 # uemulator
 
-Minimal embeddable x86_64 system emulator in Rust. Boots an unmodified Linux bzImage with a serial console, no firmware. Design is modeled on QEMU TCG: decode to micro-ops, TB cache, interpreter plus an aarch64 JIT with runtime fallback.
+Minimal embeddable x86_64 system emulator in Rust. Boots an unmodified Linux bzImage with a serial console, no firmware. Design is modeled on QEMU TCG: decode to micro-ops, TB cache, interpreter plus aarch64 and x86_64 host JITs with runtime fallback.
 
 Read `plans/README.md` first; the plans are the source of truth for design and milestones (`plans/10-milestones.md` for current status).
 
@@ -23,7 +23,8 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 
 ## Debugging
 
-- `--debug` on the example dumps CPU state and scans guest RAM for the kernel log ring buffer on exit.
+- `--debug` on the CLI dumps CPU state and scans guest RAM for the kernel log ring buffer on exit.
 - `--verify` runs the JIT in lockstep with the interpreter and stops at the first diverging block; use it after any change under `crates/uemulator/src/jit/`.
 - `--time <unix>` fixes the RTC; guest behavior must not depend on it, so a time-dependent failure is an emulator bug.
 - Slow lockstep test: `cargo test --release -- --ignored`.
+- On an Apple Silicon Mac the x86_64 JIT runs under Rosetta: `cargo test --release -p uemulator --target x86_64-apple-darwin` (`rustup target add x86_64-apple-darwin`).

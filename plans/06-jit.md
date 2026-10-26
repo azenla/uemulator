@@ -2,9 +2,9 @@
 
 ## Scope
 
-v1: **aarch64 host only** (macOS Apple Silicon, Linux aarch64). Other hosts run the interpreter. A second backend (x86_64 host) is a stretch goal behind the same `Backend` trait; not scheduled.
+Backends: **aarch64** (macOS Apple Silicon, Linux) and **x86_64** (Linux, macOS, Windows). Other hosts, and builds without the `jit` feature, run the interpreter. The feature gate is `jit` (default on): it enables the `libc` / `windows-sys` dependencies and every file under `jit/` and `sys.rs`.
 
-## Runtime probe (`jit/probe.rs`)
+## Runtime probe (`sys::jit_probe`)
 
 At `EmulatedMachine::new` when `JitMode != Off` and `cfg!(target_arch = "aarch64")`:
 1. `mmap` a page (macOS: `MAP_JIT|MAP_PRIVATE|MAP_ANON`, prot RWX; Linux: RW then `mprotect` RX or RWX).
@@ -32,6 +32,16 @@ One region (default 64 MiB), bump allocator; TB structs and metadata live outsid
 - Helpers: `extern "C" fn(env: *mut Env, ...) -> u64`; address loaded into a register and `blr`. Large immediate/address loads via `movz/movk` sequences.
 - Branch ranges: ±128 MiB for `b`; the 64 MiB buffer keeps direct branches in range. Conditional branches ±1 MiB: use `b.cond` over a `b` when targets may exceed.
 - Encodings: a small hand-written assembler module with unit tests that check bytes against known-good encodings. Reference: `tcg/aarch64/tcg-target.c.inc` for instruction forms (note the fork's "Correct register MIN/MAX instructions" fix); read-only.
+
+## x86_64 backend (`jit/x64.rs`, `jit/emit_x64.rs`, `jit/arch_x64.rs`)
+
+Same block shape and helper-fallback structure as the aarch64 backend (`jit/native.rs` is shared; `arch_*.rs` supplies the prologue, helper addresses and block compiler).
+
+- Registers: `rbx` = Cpu, `rbp` = TLB base, `rax`/`rcx` = ALU operands, `rdx` = guest address, `rsi`/`rdi`/`r8`/`r9` scratch, `r12`/`r13` survive slow-path helper calls. The prologue saves `rbx rbp rsi rdi r12-r15` (Win64 callee-saved set) and reserves 56 bytes: 32 of Win64 shadow space plus an 8-byte load-result slot, keeping calls 16-byte aligned.
+- ABI: SysV and Win64 differ only in the argument registers (`x64::ARGS`). Helpers take at most four arguments and never return a 16-byte struct (Win64 returns it by hidden pointer), so the x86 backend uses `h_ld_x`/`h_st_x`, which write the load result through a pointer; the block stores `cpu.rip` itself before calling them.
+- Flags: guest and host flags agree for add/sub/logic, so a `jcc` right after an inlined ALU op tests the host flags directly (`Gen::live`). TLB probes and helper calls clobber them and end the window; effective addresses use `lea` only so they do not. Otherwise `jcc` calls `h_cond`.
+- Memory: `mmap` RWX (`MAP_JIT` on macOS) or `VirtualAlloc(PAGE_EXECUTE_READWRITE)`; the x86 icache is coherent so no flush is needed.
+- Tests: encoder tests in `x64.rs` execute generated code; the boot/devices tests and `--verify` exercise the whole backend. On an Apple Silicon host run them under Rosetta: `cargo test --release -p uemulator --target x86_64-apple-darwin`.
 
 ## Chaining
 
