@@ -93,6 +93,9 @@ impl Jit {
     }
 
     pub fn invalidate_page(&mut self, ppn: u64) {
+        if std::env::var_os("UEMU_JITDBG").is_some() && ppn == 0x1d04 {
+            eprintln!("invalidate page {ppn:#x}: {:?} blocks", self.page_blocks.get(&ppn).map(|l| l.len()));
+        }
         if let Some(list) = self.page_blocks.remove(&ppn) {
             for idx in list {
                 self.blocks[idx as usize].valid = false;
@@ -183,6 +186,9 @@ impl Jit {
             let pa2 = cpu.translate((rip & !0xfff).wrapping_add(4096), Acc::Exec, false)?;
             pages.push(pa2 >> 12);
         }
+        if std::env::var_os("UEMU_JITDBG").is_some() && (pa >> 12) == 0x1d04 {
+            eprintln!("translate {rip:#x} pa {pa:#x} n={} b13={:02x?}", insns.len(), &cpu.ram[0x1d04f13..0x1d04f18]);
+        }
         let insns: Box<[Insn]> = insns.into_boxed_slice();
         self.used = (self.used + 15) & !15;
         let code_addr = self.mem.base() + self.used as u64;
@@ -224,11 +230,19 @@ impl Cpu {
         let code = code?;
         let f: extern "C" fn(*mut Cpu, u64) -> u64 = unsafe { std::mem::transmute(enter as usize) };
         let r = f(self as *mut Cpu, code);
-        self.icount += (r >> 8).saturating_sub(1);
+        let done = r >> 8;
+        self.last_done = done;
+        let prepaid = std::mem::take(&mut self.prepaid);
         self.exit_block = false;
         match r & 0xff {
-            1 => Err(self.pending.take().expect("pending exception")),
-            _ => Ok(()),
+            1 => {
+                self.icount += done - prepaid;
+                Err(self.pending.take().expect("pending exception"))
+            }
+            _ => {
+                self.icount += done.saturating_sub(1) - prepaid;
+                Ok(())
+            }
         }
     }
 }

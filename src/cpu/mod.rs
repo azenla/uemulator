@@ -22,6 +22,12 @@ pub(crate) use exc::Exc;
 
 pub(crate) type R<T> = Result<T, Exc>;
 
+enum Pre {
+    Exit(ExitReason),
+    Again,
+    Go,
+}
+
 pub(crate) const NS_PER_INSN: u64 = 1;
 const EVENT_INTERVAL: u64 = 4096;
 
@@ -100,6 +106,7 @@ pub(crate) struct Cpu {
     pub tlb_cur: u64,
     pub cpl: u8,
     pub exit_block: bool,
+    pub prepaid: u64,
     pub seg: [Seg; 6],
     pub gdtr: Dt,
     pub idtr: Dt,
@@ -145,6 +152,7 @@ pub(crate) struct Cpu {
     pub logged: std::collections::HashSet<u64>,
     pub exc_depth: u32,
     pub flushes: u64,
+    pub last_done: u64,
     pub pending: Option<Exc>,
     pub jit: Option<Box<crate::jit::Jit>>,
     pub trace: Option<std::collections::VecDeque<u64>>,
@@ -250,10 +258,12 @@ impl Cpu {
             logged: Default::default(),
             exc_depth: 0,
             flushes: 0,
+            last_done: 0,
             pending: None,
             jit: None,
             tlb_cur: 0,
             exit_block: false,
+            prepaid: 0,
             trace: None,
         };
         cpu.ram_base = cpu.ram.as_ptr() as u64;
@@ -302,28 +312,45 @@ impl Cpu {
         self.dev.pic.ack()
     }
 
+    fn pre(&mut self) -> Pre {
+        if self.icount >= self.next_event
+            && let Some(r) = self.service_events()
+        {
+            return Pre::Exit(r);
+        }
+        if self.eflags & flags::IF != 0
+            && !self.shadow
+            && self.dev.pic.has_pending()
+            && let Some(v) = self.pending_interrupt()
+        {
+            self.halted = false;
+            if let Some(r) = self.deliver_event(v, None, false) {
+                return Pre::Exit(r);
+            }
+        }
+        if self.halted {
+            return match self.idle() {
+                Some(r) => Pre::Exit(r),
+                None => Pre::Again,
+            };
+        }
+        Pre::Go
+    }
+
+    fn after(&mut self, r: R<()>) -> Option<ExitReason> {
+        match r {
+            Ok(()) => None,
+            Err(Exc::Fault { vec, err, soft }) => self.deliver_event(vec, err, soft),
+            Err(Exc::Exit(r)) => Some(r),
+        }
+    }
+
     pub fn run(&mut self) -> ExitReason {
         loop {
-            if self.icount >= self.next_event
-                && let Some(r) = self.service_events()
-            {
-                return r;
-            }
-            if self.eflags & flags::IF != 0
-                && !self.shadow
-                && self.dev.pic.has_pending()
-                && let Some(v) = self.pending_interrupt()
-            {
-                self.halted = false;
-                if let Some(r) = self.deliver_event(v, None, false) {
-                    return r;
-                }
-            }
-            if self.halted {
-                match self.idle() {
-                    Some(r) => return r,
-                    None => continue,
-                }
+            match self.pre() {
+                Pre::Exit(r) => return r,
+                Pre::Again => continue,
+                Pre::Go => {}
             }
             self.shadow = false;
             self.icount += 1;
@@ -332,17 +359,116 @@ impl Cpu {
             } else {
                 self.step()
             };
-            if let Err(e) = r {
-                match e {
-                    Exc::Fault { vec, err, soft } => {
-                        if let Some(r) = self.deliver_event(vec, err, soft) {
-                            return r;
-                        }
-                    }
-                    Exc::Exit(r) => return r,
-                }
+            if let Some(r) = self.after(r) {
+                return r;
             }
         }
+    }
+
+    pub fn run_verify(&mut self, sh: &mut Cpu) -> ExitReason {
+        loop {
+            let (a, b) = (self.pre(), sh.pre());
+            match (a, b) {
+                (Pre::Exit(r), _) => return r,
+                (Pre::Again, Pre::Again) => continue,
+                (Pre::Go, Pre::Go) => {}
+                _ => return ExitReason::Internal("verify: pre-step divergence".into()),
+            }
+            self.shadow = false;
+            sh.shadow = false;
+            let before = (self.gpr, self.eflags_full(), self.rip);
+            let sh_before = (sh.rip, sh.icount, self.icount);
+            let start = self.rip;
+            self.icount += 1;
+            sh.icount += 1;
+            let rm = self.step_block();
+            let done = self.last_done;
+            let attempts = if rm.is_err() { done + 1 } else { done };
+            let mut rs = Ok(());
+            for k in 0..attempts {
+                if k > 0 {
+                    sh.icount += 1;
+                }
+                rs = sh.step();
+                if rs.is_err() {
+                    break;
+                }
+            }
+            let same_exc = match (&rm, &rs) {
+                (Ok(()), Ok(())) => true,
+                (Err(Exc::Fault { vec: a, err: ea, .. }), Err(Exc::Fault { vec: b, err: eb, .. })) => a == b && ea == eb,
+                (Err(Exc::Exit(_)), Err(Exc::Exit(_))) => true,
+                _ => false,
+            };
+            let diff = self.diff(sh);
+            if !same_exc || diff.is_some() {
+                let pa = self.translate(start, mem::Acc::Exec, true).unwrap_or(0) as usize & !0xfff;
+                let page_diff: Vec<usize> = (0..4096)
+                    .filter(|&k| self.ram[pa + k] != sh.ram[pa + k])
+                    .take(8)
+                    .collect();
+                let bytes_m = self.ram[pa + (start as usize & 0xfff)..][..24].to_vec();
+                let bytes_s = sh.ram[pa + (start as usize & 0xfff)..][..24].to_vec();
+                if let Some(l) = &self.log {
+                    l(&format!("page diffs at {page_diff:x?}; main bytes {bytes_m:02x?}; shadow bytes {bytes_s:02x?}"));
+                }
+                let msg = format!(
+                    "verify: divergence after block at {start:#x} ({done} insns, attempts {attempts}, shadow start {sh_before:x?}): exc main={:?} shadow={:?} diff={:?}\n--- before {before:x?}\n--- main\n{}--- shadow\n{}",
+                    rm.as_ref().err(),
+                    rs.as_ref().err(),
+                    diff,
+                    self.dump_regs(),
+                    sh.dump_regs()
+                );
+                return ExitReason::Internal(msg);
+            }
+            if let Some(r) = self.after(rm) {
+                return r;
+            }
+            if let Some(r) = sh.after(rs) {
+                return r;
+            }
+        }
+    }
+
+    fn diff(&mut self, o: &mut Cpu) -> Option<String> {
+        let mut d = Vec::new();
+        for k in 0..16 {
+            if self.gpr[k] != o.gpr[k] {
+                d.push(format!("r{k}: {:#x} vs {:#x}", self.gpr[k], o.gpr[k]));
+            }
+        }
+        if self.rip != o.rip {
+            d.push(format!("rip: {:#x} vs {:#x}", self.rip, o.rip));
+        }
+        let (fa, fb) = (self.eflags_full(), o.eflags_full());
+        if fa != fb {
+            d.push(format!("eflags: {fa:#x} vs {fb:#x}"));
+        }
+        if self.cpl != o.cpl {
+            d.push("cpl".into());
+        }
+        for k in 0..6 {
+            if self.seg[k].sel != o.seg[k].sel || self.seg[k].base != o.seg[k].base {
+                d.push(format!("seg{k}"));
+            }
+        }
+        for (n, a, b) in [
+            ("cr0", self.cr0, o.cr0),
+            ("cr2", self.cr2, o.cr2),
+            ("cr3", self.cr3, o.cr3),
+            ("cr4", self.cr4, o.cr4),
+            ("efer", self.efer, o.efer),
+            ("icount", self.icount, o.icount),
+        ] {
+            if a != b {
+                d.push(format!("{n}: {a:#x} vs {b:#x}"));
+            }
+        }
+        if self.xmm != o.xmm {
+            d.push("xmm".into());
+        }
+        if d.is_empty() { None } else { Some(d.join(", ")) }
     }
 
     fn idle(&mut self) -> Option<ExitReason> {
@@ -379,6 +505,17 @@ impl Cpu {
             t.push_back(self.rip);
         }
         self.exec(&insn)
+    }
+
+    pub fn dump_regs(&self) -> String {
+        let mut s = format!("rip={:016x} cpl={} eflags={:x}\n", self.rip, self.cpl, self.eflags_full());
+        for (i, g) in self.gpr.iter().enumerate() {
+            s += &format!("r{i:<2}={g:016x} ");
+            if i % 4 == 3 {
+                s += "\n";
+            }
+        }
+        s
     }
 
     pub fn dump(&self) -> String {

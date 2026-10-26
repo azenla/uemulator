@@ -239,6 +239,9 @@ impl Cpu {
     }
 
     fn code_written(&mut self, ppn: usize) {
+        if ppn == 0x1d04 && std::env::var_os("UEMU_JITDBG").is_some() {
+            eprintln!("code_written ppn {ppn:#x} rip {:#x} icount {}", self.rip, self.icount);
+        }
         if let Some(mut j) = self.jit.take() {
             j.invalidate_page(ppn as u64);
             self.jit = Some(j);

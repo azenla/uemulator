@@ -8,6 +8,9 @@ use crate::cpu::{Cpu, Seg, TLB_BITS, TLB_N};
 
 const GPR: u32 = offset_of!(Cpu, gpr) as u32;
 const RIP: u32 = offset_of!(Cpu, rip) as u32;
+const ICOUNT: u32 = offset_of!(Cpu, icount) as u32;
+const EXIT_BLOCK: u32 = offset_of!(Cpu, exit_block) as u32;
+const PREPAID: u32 = offset_of!(Cpu, prepaid) as u32;
 const CC_OFF: u32 = offset_of!(Cpu, cc) as u32;
 const CC_DST: u32 = offset_of!(Cpu, cc_dst) as u32;
 const CC_SRC: u32 = offset_of!(Cpu, cc_src) as u32;
@@ -142,6 +145,7 @@ pub(crate) struct Gen<'a> {
     ad: &'a Addrs,
     insns: &'a [Insn],
     slows: Vec<Slow>,
+    smc: Vec<(Label, u32, u64)>,
     live: Option<Live>,
     pub inlined: u32,
 }
@@ -193,6 +197,7 @@ impl<'a> Gen<'a> {
             ad,
             insns,
             slows: Vec::new(),
+            smc: Vec::new(),
             live: None,
             inlined: 0,
         }
@@ -228,6 +233,13 @@ impl<'a> Gen<'a> {
 
     fn helper(&mut self, k: usize, rip: u64, terminal: bool) {
         let insn = &self.insns[k] as *const Insn as u64;
+        if k > 0 && matches!(self.insns[k].op, 0x131 | 0xe4..=0xe7 | 0xec..=0xef) {
+            self.a.ldr(4, CPU, ICOUNT);
+            self.a.add_imm(4, 4, k as u32, true);
+            self.a.str(4, CPU, ICOUNT);
+            self.a.mov_imm(4, k as u64);
+            self.a.str(4, CPU, PREPAID);
+        }
         self.a.mov(0, CPU);
         self.a.mov_imm(1, insn);
         self.a.mov_imm(2, rip);
@@ -329,7 +341,20 @@ impl<'a> Gen<'a> {
         });
     }
 
+    fn smc_check(&mut self, k: u32, next: u64) {
+        let l = self.a.label();
+        self.a.ldrb(4, CPU, EXIT_BLOCK);
+        self.a.cbnz(4, l, false);
+        self.smc.push((l, k, next));
+    }
+
     fn emit_slows(&mut self) {
+        let smc = std::mem::take(&mut self.smc);
+        for (l, k, next) in smc {
+            self.a.bind(l);
+            self.set_rip(next);
+            self.exit_ok(k + 1);
+        }
         let slows = std::mem::take(&mut self.slows);
         for s in slows {
             self.a.bind(s.slow);
@@ -506,6 +531,7 @@ impl<'a> Gen<'a> {
         let mem = i.md != 3;
         let mem_ok = Self::mem_ok(&i);
         let rex = i.rex_present;
+        let mut store = false;
         match i.op {
             0x00..=0x3f if i.op & 7 < 6 && std => {
                 let kk = ((i.op >> 3) & 7) as u8;
@@ -570,6 +596,7 @@ impl<'a> Gen<'a> {
                     self.ea(&i, next, 2);
                     self.ld_gpr(6, i.reg);
                     self.mem_store(6, osz, kidx, rip);
+                    store = true;
                 } else {
                     self.ld_gpr(6, i.reg);
                     if osz == 4 {
@@ -602,6 +629,7 @@ impl<'a> Gen<'a> {
                 }
                 self.ea(&i, next, 2);
                 self.mem_store(6, 1, kidx, rip);
+                store = true;
             }
             0xc7 if std && i.reg & 7 == 0 => {
                 let v = Self::imm_for(osz, i.imm);
@@ -612,6 +640,7 @@ impl<'a> Gen<'a> {
                     self.ea(&i, next, 2);
                     self.a.mov_imm(6, v);
                     self.mem_store(6, osz, kidx, rip);
+                    store = true;
                 } else {
                     self.a.mov_imm(6, v);
                     self.st_gpr(i.rm, 6);
@@ -672,6 +701,7 @@ impl<'a> Gen<'a> {
                 self.ld_gpr(6, r);
                 self.mem_store(6, 8, kidx, rip);
                 self.st_gpr(4, 2);
+                store = true;
             }
             0x58..=0x5f if !i.p66 => {
                 let r = (i.op as u8 & 7) | ((i.rex & 1) << 3);
@@ -720,6 +750,9 @@ impl<'a> Gen<'a> {
                 return true;
             }
             _ => return false,
+        }
+        if store {
+            self.smc_check(kidx, next);
         }
         self.inlined += 1;
         true

@@ -47,7 +47,8 @@ fn main() {
     let mut cfg = MachineConfig::new()
         .kernel(fetch("linux"))
         .log(|m| eprintln!("[uemu] {m}"))
-        .debug(args.iter().any(|a| a == "--debug"));
+        .debug(args.iter().any(|a| a == "--debug"))
+        .verify_jit(args.iter().any(|a| a == "--verify"));
     if !args.iter().any(|a| a == "--no-initrd") {
         cfg = cfg.initrd(fetch("initrd.gz"));
     }

@@ -63,6 +63,7 @@ pub struct MachineConfig {
     clock: ClockMode,
     log: Option<LogFn>,
     debug: bool,
+    verify: bool,
 }
 
 impl Default for MachineConfig {
@@ -78,6 +79,7 @@ impl Default for MachineConfig {
             clock: ClockMode::Virtual,
             log: None,
             debug: false,
+            verify: false,
         }
     }
 }
@@ -122,6 +124,12 @@ impl MachineConfig {
         self
     }
 
+    #[doc(hidden)]
+    pub fn verify_jit(mut self, on: bool) -> Self {
+        self.verify = on;
+        self
+    }
+
     pub fn log(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.log = Some(Arc::new(f));
         self
@@ -145,10 +153,12 @@ struct Vcpu {
     log: Option<LogFn>,
     debug: bool,
     jit: JitMode,
+    verify: bool,
+    boot_ram: Option<Vec<u8>>,
 }
 
 impl Vcpu {
-    fn run(self) -> ExitReason {
+    fn run(mut self) -> ExitReason {
         let mut cpu = Cpu::new(
             self.ram,
             self.boot,
@@ -162,7 +172,12 @@ impl Vcpu {
         if self.debug {
             cpu.trace = Some(Default::default());
         }
-        let r = cpu.run();
+        let r = if self.verify {
+            let mut sh = Cpu::new(self.boot_ram.take().unwrap(), self.boot, ConsoleHandle::default(), cpu.stop.clone(), None);
+            cpu.run_verify(&mut sh)
+        } else {
+            cpu.run()
+        };
         if let (Some(l), true) = (
             &self.log,
             self.debug || matches!(r, ExitReason::TripleFault | ExitReason::Internal(_)),
@@ -190,6 +205,7 @@ impl EmulatedMachine {
         }
         let mut ram = vec![0u8; cfg.memory_mib << 20];
         let boot = boot::load(&mut ram, &cfg.kernel, cfg.initrd.as_deref(), &cfg.cmdline)?;
+        let ram_copy = if cfg.verify { ram.clone() } else { Vec::new() };
         let console = ConsoleHandle::default();
         let stop = Arc::new(AtomicBool::new(false));
         Ok(Self {
@@ -201,6 +217,8 @@ impl EmulatedMachine {
                 log: cfg.log,
                 debug: cfg.debug,
                 jit: cfg.jit,
+                verify: cfg.verify,
+                boot_ram: if cfg.verify { Some(ram_copy) } else { None },
             }),
             thread: None,
             console,
