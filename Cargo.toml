@@ -1,0 +1,14 @@
+[package]
+name = "uemulator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[lib]
+name = "uemulator"
+path = "src/lib.rs"
+
+[[example]]
+name = "boot-linux"
+path = "examples/linux.rs"
