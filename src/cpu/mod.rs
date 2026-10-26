@@ -4,6 +4,7 @@ mod exec;
 mod flags;
 mod fpu;
 mod mem;
+mod sse;
 mod sys;
 
 use std::sync::Arc;

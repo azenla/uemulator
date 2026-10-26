@@ -1,5 +1,9 @@
 # Milestones
 
+## Status
+
+- M0 done. M1 done (console prints `Linux version 6.12.107+deb13-amd64`). M2 done for the no-initrd path (VFS panic, then `ExitReason::Reset`, ~30 s wall in release). M3 in progress (initrd boot: x87/SSE2 implemented, validating userspace).
+
 Each has an observable serial-output exit criterion. Interpreter first.
 
 | # | deliverable | exit criterion |

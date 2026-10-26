@@ -1,5 +1,11 @@
 # IR, TB cache, interpreter
 
+## Status / deviation (M1-M2 built this way)
+
+The interpreter currently executes decoded `Insn` records directly (`src/cpu/decode.rs`, `exec.rs`), with a decode cache keyed by guest physical address (`mem.rs::fetch_decode`) and generation-based invalidation when a store hits a page that holds cached code. There is no uop layer yet; it is introduced with the JIT (M4), lowering from `Insn` (or via uops) while the Insn interpreter stays the oracle. Only 64-bit long mode (CS.L=1) is executed; other modes are not implemented. Measured: ~35-60 MIPS release on an Apple M-series host.
+
+The text below is the target design for the JIT phase.
+
 ## uops (`ir.rs`)
 
 Register-based, non-SSA, per-TB temporaries `t0..tN` (u64; `u128` handled by paired temps or helpers). Compact enum, ≤ 16 bytes each, stored in a `Vec<Uop>` per TB.
