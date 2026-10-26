@@ -96,7 +96,7 @@ impl Devices {
         let t = self.boot_unix + now / 1_000_000_000;
         let (y, mo, d) = civil((t / 86400) as i64);
         let s = t % 86400;
-        let dow = ((t / 86400 + 4) % 7 + 1) as u64;
+        let dow = (t / 86400 + 4) % 7 + 1;
         match idx {
             0 => bcd(s % 60),
             2 => bcd((s / 60) % 60),

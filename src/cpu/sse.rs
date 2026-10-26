@@ -104,7 +104,7 @@ fn cvt_i32(v: f64, trunc: bool, mxcsr: u32) -> i32 {
 
 fn cvt_i64(v: f64, trunc: bool, mxcsr: u32) -> i64 {
     let r = if trunc { v.trunc() } else { round_rc(v, mxcsr) };
-    if r.is_nan() || r >= 9.223372036854775808e18 || r < -9.223372036854775808e18 {
+    if r.is_nan() || r >= 9.223_372_036_854_776e18 || r < -9.223_372_036_854_776e18 {
         i64::MIN
     } else {
         r as i64
@@ -128,8 +128,11 @@ fn cmp_pred(p: u8, a: f64, b: f64) -> bool {
         2 => a <= b,
         3 => un,
         4 => a != b || un,
-        5 => !(a < b),
-        6 => !(a <= b),
+        5 => a.partial_cmp(&b) != Some(std::cmp::Ordering::Less),
+        6 => !matches!(
+            a.partial_cmp(&b),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ),
         _ => !un,
     }
 }
@@ -376,7 +379,7 @@ impl Cpu {
                 self.gpr[d] = if p == P::N {
                     (0..4).fold(0, |m, k| m | (((u32::get(x, k) >> 31) as u64) << k))
                 } else {
-                    (0..2).fold(0, |m, k| m | (((u64::get(x, k) >> 63) as u64) << k))
+                    (0..2).fold(0, |m, k| m | ((u64::get(x, k) >> 63) << k))
                 };
                 None
             }

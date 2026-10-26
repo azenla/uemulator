@@ -15,5 +15,6 @@ Index. Read in order; each file ends with open questions where the answer needs 
 | 08-testing.md | unit, differential, boot tests |
 | 09-qemu-map.md | which QEMU files to read for which subsystem; fork notes |
 | 10-milestones.md | ordered milestones with observable exit criteria |
+| 11-storage-net-console.md | configurable RAM, virtio-pci disk/net/console (resize) |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. Zero crate dependencies.

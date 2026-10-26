@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub(crate) const XZR: u32 = 31;
 pub(crate) const SP: u32 = 31;
 
@@ -74,7 +76,7 @@ pub(crate) fn encode_bitmask(val: u64, is64: bool) -> Option<u32> {
         cto = clo + imm.trailing_ones() - (64 - size);
     }
     let immr = (size - i) & (size - 1);
-    let mut nimms = (!(size - 1) << 1) as u32;
+    let mut nimms = !(size - 1) << 1;
     nimms |= cto - 1;
     let n = ((nimms >> 6) & 1) ^ 1;
     Some((n << 12) | (immr << 6) | (nimms & 0x3f))
@@ -345,7 +347,7 @@ impl Asm {
 
     fn ldst_imm(&mut self, base: u32, scale: u32, rt: u32, rn: u32, off: u32) {
         assert!(
-            off % (1 << scale) == 0 && (off >> scale) < 4096,
+            off.is_multiple_of(1 << scale) && (off >> scale) < 4096,
             "bad ldst offset {off}"
         );
         self.emit(base | (off >> scale) << 10 | rn << 5 | rt);

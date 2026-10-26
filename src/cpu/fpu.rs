@@ -398,11 +398,7 @@ impl Cpu {
                         };
                         self.set_st(sti, v);
                     }
-                    if i.modrm != 0xd9 {
-                        self.fpop();
-                    } else {
-                        self.fpop();
-                    }
+                    self.fpop();
                 }
                 _ => match i.modrm {
                     0xe0 => {
@@ -656,8 +652,8 @@ impl Cpu {
         let mut st = [[0u8; 10]; 8];
         let top = ((fsw >> 11) & 7) as usize;
         for k in 0..8 {
-            for j in 0..10 {
-                st[(top + k) & 7][j] = self.read(a + 32 + k as u64 * 16 + j as u64, 1)? as u8;
+            for (j, b) in st[(top + k) & 7].iter_mut().enumerate() {
+                *b = self.read(a + 32 + k as u64 * 16 + j as u64, 1)? as u8;
             }
         }
         for k in 0..16 {

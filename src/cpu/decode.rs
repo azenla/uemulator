@@ -26,9 +26,6 @@ pub(crate) struct Insn {
 
 pub(crate) const NO_REG: u8 = 0xff;
 pub(crate) const NO_SEG: u8 = 0xff;
-pub(crate) const MAP_0F: u16 = 0x100;
-pub(crate) const MAP_0F38: u16 = 0x200;
-pub(crate) const MAP_0F3A: u16 = 0x300;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DecodeErr {

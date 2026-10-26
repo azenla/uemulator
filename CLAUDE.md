@@ -8,7 +8,7 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 
 - Run: `cargo run --release --example boot-linux` (downloads and caches the Debian netboot kernel/initrd in `~/.cache/uemulator`, override with `UEMULATOR_CACHE`)
 - Test: `cargo test --release`
-- Before finishing: `hack/autofix.sh` (clippy fix + fmt), or `hack/format.sh` for fmt only
+- Before EVERY commit: run `./hack/autofix.sh` (clippy --fix + fmt), then fix by hand every warning it leaves; `cargo clippy --release --all-targets` must print zero warnings. Never commit with warnings.
 
 ## Rules
 

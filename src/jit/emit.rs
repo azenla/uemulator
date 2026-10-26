@@ -367,7 +367,7 @@ impl<'a> Gen<'a> {
                     self.a.mov(1, 2);
                     self.a.mov_imm(2, size as u64);
                     self.a.mov_imm(3, s.rip);
-                    self.call(self.ad.ld as u64);
+                    self.call(self.ad.ld);
                     self.a.cbnz(1, fail, true);
                     if signed {
                         match size {
@@ -392,7 +392,7 @@ impl<'a> Gen<'a> {
                     self.a.mov_imm(2, size as u64);
                     self.a.mov_imm(4, s.rip);
                     self.a.mov(0, CPU);
-                    self.call(self.ad.st as u64);
+                    self.call(self.ad.st);
                     self.a.cbnz(0, fail, true);
                     self.a.msr_nzcv(SAVE_NZCV);
                     self.a.mov(2, SAVE_LA);
@@ -485,10 +485,11 @@ impl<'a> Gen<'a> {
                 Kind::Logic
             }
         };
-        if k != 7 && k != 8 {
-            if let Dst::Reg(d) = dst {
-                self.st_gpr(d, 0);
-            }
+        if k != 7
+            && k != 8
+            && let Dst::Reg(d) = dst
+        {
+            self.st_gpr(d, 0);
         }
         self.store_cc(kind, osz);
     }

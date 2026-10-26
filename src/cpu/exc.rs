@@ -32,9 +32,6 @@ impl Exc {
     pub fn nm() -> Exc {
         Exc::fault(7, None)
     }
-    pub fn ss(code: u32) -> Exc {
-        Exc::fault(12, Some(code))
-    }
 }
 
 fn contributory(v: u8) -> bool {

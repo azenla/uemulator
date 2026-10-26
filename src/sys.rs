@@ -61,10 +61,6 @@ impl ExecMem {
         }
     }
 
-    pub fn patch(&self, off: usize, word: u32) {
-        self.write(off, &[word]);
-    }
-
     unsafe fn flush(&self, off: usize, len: usize) {
         let start = unsafe { self.ptr.add(off) } as *mut c_void;
         #[cfg(target_os = "macos")]

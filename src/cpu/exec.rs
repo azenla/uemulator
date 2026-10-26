@@ -203,7 +203,7 @@ impl Cpu {
             }
             2 => {
                 let mut r = a;
-                let mut cf = (fl & CF) as u64;
+                let mut cf = fl & CF;
                 for _ in 0..c % (bits + 1) {
                     let out = msb(r);
                     r = ((r << 1) | cf) & m;
@@ -213,7 +213,7 @@ impl Cpu {
             }
             3 => {
                 let mut r = a;
-                let mut cf = (fl & CF) as u64;
+                let mut cf = fl & CF;
                 for _ in 0..c % (bits + 1) {
                     let out = r & 1;
                     r = (r >> 1) | (cf << (bits - 1));

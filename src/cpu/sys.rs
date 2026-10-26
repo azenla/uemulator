@@ -283,7 +283,10 @@ impl Cpu {
                     if sel & 0xfffc == 0 {
                         if r == 2 {
                             self.ldtr = Seg::default();
-                            return Ok(self.rip = next);
+                            return {
+                                let _: () = self.rip = next;
+                                Ok(())
+                            };
                         }
                         return Err(Exc::gp(0));
                     }
