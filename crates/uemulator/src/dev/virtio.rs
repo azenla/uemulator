@@ -1,4 +1,6 @@
 use super::guestmem::GuestMem;
+#[cfg(target_os = "uefi")]
+use crate::prelude::*;
 
 pub(crate) const QUEUE_MAX: u16 = 256;
 pub(crate) const F_VERSION_1: u64 = 1 << 32;

@@ -1,16 +1,18 @@
+#[cfg(target_os = "uefi")]
+use crate::prelude::*;
 pub(crate) mod guestmem;
 mod pci;
 mod pic;
 mod pit;
 mod serial;
+#[cfg(not(target_os = "uefi"))]
 mod vblk;
 mod vcons;
 mod virtio;
 mod vnet;
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::console::ConsoleHandle;
+#[cfg(not(target_os = "uefi"))]
 use crate::disk::Disk;
 use crate::netdev::NetHandle;
 use guestmem::GuestMem;
@@ -18,6 +20,7 @@ use pci::PciHost;
 use pic::Pics;
 use pit::Pit;
 use serial::Uart;
+#[cfg(not(target_os = "uefi"))]
 use vblk::VirtioBlk;
 use vcons::VirtioConsole;
 use virtio::Transport;
@@ -25,6 +28,7 @@ use vnet::VirtioNet;
 
 #[derive(Default)]
 pub(crate) struct DevConfig {
+    #[cfg(not(target_os = "uefi"))]
     pub disk: Option<Disk>,
     pub net: Option<([u8; 6], NetHandle)>,
     pub virtio_console: bool,
@@ -68,16 +72,20 @@ impl Devices {
                 console.clone(),
             ))));
         }
+        #[cfg(not(target_os = "uefi"))]
         if let Some(d) = cfg.disk {
             devs.push(Transport::new(Box::new(VirtioBlk::new(d))));
         }
         if let Some((mac, h)) = cfg.net {
             devs.push(Transport::new(Box::new(VirtioNet::new(mac, h))));
         }
-        let boot_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        #[cfg(not(target_os = "uefi"))]
+        let boot_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        #[cfg(target_os = "uefi")]
+        let boot_unix = 0;
         Devices {
             pic: Pics::default(),
             pit: Pit::new(),

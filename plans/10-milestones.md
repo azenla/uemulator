@@ -11,6 +11,8 @@
 - `jit` feature (default on) gates `libc`/`windows-sys`; `--no-default-features` is dependency-free and interpreter-only.
 - x86_64 host JIT done (see 06): same inlined subset as aarch64, verified in lockstep. Exercised on macOS x86_64 under Rosetta; Linux and Windows x86_64 hosts compile but are untested.
 
+- UEFI application done (see 12): `crates/uemulator-uefi`, library `no_std` on `target_os = "uefi"`, `hack/uefi/boot.sh`; emulator (interpreter) everywhere, plus a hardware-virtualization path on x86_64 (AMD SVM verified under TCG, Intel VMX untested), no disk/net.
+
 Each has an observable serial-output exit criterion. Interpreter first.
 
 | # | deliverable | exit criterion |

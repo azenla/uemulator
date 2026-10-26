@@ -1,3 +1,5 @@
+#[cfg(target_os = "uefi")]
+use crate::prelude::*;
 pub(crate) struct GuestMem<'a> {
     ram: &'a mut [u8],
     code: &'a [u8],

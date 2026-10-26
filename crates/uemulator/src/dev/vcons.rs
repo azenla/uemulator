@@ -77,7 +77,7 @@ impl VirtioDev for VirtioConsole {
     }
 
     fn config_event(&mut self) -> bool {
-        std::mem::take(&mut self.changed)
+        core::mem::take(&mut self.changed)
     }
 }
 

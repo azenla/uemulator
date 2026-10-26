@@ -320,7 +320,7 @@ impl Cpu {
             match i.modrm {
                 0xf8 => {
                     self.need_cpl0()?;
-                    std::mem::swap(&mut self.seg[5].base, &mut self.kgsbase);
+                    core::mem::swap(&mut self.seg[5].base, &mut self.kgsbase);
                 }
                 _ => return Err(self.unimpl(i)),
             }

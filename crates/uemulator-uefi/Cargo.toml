@@ -1,0 +1,16 @@
+[package]
+name = "uemulator-uefi"
+description = "UEFI application that boots a Linux bzImage and initramfs on uemulator"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "uemulator-uefi"
+path = "src/main.rs"
+test = false
+
+# Only built for the UEFI targets; on any other target the crate is empty.
+[target.'cfg(target_os = "uefi")'.dependencies]
+uemulator = { path = "../uemulator", default-features = false }
+uefi = { version = "0.41.0", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }
+spin = "0.12.3"

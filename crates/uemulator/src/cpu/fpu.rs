@@ -3,6 +3,8 @@ use super::exc::Exc;
 use super::exec::Loc;
 use super::flags::*;
 use super::*;
+#[cfg(target_os = "uefi")]
+use crate::math::{Float64Ext, FloatExt};
 
 pub(crate) fn ext_to_f64(b: [u8; 10]) -> f64 {
     let m = u64::from_le_bytes(b[..8].try_into().unwrap());
@@ -219,15 +221,15 @@ impl Cpu {
                         self.fsw = (self.fsw & !0x200) | ((neg as u16) << 9);
                     }
                     0xe8 => self.fpush(1.0),
-                    0xe9 => self.fpush(std::f64::consts::LOG2_10),
-                    0xea => self.fpush(std::f64::consts::LOG2_E),
-                    0xeb => self.fpush(std::f64::consts::PI),
-                    0xec => self.fpush(std::f64::consts::LOG10_2),
-                    0xed => self.fpush(std::f64::consts::LN_2),
+                    0xe9 => self.fpush(core::f64::consts::LOG2_10),
+                    0xea => self.fpush(core::f64::consts::LOG2_E),
+                    0xeb => self.fpush(core::f64::consts::PI),
+                    0xec => self.fpush(core::f64::consts::LOG10_2),
+                    0xed => self.fpush(core::f64::consts::LN_2),
                     0xee => self.fpush(0.0),
                     0xf0 => {
                         let x = self.st_val(0);
-                        self.set_st(0, (x * std::f64::consts::LN_2).exp_m1());
+                        self.set_st(0, (x * core::f64::consts::LN_2).exp_m1());
                     }
                     0xf1 => {
                         let v = self.st_val(1) * self.st_val(0).log2();

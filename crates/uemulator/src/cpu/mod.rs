@@ -1,3 +1,5 @@
+#[cfg(target_os = "uefi")]
+use crate::prelude::*;
 pub(crate) mod decode;
 pub(crate) mod exc;
 mod exec;
@@ -7,14 +9,15 @@ pub(crate) mod mem;
 mod sse;
 mod sys;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::sync::Arc;
 
 use crate::boot::BootState;
 use crate::console::ConsoleHandle;
 use crate::dev::guestmem::GuestMem;
 use crate::dev::{DevConfig, Devices};
-use crate::machine::{ExitReason, LogFn};
+use crate::machine::{ExitReason, LogFn, PollFn};
 
 use decode::Insn;
 use flags::Cc;
@@ -128,7 +131,7 @@ pub(crate) struct Cpu {
     pub pat: u64,
     pub sysenter: [u64; 3],
     pub dr: [u64; 8],
-    pub msr_misc: std::collections::HashMap<u32, u64>,
+    pub msr_misc: alloc::collections::BTreeMap<u32, u64>,
     pub xmm: [u128; 16],
     pub mxcsr: u32,
     pub fcw: u16,
@@ -150,14 +153,15 @@ pub(crate) struct Cpu {
     pub next_event: u64,
     pub stop: Arc<AtomicBool>,
     pub log: Option<LogFn>,
-    pub logged: std::collections::HashSet<u64>,
+    pub poll: Option<PollFn>,
+    pub logged: alloc::collections::BTreeSet<u64>,
     pub exc_depth: u32,
     pub flushes: u64,
     pub realtime: bool,
     pub last_done: u64,
     pub pending: Option<Exc>,
     pub jit: Option<Box<crate::jit::Jit>>,
-    pub trace: Option<std::collections::VecDeque<u64>>,
+    pub trace: Option<alloc::collections::VecDeque<u64>>,
 }
 
 impl Cpu {
@@ -258,6 +262,7 @@ impl Cpu {
             next_event: 0,
             stop,
             log,
+            poll: None,
             logged: Default::default(),
             exc_depth: 0,
             flushes: 0,
@@ -297,6 +302,9 @@ impl Cpu {
     }
 
     pub fn tick_devices(&mut self, now: u64) {
+        if let Some(p) = &self.poll {
+            p(false);
+        }
         let hits = {
             let mut mem = GuestMem::new(&mut self.ram, &self.code_page);
             self.dev.tick(now, &mut mem);
@@ -507,11 +515,16 @@ impl Cpu {
         match self.dev.next_deadline(now) {
             Some(t) => {
                 if t > now {
-                    let mut dt = t - now;
-                    if self.realtime {
-                        dt = dt.min(2_000_000);
+                    #[cfg(not(target_os = "uefi"))]
+                    let dt = if self.realtime {
+                        let dt = (t - now).min(2_000_000);
                         std::thread::sleep(std::time::Duration::from_nanos(dt));
-                    }
+                        dt
+                    } else {
+                        t - now
+                    };
+                    #[cfg(target_os = "uefi")]
+                    let dt = t - now;
                     self.warp_ns += dt;
                 }
                 self.tick_devices(self.now_ns());
@@ -521,7 +534,12 @@ impl Cpu {
                 if self.dev.pic.has_pending() {
                     return None;
                 }
+                #[cfg(not(target_os = "uefi"))]
                 std::thread::sleep(std::time::Duration::from_millis(1));
+                #[cfg(target_os = "uefi")]
+                if let Some(p) = &self.poll {
+                    p(true);
+                }
             }
         }
         if self.dev.reset_requested {

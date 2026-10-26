@@ -2,6 +2,8 @@ use super::decode::*;
 use super::exc::Exc;
 use super::flags::*;
 use super::*;
+#[cfg(target_os = "uefi")]
+use crate::math::FloatExt;
 
 trait Lane: Copy {
     const N: usize;
@@ -128,10 +130,10 @@ fn cmp_pred(p: u8, a: f64, b: f64) -> bool {
         2 => a <= b,
         3 => un,
         4 => a != b || un,
-        5 => a.partial_cmp(&b) != Some(std::cmp::Ordering::Less),
+        5 => a.partial_cmp(&b) != Some(core::cmp::Ordering::Less),
         6 => !matches!(
             a.partial_cmp(&b),
-            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
         ),
         _ => !un,
     }

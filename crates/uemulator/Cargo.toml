@@ -13,3 +13,6 @@ libc = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = ["Win32_System_Memory", "Win32_System_Threading", "Win32_System_Diagnostics_Debug"] }
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+libm = "0.2"

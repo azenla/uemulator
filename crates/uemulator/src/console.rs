@@ -1,6 +1,9 @@
-use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+#[cfg(target_os = "uefi")]
+use crate::prelude::*;
+use alloc::collections::VecDeque;
+use core::time::Duration;
+
+use crate::sync::{Arc, Condvar, Mutex};
 
 const QUEUE_CAP: usize = 1 << 20;
 

@@ -1,5 +1,7 @@
 use super::guestmem::GuestMem;
 use super::virtio::Transport;
+#[cfg(target_os = "uefi")]
+use crate::prelude::*;
 
 pub(crate) const MMIO_BASE: u64 = 0xc000_0000;
 const BAR_SIZE: u64 = 0x4000;

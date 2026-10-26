@@ -1,3 +1,5 @@
+#[cfg(target_os = "uefi")]
+use crate::prelude::*;
 #[derive(Default)]
 struct Pic {
     irr: u8,

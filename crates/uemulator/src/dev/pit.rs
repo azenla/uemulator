@@ -1,3 +1,5 @@
+#[cfg(target_os = "uefi")]
+use crate::prelude::*;
 const HZ: u128 = 1_193_182;
 
 #[derive(Default, Clone, Copy)]

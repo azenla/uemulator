@@ -1,14 +1,18 @@
-use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "uefi")]
+use crate::prelude::*;
+use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "uefi"))]
 use std::thread::JoinHandle;
 
 use crate::boot::{self, BootState};
 use crate::console::ConsoleHandle;
 use crate::cpu::Cpu;
 use crate::dev::DevConfig;
+#[cfg(not(target_os = "uefi"))]
 use crate::disk::Disk;
 use crate::netdev::NetHandle;
+use crate::sync::Arc;
 
 #[derive(Debug)]
 pub enum Error {
@@ -29,7 +33,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JitMode {
@@ -66,6 +70,8 @@ pub const MIN_MEMORY_MIB: usize = 64;
 pub const MAX_MEMORY_MIB: usize = 3072;
 
 pub(crate) type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
+pub(crate) type PollFn = Arc<dyn Fn(bool) + Send + Sync>;
+type HostPollFn = Arc<dyn Fn(&ConsoleHandle, bool) + Send + Sync>;
 
 pub struct MachineConfig {
     kernel: Vec<u8>,
@@ -73,12 +79,14 @@ pub struct MachineConfig {
     cmdline: Option<String>,
     cmdline_extra: Vec<String>,
     memory_mib: usize,
+    #[cfg(not(target_os = "uefi"))]
     disk: Option<Disk>,
     net_mac: Option<[u8; 6]>,
     console_kind: ConsoleKind,
     jit: JitMode,
     clock: ClockMode,
     log: Option<LogFn>,
+    poll: Option<HostPollFn>,
     debug: bool,
     verify: bool,
     unix_time: Option<u64>,
@@ -92,12 +100,14 @@ impl Default for MachineConfig {
             cmdline: None,
             cmdline_extra: Vec::new(),
             memory_mib: 512,
+            #[cfg(not(target_os = "uefi"))]
             disk: None,
             net_mac: None,
             console_kind: ConsoleKind::Serial,
             jit: JitMode::Auto,
             clock: ClockMode::Virtual,
             log: None,
+            poll: None,
             debug: false,
             verify: false,
             unix_time: None,
@@ -131,6 +141,7 @@ impl MachineConfig {
         self
     }
 
+    #[cfg(not(target_os = "uefi"))]
     pub fn disk(mut self, disk: Disk) -> Self {
         self.disk = Some(disk);
         self
@@ -183,6 +194,15 @@ impl MachineConfig {
     }
 }
 
+impl MachineConfig {
+    /// Called from the vCPU loop. The flag is true while the guest is halted with nothing to
+    /// do, when the host may wait. Single-threaded hosts use it to pump their console.
+    pub fn poll(mut self, f: impl Fn(&ConsoleHandle, bool) + Send + Sync + 'static) -> Self {
+        self.poll = Some(Arc::new(f));
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct StopHandle(Arc<AtomicBool>);
 
@@ -198,6 +218,7 @@ struct Vcpu {
     console: ConsoleHandle,
     stop: Arc<AtomicBool>,
     log: Option<LogFn>,
+    poll: Option<HostPollFn>,
     debug: bool,
     jit: JitMode,
     clock: ClockMode,
@@ -209,18 +230,23 @@ struct Vcpu {
 
 impl Vcpu {
     fn run(mut self) -> ExitReason {
+        let console = self.console.clone();
         let mut cpu = Cpu::new(
             self.ram,
             self.boot,
             self.console,
             self.stop,
             self.log.clone(),
-            std::mem::take(&mut self.devcfg),
+            core::mem::take(&mut self.devcfg),
         );
         if let Some(t) = self.unix_time {
             cpu.dev.set_boot_time(t);
         }
         cpu.realtime = self.clock == ClockMode::Realtime;
+        cpu.poll = self.poll.take().map(|p| {
+            let f: PollFn = Arc::new(move |idle| p(&console, idle));
+            f
+        });
         if self.jit != JitMode::Off {
             cpu.jit = crate::jit::Jit::new().map(Box::new);
         }
@@ -252,7 +278,10 @@ impl Vcpu {
 
 pub struct EmulatedMachine {
     vcpu: Option<Vcpu>,
+    #[cfg(not(target_os = "uefi"))]
     thread: Option<JoinHandle<ExitReason>>,
+    #[cfg(target_os = "uefi")]
+    started: bool,
     console: ConsoleHandle,
     net: Option<NetHandle>,
     stop: Arc<AtomicBool>,
@@ -287,6 +316,7 @@ impl EmulatedMachine {
         let net = cfg.net_mac.map(|m| (m, NetHandle::default()));
         let net_handle = net.as_ref().map(|(_, h)| h.clone());
         let devcfg = DevConfig {
+            #[cfg(not(target_os = "uefi"))]
             disk: cfg.disk,
             net,
             virtio_console: cfg.console_kind == ConsoleKind::Virtio,
@@ -301,6 +331,7 @@ impl EmulatedMachine {
                 console: console.clone(),
                 stop: stop.clone(),
                 log: cfg.log,
+                poll: cfg.poll,
                 debug: cfg.debug,
                 jit: cfg.jit,
                 clock: cfg.clock,
@@ -309,7 +340,10 @@ impl EmulatedMachine {
                 boot_ram: if cfg.verify { Some(ram_copy) } else { None },
                 devcfg,
             }),
+            #[cfg(not(target_os = "uefi"))]
             thread: None,
+            #[cfg(target_os = "uefi")]
+            started: false,
             console,
             net: net_handle,
             stop,
@@ -333,11 +367,31 @@ impl EmulatedMachine {
     }
 
     pub fn start(&mut self) -> Result<(), Error> {
-        let vcpu = self.vcpu.take().ok_or(Error::AlreadyStarted)?;
-        self.thread = Some(std::thread::spawn(move || vcpu.run()));
+        #[cfg(not(target_os = "uefi"))]
+        {
+            let vcpu = self.vcpu.take().ok_or(Error::AlreadyStarted)?;
+            self.thread = Some(std::thread::spawn(move || vcpu.run()));
+        }
+        // There are no threads: the vCPU runs inside `wait`.
+        #[cfg(target_os = "uefi")]
+        {
+            if self.started || self.vcpu.is_none() {
+                return Err(Error::AlreadyStarted);
+            }
+            self.started = true;
+        }
         Ok(())
     }
 
+    #[cfg(target_os = "uefi")]
+    pub fn wait(&mut self) -> ExitReason {
+        match self.vcpu.take() {
+            Some(v) if self.started => v.run(),
+            _ => ExitReason::Stopped,
+        }
+    }
+
+    #[cfg(not(target_os = "uefi"))]
     pub fn wait(&mut self) -> ExitReason {
         match self.thread.take() {
             Some(t) => t

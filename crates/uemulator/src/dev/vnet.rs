@@ -1,6 +1,8 @@
 use super::guestmem::GuestMem;
 use super::virtio::{Queue, VirtioDev};
 use crate::netdev::NetHandle;
+#[cfg(target_os = "uefi")]
+use crate::prelude::*;
 
 const F_MAC: u64 = 1 << 5;
 const F_STATUS: u64 = 1 << 16;

@@ -1,4 +1,6 @@
 use crate::machine::Error;
+#[cfg(target_os = "uefi")]
+use crate::prelude::*;
 
 pub(crate) const KERNEL_LOAD: u64 = 0x100_0000;
 const BOOT_PARAMS: u64 = 0x7000;
@@ -62,9 +64,10 @@ impl SetupHeader {
     }
 }
 
+/// Register state of a 64-bit Linux entry: paging on with `cr3`, the GDT at `gdt_base`, `cs` and
+/// `ds` selecting its flat code and data descriptors.
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
-pub(crate) struct BootState {
+pub struct BootState {
     pub rip: u64,
     pub rsi: u64,
     pub cr3: u64,
