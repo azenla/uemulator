@@ -12,3 +12,9 @@ path = "src/lib.rs"
 [[example]]
 name = "boot-linux"
 path = "examples/linux.rs"
+
+[profile.dev]
+opt-level = 3
+
+[profile.test]
+opt-level = 3
