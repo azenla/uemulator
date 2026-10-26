@@ -16,7 +16,8 @@ fn run_until(cfg: MachineConfig, needle: &str, limit: Duration) -> (String, Opti
     let mut m = EmulatedMachine::new(cfg).unwrap();
     let out = Arc::new(Mutex::new(Vec::<u8>::new()));
     let sink = out.clone();
-    m.console().on_output(move |b| sink.lock().unwrap().extend_from_slice(b));
+    m.console()
+        .on_output(move |b| sink.lock().unwrap().extend_from_slice(b));
     let stop = m.stop_handle();
     m.start().unwrap();
     let start = Instant::now();
@@ -36,7 +37,9 @@ fn run_until(cfg: MachineConfig, needle: &str, limit: Duration) -> (String, Opti
 
 #[test]
 fn prints_linux_version() {
-    let Some(kernel) = cached("linux") else { return };
+    let Some(kernel) = cached("linux") else {
+        return;
+    };
     let cfg = MachineConfig::new().kernel(kernel).jit(JitMode::Off);
     let (text, miss) = run_until(cfg, "Linux version 6.12", Duration::from_secs(120));
     assert!(miss.is_none(), "banner not seen:\n{text}");
@@ -44,7 +47,9 @@ fn prints_linux_version() {
 
 #[test]
 fn vfs_panic_then_reset() {
-    let Some(kernel) = cached("linux") else { return };
+    let Some(kernel) = cached("linux") else {
+        return;
+    };
     let cfg = MachineConfig::new().kernel(kernel).jit(JitMode::Off);
     let mut m = EmulatedMachine::new(cfg).unwrap();
     m.start().unwrap();
@@ -53,8 +58,13 @@ fn vfs_panic_then_reset() {
 
 #[test]
 fn installer_userspace() {
-    let (Some(kernel), Some(initrd)) = (cached("linux"), cached("initrd.gz")) else { return };
-    let cfg = MachineConfig::new().kernel(kernel).initrd(initrd).jit(JitMode::Off);
+    let (Some(kernel), Some(initrd)) = (cached("linux"), cached("initrd.gz")) else {
+        return;
+    };
+    let cfg = MachineConfig::new()
+        .kernel(kernel)
+        .initrd(initrd)
+        .jit(JitMode::Off);
     let (text, miss) = run_until(cfg, "Starting system log daemon", Duration::from_secs(240));
     assert!(miss.is_none(), "installer userspace not reached:\n{text}");
     assert!(text.contains("Run /init as init process"));

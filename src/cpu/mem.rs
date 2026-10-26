@@ -54,7 +54,7 @@ impl Cpu {
         self.eflags_full() & CF != 0
     }
 
-    fn page_fault(&mut self, la: u64, acc: Acc, user: bool, present: bool, rsvd: bool) -> Exc {
+    pub fn page_fault(&mut self, la: u64, acc: Acc, user: bool, present: bool, rsvd: bool) -> Exc {
         self.cr2 = la;
         let mut e = 0u32;
         if present {
@@ -228,13 +228,25 @@ impl Cpu {
         let n = size as usize;
         if a + n <= self.ram.len() {
             if self.code_page[a >> 12] != 0 {
-                self.flush_decode();
+                self.code_written(a >> 12);
             }
             self.ram[a..a + n].copy_from_slice(&val.to_le_bytes()[..n]);
         } else {
             self.log_once(0x2000 + (pa >> 12), || {
                 format!("write to unmapped physical address {pa:#x}")
             });
+        }
+    }
+
+    fn code_written(&mut self, ppn: usize) {
+        if let Some(mut j) = self.jit.take() {
+            j.invalidate_page(ppn as u64);
+            self.jit = Some(j);
+            self.code_page[ppn] = 0;
+            self.dc_gen = self.dc_gen.wrapping_add(1);
+            self.exit_block = true;
+        } else {
+            self.flush_decode();
         }
     }
 
@@ -246,7 +258,7 @@ impl Cpu {
         }
     }
 
-    fn mark_code(&mut self, pa: u64) {
+    pub fn mark_code(&mut self, pa: u64) {
         let p = (pa >> 12) as usize;
         if p < self.code_page.len() && self.code_page[p] == 0 {
             self.code_page[p] = 1;

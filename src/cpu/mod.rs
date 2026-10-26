@@ -1,9 +1,9 @@
-mod decode;
-mod exc;
+pub(crate) mod decode;
+pub(crate) mod exc;
 mod exec;
-mod flags;
+pub(crate) mod flags;
 mod fpu;
-mod mem;
+pub(crate) mod mem;
 mod sse;
 mod sys;
 
@@ -87,6 +87,7 @@ pub(crate) struct DEntry {
 
 pub(crate) const DC_SIZE: usize = 1 << 16;
 
+#[repr(C)]
 pub(crate) struct Cpu {
     pub gpr: [u64; 16],
     pub rip: u64,
@@ -96,6 +97,9 @@ pub(crate) struct Cpu {
     pub cc_dst: u64,
     pub cc_src: u64,
     pub cc_src2: u64,
+    pub tlb_cur: u64,
+    pub cpl: u8,
+    pub exit_block: bool,
     pub seg: [Seg; 6],
     pub gdtr: Dt,
     pub idtr: Dt,
@@ -117,7 +121,6 @@ pub(crate) struct Cpu {
     pub sysenter: [u64; 3],
     pub dr: [u64; 8],
     pub msr_misc: std::collections::HashMap<u32, u64>,
-    pub cpl: u8,
     pub xmm: [u128; 16],
     pub mxcsr: u32,
     pub fcw: u16,
@@ -142,6 +145,8 @@ pub(crate) struct Cpu {
     pub logged: std::collections::HashSet<u64>,
     pub exc_depth: u32,
     pub flushes: u64,
+    pub pending: Option<Exc>,
+    pub jit: Option<Box<crate::jit::Jit>>,
     pub trace: Option<std::collections::VecDeque<u64>>,
 }
 
@@ -245,10 +250,20 @@ impl Cpu {
             logged: Default::default(),
             exc_depth: 0,
             flushes: 0,
+            pending: None,
+            jit: None,
+            tlb_cur: 0,
+            exit_block: false,
             trace: None,
         };
         cpu.ram_base = cpu.ram.as_ptr() as u64;
+        cpu.set_cpl(0);
         cpu
+    }
+
+    pub fn set_cpl(&mut self, c: u8) {
+        self.cpl = c;
+        self.tlb_cur = self.tlb.as_ptr() as u64 + (c == 3) as u64 * (TLB_N * 32) as u64;
     }
 
     pub fn now_ns(&self) -> u64 {
@@ -312,7 +327,12 @@ impl Cpu {
             }
             self.shadow = false;
             self.icount += 1;
-            if let Err(e) = self.step() {
+            let r = if self.jit.is_some() {
+                self.step_block()
+            } else {
+                self.step()
+            };
+            if let Err(e) = r {
                 match e {
                     Exc::Fault { vec, err, soft } => {
                         if let Some(r) = self.deliver_event(vec, err, soft) {

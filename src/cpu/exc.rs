@@ -133,7 +133,7 @@ impl Cpu {
             };
         }
         self.seg[1] = cs;
-        self.cpl = new_cpl;
+        self.set_cpl(new_cpl);
         self.rip = target;
         self.set_arith_flags_from_cc();
         self.eflags &= !(TF | NT | RF | VM | AC);

@@ -216,7 +216,7 @@ impl Cpu {
         };
         self.eflags = (f & !self.sfmask & !RF) | 2;
         self.cc = Cc::Eflags;
-        self.cpl = 0;
+        self.set_cpl(0);
         self.rip = self.lstar;
         Ok(())
     }
@@ -246,7 +246,7 @@ impl Cpu {
         let m = CF | PF | AF | ZF | SF | TF | IF | DF | OF | NT | AC | (1 << 21);
         self.eflags = (r11 & m) | 2;
         self.cc = Cc::Eflags;
-        self.cpl = 3;
+        self.set_cpl(3);
         self.rip = self.gpr[1];
         Ok(())
     }

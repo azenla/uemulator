@@ -144,6 +144,7 @@ struct Vcpu {
     stop: Arc<AtomicBool>,
     log: Option<LogFn>,
     debug: bool,
+    jit: JitMode,
 }
 
 impl Vcpu {
@@ -155,6 +156,9 @@ impl Vcpu {
             self.stop,
             self.log.clone(),
         );
+        if self.jit != JitMode::Off {
+            cpu.jit = crate::jit::Jit::new().map(Box::new);
+        }
         if self.debug {
             cpu.trace = Some(Default::default());
         }
@@ -181,7 +185,7 @@ impl EmulatedMachine {
         if cfg.memory_mib < 64 {
             return Err(Error::BadConfig("memory_mib must be at least 64".into()));
         }
-        if cfg.jit == JitMode::On {
+        if cfg.jit == JitMode::On && !crate::sys::jit_probe() {
             return Err(Error::JitUnavailable);
         }
         let mut ram = vec![0u8; cfg.memory_mib << 20];
@@ -196,6 +200,7 @@ impl EmulatedMachine {
                 stop: stop.clone(),
                 log: cfg.log,
                 debug: cfg.debug,
+                jit: cfg.jit,
             }),
             thread: None,
             console,

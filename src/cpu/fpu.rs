@@ -105,7 +105,8 @@ impl Cpu {
     }
 
     fn set_cc_fsw(&mut self, c0: bool, c2: bool, c3: bool) {
-        self.fsw = (self.fsw & !0x4500) | ((c0 as u16) << 8) | ((c2 as u16) << 10) | ((c3 as u16) << 14);
+        self.fsw =
+            (self.fsw & !0x4500) | ((c0 as u16) << 8) | ((c2 as u16) << 10) | ((c3 as u16) << 14);
     }
 
     fn fcom_val(&mut self, a: f64, b: f64) {
@@ -554,7 +555,13 @@ impl Cpu {
                 3
             } else {
                 let v = ext_to_f64(self.st[p]);
-                if v == 0.0 { 1 } else if v.is_finite() { 0 } else { 2 }
+                if v == 0.0 {
+                    1
+                } else if v.is_finite() {
+                    0
+                } else {
+                    2
+                }
             };
             t |= tag << (2 * p);
         }
@@ -577,7 +584,9 @@ impl Cpu {
         self.fcw = self.read(a, 2)? as u16;
         self.fsw = self.read(a + 4, 2)? as u16;
         let t = self.read(a + 8, 2)? as u16;
-        self.ftw = (0..8).filter(|p| (t >> (2 * p)) & 3 != 3).fold(0, |m, p| m | (1 << p));
+        self.ftw = (0..8)
+            .filter(|p| (t >> (2 * p)) & 3 != 3)
+            .fold(0, |m, p| m | (1 << p));
         Ok(())
     }
 

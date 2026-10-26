@@ -75,10 +75,18 @@ fn pack_sat(a: u128, b: u128, wide: usize, signed_out: bool) -> u128 {
     for k in 0..2 * n {
         let x = get(if k < n { a } else { b }, k % n);
         if wide == 16 {
-            let y = if signed_out { x.clamp(-128, 127) as i8 as u8 } else { x.clamp(0, 255) as u8 };
+            let y = if signed_out {
+                x.clamp(-128, 127) as i8 as u8
+            } else {
+                x.clamp(0, 255) as u8
+            };
             u8::put(&mut r, k, y);
         } else {
-            let y = if signed_out { x.clamp(-32768, 32767) as i16 as u16 } else { x.clamp(0, 65535) as u16 };
+            let y = if signed_out {
+                x.clamp(-32768, 32767) as i16 as u16
+            } else {
+                x.clamp(0, 65535) as u16
+            };
             u16::put(&mut r, k, y);
         }
     }
@@ -87,12 +95,20 @@ fn pack_sat(a: u128, b: u128, wide: usize, signed_out: bool) -> u128 {
 
 fn cvt_i32(v: f64, trunc: bool, mxcsr: u32) -> i32 {
     let r = if trunc { v.trunc() } else { round_rc(v, mxcsr) };
-    if r.is_nan() || r >= 2147483648.0 || r < -2147483648.0 { i32::MIN } else { r as i32 }
+    if r.is_nan() || r >= 2147483648.0 || r < -2147483648.0 {
+        i32::MIN
+    } else {
+        r as i32
+    }
 }
 
 fn cvt_i64(v: f64, trunc: bool, mxcsr: u32) -> i64 {
     let r = if trunc { v.trunc() } else { round_rc(v, mxcsr) };
-    if r.is_nan() || r >= 9.223372036854775808e18 || r < -9.223372036854775808e18 { i64::MIN } else { r as i64 }
+    if r.is_nan() || r >= 9.223372036854775808e18 || r < -9.223372036854775808e18 {
+        i64::MIN
+    } else {
+        r as i64
+    }
 }
 
 fn round_rc(v: f64, mxcsr: u32) -> f64 {
@@ -143,9 +159,21 @@ impl Cpu {
             0x58 => a + b,
             0x59 => a * b,
             0x5c => a - b,
-            0x5d => if a < b { a } else { b },
+            0x5d => {
+                if a < b {
+                    a
+                } else {
+                    b
+                }
+            }
             0x5e => a / b,
-            _ => if a > b { a } else { b },
+            _ => {
+                if a > b {
+                    a
+                } else {
+                    b
+                }
+            }
         }
     }
 
@@ -172,7 +200,11 @@ impl Cpu {
         self.sse_gate()?;
         let d = i.reg as usize;
         let rmx = i.rm as usize;
-        let mem = if i.md == 3 { None } else { Some(self.lin(i, self.ea(i, next))) };
+        let mem = if i.md == 3 {
+            None
+        } else {
+            Some(self.lin(i, self.ea(i, next)))
+        };
         macro_rules! src {
             ($sz:expr) => {
                 match mem {
@@ -204,10 +236,18 @@ impl Cpu {
             0x10 => Some(match p {
                 P::N | P::O66 => src!(16),
                 P::F3 => {
-                    if mem.is_some() { src!(4) } else { (xd & !m32) | (self.xmm[rmx] & m32) }
+                    if mem.is_some() {
+                        src!(4)
+                    } else {
+                        (xd & !m32) | (self.xmm[rmx] & m32)
+                    }
                 }
                 P::F2 => {
-                    if mem.is_some() { src!(8) } else { (xd & !m64) | (self.xmm[rmx] & m64) }
+                    if mem.is_some() {
+                        src!(8)
+                    } else {
+                        (xd & !m64) | (self.xmm[rmx] & m64)
+                    }
                 }
             }),
             0x11 | 0x29 | 0x2b | 0x7f | 0xe7 => {
@@ -238,22 +278,38 @@ impl Cpu {
             0x12 | 0x16 => {
                 let lo = low == 0x12;
                 let v = if mem.is_none() {
-                    if lo { self.xmm[rmx] >> 64 } else { self.xmm[rmx] & m64 }
+                    if lo {
+                        self.xmm[rmx] >> 64
+                    } else {
+                        self.xmm[rmx] & m64
+                    }
                 } else {
                     src!(8)
                 } & m64;
-                Some(if lo { (xd & !m64) | v } else { (xd & m64) | (v << 64) })
+                Some(if lo {
+                    (xd & !m64) | v
+                } else {
+                    (xd & m64) | (v << 64)
+                })
             }
             0x13 | 0x17 => {
                 let a = mem.ok_or_else(Exc::ud)?;
-                let v = if low == 0x13 { xd as u64 } else { (xd >> 64) as u64 };
+                let v = if low == 0x13 {
+                    xd as u64
+                } else {
+                    (xd >> 64) as u64
+                };
                 self.write(a, 8, v)?;
                 None
             }
             0x14 | 0x15 => {
                 let s = src!(16);
                 let hi = low == 0x15;
-                Some(if p == P::N { unpack::<u32>(xd, s, hi) } else { unpack::<u64>(xd, s, hi) })
+                Some(if p == P::N {
+                    unpack::<u32>(xd, s, hi)
+                } else {
+                    unpack::<u64>(xd, s, hi)
+                })
             }
             0x28 => {
                 aligned!();
@@ -265,7 +321,11 @@ impl Cpu {
                     None => self.rd_reg(i.rm, sz, true),
                     Some(a) => self.read(a, sz)?,
                 };
-                let f = if sz == 8 { v as i64 as f64 } else { v as u32 as i32 as f64 };
+                let f = if sz == 8 {
+                    v as i64 as f64
+                } else {
+                    v as u32 as i32 as f64
+                };
                 Some(if p == P::F3 {
                     (xd & !m32) | (f as f32).to_bits() as u128
                 } else {
@@ -275,7 +335,11 @@ impl Cpu {
             0x2c | 0x2d => {
                 let sz = if p == P::F3 { 4 } else { 8 };
                 let v = src!(sz) & if sz == 4 { m32 } else { m64 };
-                let f = if sz == 4 { f32::from_bits(v as u32) as f64 } else { f64::from_bits(v as u64) };
+                let f = if sz == 4 {
+                    f32::from_bits(v as u32) as f64
+                } else {
+                    f64::from_bits(v as u64)
+                };
                 let t = low == 0x2c;
                 if i.opsize == 8 {
                     self.gpr[d] = cvt_i64(f, t, mx) as u64;
@@ -322,7 +386,9 @@ impl Cpu {
                     P::N => {
                         let s = f32s(src!(16));
                         let a = f32s(xd);
-                        from_f32s([0, 1, 2, 3].map(|k| self.fp_binop(o, a[k] as f64, s[k] as f64) as f32))
+                        from_f32s(
+                            [0, 1, 2, 3].map(|k| self.fp_binop(o, a[k] as f64, s[k] as f64) as f32),
+                        )
                     }
                     P::O66 => {
                         let s = f64s(src!(16));
@@ -399,8 +465,16 @@ impl Cpu {
                     0x62 => unpack::<u32>(xd, s, false),
                     0x63 => pack_sat(xd, s, 16, true),
                     0x64 => zip::<u8>(xd, s, |a, b| if (a as i8) > (b as i8) { 0xff } else { 0 }),
-                    0x65 => zip::<u16>(xd, s, |a, b| if (a as i16) > (b as i16) { 0xffff } else { 0 }),
-                    0x66 => zip::<u32>(xd, s, |a, b| if (a as i32) > (b as i32) { u32::MAX } else { 0 }),
+                    0x65 => zip::<u16>(
+                        xd,
+                        s,
+                        |a, b| if (a as i16) > (b as i16) { 0xffff } else { 0 },
+                    ),
+                    0x66 => zip::<u32>(
+                        xd,
+                        s,
+                        |a, b| if (a as i32) > (b as i32) { u32::MAX } else { 0 },
+                    ),
                     0x67 => pack_sat(xd, s, 16, false),
                     0x68 => unpack::<u8>(xd, s, true),
                     0x69 => unpack::<u16>(xd, s, true),
@@ -445,7 +519,11 @@ impl Cpu {
                     _ => {
                         let mut r = s & m64;
                         for k in 0..4 {
-                            u16::put(&mut r, 4 + k, u16::get(s, 4 + ((im >> (2 * k)) & 3) as usize));
+                            u16::put(
+                                &mut r,
+                                4 + k,
+                                u16::get(s, 4 + ((im >> (2 * k)) & 3) as usize),
+                            );
                         }
                         r
                     }
@@ -467,8 +545,20 @@ impl Cpu {
                     (0x72, 6) => shl_r::<u32>(x, c, true, 32),
                     (0x73, 2) => shl_r::<u64>(x, c, false, 64),
                     (0x73, 6) => shl_r::<u64>(x, c, true, 64),
-                    (0x73, 3) => if c > 15 { 0 } else { x >> (c * 8) },
-                    (0x73, 7) => if c > 15 { 0 } else { x << (c * 8) },
+                    (0x73, 3) => {
+                        if c > 15 {
+                            0
+                        } else {
+                            x >> (c * 8)
+                        }
+                    }
+                    (0x73, 7) => {
+                        if c > 15 {
+                            0
+                        } else {
+                            x << (c * 8)
+                        }
+                    }
                     _ => return Err(self.unimpl(i)),
                 };
                 self.xmm[rmx] = r;
@@ -506,7 +596,15 @@ impl Cpu {
                         let (a, s) = (f32s(xd), f32s(src!(16)));
                         let mut r = 0;
                         for k in 0..4 {
-                            u32::put(&mut r, k, if cmp_pred(pr, a[k] as f64, s[k] as f64) { u32::MAX } else { 0 });
+                            u32::put(
+                                &mut r,
+                                k,
+                                if cmp_pred(pr, a[k] as f64, s[k] as f64) {
+                                    u32::MAX
+                                } else {
+                                    0
+                                },
+                            );
                         }
                         r
                     }
@@ -514,7 +612,15 @@ impl Cpu {
                         let (a, s) = (f64s(xd), f64s(src!(16)));
                         let mut r = 0;
                         for k in 0..2 {
-                            u64::put(&mut r, k, if cmp_pred(pr, a[k], s[k]) { u64::MAX } else { 0 });
+                            u64::put(
+                                &mut r,
+                                k,
+                                if cmp_pred(pr, a[k], s[k]) {
+                                    u64::MAX
+                                } else {
+                                    0
+                                },
+                            );
                         }
                         r
                     }
@@ -607,7 +713,14 @@ impl Cpu {
                     }
                 })
             }
-            0xd4 | 0xd5 | 0xd8..=0xdf | 0xe0 | 0xe3..=0xe5 | 0xe8..=0xef | 0xf4..=0xf6 | 0xf8..=0xfe => {
+            0xd4
+            | 0xd5
+            | 0xd8..=0xdf
+            | 0xe0
+            | 0xe3..=0xe5
+            | 0xe8..=0xef
+            | 0xf4..=0xf6
+            | 0xf8..=0xfe => {
                 let s = src!(16);
                 Some(match low {
                     0xd4 => zip::<u64>(xd, s, |a, b| a.wrapping_add(b)),
@@ -623,7 +736,9 @@ impl Cpu {
                     0xe0 => zip::<u8>(xd, s, |a, b| ((a as u16 + b as u16 + 1) >> 1) as u8),
                     0xe3 => zip::<u16>(xd, s, |a, b| ((a as u32 + b as u32 + 1) >> 1) as u16),
                     0xe4 => zip::<u16>(xd, s, |a, b| ((a as u32 * b as u32) >> 16) as u16),
-                    0xe5 => zip::<u16>(xd, s, |a, b| ((a as i16 as i32 * b as i16 as i32) >> 16) as u16),
+                    0xe5 => zip::<u16>(xd, s, |a, b| {
+                        ((a as i16 as i32 * b as i16 as i32) >> 16) as u16
+                    }),
                     0xe8 => zip::<u8>(xd, s, |a, b| (a as i8).saturating_sub(b as i8) as u8),
                     0xe9 => zip::<u16>(xd, s, |a, b| (a as i16).saturating_sub(b as i16) as u16),
                     0xea => zip::<u16>(xd, s, |a, b| (a as i16).min(b as i16) as u16),
@@ -635,15 +750,21 @@ impl Cpu {
                     0xf4 => {
                         let mut r = 0;
                         for k in 0..2 {
-                            u64::put(&mut r, k, (u32::get(xd, 2 * k) as u64) * (u32::get(s, 2 * k) as u64));
+                            u64::put(
+                                &mut r,
+                                k,
+                                (u32::get(xd, 2 * k) as u64) * (u32::get(s, 2 * k) as u64),
+                            );
                         }
                         r
                     }
                     0xf5 => {
                         let mut r = 0;
                         for k in 0..4 {
-                            let lo = (u16::get(xd, 2 * k) as i16 as i32) * (u16::get(s, 2 * k) as i16 as i32);
-                            let hi = (u16::get(xd, 2 * k + 1) as i16 as i32) * (u16::get(s, 2 * k + 1) as i16 as i32);
+                            let lo = (u16::get(xd, 2 * k) as i16 as i32)
+                                * (u16::get(s, 2 * k) as i16 as i32);
+                            let hi = (u16::get(xd, 2 * k + 1) as i16 as i32)
+                                * (u16::get(s, 2 * k + 1) as i16 as i32);
                             u32::put(&mut r, k, lo.wrapping_add(hi) as u32);
                         }
                         r
@@ -652,7 +773,10 @@ impl Cpu {
                         let mut r = 0;
                         for k in 0..2 {
                             let sum: u64 = (0..8)
-                                .map(|j| (u8::get(xd, 8 * k + j) as i32 - u8::get(s, 8 * k + j) as i32).unsigned_abs() as u64)
+                                .map(|j| {
+                                    (u8::get(xd, 8 * k + j) as i32 - u8::get(s, 8 * k + j) as i32)
+                                        .unsigned_abs() as u64
+                                })
                                 .sum();
                             u64::put(&mut r, k, sum);
                         }
@@ -680,7 +804,20 @@ fn allowed(low: u8, p: P) -> bool {
     use P::*;
     match low {
         0x10 | 0x11 | 0x51 | 0x58 | 0x59 | 0x5a | 0x5c..=0x5f | 0xc2 => true,
-        0x12 | 0x13 | 0x14 | 0x15 | 0x16 | 0x17 | 0x28 | 0x29 | 0x2b | 0x2e | 0x2f | 0x50 | 0x54..=0x57 | 0xc6 => {
+        0x12
+        | 0x13
+        | 0x14
+        | 0x15
+        | 0x16
+        | 0x17
+        | 0x28
+        | 0x29
+        | 0x2b
+        | 0x2e
+        | 0x2f
+        | 0x50
+        | 0x54..=0x57
+        | 0xc6 => {
             matches!(p, N | O66)
         }
         0x2a | 0x2c | 0x2d => matches!(p, F3 | F2),
@@ -689,9 +826,16 @@ fn allowed(low: u8, p: P) -> bool {
         0x6f | 0x7f | 0x7e => matches!(p, O66 | F3) && !(low == 0x7f && false),
         0x70 | 0xe6 => p != N,
         0x77 => p == N,
-        0x60..=0x6e | 0x71..=0x76 | 0xc4 | 0xc5 | 0xd1..=0xd6 | 0xd7..=0xdf | 0xe0..=0xe5 | 0xe7..=0xef | 0xf1..=0xf6 | 0xf8..=0xfe => {
-            p == O66
-        }
+        0x60..=0x6e
+        | 0x71..=0x76
+        | 0xc4
+        | 0xc5
+        | 0xd1..=0xd6
+        | 0xd7..=0xdf
+        | 0xe0..=0xe5
+        | 0xe7..=0xef
+        | 0xf1..=0xf6
+        | 0xf8..=0xfe => p == O66,
         _ => false,
     }
 }
@@ -727,6 +871,10 @@ fn lane_u64<T: Lane>(x: u128, k: usize) -> u64 {
 }
 
 fn put_u64<T: Lane>(r: &mut u128, k: usize, v: u64, width: u32) {
-    let m = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+    let m = if width == 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    };
     *r |= ((v & m) as u128) << (k * width as usize);
 }

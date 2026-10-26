@@ -511,9 +511,9 @@ impl Cpu {
         let old_cpl = self.cpl;
         self.seg[1] = ncs;
         self.seg[1].sel = cs;
-        self.cpl = ncpl;
+        self.set_cpl(ncpl);
         if let Err(e) = self.load_data_seg(2, ss) {
-            self.cpl = old_cpl;
+            self.set_cpl(old_cpl);
             return Err(e);
         }
         let mut m = CF | PF | AF | ZF | SF | TF | DF | OF | NT | AC | (1 << 21);
@@ -558,7 +558,7 @@ impl Cpu {
             let rsp = self.read(sp + 16 + imm, 8)?;
             let ss = self.read(sp + 24 + imm, 8)? as u16;
             self.seg[1] = ncs;
-            self.cpl = ncpl;
+            self.set_cpl(ncpl);
             self.load_data_seg(2, ss)?;
             self.gpr[4] = rsp;
         } else {
