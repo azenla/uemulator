@@ -257,7 +257,7 @@ impl EmulatedMachine {
                 "memory_mib must be between {MIN_MEMORY_MIB} and {MAX_MEMORY_MIB}"
             )));
         }
-        if cfg.jit == JitMode::On && !crate::sys::jit_probe() {
+        if cfg.jit == JitMode::On && !crate::jit::probe() {
             return Err(Error::JitUnavailable);
         }
         let mut ram = vec![0u8; cfg.memory_mib << 20];

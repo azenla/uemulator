@@ -7,7 +7,11 @@ edition.workspace = true
 name = "uemulator"
 path = "src/main.rs"
 
+[features]
+default = ["jit"]
+jit = ["uemulator/jit"]
+
 [dependencies]
-uemulator = { path = "../uemulator" }
+uemulator = { path = "../uemulator", default-features = false }
 clap = { version = "4", features = ["derive"] }
 ureq = "3"

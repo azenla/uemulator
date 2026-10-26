@@ -1,16 +1,16 @@
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) mod a64;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 mod emit;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 mod helpers;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 mod native;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) use native::Jit;
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(all(feature = "jit", target_arch = "aarch64")))]
 mod stub {
     use crate::cpu::Cpu;
     use crate::cpu::exc::Exc;
@@ -31,5 +31,15 @@ mod stub {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(all(feature = "jit", target_arch = "aarch64")))]
 pub(crate) use stub::Jit;
+
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+pub(crate) fn probe() -> bool {
+    crate::sys::jit_probe()
+}
+
+#[cfg(not(all(feature = "jit", target_arch = "aarch64")))]
+pub(crate) fn probe() -> bool {
+    false
+}

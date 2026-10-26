@@ -6,6 +6,7 @@ mod disk;
 mod jit;
 mod machine;
 mod netdev;
+#[cfg(feature = "jit")]
 mod sys;
 
 pub use console::ConsoleHandle;

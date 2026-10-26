@@ -3,4 +3,13 @@ name = "uemulator"
 version.workspace = true
 edition.workspace = true
 
-[dependencies]
+[features]
+default = ["jit"]
+# Host-native code generation; without it the crate has no dependencies and runs the interpreter only.
+jit = ["dep:libc", "dep:windows-sys"]
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_System_Memory", "Win32_System_Threading", "Win32_System_Diagnostics_Debug"] }

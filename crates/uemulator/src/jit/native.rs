@@ -42,7 +42,7 @@ fn jc_hash(rip: u64) -> usize {
 
 impl Jit {
     pub fn new() -> Option<Jit> {
-        if !crate::sys::jit_probe() {
+        if !crate::jit::probe() {
             return None;
         }
         let mem = ExecMem::new(CODE_SIZE)?;

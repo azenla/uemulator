@@ -1,6 +1,5 @@
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 pub trait BlockBackend: Send {
@@ -28,18 +27,56 @@ struct FileDisk {
 
 struct MemDisk(Vec<u8>);
 
+#[cfg(unix)]
+fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(f, buf, off)
+}
+
+#[cfg(unix)]
+fn write_all_at(f: &File, data: &[u8], off: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(f, data, off)
+}
+
+#[cfg(windows)]
+fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = f.seek_read(buf, off)?;
+        if n == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = &mut buf[n..];
+        off += n as u64;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(f: &File, mut data: &[u8], mut off: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !data.is_empty() {
+        let n = f.seek_write(data, off)?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        data = &data[n..];
+        off += n as u64;
+    }
+    Ok(())
+}
+
 impl BlockBackend for FileDisk {
     fn len(&self) -> u64 {
         self.len
     }
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.file.read_exact_at(buf, offset)
+        read_exact_at(&self.file, buf, offset)
     }
     fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
         if self.ro {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
-        self.file.write_all_at(data, offset)
+        write_all_at(&self.file, data, offset)
     }
     fn flush(&mut self) -> io::Result<()> {
         if self.ro {

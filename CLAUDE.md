@@ -7,12 +7,12 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 ## Commands
 
 - Run: `cargo run --release -- quick debian` (downloads and caches netboot artifacts in `~/.cache/uemulator/quick/<distro>/artifacts/`, override the base with `UEMULATOR_CACHE`; `--update` refetches) or `-- boot --kernel K --initramfs I`
-- Test: `cargo test --release`
+- Test: `cargo test --release --workspace` (also `-p uemulator --no-default-features`)
 - Before EVERY commit: run `./hack/autofix.sh` (clippy --fix + fmt), then fix by hand every warning it leaves; `cargo clippy --release --all-targets` must print zero warnings. Never commit with warnings.
 
 ## Rules
 
-- Cargo workspace: `crates/uemulator` (library, no dependencies) and `crates/uemulator-cli` (clap, ureq; may use crates freely). Tests live in the library crate.
+- Cargo workspace: `crates/uemulator` (library; the default `jit` feature pulls in `libc` on unix and `windows-sys` on Windows, `--no-default-features` has zero dependencies and is interpreter-only) and `crates/uemulator-cli` (clap, ureq; may use crates freely). Tests live in the library crate.
 - `lib.rs` is the entire public API: `EmulatedMachine::new(cfg)` then `start()`. Everything else is `pub(crate)`.
 - The library never touches stdio, never calls `process::exit`, holds no global mutable state, never panics on guest behavior. Guest faults are guest exceptions.
 - Comments minimal; only for non-obvious why.
