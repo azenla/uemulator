@@ -102,7 +102,7 @@ impl Pics {
     }
 
     pub fn has_pending(&self) -> bool {
-        (self.m.irr | self.s.irr) != 0 && self.pick().is_some()
+        ((self.m.irr & !self.m.imr) | (self.s.irr & !self.s.imr)) != 0 && self.pick().is_some()
     }
 
     pub fn ack(&mut self) -> Option<u8> {
