@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::boot::BootState;
 use crate::console::ConsoleHandle;
-use crate::dev::Devices;
+use crate::dev::guestmem::GuestMem;
+use crate::dev::{DevConfig, Devices};
 use crate::machine::{ExitReason, LogFn};
 
 use decode::Insn;
@@ -166,6 +167,7 @@ impl Cpu {
         console: ConsoleHandle,
         stop: Arc<AtomicBool>,
         log: Option<LogFn>,
+        devcfg: DevConfig,
     ) -> Self {
         let pages = ram.len() >> 12;
         let flat = |sel: u16, flags: u32| Seg {
@@ -250,7 +252,7 @@ impl Cpu {
             dc_gen: 1,
             code_page: vec![0; pages],
             code_list: Vec::new(),
-            dev: Devices::new(console),
+            dev: Devices::new(console, devcfg),
             icount: 0,
             warp_ns: 0,
             next_event: 0,
@@ -294,12 +296,23 @@ impl Cpu {
         }
     }
 
+    pub fn tick_devices(&mut self, now: u64) {
+        let hits = {
+            let mut mem = GuestMem::new(&mut self.ram, &self.code_page);
+            self.dev.tick(now, &mut mem);
+            mem.hits
+        };
+        for p in hits {
+            self.code_written(p);
+        }
+    }
+
     fn service_events(&mut self) -> Option<ExitReason> {
         if self.stop.load(Ordering::Relaxed) {
             return Some(ExitReason::Stopped);
         }
         let now = self.now_ns();
-        self.dev.tick(now);
+        self.tick_devices(now);
         if self.dev.reset_requested {
             return Some(ExitReason::Reset);
         }
@@ -501,10 +514,11 @@ impl Cpu {
                     }
                     self.warp_ns += dt;
                 }
-                self.dev.tick(self.now_ns());
+                self.tick_devices(self.now_ns());
             }
             None => {
-                if self.dev.poll_console() {
+                self.tick_devices(now);
+                if self.dev.pic.has_pending() {
                     return None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));

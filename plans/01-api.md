@@ -12,6 +12,9 @@ impl MachineConfig {
     pub fn memory_mib(self, n: usize) -> Self;      // default 512
     pub fn jit(self, mode: JitMode) -> Self;        // Auto (default) | Off | On
     pub fn clock(self, mode: ClockMode) -> Self;    // Virtual (default) | Realtime
+    pub fn disk(self, d: Disk) -> Self;                 // raw image, virtio-blk (optional)
+    pub fn net(self, mac: [u8; 6]) -> Self;             // virtio-net; frames via EmulatedMachine::net() (optional)
+    pub fn console(self, k: ConsoleKind) -> Self;       // Serial (default) | Virtio (resizable hvc0)
     pub fn log(self, f: impl Fn(&str) + Send + 'static) -> Self;
 }
 
@@ -32,6 +35,8 @@ impl ConsoleHandle {
     pub fn write(&self, bytes: &[u8]);                       // host → guest (serial RX)
     pub fn read(&self, buf: &mut [u8], timeout: Option<Duration>) -> usize; // guest → host (serial TX)
     pub fn on_output(&self, f: impl Fn(&[u8]) + Send + 'static); // push alternative to read
+    pub fn resize(&self, cols: u16, rows: u16);              // delivered to the guest with ConsoleKind::Virtio
+    pub fn size(&self) -> (u16, u16);
 }
 ```
 

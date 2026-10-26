@@ -93,12 +93,6 @@ impl Jit {
     }
 
     pub fn invalidate_page(&mut self, ppn: u64) {
-        if std::env::var_os("UEMU_JITDBG").is_some() && ppn == 0x1d04 {
-            eprintln!(
-                "invalidate page {ppn:#x}: {:?} blocks",
-                self.page_blocks.get(&ppn).map(|l| l.len())
-            );
-        }
         if let Some(list) = self.page_blocks.remove(&ppn) {
             for idx in list {
                 self.blocks[idx as usize].valid = false;
@@ -188,13 +182,6 @@ impl Jit {
         if cross {
             let pa2 = cpu.translate((rip & !0xfff).wrapping_add(4096), Acc::Exec, false)?;
             pages.push(pa2 >> 12);
-        }
-        if std::env::var_os("UEMU_JITDBG").is_some() && (pa >> 12) == 0x1d04 {
-            eprintln!(
-                "translate {rip:#x} pa {pa:#x} n={} b13={:02x?}",
-                insns.len(),
-                &cpu.ram[0x1d04f13..0x1d04f18]
-            );
         }
         let insns: Box<[Insn]> = insns.into_boxed_slice();
         self.used = (self.used + 15) & !15;

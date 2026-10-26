@@ -2,7 +2,12 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, exit};
 
-use uemulator::{ClockMode, EmulatedMachine, JitMode, MachineConfig};
+use uemulator::{ClockMode, ConsoleKind, Disk, EmulatedMachine, JitMode, MachineConfig, NetHandle};
+
+#[path = "support/netgw.rs"]
+mod netgw;
+
+const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
 const BASE: &str = "https://deb.debian.org/debian/dists/stable/main/installer-amd64/current/images/netboot/debian-installer/amd64";
 
@@ -53,6 +58,67 @@ fn stty(args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+#[repr(C)]
+#[derive(Default)]
+struct WinSize {
+    rows: u16,
+    cols: u16,
+    xpix: u16,
+    ypix: u16,
+}
+
+unsafe extern "C" {
+    fn ioctl(fd: i32, req: u64, ...) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+const TIOCGWINSZ: u64 = 0x4008_7468;
+#[cfg(not(target_os = "macos"))]
+const TIOCGWINSZ: u64 = 0x5413;
+
+fn term_size() -> Option<(u16, u16)> {
+    let mut ws = WinSize::default();
+    let r = unsafe { ioctl(1, TIOCGWINSZ, &mut ws as *mut WinSize) };
+    (r == 0 && ws.cols > 0 && ws.rows > 0).then_some((ws.cols, ws.rows))
+}
+
+fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == name)
+        .map(|i| args[i + 1].as_str())
+}
+
+fn spawn_udp(net: NetHandle, spec: &str) {
+    let (local, remote) = spec.split_once(',').expect("--net-udp LOCAL,REMOTE");
+    let sock = std::net::UdpSocket::bind(local).expect("bind udp");
+    sock.connect(remote).expect("connect udp");
+    sock.set_read_timeout(Some(std::time::Duration::from_millis(2)))
+        .unwrap();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            if let Ok(n) = sock.recv(&mut buf) {
+                net.send_frame(&buf[..n]);
+            }
+            while let Some(f) = net.try_recv_frame() {
+                let _ = sock.send(&f);
+            }
+        }
+    });
+}
+
+fn spawn_gateway(net: NetHandle) {
+    std::thread::spawn(move || {
+        loop {
+            if let Some(f) = net.recv_frame(std::time::Duration::from_millis(5))
+                && let Some(r) = netgw::handle(&f)
+            {
+                net.send_frame(&r);
+            }
+        }
+    });
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut cfg = MachineConfig::new()
@@ -63,8 +129,22 @@ fn main() {
     if !args.iter().any(|a| a == "--no-initrd") {
         cfg = cfg.initrd(fetch("initrd.gz"));
     }
-    if let Some(i) = args.iter().position(|a| a == "--mem") {
-        cfg = cfg.memory_mib(args[i + 1].parse().expect("--mem takes MiB"));
+    if let Some(v) = arg(&args, "--mem") {
+        cfg = cfg.memory_mib(v.parse().expect("--mem takes MiB"));
+    }
+    if let Some(v) = arg(&args, "--disk") {
+        let (path, ro) = match v.strip_suffix(",ro") {
+            Some(p) => (p, true),
+            None => (v, false),
+        };
+        cfg = cfg.disk(Disk::open(path, ro).expect("open disk image"));
+    }
+    let want_net = arg(&args, "--net-udp").is_some() || args.iter().any(|a| a == "--net-loop");
+    if want_net {
+        cfg = cfg.net(GUEST_MAC);
+    }
+    if arg(&args, "--console") == Some("virtio") {
+        cfg = cfg.console(ConsoleKind::Virtio);
     }
     if let Some(i) = args.iter().position(|a| a == "--time") {
         cfg = cfg.unix_time(args[i + 1].parse().expect("unix seconds"));
@@ -88,6 +168,26 @@ fn main() {
         }
     };
     let console = machine.console();
+    if let Some(net) = machine.net() {
+        if let Some(spec) = arg(&args, "--net-udp") {
+            spawn_udp(net.clone(), spec);
+        }
+        if args.iter().any(|a| a == "--net-loop") {
+            spawn_gateway(net);
+        }
+    }
+    if let Some((c, r)) = term_size() {
+        console.resize(c, r);
+    }
+    let sizer = console.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if let Some((c, r)) = term_size() {
+                sizer.resize(c, r);
+            }
+        }
+    });
     console.on_output(|b| {
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(b);

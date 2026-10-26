@@ -14,6 +14,7 @@ pub(crate) struct Uart {
     scr: u8,
     thre_pending: bool,
     last_level: bool,
+    rx_enabled: bool,
 }
 
 impl Uart {
@@ -30,6 +31,7 @@ impl Uart {
             scr: 0,
             thre_pending: false,
             last_level: false,
+            rx_enabled: true,
         }
     }
 
@@ -44,8 +46,15 @@ impl Uart {
         edge
     }
 
+    pub fn set_rx_enabled(&mut self, on: bool) {
+        self.rx_enabled = on;
+    }
+
     pub fn poll(&mut self) -> bool {
         let mut any = false;
+        if !self.rx_enabled {
+            return false;
+        }
         while self.rx.len() < 16 {
             match self.console.guest_rx() {
                 Some(b) => {

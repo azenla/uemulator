@@ -6,6 +6,9 @@ use std::thread::JoinHandle;
 use crate::boot::{self, BootState};
 use crate::console::ConsoleHandle;
 use crate::cpu::Cpu;
+use crate::dev::DevConfig;
+use crate::disk::Disk;
+use crate::netdev::NetHandle;
 
 #[derive(Debug)]
 pub enum Error {
@@ -52,6 +55,13 @@ pub enum ExitReason {
     Internal(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsoleKind {
+    #[default]
+    Serial,
+    Virtio,
+}
+
 pub const MIN_MEMORY_MIB: usize = 64;
 pub const MAX_MEMORY_MIB: usize = 3072;
 
@@ -60,8 +70,11 @@ pub(crate) type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 pub struct MachineConfig {
     kernel: Vec<u8>,
     initrd: Option<Vec<u8>>,
-    cmdline: String,
+    cmdline: Option<String>,
     memory_mib: usize,
+    disk: Option<Disk>,
+    net_mac: Option<[u8; 6]>,
+    console_kind: ConsoleKind,
     jit: JitMode,
     clock: ClockMode,
     log: Option<LogFn>,
@@ -75,10 +88,11 @@ impl Default for MachineConfig {
         Self {
             kernel: Vec::new(),
             initrd: None,
-            cmdline:
-                "console=ttyS0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1"
-                    .into(),
+            cmdline: None,
             memory_mib: 512,
+            disk: None,
+            net_mac: None,
+            console_kind: ConsoleKind::Serial,
             jit: JitMode::Auto,
             clock: ClockMode::Virtual,
             log: None,
@@ -105,7 +119,22 @@ impl MachineConfig {
     }
 
     pub fn cmdline(mut self, s: impl Into<String>) -> Self {
-        self.cmdline = s.into();
+        self.cmdline = Some(s.into());
+        self
+    }
+
+    pub fn disk(mut self, disk: Disk) -> Self {
+        self.disk = Some(disk);
+        self
+    }
+
+    pub fn net(mut self, mac: [u8; 6]) -> Self {
+        self.net_mac = Some(mac);
+        self
+    }
+
+    pub fn console(mut self, kind: ConsoleKind) -> Self {
+        self.console_kind = kind;
         self
     }
 
@@ -167,6 +196,7 @@ struct Vcpu {
     verify: bool,
     unix_time: Option<u64>,
     boot_ram: Option<Vec<u8>>,
+    devcfg: DevConfig,
 }
 
 impl Vcpu {
@@ -177,6 +207,7 @@ impl Vcpu {
             self.console,
             self.stop,
             self.log.clone(),
+            std::mem::take(&mut self.devcfg),
         );
         if let Some(t) = self.unix_time {
             cpu.dev.set_boot_time(t);
@@ -195,6 +226,7 @@ impl Vcpu {
                 ConsoleHandle::default(),
                 cpu.stop.clone(),
                 None,
+                DevConfig::default(),
             );
             cpu.run_verify(&mut sh)
         } else {
@@ -214,6 +246,7 @@ pub struct EmulatedMachine {
     vcpu: Option<Vcpu>,
     thread: Option<JoinHandle<ExitReason>>,
     console: ConsoleHandle,
+    net: Option<NetHandle>,
     stop: Arc<AtomicBool>,
 }
 
@@ -228,7 +261,24 @@ impl EmulatedMachine {
             return Err(Error::JitUnavailable);
         }
         let mut ram = vec![0u8; cfg.memory_mib << 20];
-        let boot = boot::load(&mut ram, &cfg.kernel, cfg.initrd.as_deref(), &cfg.cmdline)?;
+        let cmdline = cfg.cmdline.clone().unwrap_or_else(|| {
+            let con = if cfg.console_kind == ConsoleKind::Virtio {
+                "hvc0"
+            } else {
+                "ttyS0"
+            };
+            format!(
+                "console={con} earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1"
+            )
+        });
+        let boot = boot::load(&mut ram, &cfg.kernel, cfg.initrd.as_deref(), &cmdline)?;
+        let net = cfg.net_mac.map(|m| (m, NetHandle::default()));
+        let net_handle = net.as_ref().map(|(_, h)| h.clone());
+        let devcfg = DevConfig {
+            disk: cfg.disk,
+            net,
+            virtio_console: cfg.console_kind == ConsoleKind::Virtio,
+        };
         let ram_copy = if cfg.verify { ram.clone() } else { Vec::new() };
         let console = ConsoleHandle::default();
         let stop = Arc::new(AtomicBool::new(false));
@@ -245,15 +295,21 @@ impl EmulatedMachine {
                 verify: cfg.verify,
                 unix_time: cfg.unix_time,
                 boot_ram: if cfg.verify { Some(ram_copy) } else { None },
+                devcfg,
             }),
             thread: None,
             console,
+            net: net_handle,
             stop,
         })
     }
 
     pub fn console(&self) -> ConsoleHandle {
         self.console.clone()
+    }
+
+    pub fn net(&self) -> Option<NetHandle> {
+        self.net.clone()
     }
 
     pub fn stop_handle(&self) -> StopHandle {

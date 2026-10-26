@@ -2,6 +2,7 @@ use super::decode::{self, DecodeErr, Insn};
 use super::exc::Exc;
 use super::flags::*;
 use super::*;
+use crate::dev::guestmem::GuestMem;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Acc {
@@ -213,9 +214,9 @@ impl Cpu {
             let mut v = [0u8; 8];
             v[..n].copy_from_slice(b);
             u64::from_le_bytes(v)
+        } else if let Some(v) = self.dev.mmio_read(pa, size) {
+            v
         } else {
-            let now = self.now_ns();
-            let _ = now;
             self.log_once(0x1000 + (pa >> 12), || {
                 format!("read of unmapped physical address {pa:#x}")
             });
@@ -232,19 +233,24 @@ impl Cpu {
             }
             self.ram[a..a + n].copy_from_slice(&val.to_le_bytes()[..n]);
         } else {
-            self.log_once(0x2000 + (pa >> 12), || {
-                format!("write to unmapped physical address {pa:#x}")
-            });
+            let hits = {
+                let mut mem = GuestMem::new(&mut self.ram, &self.code_page);
+                if self.dev.mmio_write(pa, size, val, &mut mem) {
+                    mem.hits
+                } else {
+                    self.log_once(0x2000 + (pa >> 12), || {
+                        format!("write to unmapped physical address {pa:#x}")
+                    });
+                    Vec::new()
+                }
+            };
+            for p in hits {
+                self.code_written(p);
+            }
         }
     }
 
-    fn code_written(&mut self, ppn: usize) {
-        if ppn == 0x1d04 && std::env::var_os("UEMU_JITDBG").is_some() {
-            eprintln!(
-                "code_written ppn {ppn:#x} rip {:#x} icount {}",
-                self.rip, self.icount
-            );
-        }
+    pub fn code_written(&mut self, ppn: usize) {
         if let Some(mut j) = self.jit.take() {
             j.invalidate_page(ppn as u64);
             self.jit = Some(j);
