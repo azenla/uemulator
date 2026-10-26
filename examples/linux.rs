@@ -1,8 +1,8 @@
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, exit};
+use std::process::{Command, Stdio, exit};
 
-use uemulator::{EmulatedMachine, JitMode, MachineConfig};
+use uemulator::{ClockMode, EmulatedMachine, JitMode, MachineConfig};
 
 const BASE: &str = "https://deb.debian.org/debian/dists/stable/main/installer-amd64/current/images/netboot/debian-installer/amd64";
 
@@ -42,6 +42,17 @@ fn fetch(name: &str) -> Vec<u8> {
     std::fs::read(&path).expect("read cache")
 }
 
+fn stty(args: &[&str]) -> Option<String> {
+    let out = Command::new("stty")
+        .args(args)
+        .stdin(Stdio::inherit())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut cfg = MachineConfig::new()
@@ -51,6 +62,10 @@ fn main() {
         .verify_jit(args.iter().any(|a| a == "--verify"));
     if !args.iter().any(|a| a == "--no-initrd") {
         cfg = cfg.initrd(fetch("initrd.gz"));
+    }
+    let tty = std::io::stdin().is_terminal();
+    if tty || args.iter().any(|a| a == "--realtime") {
+        cfg = cfg.clock(ClockMode::Realtime);
     }
     if args.iter().any(|a| a == "--no-jit") {
         cfg = cfg.jit(JitMode::Off);
@@ -72,11 +87,24 @@ fn main() {
         let _ = out.write_all(b);
         let _ = out.flush();
     });
+    let saved_tty = if tty {
+        let saved = stty(&["-g"]);
+        stty(&["raw", "-echo"]);
+        eprintln!("[uemu] raw terminal; Ctrl-] stops the machine\r");
+        saved
+    } else {
+        None
+    };
     let input = console.clone();
+    let stopper = machine.stop_handle();
     std::thread::spawn(move || {
         let mut buf = [0u8; 256];
         while let Ok(n) = std::io::stdin().read(&mut buf) {
             if n == 0 {
+                break;
+            }
+            if buf[..n].contains(&0x1d) {
+                stopper.stop();
                 break;
             }
             input.write(&buf[..n]);
@@ -95,5 +123,9 @@ fn main() {
         eprintln!("error: {e}");
         exit(1);
     }
-    eprintln!("machine exited: {:?}", machine.wait());
+    let reason = machine.wait();
+    if let Some(saved) = saved_tty {
+        stty(&[&saved]);
+    }
+    eprintln!("machine exited: {reason:?}");
 }

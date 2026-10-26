@@ -35,37 +35,75 @@ fn run_until(cfg: MachineConfig, needle: &str, limit: Duration) -> (String, Opti
     (text, if found { None } else { Some(reason) })
 }
 
-#[test]
-fn prints_linux_version() {
+fn prints_linux_version(jit: JitMode) {
     let Some(kernel) = cached("linux") else {
         return;
     };
-    let cfg = MachineConfig::new().kernel(kernel).jit(JitMode::Off);
+    let cfg = MachineConfig::new().kernel(kernel).jit(jit);
     let (text, miss) = run_until(cfg, "Linux version 6.12", Duration::from_secs(120));
     assert!(miss.is_none(), "banner not seen:\n{text}");
 }
 
-#[test]
-fn vfs_panic_then_reset() {
+fn vfs_panic_then_reset(jit: JitMode) {
     let Some(kernel) = cached("linux") else {
         return;
     };
-    let cfg = MachineConfig::new().kernel(kernel).jit(JitMode::Off);
+    let cfg = MachineConfig::new().kernel(kernel).jit(jit);
     let mut m = EmulatedMachine::new(cfg).unwrap();
     m.start().unwrap();
     assert_eq!(m.wait(), ExitReason::Reset);
 }
 
+fn installer_userspace(jit: JitMode) {
+    let (Some(kernel), Some(initrd)) = (cached("linux"), cached("initrd.gz")) else {
+        return;
+    };
+    let cfg = MachineConfig::new().kernel(kernel).initrd(initrd).jit(jit);
+    let (text, miss) = run_until(cfg, "Starting system log daemon", Duration::from_secs(240));
+    assert!(miss.is_none(), "installer userspace not reached:\n{text}");
+    assert!(text.contains("Run /init as init process"));
+}
+
 #[test]
-fn installer_userspace() {
+fn interp_banner() {
+    prints_linux_version(JitMode::Off);
+}
+
+#[test]
+fn interp_vfs_panic_reset() {
+    vfs_panic_then_reset(JitMode::Off);
+}
+
+#[test]
+fn interp_installer() {
+    installer_userspace(JitMode::Off);
+}
+
+#[test]
+fn jit_banner() {
+    prints_linux_version(JitMode::Auto);
+}
+
+#[test]
+fn jit_vfs_panic_reset() {
+    vfs_panic_then_reset(JitMode::Auto);
+}
+
+#[test]
+fn jit_installer() {
+    installer_userspace(JitMode::Auto);
+}
+
+#[test]
+#[ignore = "slow: runs the JIT in lockstep with the interpreter"]
+fn jit_lockstep_verify() {
     let (Some(kernel), Some(initrd)) = (cached("linux"), cached("initrd.gz")) else {
         return;
     };
     let cfg = MachineConfig::new()
         .kernel(kernel)
         .initrd(initrd)
-        .jit(JitMode::Off);
-    let (text, miss) = run_until(cfg, "Starting system log daemon", Duration::from_secs(240));
-    assert!(miss.is_none(), "installer userspace not reached:\n{text}");
-    assert!(text.contains("Run /init as init process"));
+        .verify_jit(true);
+    let (text, miss) = run_until(cfg, "Starting system log daemon", Duration::from_secs(400));
+    assert!(miss.is_none(), "lockstep verification failed:\n{text}");
 }

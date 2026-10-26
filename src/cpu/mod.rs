@@ -152,6 +152,7 @@ pub(crate) struct Cpu {
     pub logged: std::collections::HashSet<u64>,
     pub exc_depth: u32,
     pub flushes: u64,
+    pub realtime: bool,
     pub last_done: u64,
     pub pending: Option<Exc>,
     pub jit: Option<Box<crate::jit::Jit>>,
@@ -258,6 +259,7 @@ impl Cpu {
             logged: Default::default(),
             exc_depth: 0,
             flushes: 0,
+            realtime: false,
             last_done: 0,
             pending: None,
             jit: None,
@@ -479,7 +481,12 @@ impl Cpu {
         match self.dev.next_deadline(now) {
             Some(t) => {
                 if t > now {
-                    self.warp_ns += t - now;
+                    let mut dt = t - now;
+                    if self.realtime {
+                        dt = dt.min(2_000_000);
+                        std::thread::sleep(std::time::Duration::from_nanos(dt));
+                    }
+                    self.warp_ns += dt;
                 }
                 self.dev.tick(self.now_ns());
             }

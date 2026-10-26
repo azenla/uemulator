@@ -153,6 +153,7 @@ struct Vcpu {
     log: Option<LogFn>,
     debug: bool,
     jit: JitMode,
+    clock: ClockMode,
     verify: bool,
     boot_ram: Option<Vec<u8>>,
 }
@@ -166,6 +167,7 @@ impl Vcpu {
             self.stop,
             self.log.clone(),
         );
+        cpu.realtime = self.clock == ClockMode::Realtime;
         if self.jit != JitMode::Off {
             cpu.jit = crate::jit::Jit::new().map(Box::new);
         }
@@ -217,6 +219,7 @@ impl EmulatedMachine {
                 log: cfg.log,
                 debug: cfg.debug,
                 jit: cfg.jit,
+                clock: cfg.clock,
                 verify: cfg.verify,
                 boot_ram: if cfg.verify { Some(ram_copy) } else { None },
             }),
