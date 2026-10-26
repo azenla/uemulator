@@ -44,7 +44,10 @@ fn fetch(name: &str) -> Vec<u8> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cfg = MachineConfig::new().kernel(fetch("linux"));
+    let mut cfg = MachineConfig::new()
+        .kernel(fetch("linux"))
+        .log(|m| eprintln!("[uemu] {m}"))
+        .debug(args.iter().any(|a| a == "--debug"));
     if !args.iter().any(|a| a == "--no-initrd") {
         cfg = cfg.initrd(fetch("initrd.gz"));
     }
@@ -79,6 +82,14 @@ fn main() {
         }
     });
 
+    if let Some(i) = args.iter().position(|a| a == "--timeout") {
+        let secs: u64 = args[i + 1].parse().expect("seconds");
+        let stop = machine.stop_handle();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.stop();
+        });
+    }
     if let Err(e) = machine.start() {
         eprintln!("error: {e}");
         exit(1);

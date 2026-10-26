@@ -1,5 +1,7 @@
 mod boot;
 mod console;
+mod cpu;
+mod dev;
 mod machine;
 
 pub use console::ConsoleHandle;

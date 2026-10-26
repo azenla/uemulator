@@ -5,6 +5,7 @@ use std::thread::JoinHandle;
 
 use crate::boot::{self, BootState};
 use crate::console::ConsoleHandle;
+use crate::cpu::Cpu;
 
 #[derive(Debug)]
 pub enum Error {
@@ -51,7 +52,7 @@ pub enum ExitReason {
     Internal(String),
 }
 
-type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
+pub(crate) type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct MachineConfig {
     kernel: Vec<u8>,
@@ -61,6 +62,7 @@ pub struct MachineConfig {
     jit: JitMode,
     clock: ClockMode,
     log: Option<LogFn>,
+    debug: bool,
 }
 
 impl Default for MachineConfig {
@@ -75,6 +77,7 @@ impl Default for MachineConfig {
             jit: JitMode::Auto,
             clock: ClockMode::Virtual,
             log: None,
+            debug: false,
         }
     }
 }
@@ -114,6 +117,11 @@ impl MachineConfig {
         self
     }
 
+    pub fn debug(mut self, on: bool) -> Self {
+        self.debug = on;
+        self
+    }
+
     pub fn log(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.log = Some(Arc::new(f));
         self
@@ -129,23 +137,35 @@ impl StopHandle {
     }
 }
 
-#[allow(dead_code)]
 struct Vcpu {
     ram: Vec<u8>,
     boot: BootState,
     console: ConsoleHandle,
     stop: Arc<AtomicBool>,
-    jit: JitMode,
-    clock: ClockMode,
     log: Option<LogFn>,
+    debug: bool,
 }
 
 impl Vcpu {
     fn run(self) -> ExitReason {
-        if self.stop.load(Ordering::SeqCst) {
-            return ExitReason::Stopped;
+        let mut cpu = Cpu::new(
+            self.ram,
+            self.boot,
+            self.console,
+            self.stop,
+            self.log.clone(),
+        );
+        if self.debug {
+            cpu.trace = Some(Default::default());
         }
-        ExitReason::Internal("cpu core not implemented yet (see plans/10-milestones.md M1)".into())
+        let r = cpu.run();
+        if let (Some(l), true) = (
+            &self.log,
+            self.debug || matches!(r, ExitReason::TripleFault | ExitReason::Internal(_)),
+        ) {
+            l(&cpu.dump());
+        }
+        r
     }
 }
 
@@ -174,9 +194,8 @@ impl EmulatedMachine {
                 boot,
                 console: console.clone(),
                 stop: stop.clone(),
-                jit: cfg.jit,
-                clock: cfg.clock,
                 log: cfg.log,
+                debug: cfg.debug,
             }),
             thread: None,
             console,
