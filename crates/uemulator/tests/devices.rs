@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use uemulator::{ClockMode, ConsoleHandle, ConsoleKind, Disk, EmulatedMachine, MachineConfig};
 
-#[path = "../examples/support/netgw.rs"]
+#[path = "../../uemulator-cli/src/netgw.rs"]
 mod netgw;
 
 fn cache_dir() -> Option<PathBuf> {
@@ -17,7 +17,7 @@ fn cache_dir() -> Option<PathBuf> {
 }
 
 fn cached(name: &str) -> Option<Vec<u8>> {
-    std::fs::read(cache_dir()?.join(name))
+    std::fs::read(cache_dir()?.join("quick/debian/artifacts").join(name))
         .ok()
         .filter(|d| !d.is_empty())
 }

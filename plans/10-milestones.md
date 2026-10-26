@@ -7,11 +7,13 @@
 - M6 done (see 11-storage-net-console.md): configurable RAM (`--mem`), virtio-pci disk, network and console (with resize), guest-verified: ping through the gateway responder, `stty size` follows `resize()`, disk read/write through `virtio_blk`.
 - M5 partly done: realtime idle (`ClockMode::Realtime`), raw tty in the example, fixed RTC time option. Not done: block chaining, guest register caching, LAPIC/IOAPIC, SMP, x86_64 host JIT.
 
+- Workspace split done: `crates/uemulator` (library) + `crates/uemulator-cli` (`uemulator boot|quick`, clap). Next: libc/`jit` feature, x86_64 host JIT.
+
 Each has an observable serial-output exit criterion. Interpreter first.
 
 | # | deliverable | exit criterion |
 |---|-------------|----------------|
-| M0 | API skeleton, config, bzImage parse + loader, example downloads/caches kernel, clock + console + UART | `cargo run --release --example boot-linux` downloads (once), loads, and reports the parsed header; `cargo test` passes |
+| M0 | API skeleton, config, bzImage parse + loader, example downloads/caches kernel, clock + console + UART | `uemulator quick debian` downloads (once), loads, and reports the parsed header; `cargo test` passes |
 | M1 | 64-bit decoder + interpreter for the integer subset, exceptions, paging, soft TLB, PIC/PIT/CMOS | console prints `Linux version 6.12.107...` (decompressor finished, kernel `start_kernel` running) |
 | M2 | Rest of integer ISA, SSE2 basics, x87 basics, TSC calibration, SMC invalidation, reset/triple-fault exit | no initrd: `Kernel panic - not syncing: VFS: Unable to mount root fs` then clean `ExitReason::Reset`; ≥50 MIPS release |
 | M3 | Full initrd boot | `Run /init as init process`, then installer userspace output (SSE2 libc paths, syscalls, signals, fork/exec) |

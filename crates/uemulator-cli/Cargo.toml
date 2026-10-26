@@ -1,0 +1,13 @@
+[package]
+name = "uemulator-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "uemulator"
+path = "src/main.rs"
+
+[dependencies]
+uemulator = { path = "../uemulator" }
+clap = { version = "4", features = ["derive"] }
+ureq = "3"

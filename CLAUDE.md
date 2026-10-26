@@ -6,13 +6,13 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 
 ## Commands
 
-- Run: `cargo run --release --example boot-linux` (downloads and caches the Debian netboot kernel/initrd in `~/.cache/uemulator`, override with `UEMULATOR_CACHE`)
+- Run: `cargo run --release -- quick debian` (downloads and caches netboot artifacts in `~/.cache/uemulator/quick/<distro>/artifacts/`, override the base with `UEMULATOR_CACHE`; `--update` refetches) or `-- boot --kernel K --initramfs I`
 - Test: `cargo test --release`
 - Before EVERY commit: run `./hack/autofix.sh` (clippy --fix + fmt), then fix by hand every warning it leaves; `cargo clippy --release --all-targets` must print zero warnings. Never commit with warnings.
 
 ## Rules
 
-- Zero crate dependencies. libc functions are declared by hand in `src/sys.rs` (`unsafe extern "C"`, edition 2024); take signatures from the SDK headers.
+- Cargo workspace: `crates/uemulator` (library, no dependencies) and `crates/uemulator-cli` (clap, ureq; may use crates freely). Tests live in the library crate.
 - `lib.rs` is the entire public API: `EmulatedMachine::new(cfg)` then `start()`. Everything else is `pub(crate)`.
 - The library never touches stdio, never calls `process::exit`, holds no global mutable state, never panics on guest behavior. Guest faults are guest exceptions.
 - Comments minimal; only for non-obvious why.
@@ -24,6 +24,6 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 ## Debugging
 
 - `--debug` on the example dumps CPU state and scans guest RAM for the kernel log ring buffer on exit.
-- `--verify` runs the JIT in lockstep with the interpreter and stops at the first diverging block; use it after any change under `src/jit/`.
+- `--verify` runs the JIT in lockstep with the interpreter and stops at the first diverging block; use it after any change under `crates/uemulator/src/jit/`.
 - `--time <unix>` fixes the RTC; guest behavior must not depend on it, so a time-dependent failure is an emulator bug.
 - Slow lockstep test: `cargo test --release -- --ignored`.

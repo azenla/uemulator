@@ -12,16 +12,17 @@ machine.start()?;
 let reason = machine.wait();
 ```
 
-Try it with the Debian netboot kernel (downloaded once into `~/.cache/uemulator`):
+Try it with the CLI (`crates/uemulator-cli`). `quick` downloads netboot artifacts once into `~/.cache/uemulator/quick/<distro>/artifacts/` (`--update` refetches):
 
 ```
-cargo run --release --example boot-linux            # kernel + installer initrd, JIT on
-cargo run --release --example boot-linux -- --no-initrd --no-jit
+cargo run --release -- quick debian --memory 1024
+cargo run --release -- quick alpine --disable-jit
+cargo run --release -- boot --kernel vmlinuz --initramfs initrd --memory 8192
 ```
 
-In a terminal the example puts the tty in raw mode; Ctrl-] stops the machine.
+In a terminal the CLI puts the tty in raw mode; Ctrl-] stops the machine.
 
-Example flags: `--mem MiB` (64-3072, default 512), `--disk image[,ro]` (raw image as virtio-blk), `--net-loop` (virtio-net with a tiny 10.0.2.2 gateway answering ARP/ping), `--net-udp LOCAL,REMOTE` (frames over UDP), `--console virtio` (hvc0 console; the host terminal size is forwarded to the guest and follows resizes), `--no-jit`, `--no-initrd`, `--cmdline`, `--time`, `--timeout`, `--debug`, `--verify`.
+Flags (`boot` and `quick`): `--memory MiB` (64-3072, default 512), `--cmdline`, `--disk image[,ro]` (raw image as virtio-blk), `--net-loop` (virtio-net with a tiny 10.0.2.2 gateway answering ARP/ping), `--net-udp LOCAL,REMOTE` (frames over UDP), `--console serial|virtio` (hvc0; the host terminal size is forwarded and follows resizes), `--disable-jit`, `--time`, `--timeout`, `--debug`, `--verify`.
 
 Optional devices (all virtio over PCI, none present unless configured): `MachineConfig::disk(Disk)`, `MachineConfig::net(mac)` + `EmulatedMachine::net()` for a frame-level `NetHandle`, `MachineConfig::console(ConsoleKind::Virtio)` + `ConsoleHandle::resize(cols, rows)`.
 

@@ -35,6 +35,7 @@ Both executors consume the same uop lists, so the interpreter is the correctness
 ## Crate layout (single crate, zero deps)
 
 ```
+(paths relative to crates/uemulator/)
 src/lib.rs            re-exports only
 src/machine.rs        EmulatedMachine, MachineConfig, ExitReason, thread control
 src/console.rs        ConsoleHandle byte stream

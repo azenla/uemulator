@@ -9,7 +9,9 @@ fn cached(name: &str) -> Option<Vec<u8>> {
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache/uemulator")))
         .ok()?;
-    std::fs::read(dir.join(name)).ok().filter(|d| !d.is_empty())
+    std::fs::read(dir.join("quick/debian/artifacts").join(name))
+        .ok()
+        .filter(|d| !d.is_empty())
 }
 
 fn run_until(cfg: MachineConfig, needle: &str, limit: Duration) -> (String, Option<ExitReason>) {

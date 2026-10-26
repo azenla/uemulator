@@ -95,7 +95,7 @@ fn pack_sat(a: u128, b: u128, wide: usize, signed_out: bool) -> u128 {
 
 fn cvt_i32(v: f64, trunc: bool, mxcsr: u32) -> i32 {
     let r = if trunc { v.trunc() } else { round_rc(v, mxcsr) };
-    if r.is_nan() || r >= 2147483648.0 || r < -2147483648.0 {
+    if r.is_nan() || !(-2147483648.0..2147483648.0).contains(&r) {
         i32::MIN
     } else {
         r as i32
@@ -104,7 +104,7 @@ fn cvt_i32(v: f64, trunc: bool, mxcsr: u32) -> i32 {
 
 fn cvt_i64(v: f64, trunc: bool, mxcsr: u32) -> i64 {
     let r = if trunc { v.trunc() } else { round_rc(v, mxcsr) };
-    if r.is_nan() || r >= 9.223_372_036_854_776e18 || r < -9.223_372_036_854_776e18 {
+    if r.is_nan() || !(-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&r) {
         i64::MIN
     } else {
         r as i64

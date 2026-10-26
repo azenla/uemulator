@@ -45,15 +45,15 @@ impl ConsoleHandle {
 - `new` does all fallible setup (parse bzImage, allocate RAM, probe JIT) so `start` failing is rare.
 - Guest shutdown is a value (`ExitReason`), never a process exit. Triple fault and 0x64←0xFE / port 0xCF9 reset map to `Reset`/`TripleFault` so automated runs terminate.
 - Console is a plain byte stream backed by bounded queues; output with no reader drops oldest beyond a cap rather than blocking the guest.
-- Stdio bridging (raw tty, Ctrl-C) lives in `examples/linux.rs`, not the library.
-- No networking in the library. The example shells out to `curl -fL` for downloads.
+- Stdio bridging (raw tty, Ctrl-C) lives in `crates/uemulator-cli`, not the library.
+- No networking in the library. The CLI downloads with ureq.
 
-## Example (`examples/linux.rs`, target `boot-linux`)
+## CLI (`crates/uemulator-cli`, binary `uemulator`)
 
-`cargo run --release --example boot-linux [-- --no-initrd --no-jit --cmdline ...]`
+`uemulator boot --kernel K [--initramfs I] [flags]` and `uemulator quick <debian|alpine|fedora> [--update] [flags]` (flags in README).
 
-1. Cache dir: `$UEMULATOR_CACHE`, else `~/.cache/uemulator`.
-2. Fetch `https://deb.debian.org/debian/dists/stable/main/installer-amd64/current/images/netboot/debian-installer/amd64/{linux,initrd.gz}` with `curl -fL -o <name>.part`, then `rename` so partial downloads never get cached. Skip when the file exists and is non-empty.
+1. Cache dir: `$UEMULATOR_CACHE`, else `~/.cache/uemulator`; quick artifacts at `quick/<distro>/artifacts/<file>`.
+2. Sources: Debian trixie netboot (deb.debian.org), Alpine latest-stable `virt` netboot (dl-cdn.alpinelinux.org; boot.alpinelinux.org only hosts iPXE), Fedora 44 Server pxeboot. Downloads go to `<file>.part`, then `rename`. Skipped when cached and non-empty unless `--update`.
 3. Build config, start machine, pump stdin → console and console → stdout until exit; print `ExitReason`.
 
 Default cmdline: `console=ttyS0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1`.
