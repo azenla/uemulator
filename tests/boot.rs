@@ -107,3 +107,30 @@ fn jit_lockstep_verify() {
     let (text, miss) = run_until(cfg, "Starting system log daemon", Duration::from_secs(400));
     assert!(miss.is_none(), "lockstep verification failed:\n{text}");
 }
+
+fn memory_size(mib: usize, needle: &str) {
+    let Some(kernel) = cached("linux") else {
+        return;
+    };
+    let cfg = MachineConfig::new().kernel(kernel).memory_mib(mib);
+    let (text, miss) = run_until(cfg, needle, Duration::from_secs(120));
+    assert!(miss.is_none(), "e820 for {mib} MiB not seen:\n{text}");
+}
+
+#[test]
+fn memory_128_mib() {
+    memory_size(128, "[mem 0x0000000000100000-0x0000000007ffffff] usable");
+}
+
+#[test]
+fn memory_2048_mib() {
+    memory_size(2048, "[mem 0x0000000000100000-0x000000007fffffff] usable");
+}
+
+#[test]
+fn memory_bounds_rejected() {
+    for mib in [0, 16, 4096] {
+        let cfg = MachineConfig::new().kernel(vec![0; 4096]).memory_mib(mib);
+        assert!(EmulatedMachine::new(cfg).is_err());
+    }
+}

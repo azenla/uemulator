@@ -52,6 +52,9 @@ pub enum ExitReason {
     Internal(String),
 }
 
+pub const MIN_MEMORY_MIB: usize = 64;
+pub const MAX_MEMORY_MIB: usize = 3072;
+
 pub(crate) type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct MachineConfig {
@@ -216,8 +219,10 @@ pub struct EmulatedMachine {
 
 impl EmulatedMachine {
     pub fn new(cfg: MachineConfig) -> Result<Self, Error> {
-        if cfg.memory_mib < 64 {
-            return Err(Error::BadConfig("memory_mib must be at least 64".into()));
+        if !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&cfg.memory_mib) {
+            return Err(Error::BadConfig(format!(
+                "memory_mib must be between {MIN_MEMORY_MIB} and {MAX_MEMORY_MIB}"
+            )));
         }
         if cfg.jit == JitMode::On && !crate::sys::jit_probe() {
             return Err(Error::JitUnavailable);

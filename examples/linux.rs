@@ -63,6 +63,9 @@ fn main() {
     if !args.iter().any(|a| a == "--no-initrd") {
         cfg = cfg.initrd(fetch("initrd.gz"));
     }
+    if let Some(i) = args.iter().position(|a| a == "--mem") {
+        cfg = cfg.memory_mib(args[i + 1].parse().expect("--mem takes MiB"));
+    }
     if let Some(i) = args.iter().position(|a| a == "--time") {
         cfg = cfg.unix_time(args[i + 1].parse().expect("unix seconds"));
     }
