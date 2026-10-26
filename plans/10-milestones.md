@@ -2,7 +2,9 @@
 
 ## Status
 
-- M0 done. M1 done (console prints `Linux version 6.12.107+deb13-amd64`). M2 done for the no-initrd path (VFS panic, then `ExitReason::Reset`, ~30 s wall in release). M3 in progress (initrd boot: x87/SSE2 implemented, validating userspace).
+- M0-M3 done: kernel banner, VFS panic then `ExitReason::Reset`, and the Debian installer userspace (dialogs drawn) with both interpreter and JIT.
+- M4 done: aarch64 JIT (block translator, inline TLB fast paths, ALU/mov/lea/push/pop/jcc/call/ret inlined, helper fallback for everything else, lazy-flag-aware jcc, per-page invalidation, self-modifying-code exit). ~5x faster than the interpreter (no-initrd boot: 6.4 s vs 32 s; roughly 300 MIPS). A lockstep verifier (`MachineConfig::verify_jit`, `--verify` in the example) runs the JIT against the interpreter per block; the whole installer boot is divergence-free.
+- M5 partly done: realtime idle (`ClockMode::Realtime`), raw tty in the example, fixed RTC time option. Not done: block chaining, guest register caching, LAPIC/IOAPIC, SMP, x86_64 host JIT.
 
 Each has an observable serial-output exit criterion. Interpreter first.
 

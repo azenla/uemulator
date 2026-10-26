@@ -57,6 +57,14 @@ impl Devices {
         }
     }
 
+    pub fn state(&self, now: u64) -> String {
+        format!("{} | {}", self.pic.state(), self.pit.state(now))
+    }
+
+    pub fn set_boot_time(&mut self, unix: u64) {
+        self.boot_unix = unix;
+    }
+
     pub fn next_deadline(&self, _now: u64) -> Option<u64> {
         self.pit.next_deadline()
     }
@@ -121,7 +129,16 @@ impl Devices {
                 }
                 v
             }
-            0x71 => self.cmos_read(now),
+            0x71 => {
+                if std::env::var_os("UEMU_CMOS").is_some() {
+                    eprintln!(
+                        "cmos read idx {:#x} -> {:#x} at {now}",
+                        self.cmos_idx,
+                        self.cmos_read(now)
+                    );
+                }
+                self.cmos_read(now)
+            }
             0x92 => self.port92,
             0x3f8..=0x3ff => self.uart.read(port - 0x3f8),
             _ => return ones,
@@ -142,7 +159,16 @@ impl Devices {
                 self.pit.set_gate2(b & 1 != 0, now);
             }
             0x70 => self.cmos_idx = b,
-            0x71 => self.cmos[(self.cmos_idx & 0x7f) as usize] = b,
+            0x71 => {
+                if std::env::var_os("UEMU_CMOS").is_some() {
+                    eprintln!(
+                        "cmos write idx {:#x} <- {b:#x} at {now}",
+                        self.cmos_idx,
+                        now = now
+                    );
+                }
+                self.cmos[(self.cmos_idx & 0x7f) as usize] = b
+            }
             0x64 if b == 0xfe => self.reset_requested = true,
             0x92 => {
                 self.port92 = b & 2;

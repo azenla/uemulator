@@ -398,7 +398,14 @@ impl Cpu {
             }
             let same_exc = match (&rm, &rs) {
                 (Ok(()), Ok(())) => true,
-                (Err(Exc::Fault { vec: a, err: ea, .. }), Err(Exc::Fault { vec: b, err: eb, .. })) => a == b && ea == eb,
+                (
+                    Err(Exc::Fault {
+                        vec: a, err: ea, ..
+                    }),
+                    Err(Exc::Fault {
+                        vec: b, err: eb, ..
+                    }),
+                ) => a == b && ea == eb,
                 (Err(Exc::Exit(_)), Err(Exc::Exit(_))) => true,
                 _ => false,
             };
@@ -412,7 +419,9 @@ impl Cpu {
                 let bytes_m = self.ram[pa + (start as usize & 0xfff)..][..24].to_vec();
                 let bytes_s = sh.ram[pa + (start as usize & 0xfff)..][..24].to_vec();
                 if let Some(l) = &self.log {
-                    l(&format!("page diffs at {page_diff:x?}; main bytes {bytes_m:02x?}; shadow bytes {bytes_s:02x?}"));
+                    l(&format!(
+                        "page diffs at {page_diff:x?}; main bytes {bytes_m:02x?}; shadow bytes {bytes_s:02x?}"
+                    ));
                 }
                 let msg = format!(
                     "verify: divergence after block at {start:#x} ({done} insns, attempts {attempts}, shadow start {sh_before:x?}): exc main={:?} shadow={:?} diff={:?}\n--- before {before:x?}\n--- main\n{}--- shadow\n{}",
@@ -470,7 +479,11 @@ impl Cpu {
         if self.xmm != o.xmm {
             d.push("xmm".into());
         }
-        if d.is_empty() { None } else { Some(d.join(", ")) }
+        if d.is_empty() {
+            None
+        } else {
+            Some(d.join(", "))
+        }
     }
 
     fn idle(&mut self) -> Option<ExitReason> {
@@ -515,7 +528,12 @@ impl Cpu {
     }
 
     pub fn dump_regs(&self) -> String {
-        let mut s = format!("rip={:016x} cpl={} eflags={:x}\n", self.rip, self.cpl, self.eflags_full());
+        let mut s = format!(
+            "rip={:016x} cpl={} eflags={:x}\n",
+            self.rip,
+            self.cpl,
+            self.eflags_full()
+        );
         for (i, g) in self.gpr.iter().enumerate() {
             s += &format!("r{i:<2}={g:016x} ");
             if i % 4 == 3 {
@@ -544,6 +562,12 @@ impl Cpu {
                 s += "\n";
             }
         }
+        s += &format!(
+            "halted={} shadow={} dev: {}\n",
+            self.halted,
+            self.shadow,
+            self.dev.state(self.now_ns())
+        );
         let needle = b"Linux version";
         let mut found = 0;
         let mut at = 0;

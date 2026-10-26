@@ -106,7 +106,7 @@ impl Pit {
         c.running = n != 2 || c.gate;
         if n == 0 {
             self.next_irq = match c.mode & 7 {
-                2 | 3 | 6 | 7 | 0 => Some(now + ns_of_ticks(v as u64)),
+                0 | 2 | 3 | 4 | 6 | 7 => Some(now + ns_of_ticks(v as u64)),
                 _ => None,
             };
         }
@@ -193,6 +193,14 @@ impl Pit {
         }
     }
 
+    pub fn state(&self, now: u64) -> String {
+        let c = &self.ch[0];
+        format!(
+            "pit0 mode {} reload {} next_irq {:?} now {now}",
+            c.mode, c.reload, self.next_irq
+        )
+    }
+
     pub fn next_deadline(&self) -> Option<u64> {
         self.next_irq
     }
@@ -242,6 +250,17 @@ mod tests {
         assert!(d > 0);
         assert!(p.tick(d));
         assert!(p.next_deadline().unwrap() > d);
+    }
+
+    #[test]
+    fn ch0_mode4_oneshot_fires() {
+        let mut p = Pit::new();
+        p.write(0x43, 0x38, 0);
+        p.write(0x40, 0x10, 0);
+        p.write(0x40, 0x00, 0);
+        let d = p.next_deadline().expect("mode 4 must schedule an irq");
+        assert!(p.tick(d));
+        assert!(p.next_deadline().is_none());
     }
 
     #[test]

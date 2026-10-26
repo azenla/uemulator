@@ -64,6 +64,7 @@ pub struct MachineConfig {
     log: Option<LogFn>,
     debug: bool,
     verify: bool,
+    unix_time: Option<u64>,
 }
 
 impl Default for MachineConfig {
@@ -80,6 +81,7 @@ impl Default for MachineConfig {
             log: None,
             debug: false,
             verify: false,
+            unix_time: None,
         }
     }
 }
@@ -130,6 +132,11 @@ impl MachineConfig {
         self
     }
 
+    pub fn unix_time(mut self, secs: u64) -> Self {
+        self.unix_time = Some(secs);
+        self
+    }
+
     pub fn log(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.log = Some(Arc::new(f));
         self
@@ -155,6 +162,7 @@ struct Vcpu {
     jit: JitMode,
     clock: ClockMode,
     verify: bool,
+    unix_time: Option<u64>,
     boot_ram: Option<Vec<u8>>,
 }
 
@@ -167,6 +175,9 @@ impl Vcpu {
             self.stop,
             self.log.clone(),
         );
+        if let Some(t) = self.unix_time {
+            cpu.dev.set_boot_time(t);
+        }
         cpu.realtime = self.clock == ClockMode::Realtime;
         if self.jit != JitMode::Off {
             cpu.jit = crate::jit::Jit::new().map(Box::new);
@@ -175,7 +186,13 @@ impl Vcpu {
             cpu.trace = Some(Default::default());
         }
         let r = if self.verify {
-            let mut sh = Cpu::new(self.boot_ram.take().unwrap(), self.boot, ConsoleHandle::default(), cpu.stop.clone(), None);
+            let mut sh = Cpu::new(
+                self.boot_ram.take().unwrap(),
+                self.boot,
+                ConsoleHandle::default(),
+                cpu.stop.clone(),
+                None,
+            );
             cpu.run_verify(&mut sh)
         } else {
             cpu.run()
@@ -221,6 +238,7 @@ impl EmulatedMachine {
                 jit: cfg.jit,
                 clock: cfg.clock,
                 verify: cfg.verify,
+                unix_time: cfg.unix_time,
                 boot_ram: if cfg.verify { Some(ram_copy) } else { None },
             }),
             thread: None,

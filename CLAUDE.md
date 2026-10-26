@@ -20,3 +20,10 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 - The interpreter is the oracle for the JIT. Any new uop gets an interpreter implementation and a test first.
 - Advertise a CPUID bit only together with the tests for the instructions behind it.
 - Debug-profile is optimized (`opt-level = 3`) because the kernel decompressor is ~1e9 guest instructions.
+
+## Debugging
+
+- `--debug` on the example dumps CPU state and scans guest RAM for the kernel log ring buffer on exit.
+- `--verify` runs the JIT in lockstep with the interpreter and stops at the first diverging block; use it after any change under `src/jit/`.
+- `--time <unix>` fixes the RTC; guest behavior must not depend on it, so a time-dependent failure is an emulator bug.
+- Slow lockstep test: `cargo test --release -- --ignored`.

@@ -69,6 +69,20 @@ impl Pic {
 }
 
 impl Pics {
+    pub fn state(&self) -> String {
+        format!(
+            "m(irr {:02x} isr {:02x} imr {:02x} base {:02x}) s(irr {:02x} isr {:02x} imr {:02x} base {:02x})",
+            self.m.irr,
+            self.m.isr,
+            self.m.imr,
+            self.m.base,
+            self.s.irr,
+            self.s.isr,
+            self.s.imr,
+            self.s.base
+        )
+    }
+
     pub fn raise(&mut self, irq: u8) {
         if irq < 8 {
             self.m.irr |= 1 << irq;

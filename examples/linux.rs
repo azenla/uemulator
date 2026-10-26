@@ -63,6 +63,9 @@ fn main() {
     if !args.iter().any(|a| a == "--no-initrd") {
         cfg = cfg.initrd(fetch("initrd.gz"));
     }
+    if let Some(i) = args.iter().position(|a| a == "--time") {
+        cfg = cfg.unix_time(args[i + 1].parse().expect("unix seconds"));
+    }
     let tty = std::io::stdin().is_terminal();
     if tty || args.iter().any(|a| a == "--realtime") {
         cfg = cfg.clock(ClockMode::Realtime);
