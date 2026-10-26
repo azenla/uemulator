@@ -11,6 +11,29 @@ pub enum Distro {
     Fedora,
 }
 
+impl Distro {
+    /// Fedora's stage2 image (~900 MB) is downloaded into RAM and must fit beside Anaconda.
+    pub fn default_memory_mib(self) -> usize {
+        match self {
+            Distro::Fedora => 3072,
+            _ => 2048,
+        }
+    }
+
+    /// Kernel arguments that make the netboot image reach its installer over the user-mode network.
+    pub fn cmdline(self) -> &'static str {
+        match self {
+            Distro::Debian => "",
+            Distro::Alpine => {
+                "ip=dhcp alpine_repo=https://dl-cdn.alpinelinux.org/alpine/latest-stable/main modloop=https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/netboot/modloop-virt"
+            }
+            Distro::Fedora => {
+                "ip=dhcp rd.neednet=1 inst.text inst.repo=https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Server/x86_64/os/"
+            }
+        }
+    }
+}
+
 pub struct Artifacts {
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
@@ -68,12 +91,33 @@ impl Distro {
     }
 }
 
-pub fn cache_root() -> Result<PathBuf, String> {
-    if let Ok(d) = std::env::var("UEMULATOR_CACHE") {
+fn home() -> Result<PathBuf, String> {
+    if let Ok(d) = std::env::var("UEMULATOR_HOME") {
         return Ok(d.into());
     }
     let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-    Ok(Path::new(&home).join(".cache/uemulator"))
+    Ok(Path::new(&home).join(".uemulator"))
+}
+
+fn cache_root() -> Result<PathBuf, String> {
+    match std::env::var("UEMULATOR_CACHE") {
+        Ok(d) => Ok(d.into()),
+        Err(_) => Ok(home()?.join("cache")),
+    }
+}
+
+/// Per-distro scratch disk, created sparse on first use.
+pub fn ensure_disk(distro: Distro, gib: u64) -> Result<PathBuf, String> {
+    let dir = home()?.join("quick").join(distro.name());
+    let path = dir.join("disk.img");
+    if !path.exists() {
+        fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        File::create(&path)
+            .and_then(|f| f.set_len(gib << 30))
+            .map_err(|e| format!("create {}: {e}", path.display()))?;
+        eprintln!("created {gib} GiB disk {}", path.display());
+    }
+    Ok(path)
 }
 
 pub fn ensure(distro: Distro, update: bool) -> Result<Artifacts, String> {

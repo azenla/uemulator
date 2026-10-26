@@ -257,14 +257,21 @@ impl Transport {
     fn common_read(&mut self, off: u64, size: u8) -> u32 {
         let (base, v): (u64, u64) = match off {
             0x00..=0x03 => (0x00, self.dfsel as u64),
+            // selectors 2 and 3 are the extended (bits 64-127) words newer kernels probe
             0x04..=0x07 => (
                 0x04,
-                (self.dev_features() >> (32 * (self.dfsel & 1))) as u32 as u64,
+                match self.dfsel {
+                    0 | 1 => (self.dev_features() >> (32 * self.dfsel)) as u32 as u64,
+                    _ => 0,
+                },
             ),
             0x08..=0x0b => (0x08, self.fsel as u64),
             0x0c..=0x0f => (
                 0x0c,
-                (self.driver_features >> (32 * (self.fsel & 1))) as u32 as u64,
+                match self.fsel {
+                    0 | 1 => (self.driver_features >> (32 * self.fsel)) as u32 as u64,
+                    _ => 0,
+                },
             ),
             0x10..=0x11 => (0x10, 0xffff),
             0x12..=0x13 => (0x12, self.queues.len() as u64),
@@ -293,8 +300,8 @@ impl Transport {
         match (off, size) {
             (0x00, 4) => self.dfsel = val,
             (0x08, 4) => self.fsel = val,
-            (0x0c, 4) => {
-                let sh = 32 * (self.fsel & 1);
+            (0x0c, 4) if self.fsel < 2 => {
+                let sh = 32 * self.fsel;
                 self.driver_features =
                     (self.driver_features & !(0xffff_ffffu64 << sh)) | (val as u64) << sh;
             }
@@ -385,5 +392,35 @@ pub(crate) mod testutil {
     pub fn used_idx(ram: &[u8], used: u64) -> u16 {
         let u = used as usize;
         u16::from_le_bytes([ram[u + 2], ram[u + 3]])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev::guestmem::test_mem;
+    use crate::dev::vblk::VirtioBlk;
+    use crate::disk::Disk;
+
+    #[test]
+    fn extended_feature_selectors_do_not_alias() {
+        let mut t = Transport::new(Box::new(VirtioBlk::new(Disk::memory(vec![0; 4096]))));
+        let mut ram = vec![0u8; 4096];
+        let mut mem = test_mem(&mut ram);
+        let mut w = |t: &mut Transport, off, size, v| t.mmio_write(off, size, v, &mut mem);
+        // Linux 6.18 negotiates 128 feature bits: it reads and writes selectors 0..=3.
+        let mut offered = [0u32; 4];
+        for sel in 0..4 {
+            w(&mut t, 0x00, 4, sel);
+            offered[sel as usize] = t.mmio_read(0x04, 4);
+        }
+        assert_eq!(offered[2..], [0, 0]);
+        assert_ne!(offered[1] & 1, 0, "VERSION_1 offered");
+        for sel in 0..4 {
+            w(&mut t, 0x08, 4, sel);
+            w(&mut t, 0x0c, 4, offered[sel as usize]);
+        }
+        w(&mut t, 0x14, 1, 1 | 2 | 8);
+        assert_ne!(t.mmio_read(0x14, 1) & 8, 0, "FEATURES_OK must stick");
     }
 }

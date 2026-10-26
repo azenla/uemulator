@@ -2,6 +2,7 @@ mod netgw;
 mod quick;
 mod run;
 mod term;
+mod usernet;
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -36,6 +37,9 @@ enum Cmd {
         /// Re-download the cached artifacts
         #[arg(long)]
         update: bool,
+        /// Size in GiB of the disk created at ~/.uemulator/quick/<distro>/disk.img
+        #[arg(long, default_value_t = 8, value_name = "GIB")]
+        disk_size: u64,
         #[command(flatten)]
         machine: MachineArgs,
     },
@@ -50,7 +54,7 @@ pub enum ConsoleArg {
 
 #[derive(Args)]
 pub struct MachineArgs {
-    /// Guest memory in MiB
+    /// Guest memory in MiB [default: 2048, 3072 for `quick fedora`]
     #[arg(long, short = 'm')]
     memory: Option<usize>,
     /// Kernel command line
@@ -59,6 +63,12 @@ pub struct MachineArgs {
     /// Raw disk image as a virtio-blk device; append ",ro" for read-only
     #[arg(long, value_name = "PATH[,ro]")]
     disk: Option<String>,
+    /// Attach a virtio-net device with user-mode NAT to the host network (default for `quick`)
+    #[arg(long)]
+    net_user: bool,
+    /// Append to the kernel command line
+    #[arg(long, value_name = "ARGS")]
+    append: Option<String>,
     /// Attach a virtio-net device answered by a built-in gateway (DHCP, ARP, ICMP echo)
     #[arg(long)]
     net_loop: bool,
@@ -106,10 +116,27 @@ fn main() {
         Cmd::Quick {
             distro,
             update,
-            machine,
+            disk_size,
+            mut machine,
         } => quick::ensure(distro, update).and_then(|a| {
             let k = read(&a.kernel)?;
             let i = read(&a.initramfs)?;
+            if !machine.net_loop && machine.net_udp.is_none() {
+                machine.net_user = true;
+            }
+            let extra = distro.cmdline();
+            if !extra.is_empty() {
+                let mut a = extra.to_string();
+                if let Some(user) = machine.append.take() {
+                    a = format!("{a} {user}");
+                }
+                machine.append = Some(a);
+            }
+            machine.memory.get_or_insert(distro.default_memory_mib());
+            if machine.disk.is_none() {
+                let disk = quick::ensure_disk(distro, disk_size)?;
+                machine.disk = Some(disk.to_string_lossy().into_owned());
+            }
             run::run(k, Some(i), machine)
         }),
     };

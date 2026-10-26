@@ -52,7 +52,7 @@ impl ConsoleHandle {
 
 `uemulator boot --kernel K [--initramfs I] [flags]` and `uemulator quick <debian|alpine|fedora> [--update] [flags]` (flags in README).
 
-1. Cache dir: `$UEMULATOR_CACHE`, else `~/.cache/uemulator`; quick artifacts at `quick/<distro>/artifacts/<file>`.
+1. Cache dir: `$UEMULATOR_CACHE`, else `~/.uemulator/cache`; quick artifacts at `quick/<distro>/artifacts/<file>`; `$UEMULATOR_HOME` (default `~/.uemulator`) holds everything, with the cache in its `cache/` subdirectory and the per-distro disk at `quick/<distro>/disk.img`.
 2. Sources: Debian trixie netboot (deb.debian.org), Alpine latest-stable `virt` netboot (dl-cdn.alpinelinux.org; boot.alpinelinux.org only hosts iPXE), Fedora 44 Server pxeboot. Downloads go to `<file>.part`, then `rename`. Skipped when cached and non-empty unless `--update`.
 3. Build config, start machine, pump stdin → console and console → stdout until exit; print `ExitReason`.
 

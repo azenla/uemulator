@@ -7,7 +7,7 @@ use uemulator::{EmulatedMachine, ExitReason, JitMode, MachineConfig};
 fn cached(name: &str) -> Option<Vec<u8>> {
     let dir = std::env::var("UEMULATOR_CACHE")
         .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache/uemulator")))
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".uemulator/cache")))
         .ok()?;
     std::fs::read(dir.join("quick/debian/artifacts").join(name))
         .ok()

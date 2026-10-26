@@ -71,6 +71,7 @@ pub struct MachineConfig {
     kernel: Vec<u8>,
     initrd: Option<Vec<u8>>,
     cmdline: Option<String>,
+    cmdline_extra: Vec<String>,
     memory_mib: usize,
     disk: Option<Disk>,
     net_mac: Option<[u8; 6]>,
@@ -89,6 +90,7 @@ impl Default for MachineConfig {
             kernel: Vec::new(),
             initrd: None,
             cmdline: None,
+            cmdline_extra: Vec::new(),
             memory_mib: 512,
             disk: None,
             net_mac: None,
@@ -120,6 +122,12 @@ impl MachineConfig {
 
     pub fn cmdline(mut self, s: impl Into<String>) -> Self {
         self.cmdline = Some(s.into());
+        self
+    }
+
+    /// Appended to the command line, whether it is the default or set by `cmdline`.
+    pub fn cmdline_append(mut self, s: impl Into<String>) -> Self {
+        self.cmdline_extra.push(s.into());
         self
     }
 
@@ -261,7 +269,7 @@ impl EmulatedMachine {
             return Err(Error::JitUnavailable);
         }
         let mut ram = vec![0u8; cfg.memory_mib << 20];
-        let cmdline = cfg.cmdline.clone().unwrap_or_else(|| {
+        let mut cmdline = cfg.cmdline.clone().unwrap_or_else(|| {
             let con = if cfg.console_kind == ConsoleKind::Virtio {
                 "hvc0"
             } else {
@@ -271,6 +279,10 @@ impl EmulatedMachine {
                 "console={con} earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1"
             )
         });
+        for extra in &cfg.cmdline_extra {
+            cmdline.push(' ');
+            cmdline.push_str(extra);
+        }
         let boot = boot::load(&mut ram, &cfg.kernel, cfg.initrd.as_deref(), &cmdline)?;
         let net = cfg.net_mac.map(|m| (m, NetHandle::default()));
         let net_handle = net.as_ref().map(|(_, h)| h.clone());

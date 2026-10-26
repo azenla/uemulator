@@ -51,11 +51,12 @@ pub fn run(kernel: Vec<u8>, initramfs: Option<Vec<u8>>, a: MachineArgs) -> Resul
     if let Some(i) = initramfs {
         cfg = cfg.initrd(i);
     }
-    if let Some(m) = a.memory {
-        cfg = cfg.memory_mib(m);
-    }
+    cfg = cfg.memory_mib(a.memory.unwrap_or(2048));
     if let Some(c) = a.cmdline {
         cfg = cfg.cmdline(c);
+    }
+    if let Some(extra) = &a.append {
+        cfg = cfg.cmdline_append(extra.clone());
     }
     if let Some(v) = &a.disk {
         let (path, ro) = match v.strip_suffix(",ro") {
@@ -64,7 +65,7 @@ pub fn run(kernel: Vec<u8>, initramfs: Option<Vec<u8>>, a: MachineArgs) -> Resul
         };
         cfg = cfg.disk(Disk::open(path, ro).map_err(|e| format!("open disk {path}: {e}"))?);
     }
-    if a.net_loop || a.net_udp.is_some() {
+    if a.net_loop || a.net_user || a.net_udp.is_some() {
         cfg = cfg.net(GUEST_MAC);
     }
     if matches!(a.console, ConsoleArg::Virtio) {
@@ -88,7 +89,10 @@ pub fn run(kernel: Vec<u8>, initramfs: Option<Vec<u8>>, a: MachineArgs) -> Resul
             spawn_udp(net.clone(), spec)?;
         }
         if a.net_loop {
-            spawn_gateway(net);
+            spawn_gateway(net.clone());
+        }
+        if a.net_user {
+            crate::usernet::spawn(net);
         }
     }
     if let Some((c, r)) = term_size() {
