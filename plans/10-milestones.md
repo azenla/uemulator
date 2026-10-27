@@ -13,7 +13,9 @@
 - `jit` feature (default on) gates `libc`/`windows-sys`; `--no-default-features` is dependency-free and interpreter-only.
 - x86_64 host JIT done (see 06): same inlined subset as aarch64, verified in lockstep. Exercised on macOS x86_64 under Rosetta; Linux and Windows x86_64 hosts compile but are untested.
 
-- Instruction extensions done (see 03, "Instruction extensions"): POPCNT/LZCNT, CMPXCHG16B, SSE3, SSSE3 (XMM forms), SSE4.1, SSE4.2 (incl. CRC32 and pcmp[ei]str[im]), PCLMULQDQ, AES-NI, MOVBE and FSGSBASE are implemented and advertised in CPUID (leaf 1 ECX, 0x80000001 ECX, leaf 7). The Alpine boot now executes cmpxchg16b, popcnt, pshufb and palignr in the kernel. Not advertised: ERMS/FSRM, AVX*, BMI, RDRAND, XSAVE, MONITOR/MWAIT.
+- Instruction extensions done (see 03, "Instruction extensions"): POPCNT/LZCNT, CMPXCHG16B, SSE3, SSSE3 (XMM forms), SSE4.1, SSE4.2 (incl. CRC32 and pcmp[ei]str[im]), PCLMULQDQ, AES-NI, MOVBE and FSGSBASE are implemented and advertised in CPUID (leaf 1 ECX, 0x80000001 ECX, leaf 7). The Alpine boot now executes cmpxchg16b, popcnt, pshufb and palignr in the kernel. Not advertised: ERMS/FSRM, AVX*, BMI, MONITOR/MWAIT, VMX/SVM.
+
+- Speculation control, XSAVE and RDRAND done (see 03, "Speculation control" and "XSAVE and RDRAND"): guests see an in-order CPU immune to every speculative-execution bug (no retpolines, return thunks, KPTI or VERW), use `xsaveopt` for context switches, and seed the crng from `rdrand`/`rdseed`.
 
 - WebAssembly port done (see 13): `crates/uemulator-web` + `hack/web.sh serve`; interpreter in a Web Worker with an xterm.js console, boots Alpine to a busybox shell in Chrome. No JIT, disk or network.
 

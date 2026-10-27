@@ -1141,3 +1141,33 @@ fn hlt_ends_the_run_with_the_halted_flag() {
     // nop; hlt
     check(&[0x90, 0xf4]);
 }
+
+#[test]
+fn rdrand_rdseed_xgetbv() {
+    // mov rax, 0x1234; rdrand rax; rdrand ecx; rdseed rdx; hlt
+    check_with(
+        &[
+            0x48, 0xc7, 0xc0, 0x34, 0x12, 0, 0, 0x48, 0x0f, 0xc7, 0xf0, 0x0f, 0xc7, 0xf1, 0x48,
+            0x0f, 0xc7, 0xfa, 0xf4,
+        ],
+        |h| h.cpu.rng_state = 99,
+    );
+}
+
+#[test]
+fn xsave_xrstor_round_trip_matches() {
+    // mov rdi, 0x...; xsave [rdi]; pxor xmm0,xmm0; xrstor [rdi]; hlt, EDX:EAX = -1
+    check_with(
+        &[
+            0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, 0x48, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff,
+            0x0f, 0xae, 0x27, 0x66, 0x0f, 0xef, 0xc0, 0x0f, 0xae, 0x2f, 0x0f, 0x01, 0xd0, 0xf4,
+        ],
+        |h| {
+            h.cpu.cr4 |= (1 << 9) | (1 << 18);
+            h.cpu.xcr0 = 3;
+            h.cpu.gpr[7] = crate::testkit::SCRATCH + 0x1000;
+            h.cpu.xmm[0] = 0x1234_5678_9abc_def0;
+            h.cpu.gpr[1] = 0;
+        },
+    );
+}

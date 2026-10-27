@@ -46,7 +46,7 @@ Start from the fork's identity (read `target/i386/cpu.c` "XTCG CPU" model for th
 - Leaf 1 ECX: SSE3, PCLMULQDQ, SSSE3, CX16, SSE4.1, SSE4.2, MOVBE, POPCNT, AES; 0x80000001 ECX adds ABM (LZCNT). MONITOR/MWAIT, VMX/SVM, XSAVE/OSXSAVE, AVX, RDRAND and the hypervisor bit stay clear
 - Leaf 0x80000001: SYSCALL, NX, LM, (RDTSCP only if implemented)
 - Leaf 0x80000007: invariant TSC set so the kernel trusts the TSC
-- No XSAVE/OSXSAVE/AVX/RDRAND (kernel then uses FXSAVE/FXRSTOR and falls back for random; RDRAND/RDSEED would also break the JIT lockstep verifier)
+- XSAVE/OSXSAVE (x87+SSE components only) and RDRAND/RDSEED are advertised, see "XSAVE and RDRAND". No AVX
 
 Advertising a bit is a promise; add bits only together with the test that proves the instructions.
 
@@ -62,7 +62,7 @@ Dispatch: `Cpu::sse` hands everything outside the `0F` map (0F 38, 0F 3A) and ev
 - PCLMULQDQ and AES-NI (aesenc/last, aesdec/last, aesimc, aeskeygenassist), tested with FIPS-197 appendix B and C.1 end to end.
 - FSGSBASE: F3 0F AE /0../3 register forms, gated by CR4.FSGSBASE (bit 16, accepted by mov cr4), canonical check on writes.
 
-Left out on purpose: ERMS/FSRM (the kernel would switch memcpy and clear_page to `rep movsb`/`stosb`, which `string_op` runs one byte per iteration instead of eight: advertise only together with a bulk fast path there), MONITOR/MWAIT, AVX/AVX2/BMI (VEX), RDRAND/RDSEED, XSAVE. The JIT runs all of the above through `helper_exec` (none is a block ender); `testkit::assert_jit_matches_interpreter` cases cover representative forms. Several encodings are prefix-dependent (F3 0F B8 POPCNT vs JMPE, F3 0F BD LZCNT vs BSR, F3 0F BC still BSF, 0F 38 F0/F1 MOVBE vs CRC32 by F2, F3 0F AE FSGSBASE vs the fences): any inline JIT lowering of the neighbouring opcodes must check `insn.rep` and `insn.p66`, or it silently diverges from the interpreter.
+Left out on purpose: ERMS/FSRM (the kernel would switch memcpy and clear_page to `rep movsb`/`stosb`, which `string_op` runs one byte per iteration instead of eight: advertise only together with a bulk fast path there), MONITOR/MWAIT, AVX/AVX2/BMI (VEX). The JIT runs all of the above through `helper_exec` (none is a block ender); `testkit::assert_jit_matches_interpreter` cases cover representative forms. Several encodings are prefix-dependent (F3 0F B8 POPCNT vs JMPE, F3 0F BD LZCNT vs BSR, F3 0F BC still BSF, 0F 38 F0/F1 MOVBE vs CRC32 by F2, F3 0F AE FSGSBASE vs the fences): any inline JIT lowering of the neighbouring opcodes must check `insn.rep` and `insn.p66`, or it silently diverges from the interpreter.
 
 
 ## Speculation control (mitigations)
@@ -72,3 +72,11 @@ The CPU is in-order and never speculates, so it says so, to keep the guest kerne
 - Leaf 7 EDX: SPEC_CTRL, STIBP, L1D_FLUSH, ARCH_CAPABILITIES, SSBD; leaf 0x80000008 EBX: IBPB, IBRS, STIBP, SSBD. MSRs: `IA32_SPEC_CTRL` (0x48, bits 0-2 stored, others #GP), `IA32_PRED_CMD` (0x49) and `IA32_FLUSH_CMD` (0x10b) write-only with bit 0 only, `IA32_ARCH_CAPABILITIES` (0x10a, read-only) with every `*_NO` bit Linux 6.18 checks plus IBRS_ALL (so Spectre v2 resolves to one-time "Enhanced IBRS", no retpolines) and BHI_NO (no BHB clearing loop on syscall entry). RSBA stays clear.
 - Family 0x14 rather than 0x15: `VULNBL_AMD` matches families 0x15-0x17,0x19,0x1a by number for RETBLEED/SRSO regardless of ARCH_CAPABILITIES, and the answer is an untrained-return thunk on every `ret`.
 - Check (Alpine 6.18 guest, `rdinit=/bin/sh`, cmdline without `mitigations=off`): every file in `/sys/devices/system/cpu/vulnerabilities` reads "Not affected" except `spectre_v2` ("Enhanced / Automatic IBRS", a single MSR write at boot) and `spectre_v1` (usercopy barriers). Before this change retbleed selected "untrained return thunk" and spectre_v2 was "Vulnerable" only because the quick cmdline passes `mitigations=off`.
+
+## XSAVE and RDRAND
+
+`cpu/xsave.rs`. The only state components are x87 (XCR0 bit 0) and SSE (bit 1), so the XSAVE area is the 512-byte fxsave image plus the 64-byte header (576 bytes, standard format; CPUID leaf 0xD reports it).
+
+- `xsetbv`/`xgetbv` (0F 01 D1/D0): `Cpu::xcr0`, #UD without CR4.OSXSAVE (bit 18, accepted by `mov cr4`, mirrored into CPUID.1:ECX bit 27 when read), `xsetbv` CPL 0 only and #GP for ECX != 0, x87 clear, or components beyond `XCR0_SUPPORTED`. Extending that mask means extending leaf 0xD and the area layout too.
+- `xsave`/`xsaveopt` (0F AE /4, /6) and `xrstor` (/5): #UD, then #NM (CR0.TS), then #GP(0) for a non-64-byte-aligned area. The request bitmap is EDX:EAX masked by XCR0. Saved components are always marked in use in XSTATE_BV, so `xsaveopt` is `xsave` (software can only see the difference through XSTATE_BV). `xrstor` validates XSTATE_BV, XCOMP_BV (compaction is not supported, so must be 0) and the reserved header bytes, then reads everything before committing; a component in the bitmap with its XSTATE_BV bit clear is reset to its initial state, MXCSR is read whenever SSE is in the bitmap. XSAVEC/XSAVES/XGETBV1 are not advertised, so Linux uses the standard format with xsaveopt (checked: "context size is 576 bytes, using 'standard' format"). fxsave/fxrstor share `save_legacy_region`/`restore_legacy_region` in `fpu.rs`.
+- `rdrand`/`rdseed` (0F C7 /6, /7, register forms): always CF=1, other arithmetic flags clear. The generator is splitmix64 in `Cpu::rng_state`, seeded by `MachineConfig::random_seed` (the CLI passes host entropy; the library default is a fixed constant, which is right for tests and `--verify` because the twin interpreter copies the state, but wrong for a guest that generates keys). Not cryptographic; the kernel mixes it with other sources. Side effect: the guest's crng is initialised at boot (`random: crng init done` at 0.05 s) instead of waiting for interrupt entropy.

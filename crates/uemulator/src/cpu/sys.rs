@@ -84,6 +84,8 @@ pub(crate) const CR4_OSFXSR: u64 = 1 << 9;
 pub(crate) const CR4_OSXMMEXCPT: u64 = 1 << 10;
 /// Enables rdfsbase/rdgsbase/wrfsbase/wrgsbase (advertised in CPUID.7.0:EBX).
 pub(crate) const CR4_FSGSBASE: u64 = 1 << 16;
+/// Enables xgetbv/xsetbv/xsave/xrstor; also mirrored into CPUID.1:ECX bit 27.
+pub(crate) const CR4_OSXSAVE: u64 = 1 << 18;
 /// CR4 bits a guest may set. Everything else (VME, PVI, MCE, UMIP, LA57, PCIDE, OSXSAVE, SMEP,
 /// SMAP...) is rejected with #GP because CPUID does not advertise it.
 const CR4_SUPPORTED: u64 = CR4_TSD
@@ -94,7 +96,8 @@ const CR4_SUPPORTED: u64 = CR4_TSD
     | CR4_PCE
     | CR4_OSFXSR
     | CR4_OSXMMEXCPT
-    | CR4_FSGSBASE;
+    | CR4_FSGSBASE
+    | CR4_OSXSAVE;
 
 /// Address widths reported by CPUID 0x8000_0008. CR3 and the canonical-address checks follow them.
 const PHYSICAL_ADDRESS_BITS: u32 = 40;
@@ -182,6 +185,8 @@ const LOG_KEY_WRMSR_FAULT: u64 = 1 << 59;
 const CPUID_LEAF_VENDOR: u32 = 0;
 const CPUID_LEAF_FEATURES: u32 = 1;
 const CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES: u32 = 7;
+/// Processor extended state enumeration (xsave component sizes).
+const CPUID_LEAF_XSTATE: u32 = 0xd;
 const CPUID_LEAF_EXT_MAX: u32 = 0x8000_0000;
 const CPUID_LEAF_EXT_FEATURES: u32 = 0x8000_0001;
 const CPUID_LEAF_BRAND_FIRST: u32 = 0x8000_0002;
@@ -193,7 +198,7 @@ const CPUID_LEAF_ADDRESS_SIZES: u32 = 0x8000_0008;
 
 /// Highest standard leaf. Leaves 2-6 are within range and read as zero (no cache or thermal
 /// descriptors; Linux only consults them on Intel).
-const CPUID_MAX_STANDARD_LEAF: u32 = CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES;
+const CPUID_MAX_STANDARD_LEAF: u32 = CPUID_LEAF_XSTATE;
 const CPUID_MAX_EXTENDED_LEAF: u32 = 0x8000_0008;
 
 /// Vendor string "AuthenticAMD" is returned in EBX, EDX, ECX order.
@@ -246,7 +251,7 @@ const CPUID_LEAF1_EDX: u32 = FEATURE_FPU
     | FEATURE_SSE2;
 
 // Leaf 1 ECX. Each bit is advertised together with the tests of the instructions behind it.
-// MONITOR/MWAIT, VMX/SVM, XSAVE/OSXSAVE, AVX, RDRAND and the hypervisor bit stay clear.
+// MONITOR/MWAIT, VMX/SVM, AVX and the hypervisor bit stay clear.
 /// SSE3: movddup, movshdup, movsldup, lddqu, addsub*, hadd*, hsub*, and x87 fisttp.
 const FEATURE_SSE3: u32 = 1 << 0;
 /// PCLMULQDQ.
@@ -263,6 +268,12 @@ const FEATURE_MOVBE: u32 = 1 << 22;
 const FEATURE_POPCNT: u32 = 1 << 23;
 /// AES-NI: aesenc, aesenclast, aesdec, aesdeclast, aesimc, aeskeygenassist.
 const FEATURE_AES: u32 = 1 << 25;
+/// xsave, xrstor, xsaveopt, xgetbv, xsetbv (x87 and SSE state only; see `xsave.rs`).
+const FEATURE_XSAVE: u32 = 1 << 26;
+/// Mirrors CR4.OSXSAVE; computed in `cpuid`, never part of the static mask.
+const FEATURE_OSXSAVE: u32 = 1 << 27;
+/// rdrand (see `MachineConfig::random_seed`).
+const FEATURE_RDRAND: u32 = 1 << 30;
 const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
     | FEATURE_PCLMULQDQ
     | FEATURE_SSSE3
@@ -271,7 +282,9 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
     | FEATURE_SSE4_2
     | FEATURE_MOVBE
     | FEATURE_POPCNT
-    | FEATURE_AES;
+    | FEATURE_AES
+    | FEATURE_XSAVE
+    | FEATURE_RDRAND;
 
 /// Leaf 7 subleaf 0 EBX bit 0: rdfsbase, rdgsbase, wrfsbase, wrgsbase. ERMS/FSRM (bits 9 and 4)
 /// stay clear on purpose: they make the kernel's memcpy and clear_page use `rep movsb`/`rep stosb`,
@@ -280,6 +293,9 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
 /// 5.0 s CPU), because each slice of at most `REP_ITERATIONS_PER_SLICE` bytes re-enters the
 /// instruction through the run loop.
 const STRUCTURED_FEATURE_FSGSBASE: u32 = 1 << 0;
+/// rdseed.
+const STRUCTURED_FEATURE_RDSEED: u32 = 1 << 18;
+const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE | STRUCTURED_FEATURE_RDSEED;
 
 // Leaf 7 subleaf 0 EDX: the speculation-control interface. The MSRs behind these bits are
 // implemented as inert storage (see `ARCH_CAPABILITIES`).
@@ -307,6 +323,9 @@ const EXT_ADDRESS_STIBP: u32 = 1 << 15;
 const EXT_ADDRESS_SSBD: u32 = 1 << 24;
 const EXT_ADDRESS_EBX: u32 =
     EXT_ADDRESS_IBPB | EXT_ADDRESS_IBRS | EXT_ADDRESS_STIBP | EXT_ADDRESS_SSBD;
+
+/// Leaf 0xd subleaf 1 EAX bit 0.
+const XSTATE_FEATURE_XSAVEOPT: u32 = 1 << 0;
 
 /// Leaf 0x8000_0001 EDX repeats this subset of the leaf 1 bits (the AMD aliases); DE and PSE
 /// are not mirrored.
@@ -339,9 +358,9 @@ const BRAND_STRING: &[u8; 48] =
     b"uemulator virtual x86-64 cpu\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
 /// Indices into `Cpu::gpr`: hardware register numbers, so RCX is 1 and RBX is 3.
-const RAX: usize = 0;
-const RCX: usize = 1;
-const RDX: usize = 2;
+pub(super) const RAX: usize = 0;
+pub(super) const RCX: usize = 1;
+pub(super) const RDX: usize = 2;
 const RBX: usize = 3;
 const R11: usize = 11;
 
@@ -369,17 +388,36 @@ impl Cpu {
             CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES => {
                 // Only subleaf 0 exists; EAX is the highest subleaf.
                 if self.gpr[RCX] as u32 == 0 {
-                    (0, STRUCTURED_FEATURE_FSGSBASE, 0, STRUCTURED_EDX)
+                    (0, STRUCTURED_EBX, 0, STRUCTURED_EDX)
                 } else {
                     (0, 0, 0, 0)
                 }
             }
-            CPUID_LEAF_FEATURES => (
-                CPUID_SIGNATURE,
-                CPUID_LEAF1_EBX,
-                CPUID_LEAF1_ECX,
-                CPUID_LEAF1_EDX,
-            ),
+            CPUID_LEAF_FEATURES => {
+                let osxsave = if self.cr4 & CR4_OSXSAVE != 0 {
+                    FEATURE_OSXSAVE
+                } else {
+                    0
+                };
+                (
+                    CPUID_SIGNATURE,
+                    CPUID_LEAF1_EBX,
+                    CPUID_LEAF1_ECX | osxsave,
+                    CPUID_LEAF1_EDX,
+                )
+            }
+            // Subleaf 0: supported XCR0 bits, size of the area for the currently enabled bits and
+            // for all supported ones. Subleaf 1: EAX bit 0 = xsaveopt.
+            CPUID_LEAF_XSTATE => match self.gpr[RCX] as u32 {
+                0 => (
+                    xsave::XCR0_SUPPORTED as u32,
+                    xsave::enabled_area_size(self.xcr0),
+                    xsave::XSAVE_AREA_SIZE as u32,
+                    0,
+                ),
+                1 => (XSTATE_FEATURE_XSAVEOPT, xsave::XSAVE_AREA_SIZE as u32, 0, 0),
+                _ => (0, 0, 0, 0),
+            },
             CPUID_LEAF_EXT_MAX => (CPUID_MAX_EXTENDED_LEAF, VENDOR_EBX, VENDOR_ECX, VENDOR_EDX),
             CPUID_LEAF_EXT_FEATURES => (
                 CPUID_SIGNATURE,
@@ -817,6 +855,8 @@ impl Cpu {
     pub fn sys_group(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
         const OP_GROUP6: u16 = 0x100;
         const MODRM_SWAPGS: u8 = 0xf8;
+        const MODRM_XGETBV: u8 = 0xd0;
+        const MODRM_XSETBV: u8 = 0xd1;
         let reg = i.reg & 7;
         if i.op == OP_GROUP6 {
             let loc = self.modrm_location(i, next);
@@ -860,6 +900,8 @@ impl Cpu {
                     self.need_cpl0()?;
                     core::mem::swap(&mut self.seg[SEG_GS].base, &mut self.kgsbase);
                 }
+                MODRM_XGETBV => self.xgetbv()?,
+                MODRM_XSETBV => self.xsetbv()?,
                 _ => return Err(self.unimplemented_opcode(i)),
             }
             self.rip = next;
@@ -956,7 +998,7 @@ impl Cpu {
 
     /// 0F AE: fxsave, fxrstor, ldmxcsr, stmxcsr, clflush (memory forms) and lfence/mfence/sfence
     /// (register forms /5../7, no-ops), and with an F3 prefix the register forms /0../3 that read
-    /// and write the FS and GS bases. xsave/xrstor are not advertised and fault with #UD.
+    /// and write the FS and GS bases.
     pub fn group_ae(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
         const REP_REPE: u8 = 1;
         let reg = i.reg & 7;
@@ -976,6 +1018,10 @@ impl Cpu {
             match reg {
                 0 => self.fxsave(addr)?,
                 1 => self.fxrstor(addr)?,
+                // xsave, xrstor, xsaveopt (REX.W selects the 64-bit pointer layout, identical here)
+                4 => self.xsave(addr)?,
+                5 => self.xrstor(addr)?,
+                6 => self.xsave(addr)?,
                 2 => {
                     let v = self.read(addr, 4)? as u32;
                     if v & !MXCSR_VALID_BITS != 0 {
@@ -1300,7 +1346,7 @@ mod sys_tests {
         fn leaf_0_reports_the_max_standard_leaf_and_vendor_string() {
             let mut h = blank();
             let [eax, ebx, ecx, edx] = cpuid(&mut h, 0, 0);
-            assert_eq!(eax, 7);
+            assert_eq!(eax, 0xd);
             // "AuthenticAMD" comes back in EBX, EDX, ECX order.
             let mut vendor = Vec::new();
             for register in [ebx, edx, ecx] {
@@ -1406,13 +1452,31 @@ mod sys_tests {
             const MOVBE: u32 = 1 << 22;
             const POPCNT: u32 = 1 << 23;
             const AES: u32 = 1 << 25;
+            const XSAVE: u32 = 1 << 26;
+            const OSXSAVE: u32 = 1 << 27;
+            const RDRAND: u32 = 1 << 30;
             let mut h = blank();
             let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
             assert_eq!(
                 ecx,
-                SSE3 | PCLMULQDQ | SSSE3 | CX16 | SSE4_1 | SSE4_2 | MOVBE | POPCNT | AES,
-                "no MONITOR, VMX, SMX, XSAVE, OSXSAVE, AVX, RDRAND or hypervisor bit"
+                SSE3 | PCLMULQDQ
+                    | SSSE3
+                    | CX16
+                    | SSE4_1
+                    | SSE4_2
+                    | MOVBE
+                    | POPCNT
+                    | AES
+                    | XSAVE
+                    | RDRAND,
+                "no MONITOR, VMX, SMX, AVX or hypervisor bit, and OSXSAVE only follows CR4"
             );
+            h.cpu.cr4 |= CR4_OSXSAVE;
+            let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
+            assert_ne!(ecx & OSXSAVE, 0);
+            h.cpu.cr4 &= !CR4_OSXSAVE;
+            let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
+            assert_eq!(ecx & OSXSAVE, 0);
         }
 
         #[test]
@@ -1424,10 +1488,14 @@ mod sys_tests {
         #[test]
         fn leaf_7_subleaf_0_advertises_only_fsgsbase_and_speculation_control() {
             const FSGSBASE: u32 = 1 << 0;
+            const RDSEED: u32 = 1 << 18;
             let mut h = blank();
             // EAX is the highest subleaf. ERMS and FSRM stay clear (see sys.rs), as do SMEP, SMAP,
             // PCID, BMI, AVX2 and everything else.
-            assert_eq!(cpuid(&mut h, 7, 0), [0, FSGSBASE, 0, STRUCTURED_EDX]);
+            assert_eq!(
+                cpuid(&mut h, 7, 0),
+                [0, FSGSBASE | RDSEED, 0, STRUCTURED_EDX]
+            );
         }
 
         #[test]
@@ -1441,9 +1509,21 @@ mod sys_tests {
         #[test]
         fn other_standard_leaves_are_zero() {
             let mut h = blank();
-            for leaf in [2, 3, 4, 5, 6, 8, 0xa, 0xb, 0xd, 0xf, 0x10, 0x14, 0x15, 0x1f] {
+            for leaf in [
+                2, 3, 4, 5, 6, 8, 0xa, 0xb, 0xc, 0xe, 0xf, 0x10, 0x14, 0x15, 0x1f,
+            ] {
                 assert_eq!(cpuid(&mut h, leaf, 0), [0, 0, 0, 0], "leaf {leaf:#x}");
             }
+        }
+
+        #[test]
+        fn leaf_0xd_describes_the_xsave_area() {
+            let mut h = blank();
+            // supported XCR0 bits, size for the enabled set, size for all supported
+            assert_eq!(cpuid(&mut h, 0xd, 0), [3, 576, 576, 0]);
+            // xsaveopt only: no xsavec, xgetbv1 or xsaves
+            assert_eq!(cpuid(&mut h, 0xd, 1), [1, 576, 0, 0]);
+            assert_eq!(cpuid(&mut h, 0xd, 2), [0, 0, 0, 0]);
         }
 
         #[test]
@@ -1582,14 +1662,14 @@ mod sys_tests {
         fn the_leaf_is_taken_from_eax_only() {
             let mut h = blank();
             // cpuid() puts garbage in the upper half of rax; leaf 0 still answers.
-            assert_eq!(cpuid(&mut h, 0, 0)[0], 7);
+            assert_eq!(cpuid(&mut h, 0, 0)[0], 0xd);
         }
 
         #[test]
         fn cpuid_instruction_fills_eax_ebx_ecx_edx() {
             // cpuid; hlt
             let h = run_ok(&[0x0f, 0xa2, 0xf4], |h| h.cpu.gpr[RAX] = 0);
-            assert_eq!(h.cpu.gpr[RAX], 7);
+            assert_eq!(h.cpu.gpr[RAX], 0xd);
             assert_eq!(h.cpu.gpr[RBX], u32::from_le_bytes(*b"Auth") as u64);
             assert_eq!(h.cpu.gpr[RDX], u32::from_le_bytes(*b"enti") as u64);
             assert_eq!(h.cpu.gpr[RCX], u32::from_le_bytes(*b"cAMD") as u64);
@@ -2517,7 +2597,6 @@ mod sys_tests {
                 (13, "VMXE"),
                 (14, "SMXE"),
                 (17, "PCIDE"),
-                (18, "OSXSAVE"),
                 (19, "reserved"),
                 (20, "SMEP"),
                 (21, "SMAP"),
@@ -4151,7 +4230,7 @@ mod sys_tests {
         }
 
         #[test]
-        fn xsave_family_memory_forms_are_ud_because_xsave_is_not_advertised() {
+        fn xsave_family_memory_forms_are_ud_while_cr4_osxsave_is_clear() {
             for code in [
                 // .byte 0x0f, 0xae, 0x26; hlt
                 &[0x0f, 0xae, 0x26, 0xf4],

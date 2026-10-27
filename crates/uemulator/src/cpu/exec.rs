@@ -1884,6 +1884,12 @@ impl Cpu {
             }
             // cmpxchg8b m64 / cmpxchg16b m128 (group 9 /1 without / with REX.W)
             0x1c7 => {
+                // rdrand /6 and rdseed /7 take a register
+                if i.md == 3 && matches!(i.reg & 7, 6 | 7) && i.rep == 0 {
+                    self.rdrand(i.rm, osz);
+                    self.rip = next;
+                    return Ok(());
+                }
                 if i.md == 3 || i.reg & 7 != 1 {
                     return Err(self.unimplemented_opcode(i));
                 }
@@ -13849,10 +13855,7 @@ mod exec_tests {
         for (bit, name) in [
             (1 << 3, "monitor/mwait"),
             (1 << 5, "vmx"),
-            (1 << 26, "xsave"),
-            (1 << 27, "osxsave"),
             (1 << 28, "avx"),
-            (1 << 30, "rdrand"),
             (1 << 31, "hypervisor"),
         ] {
             assert_eq!(ecx & bit, 0, "{name} must not be advertised");

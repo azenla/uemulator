@@ -143,6 +143,7 @@ fn build_config(
     if let Some(t) = args.time {
         cfg = cfg.unix_time(t);
     }
+    cfg = cfg.random_seed(host_random_seed());
     if wants_realtime_clock(stdin_is_terminal, args.realtime) {
         cfg = cfg.clock(ClockMode::Realtime);
     }
@@ -241,6 +242,16 @@ pub fn run(
         eprintln!("{}", exit_message(&reason));
     }
     Ok(reason)
+}
+
+/// Seed for the guest's rdrand/rdseed from the host's per-process random hasher keys (which the
+/// standard library draws from the OS CSPRNG), so two boots do not see the same "hardware" random
+/// numbers.
+fn host_random_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
 }
 
 #[cfg(test)]

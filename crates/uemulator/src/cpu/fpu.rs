@@ -73,18 +73,18 @@ const ENV_SIZE: u64 = 28;
 const EXT_REG_SIZE: u64 = 10;
 
 /// FXSAVE image (SDM layout, 512 bytes). FOP/FIP/FDP at 6..24 are not written.
-const FXSAVE_AREA_SIZE: u64 = 512;
+pub(super) const FXSAVE_AREA_SIZE: u64 = 512;
 /// The area must be 16-byte aligned or the instruction is #GP(0).
-const FXSAVE_ALIGNMENT: u64 = 16;
-const FXSAVE_FSW_OFFSET: u64 = 2;
+pub(super) const FXSAVE_ALIGNMENT: u64 = 16;
+pub(super) const FXSAVE_FSW_OFFSET: u64 = 2;
 /// Abridged tag word: one bit per physical register, 1 = not empty.
-const FXSAVE_FTW_OFFSET: u64 = 4;
-const FXSAVE_MXCSR_OFFSET: u64 = 24;
-const FXSAVE_MXCSR_MASK_OFFSET: u64 = 28;
-const FXSAVE_ST_OFFSET: u64 = 32;
-const FXSAVE_ST_STRIDE: u64 = 16;
-const FXSAVE_XMM_OFFSET: u64 = 160;
-const FXSAVE_XMM_STRIDE: u64 = 16;
+pub(super) const FXSAVE_FTW_OFFSET: u64 = 4;
+pub(super) const FXSAVE_MXCSR_OFFSET: u64 = 24;
+pub(super) const FXSAVE_MXCSR_MASK_OFFSET: u64 = 28;
+pub(super) const FXSAVE_ST_OFFSET: u64 = 32;
+pub(super) const FXSAVE_ST_STRIDE: u64 = 16;
+pub(super) const FXSAVE_XMM_OFFSET: u64 = 160;
+pub(super) const FXSAVE_XMM_STRIDE: u64 = 16;
 
 /// MXCSR bits that may be set by ldmxcsr/fxrstor; writing any of 31:16 is #GP. Also reported
 /// as MXCSR_MASK in the FXSAVE image.
@@ -846,7 +846,7 @@ impl Cpu {
 
     /// #GP(0) unless the 512-byte area is 16-byte aligned, checked on the linear address before
     /// anything is read or written.
-    fn check_fxsave_alignment(&self, a: u64) -> ExecResult<()> {
+    pub(super) fn check_fxsave_alignment(&self, a: u64) -> ExecResult<()> {
         if a & (FXSAVE_ALIGNMENT - 1) != 0 {
             return Err(Exception::general_protection(0));
         }
@@ -859,26 +859,39 @@ impl Cpu {
         }
         self.fpu_check()?;
         self.check_fxsave_alignment(a)?;
+        self.save_legacy_region(a, true, true)
+    }
+
+    /// Writes the x87 part (control/status/tag words and the eight registers) and/or the SSE part
+    /// (MXCSR, its mask and XMM0-15) of the 512-byte legacy image. Shared by fxsave and xsave,
+    /// whose first 512 bytes are the same image; a component that is not saved leaves its bytes
+    /// untouched, as xsave with a partial mask requires.
+    pub(super) fn save_legacy_region(&mut self, a: u64, x87: bool, sse: bool) -> ExecResult<()> {
         // Probe both ends first so a page fault is raised before any byte is written.
         self.translate(a, mem::AccessKind::Write, false)?;
         self.translate(a + FXSAVE_AREA_SIZE - 1, mem::AccessKind::Write, false)?;
-        self.write(a, 2, self.fcw as u64)?;
-        self.write(a + FXSAVE_FSW_OFFSET, 2, self.fsw as u64)?;
-        self.write(a + FXSAVE_FTW_OFFSET, 1, self.ftw as u64 & 0xff)?;
-        self.write(a + FXSAVE_MXCSR_OFFSET, 4, self.mxcsr as u64)?;
-        self.write(a + FXSAVE_MXCSR_MASK_OFFSET, 4, MXCSR_VALID_BITS as u64)?;
-        for stack_pos in 0..STACK_DEPTH {
-            let raw = self.st_raw(stack_pos);
-            for (offset, byte) in raw.iter().enumerate() {
-                let at = a + FXSAVE_ST_OFFSET + stack_pos as u64 * FXSAVE_ST_STRIDE + offset as u64;
-                self.write(at, 1, *byte as u64)?;
+        if x87 {
+            self.write(a, 2, self.fcw as u64)?;
+            self.write(a + FXSAVE_FSW_OFFSET, 2, self.fsw as u64)?;
+            self.write(a + FXSAVE_FTW_OFFSET, 1, self.ftw as u64 & 0xff)?;
+            for stack_pos in 0..STACK_DEPTH {
+                let raw = self.st_raw(stack_pos);
+                for (offset, byte) in raw.iter().enumerate() {
+                    let at =
+                        a + FXSAVE_ST_OFFSET + stack_pos as u64 * FXSAVE_ST_STRIDE + offset as u64;
+                    self.write(at, 1, *byte as u64)?;
+                }
             }
         }
-        for k in 0..self.xmm.len() {
-            self.write128(
-                a + FXSAVE_XMM_OFFSET + k as u64 * FXSAVE_XMM_STRIDE,
-                self.xmm[k],
-            )?;
+        if sse {
+            self.write(a + FXSAVE_MXCSR_OFFSET, 4, self.mxcsr as u64)?;
+            self.write(a + FXSAVE_MXCSR_MASK_OFFSET, 4, MXCSR_VALID_BITS as u64)?;
+            for k in 0..self.xmm.len() {
+                self.write128(
+                    a + FXSAVE_XMM_OFFSET + k as u64 * FXSAVE_XMM_STRIDE,
+                    self.xmm[k],
+                )?;
+            }
         }
         Ok(())
     }
@@ -891,25 +904,65 @@ impl Cpu {
         }
         self.fpu_check()?;
         self.check_fxsave_alignment(a)?;
-        let fcw = self.read(a, 2)? as u16;
-        let fsw = self.read(a + FXSAVE_FSW_OFFSET, 2)? as u16;
-        let ftw = self.read(a + FXSAVE_FTW_OFFSET, 1)? as u16;
-        let mxcsr = self.read(a + FXSAVE_MXCSR_OFFSET, 4)? as u32;
-        let mut st = [[0u8; 10]; STACK_DEPTH];
-        let top = ((fsw & FSW_TOP_MASK) >> FSW_TOP_SHIFT) as usize;
-        // the image stores registers in stack order; place them by physical register
-        for stack_pos in 0..STACK_DEPTH {
-            for (offset, byte) in st[(top + stack_pos) & STACK_MASK].iter_mut().enumerate() {
-                let at = a + FXSAVE_ST_OFFSET + stack_pos as u64 * FXSAVE_ST_STRIDE + offset as u64;
-                *byte = self.read(at, 1)? as u8;
+        self.restore_legacy_region(a, LegacyRestore::Load, LegacyRestore::Load)
+    }
+
+    /// The load half shared by fxrstor and xrstor. `Init` puts a component in its reset state
+    /// (what xrstor does when the header's XSTATE_BV bit is clear) without reading its bytes.
+    /// MXCSR is read whenever the SSE component is not skipped, as the SDM specifies for xrstor,
+    /// and validated before anything is committed.
+    pub(super) fn restore_legacy_region(
+        &mut self,
+        a: u64,
+        x87: LegacyRestore,
+        sse: LegacyRestore,
+    ) -> ExecResult<()> {
+        let mut fcw = self.fcw;
+        let mut fsw = self.fsw;
+        let mut ftw = self.ftw;
+        let mut st = self.st;
+        match x87 {
+            LegacyRestore::Skip => {}
+            LegacyRestore::Init => {
+                fcw = FCW_RESET;
+                fsw = 0;
+                ftw = 0;
+                st = [[0u8; 10]; STACK_DEPTH];
+            }
+            LegacyRestore::Load => {
+                fcw = self.read(a, 2)? as u16;
+                fsw = self.read(a + FXSAVE_FSW_OFFSET, 2)? as u16;
+                ftw = self.read(a + FXSAVE_FTW_OFFSET, 1)? as u16;
+                st = [[0u8; 10]; STACK_DEPTH];
+                let top = ((fsw & FSW_TOP_MASK) >> FSW_TOP_SHIFT) as usize;
+                // the image stores registers in stack order; place them by physical register
+                for stack_pos in 0..STACK_DEPTH {
+                    for (offset, byte) in st[(top + stack_pos) & STACK_MASK].iter_mut().enumerate()
+                    {
+                        let at = a
+                            + FXSAVE_ST_OFFSET
+                            + stack_pos as u64 * FXSAVE_ST_STRIDE
+                            + offset as u64;
+                        *byte = self.read(at, 1)? as u8;
+                    }
+                }
             }
         }
-        let mut xmm = [0u128; 16];
-        for (k, register) in xmm.iter_mut().enumerate() {
-            *register = self.read128(a + FXSAVE_XMM_OFFSET + k as u64 * FXSAVE_XMM_STRIDE)?;
-        }
-        if mxcsr & !MXCSR_VALID_BITS != 0 {
-            return Err(Exception::general_protection(0));
+        let mut mxcsr = self.mxcsr;
+        let mut xmm = self.xmm;
+        if sse != LegacyRestore::Skip {
+            mxcsr = self.read(a + FXSAVE_MXCSR_OFFSET, 4)? as u32;
+            for (k, register) in xmm.iter_mut().enumerate() {
+                *register = match sse {
+                    LegacyRestore::Load => {
+                        self.read128(a + FXSAVE_XMM_OFFSET + k as u64 * FXSAVE_XMM_STRIDE)?
+                    }
+                    _ => 0,
+                };
+            }
+            if mxcsr & !MXCSR_VALID_BITS != 0 {
+                return Err(Exception::general_protection(0));
+            }
         }
         self.st = st;
         self.xmm = xmm;
@@ -919,6 +972,14 @@ impl Cpu {
         self.mxcsr = mxcsr;
         Ok(())
     }
+}
+
+/// What xrstor (or fxrstor) does with one legacy-image component.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum LegacyRestore {
+    Skip,
+    Init,
+    Load,
 }
 
 #[cfg(test)]

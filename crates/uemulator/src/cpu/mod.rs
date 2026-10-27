@@ -10,6 +10,7 @@ mod sse;
 mod sys;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod xsave;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,6 +26,9 @@ use decode::Insn;
 use flags::LazyFlagsOp;
 
 pub(crate) use exception::Exception;
+
+/// `Cpu::rng_state` until the machine overrides it with `MachineConfig::random_seed`.
+pub(crate) const DEFAULT_RANDOM_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
 pub(crate) type ExecResult<T> = Result<T, Exception>;
 
@@ -274,6 +278,10 @@ pub(crate) struct Cpu {
     pub tsc_aux: u64,
     /// IA32_SPEC_CTRL (stored, no speculation to control; see `SPEC_CTRL_WRITABLE` in sys.rs).
     pub spec_ctrl: u64,
+    /// XCR0, the enabled extended-state components (xgetbv/xsetbv). Bit 0 (x87) is always set.
+    pub xcr0: u64,
+    /// State of the generator behind rdrand/rdseed (splitmix64). Seeded by the machine.
+    pub rng_state: u64,
     pub pat: u64,
     /// IA32_SYSENTER_CS, _ESP, _EIP (MSRs 0x174..=0x176).
     pub sysenter: [u64; 3],
@@ -412,6 +420,8 @@ impl Cpu {
             kgsbase: 0,
             tsc_aux: 0,
             spec_ctrl: 0,
+            xcr0: xsave::XCR0_X87,
+            rng_state: DEFAULT_RANDOM_SEED,
             pat: PAT_POWER_ON_DEFAULT,
             sysenter: [0; 3],
             dr: [0, 0, 0, 0, 0, 0, DR6_RESET, DR7_RESET],

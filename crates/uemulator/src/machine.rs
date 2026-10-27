@@ -125,6 +125,7 @@ pub struct MachineConfig {
     debug: bool,
     verify: bool,
     unix_time: Option<u64>,
+    random_seed: Option<u64>,
     reboot: bool,
 }
 
@@ -147,6 +148,7 @@ impl Default for MachineConfig {
             debug: false,
             verify: false,
             unix_time: None,
+            random_seed: None,
             reboot: true,
         }
     }
@@ -255,6 +257,17 @@ impl MachineConfig {
         self
     }
 
+    /// Seeds the generator behind the guest's `rdrand` and `rdseed`. The library has no entropy
+    /// source of its own (it is `no_std` on some targets), so without this the sequence is fixed
+    /// and every boot of the same image reads the same "random" numbers: fine for tests and
+    /// reproducible runs, wrong for a guest that generates keys. An embedder that cares passes
+    /// bytes from the host's CSPRNG. The generator is splitmix64, not a cryptographic one, and
+    /// the guest kernel mixes it with its other entropy sources instead of trusting it alone.
+    pub fn random_seed(mut self, seed: u64) -> Self {
+        self.random_seed = Some(seed);
+        self
+    }
+
     pub fn log(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.log = Some(Arc::new(f));
         self
@@ -294,6 +307,7 @@ struct Vcpu {
     clock: ClockMode,
     verify: bool,
     unix_time: Option<u64>,
+    random_seed: Option<u64>,
     /// Pristine copy of RAM for the lockstep interpreter CPU; only set when `verify` is on.
     boot_ram: Option<Vec<u8>>,
     devcfg: DevConfig,
@@ -467,6 +481,9 @@ impl Vcpu {
         if let Some(boot_unix) = boot_unix {
             cpu.dev.set_boot_time(boot_unix);
         }
+        if let Some(seed) = self.random_seed {
+            cpu.rng_state = seed;
+        }
         // Cloned, not taken: a reboot builds a new CPU that needs the hook again.
         cpu.poll = self.poll.clone().map(|host_poll| {
             let poll: PollFn = Arc::new(move |idle| host_poll(&console, idle));
@@ -495,6 +512,7 @@ impl Vcpu {
                     boot_unix,
                     devices,
                 );
+                twin.rng_state = cpu.rng_state;
                 cpu.run_verify(&mut twin)
             }
             _ => cpu.run(),
@@ -587,6 +605,7 @@ impl EmulatedMachine {
                 clock: cfg.clock,
                 verify: cfg.verify,
                 unix_time: cfg.unix_time,
+                random_seed: cfg.random_seed,
                 boot_ram,
                 devcfg,
                 reboot,
