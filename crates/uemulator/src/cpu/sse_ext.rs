@@ -14,8 +14,12 @@
 
 use super::*;
 
-/// The operation an `Op` performs on its second operand, decoded from (map, opcode, prefix).
-#[derive(Clone, Copy, PartialEq)]
+/// Opcode maps of `Insn::op` (the high byte) that this file adds to the `0F` map of `sse.rs`.
+const OPCODE_MAP_0F38: u16 = 2;
+const OPCODE_MAP_0F3A: u16 = 3;
+
+/// The operation of an instruction, decoded from (map, opcode, prefix).
+#[derive(Clone, Copy)]
 enum Op {
     Movddup,
     Movsldup,
@@ -30,6 +34,12 @@ enum Op {
         double: bool,
         subtract: bool,
     },
+    /// `dst = f(dst, src)` on whole registers.
+    Binary(fn(u128, u128) -> u128),
+    /// `dst = f(src)`: the old destination is ignored.
+    Unary(fn(u128) -> u128),
+    /// Binary with the imm8 that follows the ModRM bytes.
+    WithImm(fn(u128, u128, u8) -> u128),
 }
 
 /// How an operation reads its second operand.
@@ -83,8 +93,144 @@ fn decode_op(map: u16, opcode: u8, prefix: Prefix) -> Option<Op> {
             double: false,
             subtract: true,
         },
+        _ => return decode_integer_op(map, opcode, prefix),
+    })
+}
+
+/// The packed-integer instructions of the 66-prefixed `0F 38` and `0F 3A` maps. Without the 66
+/// prefix these opcodes are the MMX forms (SSSE3) or other instructions, so no match.
+fn decode_integer_op(map: u16, opcode: u8, prefix: Prefix) -> Option<Op> {
+    if prefix != Prefix::P66 {
+        return None;
+    }
+    Some(match (map, opcode) {
+        (OPCODE_MAP_0F38, 0x00) => Op::Binary(pshufb),
+        (OPCODE_MAP_0F38, 0x01) => {
+            Op::Binary(|a, b| horizontal_integer::<u16>(a, b, u16::wrapping_add))
+        }
+        (OPCODE_MAP_0F38, 0x02) => {
+            Op::Binary(|a, b| horizontal_integer::<u32>(a, b, u32::wrapping_add))
+        }
+        (OPCODE_MAP_0F38, 0x03) => Op::Binary(|a, b| {
+            horizontal_integer::<u16>(a, b, |x, y| (x as i16).saturating_add(y as i16) as u16)
+        }),
+        (OPCODE_MAP_0F38, 0x04) => Op::Binary(pmaddubsw),
+        (OPCODE_MAP_0F38, 0x05) => {
+            Op::Binary(|a, b| horizontal_integer::<u16>(a, b, u16::wrapping_sub))
+        }
+        (OPCODE_MAP_0F38, 0x06) => {
+            Op::Binary(|a, b| horizontal_integer::<u32>(a, b, u32::wrapping_sub))
+        }
+        (OPCODE_MAP_0F38, 0x07) => Op::Binary(|a, b| {
+            horizontal_integer::<u16>(a, b, |x, y| (x as i16).saturating_sub(y as i16) as u16)
+        }),
+        (OPCODE_MAP_0F38, 0x08) => Op::Binary(|a, b| {
+            zip_lanes::<u8>(a, b, |x, y| {
+                apply_sign((x as i8) as i32, (y as i8) as i32) as u8
+            })
+        }),
+        (OPCODE_MAP_0F38, 0x09) => Op::Binary(|a, b| {
+            zip_lanes::<u16>(a, b, |x, y| {
+                apply_sign((x as i16) as i32, (y as i16) as i32) as u16
+            })
+        }),
+        (OPCODE_MAP_0F38, 0x0a) => {
+            Op::Binary(|a, b| zip_lanes::<u32>(a, b, |x, y| apply_sign(x as i32, y as i32) as u32))
+        }
+        (OPCODE_MAP_0F38, 0x0b) => Op::Binary(|a, b| {
+            zip_lanes::<u16>(a, b, |x, y| {
+                let product = (x as i16 as i32) * (y as i16 as i32);
+                (((product >> 14) + 1) >> 1) as u16
+            })
+        }),
+        (OPCODE_MAP_0F38, 0x1c) => {
+            Op::Unary(|b| zip_lanes::<u8>(b, 0, |x, _| (x as i8).unsigned_abs()))
+        }
+        (OPCODE_MAP_0F38, 0x1d) => {
+            Op::Unary(|b| zip_lanes::<u16>(b, 0, |x, _| (x as i16).unsigned_abs()))
+        }
+        (OPCODE_MAP_0F38, 0x1e) => {
+            Op::Unary(|b| zip_lanes::<u32>(b, 0, |x, _| (x as i32).unsigned_abs()))
+        }
+        (OPCODE_MAP_0F3A, 0x0f) => Op::WithImm(palignr),
         _ => return None,
     })
+}
+
+/// pshufb: each result byte is the destination byte selected by the low four bits of the
+/// source byte, or zero when the source byte's top bit is set.
+fn pshufb(dst: u128, selector: u128) -> u128 {
+    const ZEROING_BIT: u8 = 0x80;
+    const INDEX_MASK: u8 = 0x0f;
+    zip_lanes::<u8>(dst, selector, |_, select| {
+        if select & ZEROING_BIT != 0 {
+            0
+        } else {
+            u8::get(dst, (select & INDEX_MASK) as usize)
+        }
+    })
+}
+
+/// phadd*/phsub*: `combine` applied to each (even, odd) lane pair of the destination, giving the
+/// low half of the result, then to those of the source, giving the high half.
+fn horizontal_integer<T: Lane>(dst: u128, src: u128, combine: impl Fn(T, T) -> T) -> u128 {
+    let half = T::N / 2;
+    let mut result = 0;
+    for pair in 0..half {
+        T::put(
+            &mut result,
+            pair,
+            combine(T::get(dst, 2 * pair), T::get(dst, 2 * pair + 1)),
+        );
+        T::put(
+            &mut result,
+            half + pair,
+            combine(T::get(src, 2 * pair), T::get(src, 2 * pair + 1)),
+        );
+    }
+    result
+}
+
+/// pmaddubsw: unsigned destination bytes times signed source bytes, adjacent products added with
+/// signed 16-bit saturation.
+fn pmaddubsw(dst: u128, src: u128) -> u128 {
+    let mut result = 0;
+    for word in 0..8 {
+        let product = |byte: usize| u8::get(dst, byte) as i32 * (u8::get(src, byte) as i8) as i32;
+        let sum = product(2 * word) + product(2 * word + 1);
+        u16::put(
+            &mut result,
+            word,
+            sum.clamp(i16::MIN as i32, i16::MAX as i32) as u16,
+        );
+    }
+    result
+}
+
+/// psign*: the destination lane negated, zeroed or kept as the source lane is negative, zero or
+/// positive. Negating the most negative value wraps to itself, which the caller's truncating
+/// cast preserves.
+fn apply_sign(value: i32, sign_source: i32) -> i32 {
+    match sign_source.signum() {
+        -1 => value.wrapping_neg(),
+        0 => 0,
+        _ => value,
+    }
+}
+
+/// palignr: the 32-byte value `dst:src` shifted right by `count` bytes, low 16 bytes kept.
+fn palignr(dst: u128, src: u128, count: u8) -> u128 {
+    const REGISTER_BYTES: u32 = 16;
+    let count = count as u32;
+    if count == 0 {
+        src
+    } else if count < REGISTER_BYTES {
+        (src >> (count * 8)) | (dst << ((REGISTER_BYTES - count) * 8))
+    } else if count < 2 * REGISTER_BYTES {
+        dst >> ((count - REGISTER_BYTES) * 8)
+    } else {
+        0
+    }
 }
 
 /// Applies `f` to each lane of `format` of the two operands, in order, and packs the results.
@@ -204,6 +350,9 @@ impl Cpu {
                 let format = if double { DOUBLE } else { SINGLE };
                 horizontal(&mut fp, format, subtract, dst, src)
             }
+            Op::Binary(f) => f(dst, src),
+            Op::Unary(f) => f(src),
+            Op::WithImm(f) => f(dst, src, i.imm as u8),
         };
         self.fp_commit(&fp)?;
         self.xmm[reg] = result;

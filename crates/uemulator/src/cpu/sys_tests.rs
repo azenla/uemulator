@@ -393,13 +393,14 @@ mod cpuid_leaves {
     #[test]
     fn leaf_1_ecx_advertises_only_what_is_implemented() {
         const SSE3: u32 = 1 << 0;
+        const SSSE3: u32 = 1 << 9;
         const CX16: u32 = 1 << 13;
         const POPCNT: u32 = 1 << 23;
         let mut h = blank();
         let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
         assert_eq!(
             ecx,
-            SSE3 | CX16 | POPCNT,
+            SSE3 | SSSE3 | CX16 | POPCNT,
             "no MONITOR, VMX, SMX, XSAVE, OSXSAVE, AVX, RDRAND or hypervisor bit"
         );
     }

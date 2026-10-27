@@ -544,6 +544,424 @@ mod integer {
     }
 }
 
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn vector(&mut self) -> u128 {
+        ((self.next() as u128) << 64) | self.next() as u128
+    }
+}
+
+/// Edge-case registers followed by random ones: the operands every table-driven test runs over.
+fn vectors() -> Vec<u128> {
+    let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+    let mut all = vec![
+        0,
+        u128::MAX,
+        lanes8([0x80; 16]),
+        lanes8([0x7f; 16]),
+        lanes16([0x8000; 8]),
+        lanes16([0x7fff, 0x8000, 0xffff, 1, 0, 2, 0x4000, 0xc000]),
+        lanes32([0x8000_0000, 0x7fff_ffff, 0xffff_ffff, 1]),
+        lanes8([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+        lanes8([
+            15, 14, 13, 12, 11, 10, 9, 8, 0x87, 6, 0xff, 4, 3, 2, 1, 0x80,
+        ]),
+    ];
+    for _ in 0..24 {
+        all.push(rng.vector());
+    }
+    all
+}
+
+fn bytes_of(v: u128) -> [u8; 16] {
+    v.to_le_bytes()
+}
+fn words_of(v: u128) -> [u16; 8] {
+    std::array::from_fn(|k| (v >> (16 * k)) as u16)
+}
+fn dwords_of(v: u128) -> [u32; 4] {
+    std::array::from_fn(|k| (v >> (32 * k)) as u32)
+}
+fn lanes16(v: [u16; 8]) -> u128 {
+    v.iter().rev().fold(0, |acc, &x| (acc << 16) | x as u128)
+}
+
+/// Runs `name xmm0, xmm1` and `name xmm0, [rsi]` over pairs of `vectors()` (a stride keeps the
+/// pair count modest) and compares with `reference(dst, src)`.
+#[track_caller]
+fn check_binary(rig: &mut Rig, name: &str, reference: impl Fn(u128, u128) -> u128) {
+    let register = format!("{name} xmm0, xmm1");
+    let memory = format!("{name} xmm0, [rsi]");
+    let all = vectors();
+    for (index, &dst) in all.iter().enumerate() {
+        for &src in all.iter().skip(index % 3).step_by(3) {
+            let want = reference(dst, src);
+            assert_eq!(
+                rig.op(&register, dst, src),
+                want,
+                "{register} {dst:#x} {src:#x}"
+            );
+            assert_eq!(
+                rig.op_mem(&memory, dst, src),
+                want,
+                "{memory} {dst:#x} {src:#x}"
+            );
+        }
+    }
+}
+
+mod ssse3 {
+    use super::*;
+
+    type UnaryReference = fn(u128) -> u128;
+
+    #[test]
+    fn pshufb_selects_bytes_of_the_destination_or_zero() {
+        let mut rig = Rig::new();
+        check_binary(&mut rig, "pshufb", |dst, selector| {
+            let (data, select) = (bytes_of(dst), bytes_of(selector));
+            lanes8(std::array::from_fn(|k| {
+                if select[k] & 0x80 != 0 {
+                    0
+                } else {
+                    data[(select[k] & 0xf) as usize]
+                }
+            }))
+        });
+        // A concrete case: reverse the bytes, zero the odd ones.
+        let data = lanes8(std::array::from_fn(|k| 0x10 + k as u8));
+        let selector = lanes8(std::array::from_fn(|k| {
+            if k % 2 == 1 { 0x80 } else { 15 - k as u8 }
+        }));
+        let want = lanes8(std::array::from_fn(|k| {
+            if k % 2 == 1 { 0 } else { 0x10 + (15 - k) as u8 }
+        }));
+        assert_eq!(rig.op("pshufb xmm0, xmm1", data, selector), want);
+    }
+
+    fn horizontal_words(dst: u128, src: u128, f: impl Fn(i16, i16) -> i16) -> u128 {
+        let (d, s) = (words_of(dst), words_of(src));
+        lanes16(std::array::from_fn(|k| {
+            let (from, pair) = if k < 4 { (d, k) } else { (s, k - 4) };
+            f(from[2 * pair] as i16, from[2 * pair + 1] as i16) as u16
+        }))
+    }
+
+    fn horizontal_dwords(dst: u128, src: u128, f: impl Fn(i32, i32) -> i32) -> u128 {
+        let (d, s) = (dwords_of(dst), dwords_of(src));
+        lanes32(std::array::from_fn(|k| {
+            let (from, pair) = if k < 2 { (d, k) } else { (s, k - 2) };
+            f(from[2 * pair] as i32, from[2 * pair + 1] as i32) as u32
+        }))
+    }
+
+    #[test]
+    fn horizontal_add_and_subtract_pair_adjacent_lanes() {
+        let mut rig = Rig::new();
+        check_binary(&mut rig, "phaddw", |a, b| {
+            horizontal_words(a, b, i16::wrapping_add)
+        });
+        check_binary(&mut rig, "phsubw", |a, b| {
+            horizontal_words(a, b, i16::wrapping_sub)
+        });
+        check_binary(&mut rig, "phaddsw", |a, b| {
+            horizontal_words(a, b, |x, y| {
+                (x as i32 + y as i32).clamp(-32768, 32767) as i16
+            })
+        });
+        check_binary(&mut rig, "phsubsw", |a, b| {
+            horizontal_words(a, b, |x, y| {
+                (x as i32 - y as i32).clamp(-32768, 32767) as i16
+            })
+        });
+        check_binary(&mut rig, "phaddd", |a, b| {
+            horizontal_dwords(a, b, i32::wrapping_add)
+        });
+        check_binary(&mut rig, "phsubd", |a, b| {
+            horizontal_dwords(a, b, i32::wrapping_sub)
+        });
+    }
+
+    #[test]
+    fn horizontal_ops_put_destination_pairs_low_and_the_lower_lane_first() {
+        let mut rig = Rig::new();
+        let dst = lanes16([1, 2, 3, 4, 5, 6, 7, 8]);
+        let src = lanes16([10, 20, 30, 40, 50, 60, 70, 80]);
+        assert_eq!(
+            rig.op("phaddw xmm0, xmm1", dst, src),
+            lanes16([3, 7, 11, 15, 30, 70, 110, 150])
+        );
+        let minus = |v: i16| v as u16;
+        assert_eq!(
+            rig.op("phsubw xmm0, xmm1", dst, src),
+            lanes16([
+                minus(-1),
+                minus(-1),
+                minus(-1),
+                minus(-1),
+                minus(-10),
+                minus(-10),
+                minus(-10),
+                minus(-10)
+            ])
+        );
+    }
+
+    #[test]
+    fn saturating_horizontal_ops_clamp_at_the_signed_limits() {
+        let mut rig = Rig::new();
+        let dst = lanes16([0x7fff, 1, 0x8000, 0xffff, 0x7fff, 0x7fff, 0x8000, 0x8000]);
+        assert_eq!(
+            rig.op("phaddsw xmm0, xmm1", dst, 0),
+            lanes16([0x7fff, 0x8000, 0x7fff, 0x8000, 0, 0, 0, 0])
+        );
+        let dst = lanes16([0x7fff, 0xffff, 0x8000, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            rig.op("phsubsw xmm0, xmm1", dst, 0),
+            lanes16([0x7fff, 0x8000, 0, 0, 0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn pmaddubsw_multiplies_unsigned_by_signed_and_saturates_the_pair_sum() {
+        let mut rig = Rig::new();
+        check_binary(&mut rig, "pmaddubsw", |dst, src| {
+            let (u, s) = (bytes_of(dst), bytes_of(src));
+            lanes16(std::array::from_fn(|k| {
+                let sum = u[2 * k] as i32 * (s[2 * k] as i8) as i32
+                    + u[2 * k + 1] as i32 * (s[2 * k + 1] as i8) as i32;
+                sum.clamp(-32768, 32767) as u16
+            }))
+        });
+        // 255*127 twice saturates high; 255*-128 twice saturates low; the rest is exact.
+        let signed = lanes8([
+            127, 127, 0x80, 0x80, 1, 2, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        assert_eq!(
+            rig.op("pmaddubsw xmm0, xmm1", lanes8([255; 16]), signed),
+            lanes16([0x7fff, 0x8000, 255 * 3, (-510i16) as u16, 0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn pmulhrsw_rounds_the_scaled_product() {
+        let mut rig = Rig::new();
+        check_binary(&mut rig, "pmulhrsw", |dst, src| {
+            let (a, b) = (words_of(dst), words_of(src));
+            lanes16(std::array::from_fn(|k| {
+                let product = a[k] as i16 as i32 * b[k] as i16 as i32;
+                (((product >> 14) + 1) >> 1) as u16
+            }))
+        });
+        // 0.5 * 0.5 = 0.25 in Q15; -1 * -1 overflows back to -1.
+        assert_eq!(
+            rig.op(
+                "pmulhrsw xmm0, xmm1",
+                lanes16([0x4000; 8]),
+                lanes16([0x4000; 8])
+            ),
+            lanes16([0x2000; 8])
+        );
+        assert_eq!(
+            rig.op(
+                "pmulhrsw xmm0, xmm1",
+                lanes16([0x8000; 8]),
+                lanes16([0x8000; 8])
+            ),
+            lanes16([0x8000; 8])
+        );
+    }
+
+    #[test]
+    fn psign_negates_zeroes_or_keeps_by_the_source_sign() {
+        let mut rig = Rig::new();
+        check_binary(&mut rig, "psignb", |dst, src| {
+            let (a, b) = (bytes_of(dst), bytes_of(src));
+            lanes8(std::array::from_fn(|k| match (b[k] as i8).signum() {
+                -1 => (a[k] as i8).wrapping_neg() as u8,
+                0 => 0,
+                _ => a[k],
+            }))
+        });
+        check_binary(&mut rig, "psignw", |dst, src| {
+            let (a, b) = (words_of(dst), words_of(src));
+            lanes16(std::array::from_fn(|k| match (b[k] as i16).signum() {
+                -1 => (a[k] as i16).wrapping_neg() as u16,
+                0 => 0,
+                _ => a[k],
+            }))
+        });
+        check_binary(&mut rig, "psignd", |dst, src| {
+            let (a, b) = (dwords_of(dst), dwords_of(src));
+            lanes32(std::array::from_fn(|k| match (b[k] as i32).signum() {
+                -1 => (a[k] as i32).wrapping_neg() as u32,
+                0 => 0,
+                _ => a[k],
+            }))
+        });
+        // The most negative value negates to itself.
+        assert_eq!(
+            rig.op("psignb xmm0, xmm1", lanes8([0x80; 16]), lanes8([0xff; 16])),
+            lanes8([0x80; 16])
+        );
+    }
+
+    #[test]
+    fn pabs_takes_the_absolute_value_of_the_source() {
+        let mut rig = Rig::new();
+        let references: [(&str, UnaryReference); 3] = [
+            ("pabsb", |v| {
+                lanes8(bytes_of(v).map(|x| (x as i8).unsigned_abs()))
+            }),
+            ("pabsw", |v| {
+                lanes16(words_of(v).map(|x| (x as i16).unsigned_abs()))
+            }),
+            ("pabsd", |v| {
+                lanes32(dwords_of(v).map(|x| (x as i32).unsigned_abs()))
+            }),
+        ];
+        for (name, reference) in references {
+            for &src in &vectors() {
+                let junk = !src;
+                assert_eq!(
+                    rig.op(&format!("{name} xmm0, xmm1"), junk, src),
+                    reference(src),
+                    "{name} {src:#x}: the old destination is ignored"
+                );
+                assert_eq!(
+                    rig.op_mem(&format!("{name} xmm0, [rsi]"), junk, src),
+                    reference(src),
+                    "{name} memory {src:#x}"
+                );
+            }
+        }
+        // abs of the most negative value is its own unsigned magnitude.
+        assert_eq!(
+            rig.op("pabsb xmm0, xmm1", 0, lanes8([0x80; 16])),
+            lanes8([0x80; 16])
+        );
+        assert_eq!(
+            rig.op("pabsd xmm0, xmm1", 0, lanes32([0x8000_0000; 4])),
+            lanes32([0x8000_0000; 4])
+        );
+    }
+
+    #[test]
+    fn palignr_shifts_the_concatenation_right_by_bytes() {
+        let mut rig = Rig::new();
+        let all = vectors();
+        for count in [0u8, 1, 4, 15, 16, 17, 31, 32, 255] {
+            let asm = format!("palignr xmm0, xmm1, {count}");
+            for (index, &dst) in all.iter().enumerate() {
+                let src = all[(index * 7 + 3) % all.len()];
+                // dst is the high half of the 32-byte value, src the low half; the bytes beyond
+                // the pair read as zero.
+                let mut joined = [0u8; 48];
+                joined[..16].copy_from_slice(&bytes_of(src));
+                joined[16..32].copy_from_slice(&bytes_of(dst));
+                let want = lanes8(std::array::from_fn(|k| {
+                    joined[(k + count as usize).min(47)]
+                }));
+                assert_eq!(rig.op(&asm, dst, src), want, "{asm} {dst:#x} {src:#x}");
+            }
+        }
+        let (dst, src) = (lanes8([0xdd; 16]), lanes8([0xcc; 16]));
+        let mut want = [0xcc; 16];
+        want[13..].fill(0xdd);
+        assert_eq!(rig.op_mem("palignr xmm0, [rsi], 3", dst, src), lanes8(want));
+    }
+
+    #[test]
+    fn memory_operands_must_be_aligned() {
+        let mut rig = Rig::new();
+        for asm in [
+            "pshufb xmm0, [rsi]",
+            "phaddd xmm0, [rsi]",
+            "pmaddubsw xmm0, [rsi]",
+            "pabsw xmm0, [rsi]",
+            "palignr xmm0, [rsi], 3",
+        ] {
+            rig.reset();
+            rig.h.cpu.gpr[RSI] = DATA + 1;
+            assert_eq!(rig.exec(asm), gp0(), "{asm}");
+        }
+    }
+
+    #[test]
+    fn mmx_register_forms_and_foreign_prefixes_are_invalid() {
+        // The MMX forms (no prefix) are deliberately not implemented: see the module comment of
+        // sse_ext.rs. They are #UD, as are the F2/F3-prefixed encodings.
+        let mut rig = Rig::new();
+        for asm in [
+            ".byte 0x0f, 0x38, 0x00, 0xc1",
+            ".byte 0x0f, 0x38, 0x1c, 0xc1",
+            ".byte 0x0f, 0x3a, 0x0f, 0xc1, 0x04",
+            ".byte 0xf2, 0x0f, 0x38, 0x00, 0xc1",
+            ".byte 0xf3, 0x0f, 0x38, 0x00, 0xc1",
+        ] {
+            assert_eq!(rig.run(asm), ud(), "{asm}");
+        }
+    }
+
+    #[test]
+    fn enable_rules_apply() {
+        let mut rig = Rig::new();
+        for asm in [
+            "pshufb xmm0, xmm1",
+            "palignr xmm0, xmm1, 4",
+            "pabsb xmm0, [rsi]",
+        ] {
+            rig.reset();
+            rig.h.cpu.cr4 &= !CR4_OSFXSR;
+            assert_eq!(rig.exec(asm), ud(), "{asm} without OSFXSR");
+            rig.reset();
+            rig.h.cpu.cr0 |= CR0_EM;
+            assert_eq!(rig.exec(asm), ud(), "{asm} with CR0.EM");
+            rig.reset();
+            rig.h.cpu.cr0 |= CR0_TS;
+            assert_eq!(rig.exec(asm), nm(), "{asm} with CR0.TS");
+        }
+    }
+
+    #[test]
+    fn jit_matches_the_interpreter() {
+        for asm in [
+            "pshufb xmm0, xmm1",
+            "phaddsw xmm0, [rsi]",
+            "pmaddubsw xmm0, xmm1",
+            "psignw xmm0, xmm1",
+            "pabsd xmm0, xmm1",
+            "palignr xmm0, xmm1, 4",
+        ] {
+            assert_jit_matches_interpreter(code(asm), |h| {
+                h.cpu.cr4 |= CR4_OSFXSR;
+                h.cpu.gpr[RSI] = DATA;
+                h.cpu.xmm[0] = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+                h.cpu.xmm[1] = 0x8070_6050_4030_2010_00ff_7f80_0102_0304;
+                h.write(DATA, &h.cpu.xmm[1].to_le_bytes());
+            });
+        }
+    }
+}
+
+#[test]
+fn unassigned_extension_opcodes_are_invalid() {
+    let mut rig = Rig::new();
+    for asm in [
+        ".byte 0x66, 0x0f, 0x38, 0xff, 0xc1",
+        ".byte 0x66, 0x0f, 0x3a, 0xff, 0xc1, 0x00",
+    ] {
+        assert_eq!(rig.run(asm), ud(), "{asm}");
+    }
+}
+
 const SNIPPETS: &[(&str, &[u8])] = &[
     ("movddup xmm0, xmm1", &[0xf2, 0x0f, 0x12, 0xc1, 0xf4]),
     ("movddup xmm0, [rsi]", &[0xf2, 0x0f, 0x12, 0x06, 0xf4]),
@@ -622,5 +1040,112 @@ const SNIPPETS: &[(&str, &[u8])] = &[
         &[0x48, 0x0f, 0xc7, 0xce, 0xf4],
     ),
     ("cmpxchg8b [rsi]", &[0x0f, 0xc7, 0x0e, 0xf4]),
+    ("pshufb xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x00, 0xc1, 0xf4]),
+    ("pshufb xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x00, 0x06, 0xf4]),
+    ("phaddw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x01, 0xc1, 0xf4]),
+    ("phaddw xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x01, 0x06, 0xf4]),
+    ("phaddd xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x02, 0xc1, 0xf4]),
+    ("phaddd xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x02, 0x06, 0xf4]),
+    ("phaddsw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x03, 0xc1, 0xf4]),
+    ("phaddsw xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x03, 0x06, 0xf4]),
+    (
+        "pmaddubsw xmm0, xmm1",
+        &[0x66, 0x0f, 0x38, 0x04, 0xc1, 0xf4],
+    ),
+    (
+        "pmaddubsw xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x04, 0x06, 0xf4],
+    ),
+    ("phsubw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x05, 0xc1, 0xf4]),
+    ("phsubw xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x05, 0x06, 0xf4]),
+    ("phsubd xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x06, 0xc1, 0xf4]),
+    ("phsubd xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x06, 0x06, 0xf4]),
+    ("phsubsw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x07, 0xc1, 0xf4]),
+    ("phsubsw xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x07, 0x06, 0xf4]),
+    ("psignb xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x08, 0xc1, 0xf4]),
+    ("psignb xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x08, 0x06, 0xf4]),
+    ("psignw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x09, 0xc1, 0xf4]),
+    ("psignw xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x09, 0x06, 0xf4]),
+    ("psignd xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x0a, 0xc1, 0xf4]),
+    ("psignd xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x0a, 0x06, 0xf4]),
+    ("pmulhrsw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x0b, 0xc1, 0xf4]),
+    (
+        "pmulhrsw xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x0b, 0x06, 0xf4],
+    ),
+    ("pabsb xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x1c, 0xc1, 0xf4]),
+    ("pabsb xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x1c, 0x06, 0xf4]),
+    ("pabsw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x1d, 0xc1, 0xf4]),
+    ("pabsw xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x1d, 0x06, 0xf4]),
+    ("pabsd xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x1e, 0xc1, 0xf4]),
+    ("pabsd xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x1e, 0x06, 0xf4]),
+    (
+        "palignr xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "palignr xmm0, xmm1, 1",
+        &[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x01, 0xf4],
+    ),
+    (
+        "palignr xmm0, xmm1, 4",
+        &[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x04, 0xf4],
+    ),
+    (
+        "palignr xmm0, xmm1, 15",
+        &[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x0f, 0xf4],
+    ),
+    (
+        "palignr xmm0, xmm1, 16",
+        &[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x10, 0xf4],
+    ),
+    (
+        "palignr xmm0, xmm1, 17",
+        &[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x11, 0xf4],
+    ),
+    (
+        "palignr xmm0, xmm1, 31",
+        &[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x1f, 0xf4],
+    ),
+    (
+        "palignr xmm0, xmm1, 32",
+        &[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x20, 0xf4],
+    ),
+    (
+        "palignr xmm0, xmm1, 255",
+        &[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0xff, 0xf4],
+    ),
+    (
+        "palignr xmm0, [rsi], 3",
+        &[0x66, 0x0f, 0x3a, 0x0f, 0x06, 0x03, 0xf4],
+    ),
+    (
+        ".byte 0x0f, 0x38, 0x00, 0xc1",
+        &[0x0f, 0x38, 0x00, 0xc1, 0xf4],
+    ),
+    (
+        ".byte 0x0f, 0x38, 0x1c, 0xc1",
+        &[0x0f, 0x38, 0x1c, 0xc1, 0xf4],
+    ),
+    (
+        ".byte 0x0f, 0x3a, 0x0f, 0xc1, 0x04",
+        &[0x0f, 0x3a, 0x0f, 0xc1, 0x04, 0xf4],
+    ),
+    (
+        ".byte 0xf2, 0x0f, 0x38, 0x00, 0xc1",
+        &[0xf2, 0x0f, 0x38, 0x00, 0xc1, 0xf4],
+    ),
+    (
+        ".byte 0xf3, 0x0f, 0x38, 0x00, 0xc1",
+        &[0xf3, 0x0f, 0x38, 0x00, 0xc1, 0xf4],
+    ),
+    (
+        ".byte 0x66, 0x0f, 0x38, 0xff, 0xc1",
+        &[0x66, 0x0f, 0x38, 0xff, 0xc1, 0xf4],
+    ),
+    (
+        ".byte 0x66, 0x0f, 0x3a, 0xff, 0xc1, 0x00",
+        &[0x66, 0x0f, 0x3a, 0xff, 0xc1, 0x00, 0xf4],
+    ),
     // SNIPPETS-END
 ];

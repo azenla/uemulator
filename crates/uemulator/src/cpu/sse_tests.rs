@@ -5645,7 +5645,6 @@ fn invalid_prefix_combinations_raise_invalid_opcode() {
         ".byte 0x0f, 0xd6, 0xc1",
         ".byte 0xf3, 0x0f, 0xc6, 0xc1, 0x00",
         ".byte 0x66, 0x0f, 0xf7, 0xc1",
-        ".byte 0x66, 0x0f, 0x38, 0x00, 0xc1",
         ".byte 0x66, 0x0f, 0x78, 0xc1",
     ];
     for key in invalid {
@@ -5697,14 +5696,6 @@ fn invalid_encoding_is_ud_even_with_cr0_ts_set() {
         rig.h.cpu.cr0 |= CR0_TS;
         assert_eq!(rig.exec(key), ud(), "{key}");
     }
-}
-
-#[test]
-fn ssse3_and_later_opcodes_are_not_implemented_yet() {
-    // CPUID does not advertise them, so #UD is the architecturally correct answer.
-    let mut rig = Rig::new();
-    let key = ".byte 0x66, 0x0f, 0x38, 0x00, 0xc1";
-    assert_eq!(rig.run(key), ud(), "{key}");
 }
 
 fn set_status_flags(rig: &mut Rig, flags: u64) {
