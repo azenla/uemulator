@@ -1,15 +1,15 @@
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 use crate::prelude::*;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(target_os = "uefi"))]
+#[cfg(not(freestanding))]
 use std::thread::JoinHandle;
 
 use crate::boot::{self, BootState};
 use crate::console::ConsoleHandle;
 use crate::cpu::Cpu;
 use crate::dev::DevConfig;
-#[cfg(not(target_os = "uefi"))]
+#[cfg(not(freestanding))]
 use crate::disk::Disk;
 use crate::netdev::NetHandle;
 use crate::platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE};
@@ -114,7 +114,7 @@ pub struct MachineConfig {
     cmdline: Option<String>,
     cmdline_extra: Vec<String>,
     memory_mib: usize,
-    #[cfg(not(target_os = "uefi"))]
+    #[cfg(not(freestanding))]
     disk: Option<Disk>,
     net_mac: Option<[u8; 6]>,
     console_kind: ConsoleKind,
@@ -136,7 +136,7 @@ impl Default for MachineConfig {
             cmdline: None,
             cmdline_extra: Vec::new(),
             memory_mib: DEFAULT_MEMORY_MIB,
-            #[cfg(not(target_os = "uefi"))]
+            #[cfg(not(freestanding))]
             disk: None,
             net_mac: None,
             console_kind: ConsoleKind::Virtio,
@@ -178,7 +178,7 @@ impl MachineConfig {
         self
     }
 
-    #[cfg(not(target_os = "uefi"))]
+    #[cfg(not(freestanding))]
     pub fn disk(mut self, disk: Disk) -> Self {
         self.disk = Some(disk);
         self
@@ -316,14 +316,14 @@ struct RebootImage {
 
 /// Wall-clock seconds, or 0 where there is no clock (UEFI keeps its own, see `unix_time`).
 fn host_unix_time() -> u64 {
-    #[cfg(not(target_os = "uefi"))]
+    #[cfg(not(freestanding))]
     {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0)
     }
-    #[cfg(target_os = "uefi")]
+    #[cfg(freestanding)]
     {
         0
     }
@@ -331,13 +331,13 @@ fn host_unix_time() -> u64 {
 
 /// Stands in for a disk on the verify twin: same capacity and read-only flag as the real one so
 /// the guest sees the same device, but no data behind it. Reads return zeros, writes vanish.
-#[cfg(not(target_os = "uefi"))]
+#[cfg(not(freestanding))]
 struct ShadowDisk {
     len: u64,
     read_only: bool,
 }
 
-#[cfg(not(target_os = "uefi"))]
+#[cfg(not(freestanding))]
 impl crate::disk::BlockBackend for ShadowDisk {
     fn len(&self) -> u64 {
         self.len
@@ -363,7 +363,7 @@ impl crate::disk::BlockBackend for ShadowDisk {
 /// is a legitimate divergence of this check, as is host console input.
 fn mirrored_devices(main: &DevConfig) -> DevConfig {
     DevConfig {
-        #[cfg(not(target_os = "uefi"))]
+        #[cfg(not(freestanding))]
         disk: main.disk.as_ref().map(|disk| {
             Disk::from_backend(ShadowDisk {
                 len: disk.backend.len(),
@@ -399,7 +399,7 @@ fn interpreter_twin(
 /// What a finished run hands to the next one.
 struct Finished {
     ram_bytes: usize,
-    #[cfg(not(target_os = "uefi"))]
+    #[cfg(not(freestanding))]
     disk: Option<Disk>,
 }
 
@@ -428,7 +428,7 @@ impl Vcpu {
             }
             self.ram = ram;
             self.devcfg = DevConfig {
-                #[cfg(not(target_os = "uefi"))]
+                #[cfg(not(freestanding))]
                 disk: finished.disk,
                 net: image.net.clone(),
                 virtio_console: image.virtio_console,
@@ -507,7 +507,7 @@ impl Vcpu {
         }
         let finished = Finished {
             ram_bytes,
-            #[cfg(not(target_os = "uefi"))]
+            #[cfg(not(freestanding))]
             disk: cpu.dev.into_disk(),
         };
         (reason, finished)
@@ -517,9 +517,9 @@ impl Vcpu {
 pub struct EmulatedMachine {
     /// Taken by `start` (hosted) or `wait` (UEFI); `None` afterwards.
     vcpu: Option<Vcpu>,
-    #[cfg(not(target_os = "uefi"))]
+    #[cfg(not(freestanding))]
     thread: Option<JoinHandle<ExitReason>>,
-    #[cfg(target_os = "uefi")]
+    #[cfg(freestanding)]
     started: bool,
     console: ConsoleHandle,
     /// Same queues as the virtio-net device in `Vcpu::devcfg`.
@@ -557,7 +557,7 @@ impl EmulatedMachine {
         let net_handle = net.as_ref().map(|(_, handle)| handle.clone());
         let virtio_console = cfg.console_kind == ConsoleKind::Virtio;
         let devcfg = DevConfig {
-            #[cfg(not(target_os = "uefi"))]
+            #[cfg(not(freestanding))]
             disk: cfg.disk,
             net,
             virtio_console,
@@ -591,9 +591,9 @@ impl EmulatedMachine {
                 devcfg,
                 reboot,
             }),
-            #[cfg(not(target_os = "uefi"))]
+            #[cfg(not(freestanding))]
             thread: None,
-            #[cfg(target_os = "uefi")]
+            #[cfg(freestanding)]
             started: false,
             console,
             net: net_handle,
@@ -620,12 +620,12 @@ impl EmulatedMachine {
     /// Hosted: spawns the vCPU thread and returns. UEFI has no threads, so this only marks the
     /// machine started and the vCPU runs inside `wait`.
     pub fn start(&mut self) -> Result<(), Error> {
-        #[cfg(not(target_os = "uefi"))]
+        #[cfg(not(freestanding))]
         {
             let vcpu = self.vcpu.take().ok_or(Error::AlreadyStarted)?;
             self.thread = Some(std::thread::spawn(move || vcpu.run()));
         }
-        #[cfg(target_os = "uefi")]
+        #[cfg(freestanding)]
         {
             if self.started || self.vcpu.is_none() {
                 return Err(Error::AlreadyStarted);
@@ -637,7 +637,7 @@ impl EmulatedMachine {
 
     /// Blocks until the guest exits. `Stopped` if the machine was never started or was already
     /// waited on.
-    #[cfg(target_os = "uefi")]
+    #[cfg(freestanding)]
     pub fn wait(&mut self) -> ExitReason {
         match self.vcpu.take() {
             Some(v) if self.started => v.run(),
@@ -646,7 +646,7 @@ impl EmulatedMachine {
     }
 
     /// Blocks until the guest exits; `Stopped` if the machine was never started.
-    #[cfg(not(target_os = "uefi"))]
+    #[cfg(not(freestanding))]
     pub fn wait(&mut self) -> ExitReason {
         match self.thread.take() {
             Some(t) => t

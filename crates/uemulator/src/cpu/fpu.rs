@@ -4,7 +4,7 @@ use super::exec::Loc;
 use super::flags::*;
 use super::sys::{CR0_EM, CR0_TS};
 use super::*;
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 use crate::math::{Float64Ext, FloatExt};
 
 // x87 registers are kept as raw 80-bit values (`Cpu::st`, 10 bytes little-endian: 64-bit

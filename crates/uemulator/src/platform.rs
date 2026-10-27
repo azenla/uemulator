@@ -1,4 +1,4 @@
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 use crate::prelude::*;
 
 use crate::boot::{self, BootState};

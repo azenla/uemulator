@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uemulator</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" crossorigin="anonymous">
+<style>
+  :root { --bg: #fff; --fg: #1b1f24; --muted: #667085; --line: #d0d5dd; --accent: #2457d6; --error: #b42318; --panel: #f6f7f9; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #0e1116; --fg: #e6e8eb; --muted: #98a2b3; --line: #2d333b; --accent: #7aa2ff; --error: #ff8a80; --panel: #161b22; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+  header, form { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 16px; margin: 0 0 2px; }
+  p { margin: 0; color: var(--muted); }
+  form { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px 16px; background: var(--panel); }
+  label { display: flex; flex-direction: column; gap: 3px; font-weight: 600; font-size: 12px; }
+  label span.row { display: flex; gap: 6px; font-weight: 400; }
+  input, select, button { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; min-width: 0; }
+  input[type=text] { flex: 1; }
+  .actions { display: flex; gap: 8px; align-items: end; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { align-self: center; color: var(--muted); }
+  #status[data-kind=error] { color: var(--error); }
+  main { flex: 1; min-height: 0; padding: 8px 16px; background: #000; }
+  #terminal { height: 100%; }
+</style>
+</head>
+<body>
+<header>
+  <h1>uemulator</h1>
+  <p>x86_64 Linux in WebAssembly (interpreter only, no JIT, no disk or network). Boots a bzImage and optional initramfs; the console is hvc0.</p>
+</header>
+<form onsubmit="return false">
+  <label>Kernel (bzImage)
+    <span class="row"><input id="kernel-file" type="file"></span>
+    <span class="row"><input id="kernel-url" type="text" placeholder="or URL"></span>
+  </label>
+  <label>Initramfs (optional)
+    <span class="row"><input id="initrd-file" type="file"></span>
+    <span class="row"><input id="initrd-url" type="text" placeholder="or URL"></span>
+  </label>
+  <label>Extra kernel arguments
+    <input id="cmdline" type="text">
+    <span class="row"><input id="shell" type="checkbox" checked> Boot to a shell (rdinit=/bin/sh) instead of the distro's init</span>
+    <span class="row">Memory
+      <select id="memory">
+        <option>128</option><option>256</option><option selected>512</option><option>1024</option>
+      </select> MiB
+    </span>
+  </label>
+  <div class="actions">
+    <button id="start" class="primary">Boot</button>
+    <button id="stop" disabled>Stop</button>
+    <span id="status">idle</span>
+  </div>
+</form>
+<main><div id="terminal"></div></main>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js" crossorigin="anonymous"></script>
+<script type="module" src="main.js"></script>
+</body>
+</html>

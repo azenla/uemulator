@@ -1,4 +1,4 @@
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 use crate::prelude::*;
 pub(crate) mod decode;
 pub(crate) mod exception;
@@ -772,7 +772,7 @@ impl Cpu {
         match self.dev.next_deadline(now) {
             Some(deadline) => {
                 if deadline > now {
-                    #[cfg(not(target_os = "uefi"))]
+                    #[cfg(not(freestanding))]
                     let advance_ns = if self.realtime {
                         // Short sleeps keep the stop flag and host console responsive.
                         const MAX_SLEEP_NS: u64 = 2_000_000;
@@ -782,7 +782,7 @@ impl Cpu {
                     } else {
                         deadline - now
                     };
-                    #[cfg(target_os = "uefi")]
+                    #[cfg(freestanding)]
                     let advance_ns = deadline - now;
                     self.idle_skipped_ns += advance_ns;
                 }
@@ -794,9 +794,9 @@ impl Cpu {
                 if self.dev.pic.has_pending() {
                     return None;
                 }
-                #[cfg(not(target_os = "uefi"))]
+                #[cfg(not(freestanding))]
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                #[cfg(target_os = "uefi")]
+                #[cfg(freestanding)]
                 if let Some(poll) = &self.poll {
                     poll(true);
                 }

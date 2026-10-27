@@ -2,17 +2,17 @@
 //! The stand-ins keep `std`'s call shapes (`lock().unwrap()`, `wait_timeout(..).unwrap().0`) so
 //! shared code such as the console and net queues compiles unchanged on both.
 
-#[cfg(not(target_os = "uefi"))]
+#[cfg(not(freestanding))]
 pub(crate) use std::sync::{Arc, Condvar, Mutex};
 
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 pub(crate) use alloc::sync::Arc;
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 pub(crate) use uefi_stubs::{Condvar, Mutex};
 
 // Also built for tests so the stand-ins' logic runs on the host; nothing outside the tests uses
 // them there.
-#[cfg(any(target_os = "uefi", test))]
+#[cfg(any(freestanding, test))]
 mod uefi_stubs {
     use core::cell::UnsafeCell;
     use core::convert::Infallible;

@@ -1,5 +1,5 @@
 use super::guestmem::GuestMem;
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 use crate::prelude::*;
 
 /// Largest queue size offered. Must be a power of two: `push_used` and `pop` index the
@@ -339,7 +339,7 @@ pub(crate) trait VirtioDev: Send {
     fn reset(&mut self) {}
     /// Gives the backing disk back when the device is torn down for a machine reboot, so the
     /// next incarnation of the device can serve the same image. Only virtio-blk has one.
-    #[cfg(not(target_os = "uefi"))]
+    #[cfg(not(freestanding))]
     fn into_disk(self: Box<Self>) -> Option<crate::disk::Disk> {
         None
     }

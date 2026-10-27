@@ -4,7 +4,7 @@ use super::virtio::{
     COMMON_CFG_OFFSET, DEVICE_CFG_OFFSET, DEVICE_TYPE_BLOCK, DEVICE_TYPE_CONSOLE, DEVICE_TYPE_NET,
     ISR_OFFSET, NOTIFY_OFF_MULTIPLIER, NOTIFY_OFFSET, REGION_SIZE, Transport,
 };
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 use crate::prelude::*;
 
 /// Start of the MMIO window; everything at or above guest RAM size dispatches to the devices.
@@ -257,7 +257,7 @@ impl PciFunction {
 
 impl PciHost {
     /// Tears the bus down and returns the disk behind its virtio-blk function, if any.
-    #[cfg(not(target_os = "uefi"))]
+    #[cfg(not(freestanding))]
     pub fn into_disk(self) -> Option<crate::disk::Disk> {
         self.funcs
             .into_iter()

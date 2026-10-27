@@ -1,4 +1,4 @@
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 use crate::prelude::*;
 use alloc::collections::VecDeque;
 use core::time::Duration;

@@ -1,4 +1,4 @@
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 use crate::prelude::*;
 
 const MASTER_COMMAND_PORT: u16 = 0x20;

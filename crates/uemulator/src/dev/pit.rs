@@ -1,4 +1,4 @@
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 use crate::prelude::*;
 
 /// Input clock of the 8254 (14.31818 MHz / 12, rounded). The guest calibrates the TSC against

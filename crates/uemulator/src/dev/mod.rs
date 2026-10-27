@@ -1,18 +1,18 @@
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 use crate::prelude::*;
 pub(crate) mod guestmem;
 mod pci;
 mod pic;
 mod pit;
 mod serial;
-#[cfg(not(target_os = "uefi"))]
+#[cfg(not(freestanding))]
 mod vblk;
 mod vcons;
 mod virtio;
 mod vnet;
 
 use crate::console::ConsoleHandle;
-#[cfg(not(target_os = "uefi"))]
+#[cfg(not(freestanding))]
 use crate::disk::Disk;
 use crate::netdev::NetHandle;
 use guestmem::GuestMem;
@@ -20,7 +20,7 @@ use pci::PciHost;
 use pic::Pics;
 use pit::Pit;
 use serial::Uart;
-#[cfg(not(target_os = "uefi"))]
+#[cfg(not(freestanding))]
 use vblk::VirtioBlk;
 use vcons::VirtioConsole;
 use virtio::Transport;
@@ -109,7 +109,7 @@ const CMOS_STATUS_D_VALUE: u8 = 0x80;
 /// What to attach to the PCI bus; every device is optional.
 #[derive(Default)]
 pub(crate) struct DevConfig {
-    #[cfg(not(target_os = "uefi"))]
+    #[cfg(not(freestanding))]
     pub disk: Option<Disk>,
     /// MAC address and the host side of the frame channel.
     pub net: Option<([u8; 6], NetHandle)>,
@@ -187,19 +187,19 @@ impl Devices {
                 console.clone(),
             ))));
         }
-        #[cfg(not(target_os = "uefi"))]
+        #[cfg(not(freestanding))]
         if let Some(disk) = cfg.disk {
             virtio_devices.push(Transport::new(Box::new(VirtioBlk::new(disk))));
         }
         if let Some((mac, handle)) = cfg.net {
             virtio_devices.push(Transport::new(Box::new(VirtioNet::new(mac, handle))));
         }
-        #[cfg(not(target_os = "uefi"))]
+        #[cfg(not(freestanding))]
         let boot_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        #[cfg(target_os = "uefi")]
+        #[cfg(freestanding)]
         let boot_unix = 0;
         Devices {
             pic: Pics::default(),
@@ -219,7 +219,7 @@ impl Devices {
     /// Consumes the devices and returns the disk, for the machine to attach to the devices it
     /// builds for the next boot. Everything else (PCI config, virtqueues, UART, PIC, PIT) is
     /// dropped on purpose: a reboot must not leak state from the previous run.
-    #[cfg(not(target_os = "uefi"))]
+    #[cfg(not(freestanding))]
     pub fn into_disk(self) -> Option<Disk> {
         self.pci.into_disk()
     }

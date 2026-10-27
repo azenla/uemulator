@@ -1,12 +1,13 @@
 //! Embeddable x86_64 PC emulator that boots an unmodified Linux bzImage. Start from
 //! `MachineConfig` and `EmulatedMachine`.
 //!
-//! The cfg gates: `target_os = "uefi"` selects the `no_std` build, which has no threads and no
+//! The cfg gates: `freestanding` (set by `build.rs` for UEFI and wasm32) selects the `no_std`
+//! build, which has no threads and no
 //! `std::fs` (so no `disk`) and needs `prelude` and `math` to replace what `std` provides. The
 //! `jit` feature enables `sys` (executable memory); without it the crate has no dependencies and
 //! only interprets.
 
-#![cfg_attr(target_os = "uefi", no_std)]
+#![cfg_attr(freestanding, no_std)]
 
 extern crate alloc;
 
@@ -14,15 +15,15 @@ mod boot;
 mod console;
 mod cpu;
 mod dev;
-#[cfg(not(target_os = "uefi"))]
+#[cfg(not(freestanding))]
 mod disk;
 mod jit;
 mod machine;
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 mod math;
 mod netdev;
 mod platform;
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 mod prelude;
 mod sync;
 #[cfg(feature = "jit")]
@@ -32,7 +33,7 @@ mod testkit;
 
 pub use boot::BootState;
 pub use console::ConsoleHandle;
-#[cfg(not(target_os = "uefi"))]
+#[cfg(not(freestanding))]
 pub use disk::{BlockBackend, Disk};
 pub use machine::{
     ClockMode, ConsoleKind, EmulatedMachine, Error, ExitReason, JitMode, MachineConfig, StopHandle,

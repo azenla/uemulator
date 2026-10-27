@@ -1,0 +1,13 @@
+[package]
+name = "uemulator-web"
+description = "WebAssembly build of uemulator for the browser: boots a Linux bzImage in a Web Worker"
+version.workspace = true
+edition.workspace = true
+
+# Only meaningful on wasm32; on any other target the crate is empty so `cargo test --workspace`
+# and clippy on the host do not try to link a module whose imports only the page provides.
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uemulator = { path = "../uemulator", default-features = false }

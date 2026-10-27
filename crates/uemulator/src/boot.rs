@@ -1,5 +1,5 @@
 use crate::machine::Error;
-#[cfg(target_os = "uefi")]
+#[cfg(freestanding)]
 use crate::prelude::*;
 
 /// Where a relocatable kernel's protected-mode part is loaded. 16 MiB is the Debian kernel's
