@@ -391,12 +391,16 @@ mod cpuid_leaves {
     }
 
     #[test]
-    fn leaf_1_ecx_advertises_nothing() {
+    fn leaf_1_ecx_advertises_only_what_is_implemented() {
+        const SSE3: u32 = 1 << 0;
+        const CX16: u32 = 1 << 13;
+        const POPCNT: u32 = 1 << 23;
         let mut h = blank();
         let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
         assert_eq!(
-            ecx, 0,
-            "no SSE3, SSSE3, SSE4, XSAVE, OSXSAVE, AVX, RDRAND or hypervisor bit"
+            ecx,
+            SSE3 | CX16 | POPCNT,
+            "no MONITOR, VMX, SMX, XSAVE, OSXSAVE, AVX, RDRAND or hypervisor bit"
         );
     }
 
@@ -450,10 +454,12 @@ mod cpuid_leaves {
     }
 
     #[test]
-    fn extended_leaf_1_ecx_has_only_lahf_in_long_mode() {
+    fn extended_leaf_1_ecx_has_only_lahf_in_long_mode_and_abm() {
+        const LAHF_LM: u32 = 1 << 0;
+        const ABM: u32 = 1 << 5;
         let mut h = blank();
         let [_, _, ecx, _] = cpuid(&mut h, 0x8000_0001, 0);
-        assert_eq!(ecx, 1);
+        assert_eq!(ecx, LAHF_LM | ABM);
     }
 
     #[test]

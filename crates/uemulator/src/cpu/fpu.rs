@@ -41,6 +41,7 @@ const ROUNDING_CONTROL_MASK: u16 = 3;
 const ROUND_NEAREST_EVEN: u16 = 0;
 const ROUND_DOWN: u16 = 1;
 const ROUND_UP: u16 = 2;
+const ROUND_TOWARD_ZERO: u16 = 3;
 
 /// FSW: TOP in bits 11-13, condition codes C0 (8), C1 (9), C2 (10), C3 (14).
 const FSW_TOP_SHIFT: u32 = 11;
@@ -294,7 +295,12 @@ impl Cpu {
     /// Converts to a signed integer of `bits` width using FCW.RC. Out-of-range and NaN give the
     /// "integer indefinite" value (only the sign bit set) without signalling #IA.
     fn to_int(&self, v: f64, bits: u32) -> i64 {
-        let rounded = round_to_integral(v, self.fcw >> FCW_ROUNDING_CONTROL_SHIFT);
+        self.to_int_rounded(v, bits, self.fcw >> FCW_ROUNDING_CONTROL_SHIFT)
+    }
+
+    /// `to_int` with an explicit rounding control instead of FCW.RC (fisttp always truncates).
+    fn to_int_rounded(&self, v: f64, bits: u32, rounding_control: u16) -> i64 {
+        let rounded = round_to_integral(v, rounding_control);
         let limit = (1u128 << (bits - 1)) as f64;
         if rounded.is_nan() || rounded >= limit || rounded < -limit {
             i64::MIN >> (64 - bits)
@@ -660,6 +666,12 @@ impl Cpu {
                     let v = self.read(a, 4)? as u32 as i32 as f64;
                     self.fpush(v);
                 }
+                // fisttp m32int (SSE3): truncates whatever FCW.RC says, and always pops
+                1 => {
+                    let v = self.to_int_rounded(self.st_val(0), 32, ROUND_TOWARD_ZERO) as u32;
+                    self.write(a, 4, v as u64)?;
+                    self.fpop();
+                }
                 2 | 3 => {
                     let v = self.to_int(self.st_val(0), 32) as u32;
                     self.write(a, 4, v as u64)?;
@@ -696,16 +708,28 @@ impl Cpu {
                         self.fpop();
                     }
                 }
+                // fisttp m64int
+                1 => {
+                    let v = self.to_int_rounded(self.st_val(0), 64, ROUND_TOWARD_ZERO);
+                    self.write(a, 8, v as u64)?;
+                    self.fpop();
+                }
                 4 => self.frstor(a)?,
                 6 => self.fnsave(a)?,
                 7 => self.write(a, 2, self.fsw as u64)?,
                 _ => return Err(self.unimplemented_opcode(i)),
             },
-            // df: fild/fist/fistp m16, fild/fistp m64 (bcd forms are not implemented)
+            // df: fild/fist/fistp/fisttp m16, fild/fistp m64 (bcd forms are not implemented)
             _ => match r {
                 0 => {
                     let v = self.read(a, 2)? as u16 as i16 as f64;
                     self.fpush(v);
+                }
+                // fisttp m16int
+                1 => {
+                    let v = self.to_int_rounded(self.st_val(0), 16, ROUND_TOWARD_ZERO) as u16;
+                    self.write(a, 2, v as u64)?;
+                    self.fpop();
                 }
                 2 | 3 => {
                     let v = self.to_int(self.st_val(0), 16) as u16;

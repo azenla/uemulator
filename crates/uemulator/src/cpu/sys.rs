@@ -164,11 +164,9 @@ const FEATURE_MMX: u32 = 1 << 23;
 const FEATURE_FXSR: u32 = 1 << 24;
 const FEATURE_SSE: u32 = 1 << 25;
 const FEATURE_SSE2: u32 = 1 << 26;
-/// Leaf 1 EDX. MMX stays advertised although only `emms` is implemented and the MMX register
-/// forms are #UD: glibc's x86-64 baseline ISA check (CMOV, CX8, FPU, FXSR, MMX, SSE, SSE2) needs
-/// the bit, and without it every Debian binary refuses to start ("CPU ISA level is lower than
-/// required"). Clear it only once the register forms exist. APIC, SEP and PSE36 are clear, and
-/// so is every ECX bit.
+/// Leaf 1 EDX. MMX is advertised because glibc's x86-64 baseline ISA check (CMOV, CX8, FPU,
+/// FXSR, MMX, SSE, SSE2) needs the bit; without it every Debian binary refuses to start ("CPU ISA
+/// level is lower than required"). APIC, SEP and PSE36 are clear.
 const CPUID_LEAF1_EDX: u32 = FEATURE_FPU
     | FEATURE_DE
     | FEATURE_PSE
@@ -184,6 +182,15 @@ const CPUID_LEAF1_EDX: u32 = FEATURE_FPU
     | FEATURE_FXSR
     | FEATURE_SSE
     | FEATURE_SSE2;
+
+// Leaf 1 ECX. Each bit is advertised together with the tests of the instructions behind it.
+// MONITOR/MWAIT, VMX/SVM, XSAVE/OSXSAVE, AVX, RDRAND and the hypervisor bit stay clear.
+/// SSE3: movddup, movshdup, movsldup, lddqu, addsub*, hadd*, hsub*, and x87 fisttp.
+const FEATURE_SSE3: u32 = 1 << 0;
+/// CMPXCHG16B.
+const FEATURE_CX16: u32 = 1 << 13;
+const FEATURE_POPCNT: u32 = 1 << 23;
+const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3 | FEATURE_CX16 | FEATURE_POPCNT;
 
 /// Leaf 0x8000_0001 EDX repeats this subset of the leaf 1 bits (the AMD aliases); DE and PSE
 /// are not mirrored.
@@ -202,6 +209,9 @@ const EXT_FEATURE_NX: u32 = 1 << 20;
 const EXT_FEATURE_LONG_MODE: u32 = 1 << 29;
 /// Leaf 0x8000_0001 ECX bit 0: LAHF/SAHF in 64-bit mode.
 const EXT_FEATURE_LAHF_LM: u32 = 1 << 0;
+/// Leaf 0x8000_0001 ECX bit 5: advanced bit manipulation, i.e. LZCNT (POPCNT has its own bit in
+/// leaf 1).
+const EXT_FEATURE_ABM: u32 = 1 << 5;
 /// Leaf 0x8000_0007 EDX bit 8: invariant TSC, so the kernel trusts it as a clocksource.
 const APM_INVARIANT_TSC: u32 = 1 << 8;
 
@@ -240,12 +250,17 @@ impl Cpu {
         let leaf = self.gpr[RAX] as u32;
         let (eax, ebx, ecx, edx): (u32, u32, u32, u32) = match leaf {
             CPUID_LEAF_VENDOR => (CPUID_MAX_STANDARD_LEAF, VENDOR_EBX, VENDOR_ECX, VENDOR_EDX),
-            CPUID_LEAF_FEATURES => (CPUID_SIGNATURE, CPUID_LEAF1_EBX, 0, CPUID_LEAF1_EDX),
+            CPUID_LEAF_FEATURES => (
+                CPUID_SIGNATURE,
+                CPUID_LEAF1_EBX,
+                CPUID_LEAF1_ECX,
+                CPUID_LEAF1_EDX,
+            ),
             CPUID_LEAF_EXT_MAX => (CPUID_MAX_EXTENDED_LEAF, VENDOR_EBX, VENDOR_ECX, VENDOR_EDX),
             CPUID_LEAF_EXT_FEATURES => (
                 CPUID_SIGNATURE,
                 0,
-                EXT_FEATURE_LAHF_LM,
+                EXT_FEATURE_LAHF_LM | EXT_FEATURE_ABM,
                 EXT_FEATURE_SYSCALL
                     | EXT_FEATURE_NX
                     | EXT_FEATURE_LONG_MODE

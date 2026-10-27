@@ -257,6 +257,32 @@ impl Cpu {
         self.gpr[GPR_RDX] = v >> 32;
     }
 
+    /// cmpxchg16b: compares RDX:RAX with the 16 bytes at `address` and either stores RCX:RBX (ZF
+    /// set) or loads the memory into RDX:RAX (ZF clear). The operand must be 16-byte aligned
+    /// (#GP(0), checked before any access). Hardware always performs the write cycle, so the
+    /// failing case writes the old value back to take a write fault on a read-only page.
+    fn cmpxchg16b(&mut self, address: u64, next: u64) -> ExecResult<()> {
+        const OPERAND_ALIGNMENT: u64 = 16;
+        if address & (OPERAND_ALIGNMENT - 1) != 0 {
+            return Err(Exception::general_protection(0));
+        }
+        let current = self.read128(address)?;
+        let expected = ((self.gpr[GPR_RDX] as u128) << 64) | self.gpr[GPR_RAX] as u128;
+        let f = self.eflags_full();
+        if current == expected {
+            let replacement = ((self.gpr[GPR_RCX] as u128) << 64) | self.gpr[GPR_RBX] as u128;
+            self.write128(address, replacement)?;
+            self.set_eflags_arith(f | ZF);
+        } else {
+            self.write128(address, current)?;
+            self.gpr[GPR_RAX] = current as u64;
+            self.gpr[GPR_RDX] = (current >> 64) as u64;
+            self.set_eflags_arith(f & !ZF);
+        }
+        self.rip = next;
+        Ok(())
+    }
+
     fn iopl(&self) -> u8 {
         ((self.eflags & IOPL) >> IOPL_SHIFT) as u8
     }
@@ -1767,12 +1793,15 @@ impl Cpu {
                 let v = self.read_gpr(i.reg, osz, true);
                 self.store_operand(loc, osz, i, v)?;
             }
-            // cmpxchg8b m64 (group 9 /1); cmpxchg16b (REX.W) is not implemented
+            // cmpxchg8b m64 / cmpxchg16b m128 (group 9 /1 without / with REX.W)
             0x1c7 => {
-                if i.md == 3 || i.reg & 7 != 1 || osz == 8 {
+                if i.md == 3 || i.reg & 7 != 1 {
                     return Err(self.unimplemented_opcode(i));
                 }
                 let a = self.linear_address(i, self.effective_address(i, next));
+                if osz == 8 {
+                    return self.cmpxchg16b(a, next);
+                }
                 let current = self.read(a, 8)?;
                 let expected = combine_dwords(self.gpr[GPR_RAX], self.gpr[GPR_RDX]);
                 let f = self.eflags_full();
@@ -1807,6 +1836,35 @@ impl Cpu {
                     v as u16 as i16 as i64 as u64
                 };
                 self.write_gpr(i.reg, osz, true, v);
+            }
+            // popcnt (F3 0F B8). Without F3 this opcode is JMPE, which does not exist here.
+            0x1b8 => {
+                if i.rep != REP_REPE {
+                    return Err(self.unimplemented_opcode(i));
+                }
+                let loc = self.modrm_location(i, next);
+                let v = self.load_operand(loc, osz, i)? & mask(osz);
+                self.write_gpr(i.reg, osz, true, v.count_ones() as u64);
+                // CF, OF, SF, AF and PF are cleared; ZF reports a zero source.
+                self.set_eflags_arith(if v == 0 { ZF } else { 0 });
+            }
+            // lzcnt (F3 0F BD): counts leading zeros within the operand size, so a zero source
+            // gives the operand width and CF. On a CPU without ABM this opcode is plain bsr, which
+            // is why CPUID must advertise ABM (0x8000_0001 ECX) together with this arm.
+            0x1bd if i.rep == REP_REPE => {
+                let loc = self.modrm_location(i, next);
+                let v = self.load_operand(loc, osz, i)? & mask(osz);
+                let operand_bits = osz as u32 * 8;
+                let count = v.leading_zeros() - (u64::BITS - operand_bits);
+                self.write_gpr(i.reg, osz, true, count as u64);
+                let mut f = 0;
+                if v == 0 {
+                    f |= CF;
+                }
+                if count == 0 {
+                    f |= ZF;
+                }
+                self.set_eflags_arith(f);
             }
             // bsf / bsr: a zero source sets ZF and leaves the destination unchanged
             0x1bc | 0x1bd => {
