@@ -25,7 +25,7 @@
 - **Correctness fixes to adopt by design** (check each against our implementation): "fix immediate stack adjustment for RET and RETF", "Fix FXCH to unconditionally clear C1", "Mark MOVNTI as not valid with prefixes 66/F2/F3", "tcg/optimize: Fix expansion/simplification of deposit", "Fix fold_multiply2", "tcg/aarch64: Correct register MIN/MAX instructions", "fix EFLAGS reads in TCG plugin callbacks".
 - **Perf features, JIT phase notes only**: x-tblookup, x-tblayout, x-iofast, x-edgesys, x-slowthunk, x-ssefp, lazy INC/DEC CC_OP, x-vexzero/regcache/superblock.
 - **Not applicable**: x-tso (SMP memory ordering), x-hyperv, x-user, x-versal/zynqmp/zcu/aio/blockdev, `[DEV]` stats commits.
-- **CPU identity**: AMD family 0x15 model 0 stepping 1, no hypervisor bit. Read its leaves, then subtract (03).
+- **CPU identity**: AMD family 0x14 (fork: 0x15, see 03 "Speculation control") model 0 stepping 1, no hypervisor bit. Read its leaves, then subtract (03).
 
 ## Open questions to answer from the tree
 

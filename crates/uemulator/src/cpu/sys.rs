@@ -20,6 +20,54 @@ pub(crate) const MSR_FS_BASE: u32 = 0xc000_0100;
 pub(crate) const MSR_GS_BASE: u32 = 0xc000_0101;
 pub(crate) const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
 pub(crate) const MSR_TSC_AUX: u32 = 0xc000_0103;
+pub(crate) const MSR_SPEC_CTRL: u32 = 0x48;
+pub(crate) const MSR_PRED_CMD: u32 = 0x49;
+pub(crate) const MSR_ARCH_CAPABILITIES: u32 = 0x10a;
+pub(crate) const MSR_FLUSH_CMD: u32 = 0x10b;
+
+/// IA32_SPEC_CTRL bits: IBRS, STIBP, SSBD. Any other bit is reserved and #GPs on write.
+const SPEC_CTRL_WRITABLE: u64 = 0b111;
+/// IA32_PRED_CMD bit 0 (IBPB) and IA32_FLUSH_CMD bit 0 (L1D flush): write-only command MSRs.
+/// The emulator has no predictors or L1D to flush, so accepting the write is the whole job.
+const COMMAND_MSR_WRITABLE: u64 = 1;
+
+// IA32_ARCH_CAPABILITIES bits. The emulated CPU executes strictly in order with no speculation,
+// so it states that it is immune to every speculative-execution vulnerability Linux knows about.
+// That makes the kernel pick "Not affected" everywhere (no KPTI, no VERW on exit, no retpolines
+// or return thunks, no BHB clearing loop on syscall entry), which is the point: those
+// mitigations cost guest instructions the emulator would then have to run. Add a bit here only
+// together with the kernel check it silences; a bit that is *not* a "_NO" bit (RSBA, bit 2)
+// must stay clear because it marks the CPU as vulnerable.
+const ARCH_CAP_RDCL_NO: u64 = 1 << 0;
+const ARCH_CAP_IBRS_ALL: u64 = 1 << 1;
+const ARCH_CAP_SKIP_L1DFL_VMENTRY: u64 = 1 << 3;
+const ARCH_CAP_SSB_NO: u64 = 1 << 4;
+const ARCH_CAP_MDS_NO: u64 = 1 << 5;
+const ARCH_CAP_PSCHANGE_MC_NO: u64 = 1 << 6;
+const ARCH_CAP_TAA_NO: u64 = 1 << 8;
+const ARCH_CAP_SBDR_SSDP_NO: u64 = 1 << 13;
+const ARCH_CAP_FBSDP_NO: u64 = 1 << 14;
+const ARCH_CAP_PSDP_NO: u64 = 1 << 15;
+const ARCH_CAP_BHI_NO: u64 = 1 << 20;
+const ARCH_CAP_PBRSB_NO: u64 = 1 << 24;
+const ARCH_CAP_GDS_NO: u64 = 1 << 26;
+const ARCH_CAP_RFDS_NO: u64 = 1 << 27;
+const ARCH_CAP_ITS_NO: u64 = 1 << 62;
+const ARCH_CAPABILITIES: u64 = ARCH_CAP_RDCL_NO
+    | ARCH_CAP_IBRS_ALL
+    | ARCH_CAP_SKIP_L1DFL_VMENTRY
+    | ARCH_CAP_SSB_NO
+    | ARCH_CAP_MDS_NO
+    | ARCH_CAP_PSCHANGE_MC_NO
+    | ARCH_CAP_TAA_NO
+    | ARCH_CAP_SBDR_SSDP_NO
+    | ARCH_CAP_FBSDP_NO
+    | ARCH_CAP_PSDP_NO
+    | ARCH_CAP_BHI_NO
+    | ARCH_CAP_PBRSB_NO
+    | ARCH_CAP_GDS_NO
+    | ARCH_CAP_RFDS_NO
+    | ARCH_CAP_ITS_NO;
 
 // CR0_PE/MP/ET/PG, CR4_PAE and EFER_LME/LMA/NXE live in cpu/mod.rs.
 pub(crate) const CR0_EM: u64 = 1 << 2;
@@ -129,7 +177,7 @@ const USER_DATA_FLAGS: u32 = SEG_FLAGS_FLAT_DATA | DESC_DPL_USER;
 const LOG_KEY_RDMSR_FAULT: u64 = 1 << 60;
 const LOG_KEY_WRMSR_FAULT: u64 = 1 << 59;
 
-// CPUID identity: AuthenticAMD, family 0x15, model 0, stepping 1 (plans/03-cpu.md). Only
+// CPUID identity: AuthenticAMD, family 0x14, model 0, stepping 1 (plans/03-cpu.md). Only
 // features that have tests behind them are advertised; everything else reads as zero.
 const CPUID_LEAF_VENDOR: u32 = 0;
 const CPUID_LEAF_FEATURES: u32 = 1;
@@ -154,8 +202,11 @@ const VENDOR_EDX: u32 = u32::from_le_bytes(*b"enti");
 const VENDOR_ECX: u32 = u32::from_le_bytes(*b"cAMD");
 
 /// Returned as EAX of leaf 1 and leaf 0x8000_0001: stepping 1, model 0, base family 0xf plus
-/// extended family 6.
-const CPUID_SIGNATURE: u32 = 0x0060_0f01;
+/// extended family 5, i.e. family 0x14. Not 0x15: Linux's vulnerability table names AMD families
+/// 0x15, 0x16, 0x17... as RETBLEED (and later SRSO) victims by family number alone, no matter what
+/// ARCH_CAPABILITIES says, and answers with return thunks on every `ret`. Family 0x14 is in no
+/// such list and takes the same generic AMD paths (REP_GOOD, no Zen quirks).
+const CPUID_SIGNATURE: u32 = 0x0050_0f01;
 /// Leaf 1 EBX: CLFLUSH line size in 8-byte units (bits 15:8) and logical processor count
 /// (23:16). The initial APIC id (31:24) is 0.
 const CPUID_LEAF1_EBX: u32 = (1 << 16) | (8 << 8);
@@ -230,6 +281,33 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
 /// instruction through the run loop.
 const STRUCTURED_FEATURE_FSGSBASE: u32 = 1 << 0;
 
+// Leaf 7 subleaf 0 EDX: the speculation-control interface. The MSRs behind these bits are
+// implemented as inert storage (see `ARCH_CAPABILITIES`).
+/// IA32_SPEC_CTRL and IA32_PRED_CMD (IBRS and IBPB).
+const STRUCTURED_FEATURE_SPEC_CTRL: u32 = 1 << 26;
+/// STIBP bit in IA32_SPEC_CTRL.
+const STRUCTURED_FEATURE_STIBP: u32 = 1 << 27;
+/// IA32_FLUSH_CMD.
+const STRUCTURED_FEATURE_L1D_FLUSH: u32 = 1 << 28;
+/// IA32_ARCH_CAPABILITIES.
+const STRUCTURED_FEATURE_ARCH_CAPABILITIES: u32 = 1 << 29;
+/// SSBD bit in IA32_SPEC_CTRL.
+const STRUCTURED_FEATURE_SSBD: u32 = 1 << 31;
+const STRUCTURED_EDX: u32 = STRUCTURED_FEATURE_SPEC_CTRL
+    | STRUCTURED_FEATURE_STIBP
+    | STRUCTURED_FEATURE_L1D_FLUSH
+    | STRUCTURED_FEATURE_ARCH_CAPABILITIES
+    | STRUCTURED_FEATURE_SSBD;
+
+// Leaf 0x8000_0008 EBX: the AMD spelling of the same interface (Linux consults these on AMD
+// vendor CPUs).
+const EXT_ADDRESS_IBPB: u32 = 1 << 12;
+const EXT_ADDRESS_IBRS: u32 = 1 << 14;
+const EXT_ADDRESS_STIBP: u32 = 1 << 15;
+const EXT_ADDRESS_SSBD: u32 = 1 << 24;
+const EXT_ADDRESS_EBX: u32 =
+    EXT_ADDRESS_IBPB | EXT_ADDRESS_IBRS | EXT_ADDRESS_STIBP | EXT_ADDRESS_SSBD;
+
 /// Leaf 0x8000_0001 EDX repeats this subset of the leaf 1 bits (the AMD aliases); DE and PSE
 /// are not mirrored.
 const CPUID_EXT_ALIASED_EDX: u32 = FEATURE_FPU
@@ -291,7 +369,7 @@ impl Cpu {
             CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES => {
                 // Only subleaf 0 exists; EAX is the highest subleaf.
                 if self.gpr[RCX] as u32 == 0 {
-                    (0, STRUCTURED_FEATURE_FSGSBASE, 0, 0)
+                    (0, STRUCTURED_FEATURE_FSGSBASE, 0, STRUCTURED_EDX)
                 } else {
                     (0, 0, 0, 0)
                 }
@@ -328,7 +406,7 @@ impl Cpu {
             CPUID_LEAF_L1_CACHE_TLB => (0xff40_ff40, 0xff40_ff40, 0x2008_0140, 0x4002_0140),
             CPUID_LEAF_L2_CACHE_TLB => (0x6400_6400, 0x6400_4200, 0x0200_6140, 0),
             CPUID_LEAF_ADVANCED_POWER => (0, 0, 0, APM_INVARIANT_TSC),
-            CPUID_LEAF_ADDRESS_SIZES => (CPUID_ADDRESS_SIZES, 0, 0, 0),
+            CPUID_LEAF_ADDRESS_SIZES => (CPUID_ADDRESS_SIZES, EXT_ADDRESS_EBX, 0, 0),
             _ => (0, 0, 0, 0),
         };
         self.gpr[RAX] = eax as u64;
@@ -354,6 +432,8 @@ impl Cpu {
             MSR_GS_BASE => self.seg[SEG_GS].base,
             MSR_KERNEL_GS_BASE => self.kgsbase,
             MSR_TSC_AUX => self.tsc_aux,
+            MSR_SPEC_CTRL => self.spec_ctrl,
+            MSR_ARCH_CAPABILITIES => ARCH_CAPABILITIES,
             MSR_SYSENTER_CS..=MSR_SYSENTER_EIP => self.sysenter[(msr - MSR_SYSENTER_CS) as usize],
             _ => match self.msr_misc.get(&msr) {
                 Some(v) => *v,
@@ -402,6 +482,17 @@ impl Cpu {
             MSR_GS_BASE => self.seg[SEG_GS].base = v,
             MSR_KERNEL_GS_BASE => self.kgsbase = v,
             MSR_TSC_AUX => self.tsc_aux = v,
+            MSR_SPEC_CTRL => {
+                if v & !SPEC_CTRL_WRITABLE != 0 {
+                    return Err(Exception::general_protection(0));
+                }
+                self.spec_ctrl = v;
+            }
+            MSR_PRED_CMD | MSR_FLUSH_CMD => {
+                if v & !COMMAND_MSR_WRITABLE != 0 {
+                    return Err(Exception::general_protection(0));
+                }
+            }
             // the TSC follows the virtual clock and cannot be set
             MSR_TSC => {}
             MSR_SYSENTER_CS..=MSR_SYSENTER_EIP => {
@@ -1219,7 +1310,7 @@ mod sys_tests {
         }
 
         #[test]
-        fn leaf_1_signature_is_family_15h_model_0_stepping_1() {
+        fn leaf_1_signature_is_family_14h_model_0_stepping_1() {
             let mut h = blank();
             let [eax, ..] = cpuid(&mut h, 1, 0);
             let stepping = eax & 0xf;
@@ -1235,9 +1326,9 @@ mod sys_tests {
                     extended_model,
                     extended_family
                 ),
-                (1, 0, 0xf, 0, 6)
+                (1, 0, 0xf, 0, 5)
             );
-            assert_eq!(eax, 0x0060_0f01);
+            assert_eq!(eax, 0x0050_0f01);
         }
 
         #[test]
@@ -1331,12 +1422,12 @@ mod sys_tests {
         }
 
         #[test]
-        fn leaf_7_subleaf_0_advertises_only_fsgsbase() {
+        fn leaf_7_subleaf_0_advertises_only_fsgsbase_and_speculation_control() {
             const FSGSBASE: u32 = 1 << 0;
             let mut h = blank();
             // EAX is the highest subleaf. ERMS and FSRM stay clear (see sys.rs), as do SMEP, SMAP,
             // PCID, BMI, AVX2 and everything else.
-            assert_eq!(cpuid(&mut h, 7, 0), [0, FSGSBASE, 0, 0]);
+            assert_eq!(cpuid(&mut h, 7, 0), [0, FSGSBASE, 0, STRUCTURED_EDX]);
         }
 
         #[test]
@@ -1467,7 +1558,7 @@ mod sys_tests {
             assert_eq!(eax & 0xff, 40);
             assert_eq!((eax >> 8) & 0xff, 48);
             assert_eq!(eax >> 16, 0);
-            assert_eq!((ebx, ecx, edx), (0, 0, 0));
+            assert_eq!((ebx, ecx, edx), (EXT_ADDRESS_EBX, 0, 0));
         }
 
         #[test]
@@ -1521,7 +1612,7 @@ mod sys_tests {
                 "hlt at CPL 3 is the only fault"
             );
             assert_eq!(h.cpu.rip, CODE_BASE + 2);
-            assert_eq!(h.cpu.gpr[RAX], 0x0060_0f01);
+            assert_eq!(h.cpu.gpr[RAX], 0x0050_0f01);
         }
 
         #[test]
@@ -1770,6 +1861,62 @@ mod sys_tests {
                 assert_gp0(h.cpu.rdmsr(msr));
                 assert_gp0(h.cpu.wrmsr(msr, 1));
             }
+        }
+
+        #[test]
+        fn spec_ctrl_stores_ibrs_stibp_ssbd_and_rejects_reserved_bits() {
+            let mut h = blank();
+            assert_eq!(h.cpu.rdmsr(MSR_SPEC_CTRL).unwrap(), 0);
+            h.cpu.wrmsr(MSR_SPEC_CTRL, 0b111).unwrap();
+            assert_eq!(h.cpu.rdmsr(MSR_SPEC_CTRL).unwrap(), 0b111);
+            assert_gp0(h.cpu.wrmsr(MSR_SPEC_CTRL, 1 << 3));
+            assert_eq!(h.cpu.rdmsr(MSR_SPEC_CTRL).unwrap(), 0b111);
+        }
+
+        #[test]
+        fn command_msrs_are_write_only_and_take_bit_zero() {
+            let mut h = blank();
+            for msr in [MSR_PRED_CMD, MSR_FLUSH_CMD] {
+                h.cpu.wrmsr(msr, 1).unwrap();
+                h.cpu.wrmsr(msr, 0).unwrap();
+                assert_gp0(h.cpu.wrmsr(msr, 2));
+                assert_gp0(h.cpu.rdmsr(msr));
+            }
+        }
+
+        #[test]
+        fn arch_capabilities_claims_immunity_and_is_read_only() {
+            let mut h = blank();
+            let value = h.cpu.rdmsr(MSR_ARCH_CAPABILITIES).unwrap();
+            // RSBA (bit 2) marks the CPU as vulnerable and must stay clear.
+            assert_eq!(value & (1 << 2), 0);
+            for bit in [
+                ARCH_CAP_RDCL_NO,
+                ARCH_CAP_IBRS_ALL,
+                ARCH_CAP_SSB_NO,
+                ARCH_CAP_MDS_NO,
+                ARCH_CAP_BHI_NO,
+            ] {
+                assert_ne!(value & bit, 0);
+            }
+            assert_gp0(h.cpu.wrmsr(MSR_ARCH_CAPABILITIES, 0));
+        }
+
+        #[test]
+        fn speculation_control_cpuid_bits_match_the_msrs() {
+            let mut h = blank();
+            let [_, _, _, edx] = cpuid(&mut h, 7, 0);
+            assert_eq!(edx, STRUCTURED_EDX);
+            let [_, ebx, _, _] = cpuid(&mut h, 0x8000_0008, 0);
+            assert_eq!(ebx, EXT_ADDRESS_EBX);
+        }
+
+        #[test]
+        fn cpu_family_is_not_one_linux_blacklists_for_retbleed() {
+            let mut h = blank();
+            let [eax, _, _, _] = cpuid(&mut h, 1, 0);
+            let family = ((eax >> 8) & 0xf) + ((eax >> 20) & 0xff);
+            assert_eq!(family, 0x14);
         }
 
         #[test]

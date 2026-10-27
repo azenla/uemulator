@@ -41,7 +41,7 @@ Interpreter and JIT both call the same `flags::compute_all(cc_op, dst, src, src2
 
 Start from the fork's identity (read `target/i386/cpu.c` "XTCG CPU" model for the exact leaves) and then **subtract** to what we implement. Initial advertised set:
 
-- Leaf 0/1: vendor AuthenticAMD (fork) family 0x15 model 0, FPU, VME no, PSE, TSC, MSR, PAE, CX8, SEP no (syscall only), MTRR, PGE, CMOV, PAT, PSE36 no, CLFLUSH, MMX, FXSR, SSE, SSE2; **APIC clear**, SSE3 later after implementing, **hypervisor bit clear**
+- Leaf 0/1: vendor AuthenticAMD family 0x14 (the fork says 0x15, but Linux blacklists 0x15 for RETBLEED and installs return thunks; see "Speculation control") model 0, FPU, VME no, PSE, TSC, MSR, PAE, CX8, SEP no (syscall only), MTRR, PGE, CMOV, PAT, PSE36 no, CLFLUSH, MMX, FXSR, SSE, SSE2; **APIC clear**, SSE3 later after implementing, **hypervisor bit clear**
 - Leaf 7 subleaf 0: only FSGSBASE (EBX bit 0); EAX = 0. No SMEP, SMAP, AVX2, BMI, ERMS/FSRM, PCID, LA57
 - Leaf 1 ECX: SSE3, PCLMULQDQ, SSSE3, CX16, SSE4.1, SSE4.2, MOVBE, POPCNT, AES; 0x80000001 ECX adds ABM (LZCNT). MONITOR/MWAIT, VMX/SVM, XSAVE/OSXSAVE, AVX, RDRAND and the hypervisor bit stay clear
 - Leaf 0x80000001: SYSCALL, NX, LM, (RDTSCP only if implemented)
@@ -63,3 +63,12 @@ Dispatch: `Cpu::sse` hands everything outside the `0F` map (0F 38, 0F 3A) and ev
 - FSGSBASE: F3 0F AE /0../3 register forms, gated by CR4.FSGSBASE (bit 16, accepted by mov cr4), canonical check on writes.
 
 Left out on purpose: ERMS/FSRM (the kernel would switch memcpy and clear_page to `rep movsb`/`stosb`, which `string_op` runs one byte per iteration instead of eight: advertise only together with a bulk fast path there), MONITOR/MWAIT, AVX/AVX2/BMI (VEX), RDRAND/RDSEED, XSAVE. The JIT runs all of the above through `helper_exec` (none is a block ender); `testkit::assert_jit_matches_interpreter` cases cover representative forms. Several encodings are prefix-dependent (F3 0F B8 POPCNT vs JMPE, F3 0F BD LZCNT vs BSR, F3 0F BC still BSF, 0F 38 F0/F1 MOVBE vs CRC32 by F2, F3 0F AE FSGSBASE vs the fences): any inline JIT lowering of the neighbouring opcodes must check `insn.rep` and `insn.p66`, or it silently diverges from the interpreter.
+
+
+## Speculation control (mitigations)
+
+The CPU is in-order and never speculates, so it says so, to keep the guest kernel from running mitigation code the emulator would have to interpret:
+
+- Leaf 7 EDX: SPEC_CTRL, STIBP, L1D_FLUSH, ARCH_CAPABILITIES, SSBD; leaf 0x80000008 EBX: IBPB, IBRS, STIBP, SSBD. MSRs: `IA32_SPEC_CTRL` (0x48, bits 0-2 stored, others #GP), `IA32_PRED_CMD` (0x49) and `IA32_FLUSH_CMD` (0x10b) write-only with bit 0 only, `IA32_ARCH_CAPABILITIES` (0x10a, read-only) with every `*_NO` bit Linux 6.18 checks plus IBRS_ALL (so Spectre v2 resolves to one-time "Enhanced IBRS", no retpolines) and BHI_NO (no BHB clearing loop on syscall entry). RSBA stays clear.
+- Family 0x14 rather than 0x15: `VULNBL_AMD` matches families 0x15-0x17,0x19,0x1a by number for RETBLEED/SRSO regardless of ARCH_CAPABILITIES, and the answer is an untrained-return thunk on every `ret`.
+- Check (Alpine 6.18 guest, `rdinit=/bin/sh`, cmdline without `mitigations=off`): every file in `/sys/devices/system/cpu/vulnerabilities` reads "Not affected" except `spectre_v2` ("Enhanced / Automatic IBRS", a single MSR write at boot) and `spectre_v1` (usercopy barriers). Before this change retbleed selected "untrained return thunk" and spectre_v2 was "Vulnerable" only because the quick cmdline passes `mitigations=off`.

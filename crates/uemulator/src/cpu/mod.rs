@@ -272,6 +272,8 @@ pub(crate) struct Cpu {
     /// IA32_KERNEL_GS_BASE, exchanged with the GS base by SWAPGS.
     pub kgsbase: u64,
     pub tsc_aux: u64,
+    /// IA32_SPEC_CTRL (stored, no speculation to control; see `SPEC_CTRL_WRITABLE` in sys.rs).
+    pub spec_ctrl: u64,
     pub pat: u64,
     /// IA32_SYSENTER_CS, _ESP, _EIP (MSRs 0x174..=0x176).
     pub sysenter: [u64; 3],
@@ -409,6 +411,7 @@ impl Cpu {
             sfmask: 0,
             kgsbase: 0,
             tsc_aux: 0,
+            spec_ctrl: 0,
             pat: PAT_POWER_ON_DEFAULT,
             sysenter: [0; 3],
             dr: [0, 0, 0, 0, 0, 0, DR6_RESET, DR7_RESET],
