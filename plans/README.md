@@ -17,5 +17,7 @@ Index. Read in order; each file ends with open questions where the answer needs 
 | 10-milestones.md | ordered milestones with observable exit criteria |
 | 11-storage-net-console.md | configurable RAM, virtio-pci disk/net/console (resize) |
 | 12-uefi.md | UEFI application, `no_std` port, hardware-MMU analysis |
+| 13-web.md | WebAssembly port |
+| 14-avx-and-virtualization.md | designs for AVX/AVX2/FMA, SVM and VMX (not implemented) |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. Zero crate dependencies.
