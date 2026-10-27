@@ -14,7 +14,7 @@ impl MachineConfig {
     pub fn clock(self, mode: ClockMode) -> Self;    // Virtual (default) | Realtime
     pub fn disk(self, d: Disk) -> Self;                 // raw image, virtio-blk (optional)
     pub fn net(self, mac: [u8; 6]) -> Self;             // virtio-net; frames via EmulatedMachine::net() (optional)
-    pub fn console(self, k: ConsoleKind) -> Self;       // Serial (default) | Virtio (resizable hvc0)
+    pub fn console(self, k: ConsoleKind) -> Self;       // Virtio (default, resizable hvc0) | Serial (ttyS0)
     pub fn reboot(self, on: bool) -> Self;              // true (default): guest reset restarts the machine in place; false: ExitReason::Reset
     pub fn log(self, f: impl Fn(&str) + Send + 'static) -> Self;
 }
@@ -58,6 +58,6 @@ impl ConsoleHandle {
 2. Sources: Debian trixie netboot (deb.debian.org), Alpine latest-stable `virt` netboot (dl-cdn.alpinelinux.org; boot.alpinelinux.org only hosts iPXE), Fedora 44 Server pxeboot. Downloads go to `<file>.part`, then `rename`. Skipped when cached and non-empty unless `--update`.
 3. Build config, start machine, pump stdin → console and console → stdout until exit; print `ExitReason`.
 
-Default cmdline: `console=ttyS0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1`.
+Default cmdline (`platform::DEFAULT_CMDLINE`, console `virtio`): `console=hvc0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1`; `DEFAULT_SERIAL_CMDLINE` swaps in `console=ttyS0` (`--console serial`, and the UEFI hardware-virtualization path whose `Platform` has no virtio). The Alpine virt kernel has no `earlyprintk`, so `quick alpine` adds `earlycon=uart8250,io,0x3f8` to keep the early log.
 
 Debug-profile interpreter is too slow for the decompressor; set `[profile.dev] opt-level = 3` in Cargo.toml and document `--release`.

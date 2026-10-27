@@ -84,6 +84,7 @@ enum Cmd {
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum ConsoleArg {
+    /// ttyS0 on the 16550; for kernels without a built-in virtio_console driver
     Serial,
     /// hvc0; the host terminal size is forwarded and follows resizes
     Virtio,
@@ -114,7 +115,7 @@ pub struct MachineArgs {
     #[arg(long, value_name = "LOCAL,REMOTE")]
     net_udp: Option<String>,
     /// Guest console device
-    #[arg(long, value_enum, default_value = "serial")]
+    #[arg(long, value_enum, default_value = "virtio")]
     console: ConsoleArg,
     /// End the run with "machine reset" when the guest resets instead of rebooting it in place
     #[arg(long)]
@@ -384,7 +385,7 @@ mod tests {
         assert_eq!(machine.net_udp, None);
         assert_eq!(machine.time, None);
         assert_eq!(machine.timeout, None);
-        assert!(matches!(machine.console, ConsoleArg::Serial));
+        assert!(matches!(machine.console, ConsoleArg::Virtio));
         for flag in [
             machine.net_user,
             machine.net_loop,

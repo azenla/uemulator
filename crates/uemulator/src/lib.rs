@@ -38,7 +38,7 @@ pub use machine::{
     ClockMode, ConsoleKind, EmulatedMachine, Error, ExitReason, JitMode, MachineConfig, StopHandle,
 };
 pub use netdev::NetHandle;
-pub use platform::{DEFAULT_CMDLINE, Platform, load_linux};
+pub use platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE, Platform, load_linux};
 
 #[cfg(test)]
 mod api_tests {
@@ -70,6 +70,7 @@ mod api_tests {
         let _: fn(MachineConfig, bool) -> MachineConfig = MachineConfig::reboot;
         let _: LoadLinux = load_linux;
         let _: &str = DEFAULT_CMDLINE;
+        let _: &str = DEFAULT_SERIAL_CMDLINE;
         let _: fn(ConsoleHandle) -> Platform = Platform::new;
     }
 

@@ -7,9 +7,15 @@ use crate::dev::guestmem::GuestMem;
 use crate::dev::{DevConfig, Devices};
 use crate::machine::Error;
 
-/// The default `EmulatedMachine` builds for a serial console. `machine.rs` formats its own copy
-/// of this string (with `hvc0` for a virtio console); keep the two in sync.
+/// The default `EmulatedMachine` builds for its default virtio console (`hvc0`); early boot text
+/// still comes from the 16550 through `earlyprintk`. A `Platform` has no virtio devices, so a host
+/// driving one needs `DEFAULT_SERIAL_CMDLINE`.
 pub const DEFAULT_CMDLINE: &str =
+    "console=hvc0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1";
+/// `DEFAULT_CMDLINE` with the console on the UART: what `EmulatedMachine` builds for
+/// `ConsoleKind::Serial` and what a `Platform` host must use. Differs from `DEFAULT_CMDLINE` only
+/// in the `console=` word (pinned by a test).
+pub const DEFAULT_SERIAL_CMDLINE: &str =
     "console=ttyS0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1";
 
 /// Lays out a bzImage, an optional initramfs, the command line, boot parameters, a GDT and
@@ -167,18 +173,24 @@ mod tests {
     }
 
     #[test]
-    fn default_command_line_matches_what_the_machine_builds() {
+    fn default_command_lines_differ_only_in_the_console_word() {
         assert_eq!(
             DEFAULT_CMDLINE,
-            "console=ttyS0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1"
+            "console=hvc0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1"
+        );
+        assert_eq!(
+            DEFAULT_SERIAL_CMDLINE,
+            DEFAULT_CMDLINE.replace("console=hvc0", "console=ttyS0")
         );
     }
 
     #[test]
     fn default_command_line_fits_every_kernels_minimum_limit() {
         // 2.06+ kernels advertise at least 255; the loader also needs room for the NUL.
-        assert!(DEFAULT_CMDLINE.len() < 255);
-        assert!(DEFAULT_CMDLINE.is_ascii());
+        for cmdline in [DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE] {
+            assert!(cmdline.len() < 255);
+            assert!(cmdline.is_ascii());
+        }
     }
 
     #[test]

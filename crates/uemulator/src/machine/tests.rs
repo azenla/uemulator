@@ -1,7 +1,7 @@
 use super::*;
 use crate::dev::Devices;
 use crate::disk::Disk;
-use crate::platform::DEFAULT_CMDLINE;
+use crate::platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE};
 use crate::testkit::{CODE_BASE, FakeKernel, Harness, fake_bzimage, run_machine};
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
@@ -442,11 +442,22 @@ mod twin_devices {
     }
 
     #[test]
-    fn a_machine_with_no_devices_has_an_empty_pci_bus() {
+    fn a_machine_with_a_serial_console_and_no_other_devices_has_an_empty_pci_bus() {
+        for jit in auto_and_off() {
+            assert_eq!(
+                probe(|config| config.console(ConsoleKind::Serial), jit),
+                expected_slots([NOTHING; 3]),
+                "{jit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_console_is_a_virtio_console_function() {
         for jit in auto_and_off() {
             assert_eq!(
                 probe(|config| config, jit),
-                expected_slots([NOTHING; 3]),
+                expected_slots([id_bytes(DEVICE_TYPE_CONSOLE), NOTHING, NOTHING]),
                 "{jit:?}"
             );
         }
@@ -472,7 +483,10 @@ mod twin_devices {
     fn a_disk_adds_a_block_function() {
         let disk = Disk::memory(vec![0; MIB]);
         assert_eq!(
-            probe(|config| config.disk(disk), JitMode::Off),
+            probe(
+                |config| config.console(ConsoleKind::Serial).disk(disk),
+                JitMode::Off
+            ),
             expected_slots([id_bytes(DEVICE_TYPE_BLOCK), NOTHING, NOTHING])
         );
     }
@@ -480,7 +494,10 @@ mod twin_devices {
     #[test]
     fn a_net_mac_adds_a_net_function() {
         assert_eq!(
-            probe(|config| config.net(MAC), JitMode::Off),
+            probe(
+                |config| config.console(ConsoleKind::Serial).net(MAC),
+                JitMode::Off
+            ),
             expected_slots([id_bytes(DEVICE_TYPE_NET), NOTHING, NOTHING])
         );
     }
@@ -541,7 +558,7 @@ mod config {
         assert_eq!(config.memory_mib, 512);
         assert!(config.disk.is_none());
         assert!(config.net_mac.is_none());
-        assert_eq!(config.console_kind, ConsoleKind::Serial);
+        assert_eq!(config.console_kind, ConsoleKind::Virtio);
         assert_eq!(config.jit, JitMode::Auto);
         assert_eq!(config.clock, ClockMode::Virtual);
         assert!(config.log.is_none());
@@ -619,7 +636,7 @@ mod config {
     fn enum_defaults() {
         assert_eq!(JitMode::default(), JitMode::Auto);
         assert_eq!(ClockMode::default(), ClockMode::Virtual);
-        assert_eq!(ConsoleKind::default(), ConsoleKind::Serial);
+        assert_eq!(ConsoleKind::default(), ConsoleKind::Virtio);
     }
 
     #[test]
@@ -867,18 +884,20 @@ mod guest_view {
     }
 
     #[test]
-    fn default_command_line_is_the_serial_one_from_platform() {
-        assert_eq!(printed_cmdline(|config| config), DEFAULT_CMDLINE);
+    fn default_command_line_is_the_virtio_one_from_platform() {
+        let printed = printed_cmdline(|config| config);
+        assert_eq!(printed, DEFAULT_CMDLINE);
+        assert!(printed.contains("console=hvc0"));
+        assert!(printed.contains("earlyprintk=serial,ttyS0"));
     }
 
     #[test]
-    fn default_command_line_for_a_virtio_console_names_hvc0() {
-        let expected = DEFAULT_CMDLINE.replace("console=ttyS0", "console=hvc0");
+    fn default_command_line_for_a_serial_console_names_ttys0() {
         assert_eq!(
-            printed_cmdline(|config| config.console(ConsoleKind::Virtio)),
-            expected
+            printed_cmdline(|config| config.console(ConsoleKind::Serial)),
+            DEFAULT_SERIAL_CMDLINE
         );
-        assert!(expected.contains("earlyprintk=serial,ttyS0"));
+        assert!(DEFAULT_SERIAL_CMDLINE.contains("console=ttyS0"));
     }
 
     #[test]
@@ -891,10 +910,12 @@ mod guest_view {
 
     #[test]
     fn explicit_command_line_ignores_the_console_kind() {
-        assert_eq!(
-            printed_cmdline(|config| config.cmdline("single").console(ConsoleKind::Virtio)),
-            "single"
-        );
+        for kind in [ConsoleKind::Serial, ConsoleKind::Virtio] {
+            assert_eq!(
+                printed_cmdline(|config| config.cmdline("single").console(kind)),
+                "single"
+            );
+        }
     }
 
     #[test]

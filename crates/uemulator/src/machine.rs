@@ -12,6 +12,7 @@ use crate::dev::DevConfig;
 #[cfg(not(target_os = "uefi"))]
 use crate::disk::Disk;
 use crate::netdev::NetHandle;
+use crate::platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE};
 use crate::sync::Arc;
 
 #[derive(Debug)]
@@ -85,9 +86,12 @@ pub enum ExitReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConsoleKind {
     /// 16550 UART at COM1 (`ttyS0`).
-    #[default]
     Serial,
     /// virtio-console (`hvc0`); the only kind that delivers `ConsoleHandle::resize` to the guest.
+    /// The default. The UART is present either way and carries early boot text (`earlyprintk`),
+    /// but this needs a kernel whose `virtio_console` driver is built in (an initrd that only
+    /// loads it as a module has no console until then); pick `Serial` for such kernels.
+    #[default]
     Virtio,
 }
 
@@ -135,7 +139,7 @@ impl Default for MachineConfig {
             #[cfg(not(target_os = "uefi"))]
             disk: None,
             net_mac: None,
-            console_kind: ConsoleKind::Serial,
+            console_kind: ConsoleKind::Virtio,
             jit: JitMode::Auto,
             clock: ClockMode::Virtual,
             log: None,
@@ -536,15 +540,12 @@ impl EmulatedMachine {
         }
         let mut ram = vec![0u8; cfg.memory_mib << BYTES_PER_MIB_SHIFT];
         let mut cmdline = cfg.cmdline.clone().unwrap_or_else(|| {
-            // Keep in sync with `platform::DEFAULT_CMDLINE`.
-            let console_device = if cfg.console_kind == ConsoleKind::Virtio {
-                "hvc0"
+            let default = if cfg.console_kind == ConsoleKind::Virtio {
+                DEFAULT_CMDLINE
             } else {
-                "ttyS0"
+                DEFAULT_SERIAL_CMDLINE
             };
-            format!(
-                "console={console_device} earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1"
-            )
+            default.to_string()
         });
         for extra in &cfg.cmdline_extra {
             cmdline.push(' ');

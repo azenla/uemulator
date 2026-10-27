@@ -47,6 +47,15 @@ fn parse_disk_spec(spec: &str) -> (&str, bool) {
     }
 }
 
+/// Always set on the config, never skipped for the "default": the library's own default is
+/// virtio, so leaving `--console serial` unapplied would silently give hvc0.
+fn console_kind(arg: ConsoleArg) -> ConsoleKind {
+    match arg {
+        ConsoleArg::Serial => ConsoleKind::Serial,
+        ConsoleArg::Virtio => ConsoleKind::Virtio,
+    }
+}
+
 fn network_requested(args: &MachineArgs) -> bool {
     args.net_loop || args.net_user || args.net_udp.is_some()
 }
@@ -131,9 +140,7 @@ fn build_config(
     if network_requested(args) {
         cfg = cfg.net(GUEST_MAC);
     }
-    if matches!(args.console, ConsoleArg::Virtio) {
-        cfg = cfg.console(ConsoleKind::Virtio);
-    }
+    cfg = cfg.console(console_kind(args.console));
     if let Some(t) = args.time {
         cfg = cfg.unix_time(t);
     }
@@ -307,6 +314,12 @@ mod tests {
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.borrow().clone()
         }
+    }
+
+    #[test]
+    fn each_console_argument_maps_to_its_own_kind() {
+        assert_eq!(console_kind(ConsoleArg::Serial), ConsoleKind::Serial);
+        assert_eq!(console_kind(ConsoleArg::Virtio), ConsoleKind::Virtio);
     }
 
     #[test]
