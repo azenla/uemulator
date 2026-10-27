@@ -44,7 +44,7 @@ Start from the fork's identity (read `target/i386/cpu.c` "XTCG CPU" model for th
 - Leaf 0/1: vendor AuthenticAMD family 0x14 (the fork says 0x15, but Linux blacklists 0x15 for RETBLEED and installs return thunks; see "Speculation control") model 0, FPU, VME no, PSE, TSC, MSR, PAE, CX8, SEP no (syscall only), MTRR, PGE, CMOV, PAT, PSE36 no, CLFLUSH, MMX, FXSR, SSE, SSE2; **APIC clear**, SSE3 later after implementing, **hypervisor bit clear**
 - Leaf 7 subleaf 0: only FSGSBASE (EBX bit 0); EAX = 0. No SMEP, SMAP, AVX2, BMI, ERMS/FSRM, PCID, LA57
 - Leaf 1 ECX: SSE3, PCLMULQDQ, SSSE3, CX16, SSE4.1, SSE4.2, MOVBE, POPCNT, AES; 0x80000001 ECX adds ABM (LZCNT). MONITOR/MWAIT, VMX/SVM, XSAVE/OSXSAVE, AVX, RDRAND and the hypervisor bit stay clear
-- Leaf 0x80000001: SYSCALL, NX, LM, (RDTSCP only if implemented)
+- Leaf 0x80000001: SYSCALL, NX, LM, (RDTSCP)
 - Leaf 0x80000007: invariant TSC set so the kernel trusts the TSC
 - XSAVE/OSXSAVE (x87+SSE components only) and RDRAND/RDSEED are advertised, see "XSAVE and RDRAND". No AVX
 
@@ -88,3 +88,7 @@ The CPU is in-order and never speculates, so it says so, to keep the guest kerne
 `cpu/bmi.rs` (CPUID.7.0:EBX bits 3 and 8): andn, bextr, blsi, blsmsk, blsr, bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx plus tzcnt in `exec.rs`. They are LZ (VEX.L set is #UD); rorx also needs vvvv = 1111. Flag behavior: andn/blsr/blsmsk/blsi/bzhi set ZF, SF, PF from the result and clear OF; CF is "source is zero" (blsr, blsmsk), "source is non-zero" (blsi) and "index > width-1" (bzhi); bextr clears CF/OF and sets ZF only; mulx, pdep, pext, rorx and the shifts leave all flags alone. Shift counts are masked to width-1, and mulx writes the low half first so the high half wins when both destinations are the same register. AF/PF are architecturally undefined for the ones that set flags; ours are 0/computed as noted. Tests (`bmi.rs`) compare against independent reference models over a spread of edge values, and `jit/diff_alu.rs::bmi_instructions` pins JIT = interpreter.
 
 Anything else VEX-encoded (all vector forms, vzeroupper) is still #UD and logged once: AVX is not advertised.
+
+## RDTSCP
+
+`0F 01 F9`, advertised in 0x80000001 EDX bit 27: EDX:EAX = TSC (same CR4.TSD rule as rdtsc), ECX = IA32_TSC_AUX. Linux uses it for `rdpid`-less CPU/node lookup in the vDSO.

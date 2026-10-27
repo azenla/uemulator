@@ -1211,3 +1211,9 @@ fn bmi_instructions() {
         });
     }
 }
+
+#[test]
+fn rdtscp_matches() {
+    // rdtscp; hlt
+    check_with(&[0x0f, 0x01, 0xf9, 0xf4], |h| h.cpu.tsc_aux = 0x77);
+}

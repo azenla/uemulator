@@ -348,6 +348,8 @@ const CPUID_EXT_ALIASED_EDX: u32 = FEATURE_FPU
     | FEATURE_FXSR;
 const EXT_FEATURE_SYSCALL: u32 = 1 << 11;
 const EXT_FEATURE_NX: u32 = 1 << 20;
+/// rdtscp: rdtsc plus IA32_TSC_AUX in ECX.
+const EXT_FEATURE_RDTSCP: u32 = 1 << 27;
 const EXT_FEATURE_LONG_MODE: u32 = 1 << 29;
 /// Leaf 0x8000_0001 ECX bit 0: LAHF/SAHF in 64-bit mode.
 const EXT_FEATURE_LAHF_LM: u32 = 1 << 0;
@@ -432,6 +434,7 @@ impl Cpu {
                 EXT_FEATURE_LAHF_LM | EXT_FEATURE_ABM,
                 EXT_FEATURE_SYSCALL
                     | EXT_FEATURE_NX
+                    | EXT_FEATURE_RDTSCP
                     | EXT_FEATURE_LONG_MODE
                     | (CPUID_LEAF1_EDX & CPUID_EXT_ALIASED_EDX),
             ),
@@ -864,6 +867,7 @@ impl Cpu {
         const MODRM_SWAPGS: u8 = 0xf8;
         const MODRM_XGETBV: u8 = 0xd0;
         const MODRM_XSETBV: u8 = 0xd1;
+        const MODRM_RDTSCP: u8 = 0xf9;
         let reg = i.reg & 7;
         if i.op == OP_GROUP6 {
             let loc = self.modrm_location(i, next);
@@ -909,6 +913,16 @@ impl Cpu {
                 }
                 MODRM_XGETBV => self.xgetbv()?,
                 MODRM_XSETBV => self.xsetbv()?,
+                // Same CR4.TSD rule as rdtsc; ECX = IA32_TSC_AUX (zero-extended), EDX:EAX = TSC.
+                MODRM_RDTSCP => {
+                    if self.cr4 & CR4_TSD != 0 && self.cpl != 0 {
+                        return Err(Exception::general_protection(0));
+                    }
+                    let tsc = self.tsc();
+                    self.gpr[RAX] = tsc & 0xffff_ffff;
+                    self.gpr[RDX] = tsc >> 32;
+                    self.gpr[RCX] = self.tsc_aux & 0xffff_ffff;
+                }
                 _ => return Err(self.unimplemented_opcode(i)),
             }
             self.rip = next;
@@ -1575,20 +1589,19 @@ mod sys_tests {
         fn extended_leaf_1_edx_has_syscall_nx_long_mode_and_the_amd_aliases() {
             let mut h = blank();
             let [_, _, _, edx] = cpuid(&mut h, 0x8000_0001, 0);
-            // SYSCALL NX LM, then the aliased FPU TSC MSR PAE CX8 PGE CMOV PAT MMX FXSR
-            let expected = bits(&[11, 20, 29, 0, 4, 5, 6, 8, 13, 15, 16, 23, 24]);
+            // SYSCALL NX RDTSCP LM, then the aliased FPU TSC MSR PAE CX8 PGE CMOV PAT MMX FXSR
+            let expected = bits(&[11, 20, 27, 29, 0, 4, 5, 6, 8, 13, 15, 16, 23, 24]);
             assert_eq!(edx, expected, "{edx:#034b}");
-            assert_eq!(edx, 0x2191_a971);
+            assert_eq!(edx, 0x2991_a971);
         }
 
         #[test]
-        fn extended_leaf_1_edx_has_no_mmxext_page1gb_rdtscp_or_3dnow() {
+        fn extended_leaf_1_edx_has_no_mmxext_page1gb_or_3dnow() {
             let mut h = blank();
             let [_, _, _, edx] = cpuid(&mut h, 0x8000_0001, 0);
             for (bit, name) in [
                 (22, "MMXEXT"),
                 (26, "PDPE1GB"),
-                (27, "RDTSCP"),
                 (30, "3DNOWEXT"),
                 (31, "3DNOW"),
             ] {
@@ -2153,14 +2166,12 @@ mod sys_tests {
         }
 
         #[test]
-        fn rdpmc_sysenter_sysexit_and_rdtscp_are_not_implemented() {
-            let codes: [&[u8]; 4] = [
+        fn rdpmc_sysenter_and_sysexit_are_not_implemented() {
+            let codes: [&[u8]; 3] = [
                 // rdpmc; hlt
                 &[0x0f, 0x33, 0xf4],
                 // sysenter; hlt
                 &[0x0f, 0x34, 0xf4],
-                // rdtscp; hlt
-                &[0x0f, 0x01, 0xf9, 0xf4],
                 // .byte 0x0f, 0x35; hlt
                 &[0x0f, 0x35, 0xf4],
             ];
@@ -2172,6 +2183,50 @@ mod sys_tests {
 
     mod rdtsc {
         use super::*;
+
+        const RDTSCP: &[u8] = &[0x0f, 0x01, 0xf9, 0xf4];
+
+        #[test]
+        fn rdtscp_returns_the_time_stamp_and_tsc_aux() {
+            let h = run_ok(RDTSCP, |h| {
+                h.cpu.tsc_aux = 0x1_2345_6789;
+                h.cpu.gpr[RAX] = u64::MAX;
+                h.cpu.gpr[RDX] = u64::MAX;
+            });
+            assert_eq!(
+                h.cpu.gpr[RCX], 0x2345_6789,
+                "TSC_AUX zero-extended into ECX"
+            );
+            assert_eq!(h.cpu.gpr[RAX] >> 32, 0);
+            assert_eq!(h.cpu.gpr[RDX] >> 32, 0);
+            assert_ne!(h.cpu.gpr[RAX] | h.cpu.gpr[RDX], 0);
+        }
+
+        #[test]
+        fn rdtscp_obeys_cr4_tsd_like_rdtsc() {
+            let (_, stop) = run_with(RDTSCP, |h| {
+                user_mode(h);
+                h.cpu.cr4 |= CR4_TSD;
+            });
+            assert_eq!(
+                stop,
+                Stop::Fault {
+                    vector: 13,
+                    error_code: Some(0),
+                    software: false
+                }
+            );
+            let (h, stop) = run_with(RDTSCP, |h| h.cpu.cr4 |= CR4_TSD);
+            assert_eq!(stop, Stop::Halted, "CPL 0 is exempt");
+            assert_ne!(h.cpu.rip, 0);
+        }
+
+        #[test]
+        fn extended_leaf_1_advertises_rdtscp() {
+            let mut h = blank();
+            let [_, _, _, edx] = cpuid(&mut h, 0x8000_0001, 0);
+            assert_ne!(edx & (1 << 27), 0);
+        }
 
         #[test]
         fn rdtsc_returns_the_virtual_clock_in_edx_eax_and_zero_extends() {
