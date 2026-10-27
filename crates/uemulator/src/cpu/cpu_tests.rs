@@ -588,17 +588,66 @@ mod before_step {
     }
 
     #[test]
-    fn halted_cpu_with_interrupts_masked_by_if_only_idles() {
+    fn halted_cpu_with_interrupts_disabled_is_shut_down_even_with_an_irq_pending() {
         let mut h = with_idt();
         h.cpu.next_event = 1_000;
         init_pics(&mut h.cpu);
         h.cpu.eflags = RESERVED_ONE;
         h.cpu.halted = true;
         h.cpu.dev.pic.raise(1);
-        // Something is pending, so idling does not sleep: the host should poll again at once.
+        // Only NMI, SMI, INIT and RESET wake `cli; hlt`, and none of them exists here.
+        assert!(matches!(
+            h.cpu.before_step(),
+            BeforeStep::Exit(ExitReason::Shutdown)
+        ));
+        assert!(h.cpu.halted);
+        assert_eq!(h.cpu.rip, OLD_RIP);
+    }
+
+    #[test]
+    fn halted_cpu_with_interrupts_enabled_and_an_irq_pending_idles_without_sleeping() {
+        let mut h = with_idt();
+        h.cpu.next_event = 1_000;
+        init_pics(&mut h.cpu);
+        // The interrupt shadow keeps the pending IRQ from being delivered this step, but IF is
+        // set, so the halt is not terminal.
+        h.cpu.interrupt_shadow = true;
+        h.cpu.halted = true;
+        h.cpu.dev.pic.raise(1);
         assert!(matches!(h.cpu.before_step(), BeforeStep::Idled));
         assert!(h.cpu.halted);
         assert_eq!(h.cpu.rip, OLD_RIP);
+    }
+
+    #[test]
+    fn a_reset_request_beats_the_shutdown_of_a_halt_with_interrupts_disabled() {
+        let mut h = with_idt();
+        h.cpu.next_event = 1_000;
+        h.cpu.eflags = RESERVED_ONE;
+        h.cpu.halted = true;
+        h.cpu.dev.io_out(
+            KEYBOARD_CONTROLLER_COMMAND_PORT,
+            1,
+            KEYBOARD_CONTROLLER_RESET,
+            0,
+        );
+        assert!(matches!(
+            h.cpu.before_step(),
+            BeforeStep::Exit(ExitReason::Reset)
+        ));
+    }
+
+    #[test]
+    fn a_stop_request_beats_the_shutdown_of_a_halt_with_interrupts_disabled() {
+        let mut h = with_idt();
+        h.cpu.next_event = 1_000;
+        h.cpu.eflags = RESERVED_ONE;
+        h.cpu.halted = true;
+        h.cpu.stop.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            h.cpu.before_step(),
+            BeforeStep::Exit(ExitReason::Stopped)
+        ));
     }
 
     #[test]
@@ -638,7 +687,6 @@ mod before_step {
         program_pit_channel0(&mut h.cpu, 1000);
         let deadline = h.cpu.dev.next_deadline(0).unwrap();
         h.cpu.halted = true;
-        h.cpu.eflags = RESERVED_ONE;
         assert!(matches!(h.cpu.before_step(), BeforeStep::Idled));
         assert_eq!(h.cpu.idle_skipped_ns, deadline);
         assert_eq!(h.cpu.now_ns(), deadline);
@@ -647,8 +695,7 @@ mod before_step {
             h.cpu.dev.pic.has_pending(),
             "the timer fired during the skip"
         );
-        // With IF set the next step takes the timer interrupt and wakes up.
-        h.cpu.eflags = RESERVED_ONE | IF;
+        // The next step takes the timer interrupt and wakes up.
         assert!(matches!(h.cpu.before_step(), BeforeStep::Execute));
         assert!(!h.cpu.halted);
         assert_eq!(h.cpu.rip, handler_for(IRQ_VECTOR_BASE));
@@ -662,7 +709,6 @@ mod before_step {
         program_pit_channel0(&mut h.cpu, 100);
         let deadline = h.cpu.dev.next_deadline(0).unwrap();
         h.cpu.halted = true;
-        h.cpu.eflags = RESERVED_ONE;
         let started = std::time::Instant::now();
         assert!(matches!(h.cpu.before_step(), BeforeStep::Idled));
         assert!(started.elapsed() >= std::time::Duration::from_nanos(deadline));
@@ -678,7 +724,6 @@ mod before_step {
         // 65536 ticks of the 1.19 MHz clock is about 55 ms.
         program_pit_channel0(&mut h.cpu, 0);
         h.cpu.halted = true;
-        h.cpu.eflags = RESERVED_ONE;
         assert!(matches!(h.cpu.before_step(), BeforeStep::Idled));
         assert_eq!(h.cpu.idle_skipped_ns, MAX_SLEEP_NS);
     }
@@ -1171,8 +1216,10 @@ mod verification_helpers {
         if !main.enable_jit() {
             return;
         }
-        // The main CPU idles while the shadow is ready to execute.
+        // The main CPU idles (IF set, so the halt is not a shutdown) while the shadow is ready
+        // to execute.
         main.cpu.halted = true;
+        main.cpu.eflags |= IF;
         main.cpu.next_event = u64::MAX;
         shadow.cpu.next_event = u64::MAX;
         let reason = main.cpu.run_verify(&mut shadow.cpu);

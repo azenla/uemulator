@@ -43,7 +43,7 @@ impl ConsoleHandle {
 ## Rules
 
 - `new` does all fallible setup (parse bzImage, allocate RAM, probe JIT) so `start` failing is rare.
-- Guest shutdown is a value (`ExitReason`), never a process exit. Triple fault and 0x64←0xFE / port 0xCF9 reset map to `Reset`/`TripleFault` so automated runs terminate.
+- Guest shutdown is a value (`ExitReason`), never a process exit. `hlt` with IF=0 (nothing can wake it; with `acpi=off` this is how Linux poweroff/halt ends, `cli; hlt` in `stop_this_cpu`) is `Shutdown`; a triple fault is `TripleFault`, so automated runs terminate. A reset request (0x64←0xFE, 0x92 bit 0, 0xCF9 RST_CPU) wins over a `hlt` right after it.
 - Console is a plain byte stream backed by bounded queues; output with no reader drops oldest beyond a cap rather than blocking the guest.
 - Stdio bridging (raw tty, Ctrl-C) lives in `crates/uemulator-cli`, not the library.
 - No networking in the library. The CLI downloads with ureq.

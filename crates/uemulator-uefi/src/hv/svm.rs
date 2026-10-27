@@ -495,8 +495,12 @@ impl Vcpu for Svm {
         self.read_u64(VMCB_SAVE_RIP)
     }
 
-    fn irq_ok(&self) -> bool {
+    fn interrupts_enabled(&self) -> bool {
         self.read_u64(VMCB_SAVE_RFLAGS) & arch::RFLAGS_IF != 0
+    }
+
+    fn irq_ok(&self) -> bool {
+        self.interrupts_enabled()
             && self.read_u64(VMCB_INTERRUPT_SHADOW) & INTERRUPT_SHADOW == 0
             && self.event.is_none()
     }

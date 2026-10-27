@@ -65,9 +65,10 @@ pub enum ClockMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitReason {
-    /// Reserved, never produced by this emulator: there is no ACPI or power-off device, so a
-    /// guest can only end by `Reset`, `TripleFault` or the host's `stop()`. Kept so the variant
-    /// set in `plans/01-api.md` stays source-compatible.
+    /// The guest executed `hlt` with interrupts disabled (IF=0), which nothing can wake: with
+    /// `acpi=off` that is how Linux's poweroff and halt end (`cli; hlt` in a loop). There is no
+    /// ACPI or power-off device, so this is the only power-off signal. A reset request made just
+    /// before the `hlt` wins and is reported as `Reset`.
     Shutdown,
     /// The guest asked for a reset through the keyboard controller (port 0x64), fast A20 (0x92)
     /// or reset control (0xcf9) port; see `dev/mod.rs`. Kernels reboot on panic with `panic=-1`,

@@ -122,6 +122,9 @@ pub trait Vcpu {
     /// Moves the guest past the instruction behind the last exit.
     fn skip(&mut self);
     fn rip(&self) -> u64;
+    /// The guest's IF flag, regardless of any interrupt shadow or queued event. A `hlt` with it
+    /// clear can never be woken by a maskable interrupt.
+    fn interrupts_enabled(&self) -> bool;
     /// The guest can take an external interrupt now: IF set, no STI or MOV SS shadow, and no other
     /// event already queued.
     fn irq_ok(&self) -> bool;
@@ -288,11 +291,29 @@ fn wrmsr_value(rax: u64, rdx: u64) -> u64 {
     (rdx << 32) | (rax & u32::MAX as u64)
 }
 
+/// What a halted guest does next.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum HltOutcome {
+    Wake,
+    Sleep,
+    /// `cli; hlt`: nothing can wake it, the guest has powered off.
+    PowerOff,
+}
+
 /// Whether a halted guest resumes. Like hardware, a maskable interrupt only wakes it when it could
-/// be taken (IF set, no interrupt shadow, nothing else queued): `cli; hlt` sleeps until reset. A
-/// device interrupt that stays pending behind IF=0 is delivered after a later STI.
-fn hlt_should_wake(vcpu: &dyn Vcpu, irq_pending: bool, reset_requested: bool) -> bool {
-    reset_requested || (irq_pending && vcpu.irq_ok())
+/// be taken (IF set, no interrupt shadow, nothing else queued). A reset request always wakes it
+/// (the event loop then returns it). With IF clear and no reset the guest is dead, as in the
+/// emulator's `Cpu::idle`: Linux's poweroff and halt end in `cli; hlt` loops, and no NMI source
+/// exists here. Only IF decides, not the shadow: `sti; hlt` has IF set once the exit ended the
+/// shadow, and a device interrupt pending behind IF=0 never wakes the guest.
+fn hlt_outcome(vcpu: &dyn Vcpu, irq_pending: bool, reset_requested: bool) -> HltOutcome {
+    if reset_requested || (irq_pending && vcpu.irq_ok()) {
+        HltOutcome::Wake
+    } else if vcpu.interrupts_enabled() {
+        HltOutcome::Sleep
+    } else {
+        HltOutcome::PowerOff
+    }
 }
 
 #[cfg(target_os = "uefi")]
@@ -427,10 +448,11 @@ fn event_loop(
                     let now = clock.now_ns();
                     platform.tick(now, ram.bytes());
                     poll_console(console);
-                    if hlt_should_wake(vcpu, platform.irq_pending(), platform.reset_requested()) {
-                        break;
+                    match hlt_outcome(vcpu, platform.irq_pending(), platform.reset_requested()) {
+                        HltOutcome::Wake => break,
+                        HltOutcome::PowerOff => return Ok(ExitReason::Shutdown),
+                        HltOutcome::Sleep => boot::stall(HLT_POLL_INTERVAL),
                     }
-                    boot::stall(HLT_POLL_INTERVAL);
                 }
             }
             Exit::TripleFault => return Ok(ExitReason::TripleFault),
@@ -779,26 +801,30 @@ mod tests {
         assert_eq!(result, Err("out of tables".into()));
     }
 
-    // Idle wake-up.
+    // Idle wake-up and power-off.
 
     #[test]
     fn a_pending_interrupt_wakes_a_halted_guest_that_can_take_it() {
         let vcpu = FakeVcpu::with_interrupts(true);
-        assert!(hlt_should_wake(&vcpu, true, false));
+        assert_eq!(hlt_outcome(&vcpu, true, false), HltOutcome::Wake);
     }
 
     #[test]
     fn a_pending_interrupt_does_not_wake_a_guest_halted_with_interrupts_off() {
         let vcpu = FakeVcpu::with_interrupts(false);
-        assert!(!hlt_should_wake(&vcpu, true, false));
+        assert_eq!(hlt_outcome(&vcpu, true, false), HltOutcome::PowerOff);
     }
 
     #[test]
-    fn without_a_pending_interrupt_the_guest_stays_halted() {
-        for interrupts in [true, false] {
-            let vcpu = FakeVcpu::with_interrupts(interrupts);
-            assert!(!hlt_should_wake(&vcpu, false, false));
-        }
+    fn without_a_pending_interrupt_a_guest_with_interrupts_on_stays_halted() {
+        let vcpu = FakeVcpu::with_interrupts(true);
+        assert_eq!(hlt_outcome(&vcpu, false, false), HltOutcome::Sleep);
+    }
+
+    #[test]
+    fn a_guest_halted_with_interrupts_off_and_nothing_pending_is_powered_off() {
+        let vcpu = FakeVcpu::with_interrupts(false);
+        assert_eq!(hlt_outcome(&vcpu, false, false), HltOutcome::PowerOff);
     }
 
     #[test]
@@ -806,16 +832,16 @@ mod tests {
         for interrupts in [true, false] {
             for pending in [true, false] {
                 let vcpu = FakeVcpu::with_interrupts(interrupts);
-                assert!(hlt_should_wake(&vcpu, pending, true));
+                assert_eq!(hlt_outcome(&vcpu, pending, true), HltOutcome::Wake);
             }
         }
     }
 
     #[test]
-    fn an_interrupt_shadow_defers_the_wake_up() {
+    fn an_interrupt_shadow_defers_the_wake_up_but_is_not_a_power_off() {
         let mut vcpu = FakeVcpu::with_interrupts(true);
         vcpu.interrupt_shadow = true;
-        assert!(!hlt_should_wake(&vcpu, true, false));
+        assert_eq!(hlt_outcome(&vcpu, true, false), HltOutcome::Sleep);
     }
 
     #[test]
@@ -823,14 +849,14 @@ mod tests {
         let mut vcpu = FakeVcpu::with_interrupts(true);
         vcpu.interrupt_shadow = true;
         vcpu.skip();
-        assert!(hlt_should_wake(&vcpu, true, false));
+        assert_eq!(hlt_outcome(&vcpu, true, false), HltOutcome::Wake);
     }
 
     #[test]
-    fn an_event_already_queued_for_injection_defers_the_wake_up() {
+    fn an_event_already_queued_for_injection_defers_the_wake_up_but_is_not_a_power_off() {
         let mut vcpu = FakeVcpu::with_interrupts(true);
         vcpu.inject_ud();
-        assert!(!hlt_should_wake(&vcpu, true, false));
+        assert_eq!(hlt_outcome(&vcpu, true, false), HltOutcome::Sleep);
     }
 
     // Layout.

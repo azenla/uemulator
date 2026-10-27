@@ -26,11 +26,13 @@ const EXIT_MACHINE_FAILURE: i32 = 2;
 
 const EXIT_CODES_HELP: &str = "\
 Exit codes:
-  0  the machine ended by itself (guest reset or shutdown), or was stopped with Ctrl-] or --timeout
+  0  the machine ended by itself (guest power-off, or reset with --no-reboot), or was stopped
+     with Ctrl-] or --timeout
   1  setup failed (bad arguments, unreadable file, download failure, rejected configuration)
   2  the machine failed: guest triple fault or emulator-internal error (e.g. --verify divergence)";
 
-/// Maps how the machine ended to the process exit status. A reset counts as success because Linux
+/// Maps how the machine ended to the process exit status. A power-off is how a guest finishes
+/// cleanly; a reset only reaches here with `--no-reboot` and counts as success because Linux
 /// guests reboot on panic with `panic=-1` and a clean reboot is how an installer finishes.
 /// Stopping the machine (Ctrl-] or `--timeout`) is a deliberate host action, so it is success too;
 /// callers that need to tell a timeout from a normal end can run without `--timeout`.

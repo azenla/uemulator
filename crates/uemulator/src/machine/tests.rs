@@ -34,6 +34,9 @@ const SPIN: [u8; 2] = [0xeb, 0xfe];
 // mov dx, 0x3f8; mov al, 'k'; out dx, al; cli; hlt
 const PRINT_THEN_HALT_WITH_INTERRUPTS_OFF: [u8; 9] =
     [0x66, 0xba, 0xf8, 0x03, 0xb0, 0x6b, 0xee, 0xfa, 0xf4];
+// mov dx, 0x3f8; mov al, 'k'; out dx, al; sti; hlt: with no timer or input nothing ever wakes it,
+// but it is waiting, not dead.
+const PRINT_THEN_STI_HALT: [u8; 9] = [0x66, 0xba, 0xf8, 0x03, 0xb0, 0x6b, 0xee, 0xfb, 0xf4];
 // mov eax, 0x8000; lidt [rax]; int3: an empty IDT, so delivering #BP escalates to a triple fault.
 const NULL_IDT_THEN_INT3: [u8; 9] = [0xb8, 0x00, 0x80, 0x00, 0x00, 0x0f, 0x01, 0x18, 0xcc];
 
@@ -1218,11 +1221,32 @@ mod exits {
     }
 
     #[test]
-    fn a_halted_guest_with_interrupts_off_runs_until_stopped() {
+    fn a_halted_guest_with_interrupts_off_is_powered_off() {
         for jit in auto_and_off() {
-            let run = run_spinning(&PRINT_THEN_HALT_WITH_INTERRUPTS_OFF, jit);
+            let run = run_guest(&PRINT_THEN_HALT_WITH_INTERRUPTS_OFF, jit);
+            assert_eq!(run.exit, ExitReason::Shutdown, "{jit:?}");
+            assert_eq!(run.console_output, [ALIVE_MARKER], "{jit:?}");
+        }
+    }
+
+    #[test]
+    fn sti_then_hlt_waits_for_an_interrupt_instead_of_powering_off() {
+        // `sti` leaves a one-instruction interrupt shadow, but IF is set when `hlt` runs.
+        for jit in auto_and_off() {
+            let run = run_spinning(&PRINT_THEN_STI_HALT, jit);
             assert_eq!(run.exit, ExitReason::Stopped, "{jit:?}");
             assert_eq!(run.console_output, [ALIVE_MARKER], "{jit:?}");
+        }
+    }
+
+    #[test]
+    fn a_reset_written_before_a_halt_with_interrupts_off_is_a_reset_not_a_power_off() {
+        for jit in auto_and_off() {
+            assert_eq!(
+                run_guest(&HELLO_RESET, jit).exit,
+                ExitReason::Reset,
+                "{jit:?}"
+            );
         }
     }
 
@@ -1382,14 +1406,14 @@ mod exits {
     }
 
     #[test]
-    fn exit_reasons_the_machine_produces_are_reset_stopped_triple_fault_and_internal() {
+    fn exit_reasons_the_machine_produces_are_reset_shutdown_stopped_and_triple_fault() {
         let produced = [
             run_guest(&HELLO_RESET, JitMode::Off).exit,
             run_guest(&FAST_A20_RESET, JitMode::Off).exit,
             run_guest(&RESET_CONTROL_RESET, JitMode::Off).exit,
             run_guest(&NULL_IDT_THEN_INT3, JitMode::Off).exit,
             run_spinning(&SPIN, JitMode::Off).exit,
-            run_spinning(&PRINT_THEN_HALT_WITH_INTERRUPTS_OFF, JitMode::Off).exit,
+            run_guest(&PRINT_THEN_HALT_WITH_INTERRUPTS_OFF, JitMode::Off).exit,
             new_machine(&HELLO_RESET).wait(),
         ];
         let names: Vec<_> = produced.iter().map(variant_name).collect();
@@ -1401,12 +1425,10 @@ mod exits {
                 "reset",
                 "triple fault",
                 "stopped",
-                "stopped",
+                "shutdown",
                 "stopped"
             ]
         );
-        // `Shutdown` is reserved: there is no ACPI or power-off device to produce it.
-        assert!(!produced.contains(&ExitReason::Shutdown));
     }
 
     #[test]
@@ -1564,10 +1586,10 @@ mod clock {
     }
 
     #[test]
-    fn a_halt_with_interrupts_off_and_no_timer_idles_in_both_modes_until_stopped() {
+    fn a_halt_with_interrupts_on_and_no_timer_idles_in_both_modes_until_stopped() {
         for clock in [ClockMode::Virtual, ClockMode::Realtime] {
             let run = run_machine(
-                fake_bzimage(&PRINT_THEN_HALT_WITH_INTERRUPTS_OFF),
+                fake_bzimage(&PRINT_THEN_STI_HALT),
                 JitMode::Off,
                 WATCHDOG_LIMIT,
                 |config| config.clock(clock),

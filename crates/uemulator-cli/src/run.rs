@@ -146,6 +146,18 @@ fn build_config(
     Ok(cfg)
 }
 
+/// The line printed when the machine ends: a guest power-off and a guest reset (only seen with
+/// `--no-reboot`) read differently from a host stop or a failure.
+pub(crate) fn exit_message(reason: &ExitReason) -> String {
+    match reason {
+        ExitReason::Shutdown => "machine powered off".to_string(),
+        ExitReason::Reset => "machine reset".to_string(),
+        ExitReason::Stopped => "machine stopped".to_string(),
+        ExitReason::TripleFault => "machine failed: guest triple fault".to_string(),
+        ExitReason::Internal(message) => format!("machine failed: {message}"),
+    }
+}
+
 /// Runs the machine to its end and reports why it ended. `Err` is a setup failure; the machine's
 /// own failures come back as an `ExitReason` for `main` to map to a status.
 pub fn run(
@@ -220,7 +232,7 @@ pub fn run(
         stty(&[&saved]);
     }
     let reason = reason?;
-    eprintln!("machine exited: {reason:?}");
+    eprintln!("{}", exit_message(&reason));
     Ok(reason)
 }
 
@@ -294,6 +306,21 @@ mod tests {
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.borrow().clone()
         }
+    }
+
+    #[test]
+    fn every_exit_reason_prints_a_distinct_message() {
+        assert_eq!(exit_message(&ExitReason::Shutdown), "machine powered off");
+        assert_eq!(exit_message(&ExitReason::Reset), "machine reset");
+        assert_eq!(exit_message(&ExitReason::Stopped), "machine stopped");
+        assert_eq!(
+            exit_message(&ExitReason::TripleFault),
+            "machine failed: guest triple fault"
+        );
+        assert_eq!(
+            exit_message(&ExitReason::Internal("jit divergence".into())),
+            "machine failed: jit divergence"
+        );
     }
 
     #[test]
