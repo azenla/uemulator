@@ -576,13 +576,17 @@ fn phminposuw(src: u128) -> u128 {
     minimum as u128 | ((index as u128) << 16)
 }
 
+const MPSADBW_SOURCE_BLOCK_MASK: u8 = 3;
+const MPSADBW_DESTINATION_BLOCK_SHIFT: u32 = 2;
+
 /// mpsadbw: eight sums of absolute differences between a sliding 4-byte window of the
 /// destination and one fixed 4-byte block of the source. imm8 bits 1:0 pick the source block and
 /// bit 2 the destination's first window start, both in units of four bytes.
 fn mpsadbw(dst: u128, src: u128, selector: u8) -> u128 {
     const BLOCK_BYTES: usize = 4;
-    let source_start = (selector & 3) as usize * BLOCK_BYTES;
-    let destination_start = ((selector >> 2) & 1) as usize * BLOCK_BYTES;
+    let source_start = (selector & MPSADBW_SOURCE_BLOCK_MASK) as usize * BLOCK_BYTES;
+    let destination_start =
+        ((selector >> MPSADBW_DESTINATION_BLOCK_SHIFT) & 1) as usize * BLOCK_BYTES;
     let mut result = 0;
     for window in 0..u16::N {
         let sum: u16 = (0..BLOCK_BYTES)
@@ -692,13 +696,16 @@ fn round_lanes(
     result
 }
 
+const DOT_PRODUCT_MASK_SHIFT: u32 = 4;
+const DOT_OUTPUT_MASK: u8 = 0xf;
+
 /// dpps/dppd: imm8 bits 7:4 pick which products take part, bits 3:0 which result lanes receive the
 /// sum (the others are zeroed). The sum is `(p0 + p1) + (p2 + p3)` with unselected products as
 /// +0.0, the order the SDM pseudocode gives.
 fn dot_product(fp: &mut FpEnv, double: bool, dst: u128, src: u128, selector: u8) -> u128 {
     let format = if double { DOUBLE } else { SINGLE };
-    let product_mask = selector >> 4;
-    let output_mask = selector & 0xf;
+    let product_mask = selector >> DOT_PRODUCT_MASK_SHIFT;
+    let output_mask = selector & DOT_OUTPUT_MASK;
     let mut products = [format.zero(false); 4];
     for (lane, product) in products.iter_mut().enumerate().take(format.lanes()) {
         if (product_mask >> lane) & 1 != 0 {
@@ -740,16 +747,21 @@ fn insert_lane(dst: u128, kind: LaneKind, selector: u8, value: u64, wide: bool) 
     (dst & !lane_mask) | (((value as u128) << shift) & lane_mask)
 }
 
+const INSERTPS_SOURCE_SHIFT: u32 = 6;
+const INSERTPS_DESTINATION_SHIFT: u32 = 4;
+const INSERTPS_LANE_MASK: u8 = 3;
+const INSERTPS_ZERO_MASK: u8 = 0xf;
+
 /// insertps: imm8 bits 7:6 pick the source dword (register form only, the m32 form always uses
 /// its one dword), bits 5:4 the destination dword it replaces, bits 3:0 zero result dwords.
 fn insertps(dst: u128, src: u128, selector: u8, from_memory: bool) -> u128 {
     let source_lane = if from_memory {
         0
     } else {
-        (selector >> 6) as usize
+        (selector >> INSERTPS_SOURCE_SHIFT) as usize
     };
-    let destination_lane = ((selector >> 4) & 3) as u32;
-    let zero_mask = selector & 0xf;
+    let destination_lane = ((selector >> INSERTPS_DESTINATION_SHIFT) & INSERTPS_LANE_MASK) as u32;
+    let zero_mask = selector & INSERTPS_ZERO_MASK;
     let mut result = dst & !(LOW_32 << (destination_lane * 32));
     result |= (u32::get(src, source_lane) as u128) << (destination_lane * 32);
     for lane in 0..u32::N {

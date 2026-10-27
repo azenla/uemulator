@@ -225,7 +225,8 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
 /// Leaf 7 subleaf 0 EBX bit 0: rdfsbase, rdgsbase, wrfsbase, wrgsbase. ERMS/FSRM (bits 9 and 4)
 /// stay clear on purpose: they make the kernel's memcpy and clear_page use `rep movsb`/`rep stosb`,
 /// which this interpreter runs one byte per iteration, while the `rep movsq` it uses today moves
-/// eight. Advertise them only together with a bulk fast path in `Cpu::string_op`.
+/// eight. Measured with ERMS set: the no-initrd Alpine boot went from 5.0 s to 5.5-6.0 s. Advertise
+/// them only together with a bulk fast path in `Cpu::string_op`.
 const STRUCTURED_FEATURE_FSGSBASE: u32 = 1 << 0;
 
 /// Leaf 0x8000_0001 EDX repeats this subset of the leaf 1 bits (the AMD aliases); DE and PSE

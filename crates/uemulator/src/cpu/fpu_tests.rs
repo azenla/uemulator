@@ -1102,8 +1102,10 @@ mod integer_conversions {
     }
 
     #[test]
-    fn fisttp_register_forms_are_invalid() {
-        // fld1, then the /1 register encodings of dd and df, which are not instructions.
+    fn dd_and_df_slash_1_register_encodings_stay_invalid() {
+        // fld1, then DD C8 and DF C8. fisttp has no register form; hardware treats these as
+        // undocumented FXCH aliases, which this emulator does not implement (it raises #UD), and
+        // this pins that rather than architectural behavior.
         for opcode in [0xdd, 0xdf] {
             let code = program(&[&[0xd9, 0xe8], &[opcode, 0xc8]]);
             let (_, stop) = run_with(&code, |_| {});
