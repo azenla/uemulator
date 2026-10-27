@@ -187,6 +187,8 @@ const CPUID_LEAF1_EDX: u32 = FEATURE_FPU
 // MONITOR/MWAIT, VMX/SVM, XSAVE/OSXSAVE, AVX, RDRAND and the hypervisor bit stay clear.
 /// SSE3: movddup, movshdup, movsldup, lddqu, addsub*, hadd*, hsub*, and x87 fisttp.
 const FEATURE_SSE3: u32 = 1 << 0;
+/// PCLMULQDQ.
+const FEATURE_PCLMULQDQ: u32 = 1 << 1;
 /// CMPXCHG16B.
 const FEATURE_CX16: u32 = 1 << 13;
 /// SSSE3, XMM forms only (the MMX forms are #UD, see `sse_ext.rs`).
@@ -195,8 +197,16 @@ const FEATURE_SSE4_1: u32 = 1 << 19;
 /// SSE4.2: pcmpgtq, CRC32 and the pcmp[ei]str[im] string instructions.
 const FEATURE_SSE4_2: u32 = 1 << 20;
 const FEATURE_POPCNT: u32 = 1 << 23;
-const CPUID_LEAF1_ECX: u32 =
-    FEATURE_SSE3 | FEATURE_SSSE3 | FEATURE_CX16 | FEATURE_SSE4_1 | FEATURE_SSE4_2 | FEATURE_POPCNT;
+/// AES-NI: aesenc, aesenclast, aesdec, aesdeclast, aesimc, aeskeygenassist.
+const FEATURE_AES: u32 = 1 << 25;
+const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
+    | FEATURE_PCLMULQDQ
+    | FEATURE_SSSE3
+    | FEATURE_CX16
+    | FEATURE_SSE4_1
+    | FEATURE_SSE4_2
+    | FEATURE_POPCNT
+    | FEATURE_AES;
 
 /// Leaf 0x8000_0001 EDX repeats this subset of the leaf 1 bits (the AMD aliases); DE and PSE
 /// are not mirrored.

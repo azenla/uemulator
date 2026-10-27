@@ -333,7 +333,7 @@ fn decode_sse42_op(map: u16, opcode: u8) -> Option<Op> {
             explicit: false,
             mask_output: false,
         },
-        _ => return None,
+        _ => return decode_crypto_op(map, opcode),
     })
 }
 
@@ -455,6 +455,50 @@ fn horizontal(fp: &mut FpEnv, format: Format, subtract: bool, dst: u128, src: u1
         lane_put(&mut result, format, pair, bits);
     }
     result
+}
+
+/// AES-NI and PCLMULQDQ.
+fn decode_crypto_op(map: u16, opcode: u8) -> Option<Op> {
+    Some(match (map, opcode) {
+        (OPCODE_MAP_0F38, 0xdb) => Op::Unary(crypto::aes_inverse_mix_columns),
+        (OPCODE_MAP_0F38, 0xdc) => {
+            Op::Binary(|state, key| crypto::aes_encrypt_round(state, key, false))
+        }
+        (OPCODE_MAP_0F38, 0xdd) => {
+            Op::Binary(|state, key| crypto::aes_encrypt_round(state, key, true))
+        }
+        (OPCODE_MAP_0F38, 0xde) => {
+            Op::Binary(|state, key| crypto::aes_decrypt_round(state, key, false))
+        }
+        (OPCODE_MAP_0F38, 0xdf) => {
+            Op::Binary(|state, key| crypto::aes_decrypt_round(state, key, true))
+        }
+        // The old destination does not take part: the immediate is the round constant.
+        (OPCODE_MAP_0F3A, 0xdf) => {
+            Op::WithImm(|_, source, constant| crypto::aes_key_generation_assist(source, constant))
+        }
+        (OPCODE_MAP_0F3A, 0x44) => Op::WithImm(pclmulqdq),
+        _ => return None,
+    })
+}
+
+/// pclmulqdq immediate: bit 0 picks the high quadword of the destination operand, bit 4 that of
+/// the source; the other bits are ignored (the pclmul{l,h}q{l,h}qdq aliases are 0x00/0x01/0x10/0x11).
+const PCLMUL_DESTINATION_HIGH: u8 = 1 << 0;
+const PCLMUL_SOURCE_HIGH: u8 = 1 << 4;
+
+fn pclmulqdq(dst: u128, src: u128, selector: u8) -> u128 {
+    let quadword = |value: u128, high: bool| {
+        if high {
+            (value >> 64) as u64
+        } else {
+            value as u64
+        }
+    };
+    crypto::carry_less_multiply(
+        quadword(dst, selector & PCLMUL_DESTINATION_HIGH != 0),
+        quadword(src, selector & PCLMUL_SOURCE_HIGH != 0),
+    )
 }
 
 /// pmuldq: signed product of dwords 0 and 2 of each operand, as two qwords.

@@ -2650,6 +2650,337 @@ mod sse42 {
     }
 }
 
+mod crypto_instructions {
+    use super::*;
+
+    /// A block written the way FIPS-197 prints it: byte 0 first.
+    fn block(hex: &str) -> u128 {
+        let bytes: Vec<u8> = (0..hex.len() / 2)
+            .map(|k| u8::from_str_radix(&hex[2 * k..2 * k + 2], 16).unwrap())
+            .collect();
+        u128::from_le_bytes(bytes.try_into().unwrap())
+    }
+
+    fn exec_imm(rig: &mut Rig, asm: &str, imm: u8) -> Stop {
+        let mut bytes = code(asm).to_vec();
+        let last = bytes.len() - 2;
+        bytes[last] = imm;
+        rig.exec_bytes(&bytes)
+    }
+
+    /// AES-128 key expansion built from `aeskeygenassist`, `pshufd`, `pslldq` and `pxor` executed
+    /// by the emulator, the way the Linux and OpenSSL AES-NI code does it.
+    fn expand_key(rig: &mut Rig, key: u128) -> [u128; 11] {
+        const ROUND_CONSTANTS: [u8; 10] =
+            [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
+        let mut keys = [0u128; 11];
+        keys[0] = key;
+        rig.h.cpu.xmm[1] = key;
+        rig.reset();
+        for (round, &constant) in ROUND_CONSTANTS.iter().enumerate() {
+            assert_eq!(
+                exec_imm(rig, "aeskeygenassist xmm2, xmm1, 0", constant),
+                Stop::Halted
+            );
+            assert_eq!(rig.exec("pshufd xmm2, xmm2, 255"), Stop::Halted);
+            assert_eq!(
+                rig.exec(
+                    "movdqa xmm3, xmm1; pslldq xmm3, 4; pxor xmm1, xmm3; pslldq xmm3, 4; pxor xmm1, xmm3; pslldq xmm3, 4; pxor xmm1, xmm3; pxor xmm1, xmm2"
+                ),
+                Stop::Halted
+            );
+            keys[round + 1] = rig.h.cpu.xmm[1];
+        }
+        keys
+    }
+
+    fn encrypt(rig: &mut Rig, keys: &[u128; 11], plaintext: u128) -> u128 {
+        rig.h.cpu.xmm[0] = plaintext;
+        rig.h.cpu.xmm[4] = keys[0];
+        rig.reset();
+        assert_eq!(rig.exec("pxor xmm0, xmm4"), Stop::Halted);
+        for key in &keys[1..10] {
+            rig.h.cpu.xmm[4] = *key;
+            assert_eq!(rig.exec("aesenc xmm0, xmm4"), Stop::Halted);
+        }
+        rig.h.cpu.xmm[4] = keys[10];
+        assert_eq!(rig.exec("aesenclast xmm0, xmm4"), Stop::Halted);
+        rig.h.cpu.xmm[0]
+    }
+
+    /// The equivalent inverse cipher: the middle round keys go through aesimc.
+    fn decrypt(rig: &mut Rig, keys: &[u128; 11], ciphertext: u128) -> u128 {
+        rig.h.cpu.xmm[0] = ciphertext;
+        rig.h.cpu.xmm[4] = keys[10];
+        rig.reset();
+        assert_eq!(rig.exec("pxor xmm0, xmm4"), Stop::Halted);
+        for key in keys[1..10].iter().rev() {
+            rig.h.cpu.xmm[4] = *key;
+            assert_eq!(rig.exec("aesimc xmm5, xmm4"), Stop::Halted);
+            rig.h.cpu.xmm[4] = rig.h.cpu.xmm[5];
+            assert_eq!(rig.exec("aesdec xmm0, xmm4"), Stop::Halted);
+        }
+        rig.h.cpu.xmm[4] = keys[0];
+        assert_eq!(rig.exec("aesdeclast xmm0, xmm4"), Stop::Halted);
+        rig.h.cpu.xmm[0]
+    }
+
+    #[test]
+    fn aeskeygenassist_matches_the_fips_197_key_expansion_step() {
+        let mut rig = Rig::new();
+        // Appendix A.1: w3 = 09cf4f3c gives temp = SubWord(RotWord(w3)) ^ Rcon[1] = 8b84eb01.
+        let key = block("2b7e151628aed2a6abf7158809cf4f3c");
+        rig.h.cpu.xmm[1] = key;
+        rig.reset();
+        assert_eq!(
+            exec_imm(&mut rig, "aeskeygenassist xmm0, xmm1, 0", 0x01),
+            Stop::Halted
+        );
+        let result = rig.h.cpu.xmm[0].to_le_bytes();
+        assert_eq!(
+            result[12..16],
+            [0x8b, 0x84, 0xeb, 0x01],
+            "RotWord(SubWord(X3)) ^ rcon"
+        );
+        assert_eq!(result[8..12], [0x01, 0x8a, 0x84, 0xeb], "SubWord(X3)");
+        // X1 = 28aed2a6 under the S-box is 34e4b524, and RotWord moves the first byte last; the
+        // round constant is XORed into the first byte of the result.
+        assert_eq!(result[0..4], [0x34, 0xe4, 0xb5, 0x24], "SubWord(X1)");
+        assert_eq!(
+            result[4..8],
+            [0xe4 ^ 0x01, 0xb5, 0x24, 0x34],
+            "RotWord(SubWord(X1)) ^ rcon"
+        );
+        // The memory form reads an aligned m128 and ignores the old destination.
+        rig.h.cpu.xmm[0] = u128::MAX;
+        rig.h.write(DATA, &key.to_le_bytes());
+        rig.reset();
+        assert_eq!(
+            exec_imm(&mut rig, "aeskeygenassist xmm0, [rsi], 0", 0x01),
+            Stop::Halted
+        );
+        assert_eq!(rig.h.cpu.xmm[0].to_le_bytes(), result);
+    }
+
+    #[test]
+    fn one_aesenc_round_matches_the_fips_197_appendix_b_walkthrough() {
+        let mut rig = Rig::new();
+        // Round 1: start of round, then SubBytes, ShiftRows, MixColumns and the round key.
+        let state = block("193de3bea0f4e22b9ac68d2ae9f84808");
+        let round_key = block("a0fafe1788542cb123a339392a6c7605");
+        assert_eq!(
+            rig.op("aesenc xmm0, xmm1", state, round_key),
+            block("a49c7ff2689f352b6b5bea43026a5049")
+        );
+        assert_eq!(
+            rig.op_mem("aesenc xmm0, [rsi]", state, round_key),
+            block("a49c7ff2689f352b6b5bea43026a5049")
+        );
+        // With a zero key the result is exactly MixColumns(ShiftRows(SubBytes(state))).
+        assert_eq!(
+            rig.op("aesenc xmm0, xmm1", state, 0),
+            block("046681e5e0cb199a48f8d37a2806264c")
+        );
+        // aesenclast skips MixColumns: ShiftRows(SubBytes(state)).
+        assert_eq!(
+            rig.op("aesenclast xmm0, xmm1", state, 0),
+            block("d4bf5d30e0b452aeb84111f11e2798e5")
+        );
+        assert_eq!(
+            rig.op_mem("aesenclast xmm0, [rsi]", state, 0),
+            block("d4bf5d30e0b452aeb84111f11e2798e5")
+        );
+    }
+
+    #[test]
+    fn aesdeclast_and_aesimc_invert_the_fips_197_round_steps() {
+        let mut rig = Rig::new();
+        // The same Appendix B round: InvShiftRows then InvSubBytes undoes ShiftRows/SubBytes, and
+        // InvMixColumns undoes MixColumns.
+        let shifted = block("d4bf5d30e0b452aeb84111f11e2798e5");
+        let mixed = block("046681e5e0cb199a48f8d37a2806264c");
+        let round_input = block("193de3bea0f4e22b9ac68d2ae9f84808");
+        assert_eq!(rig.op("aesdeclast xmm0, xmm1", shifted, 0), round_input);
+        assert_eq!(
+            rig.op_mem("aesdeclast xmm0, [rsi]", shifted, 0),
+            round_input
+        );
+        assert_eq!(rig.op("aesimc xmm0, xmm1", !0, mixed), shifted);
+        assert_eq!(rig.op_mem("aesimc xmm0, [rsi]", !0, mixed), shifted);
+    }
+
+    #[test]
+    fn aesimc_undoes_the_mixcolumns_that_aesenc_applies() {
+        let mut rig = Rig::new();
+        // aesdeclast(y, 0) = InvSub(InvShift(y)), so aesenc(that, 0) = MixColumns(y); aesimc must
+        // bring back y. This holds for arbitrary y, which pins InvMixColumns against MixColumns
+        // and the inverse S-box against the S-box.
+        for &y in &vectors() {
+            let pre_image = rig.op("aesdeclast xmm0, xmm1", y, 0);
+            let mixed = rig.op("aesenc xmm0, xmm1", pre_image, 0);
+            assert_eq!(rig.op("aesimc xmm0, xmm1", 0, mixed), y, "{y:#x}");
+        }
+    }
+
+    #[test]
+    fn aes_128_matches_the_fips_197_vectors() {
+        let mut rig = Rig::new();
+        // Appendix B.
+        let keys = expand_key(&mut rig, block("2b7e151628aed2a6abf7158809cf4f3c"));
+        assert_eq!(keys[1], block("a0fafe1788542cb123a339392a6c7605"));
+        assert_eq!(keys[10], block("d014f9a8c9ee2589e13f0cc8b6630ca6"));
+        let plaintext = block("3243f6a8885a308d313198a2e0370734");
+        let ciphertext = block("3925841d02dc09fbdc118597196a0b32");
+        assert_eq!(encrypt(&mut rig, &keys, plaintext), ciphertext);
+        assert_eq!(decrypt(&mut rig, &keys, ciphertext), plaintext);
+        // Appendix C.1.
+        let keys = expand_key(&mut rig, block("000102030405060708090a0b0c0d0e0f"));
+        let plaintext = block("00112233445566778899aabbccddeeff");
+        let ciphertext = block("69c4e0d86a7b0430d8cdb78070b4c55a");
+        assert_eq!(encrypt(&mut rig, &keys, plaintext), ciphertext);
+        assert_eq!(decrypt(&mut rig, &keys, ciphertext), plaintext);
+    }
+
+    #[test]
+    fn aes_memory_operands_must_be_aligned() {
+        let mut rig = Rig::new();
+        for asm in [
+            "aesenc xmm0, [rsi]",
+            "aesenclast xmm0, [rsi]",
+            "aesdec xmm0, [rsi]",
+            "aesdeclast xmm0, [rsi]",
+            "aesimc xmm0, [rsi]",
+            "pclmulqdq xmm0, [rsi], 0",
+            "aeskeygenassist xmm0, [rsi], 0",
+        ] {
+            rig.reset();
+            rig.h.cpu.gpr[RSI] = DATA + 8;
+            assert_eq!(rig.exec(asm), gp0(), "{asm}");
+        }
+    }
+
+    /// Carry-less product by polynomial convolution over bit arrays: a formulation that shares no
+    /// code with the shift-and-xor loop in the implementation.
+    fn reference_product(a: u64, b: u64) -> u128 {
+        let mut coefficients = [false; 128];
+        for i in 0..64 {
+            for j in 0..64 {
+                if (a >> i) & 1 != 0 && (b >> j) & 1 != 0 {
+                    coefficients[i + j] ^= true;
+                }
+            }
+        }
+        coefficients
+            .iter()
+            .enumerate()
+            .fold(0u128, |acc, (k, &set)| acc | ((set as u128) << k))
+    }
+
+    #[test]
+    fn pclmulqdq_is_a_carry_less_multiply_of_the_selected_quadwords() {
+        let mut rig = Rig::new();
+        let all = vectors();
+        for imm in [0x00u8, 0x01, 0x10, 0x11] {
+            for (index, &dst) in all.iter().enumerate() {
+                let src = all[(index * 3 + 1) % all.len()];
+                let a = qwords_of(dst)[(imm & 1) as usize];
+                let b = qwords_of(src)[((imm >> 4) & 1) as usize];
+                rig.h.cpu.xmm[0] = dst;
+                rig.h.cpu.xmm[1] = src;
+                rig.reset();
+                assert_eq!(
+                    exec_imm(&mut rig, "pclmulqdq xmm0, xmm1, 0", imm),
+                    Stop::Halted
+                );
+                assert_eq!(
+                    rig.h.cpu.xmm[0],
+                    reference_product(a, b),
+                    "imm {imm:#x} {dst:#x} {src:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pclmulqdq_known_products_and_properties() {
+        let mut rig = Rig::new();
+        let product = |rig: &mut Rig, a: u64, b: u64| -> u128 {
+            rig.h.cpu.xmm[0] = a as u128;
+            rig.h.cpu.xmm[1] = b as u128;
+            rig.reset();
+            assert_eq!(exec_imm(rig, "pclmulqdq xmm0, xmm1, 0", 0), Stop::Halted);
+            rig.h.cpu.xmm[0]
+        };
+        assert_eq!(product(&mut rig, 0x1234, 1), 0x1234);
+        assert_eq!(product(&mut rig, 0x1234, 2), 0x2468);
+        assert_eq!(product(&mut rig, 3, 3), 5, "(x+1)^2 = x^2 + 1");
+        assert_eq!(product(&mut rig, 0, u64::MAX), 0);
+        // Squaring spreads the bits: no carries, so all-ones squares to 0x5555...
+        assert_eq!(
+            product(&mut rig, u64::MAX, u64::MAX),
+            0x5555_5555_5555_5555_5555_5555_5555_5555
+        );
+        assert_eq!(product(&mut rig, 1 << 63, 1 << 63), 1 << 126);
+        // (x^4 + x^3 + x + 1) * x^63 = x^67 + x^66 + x^64 + x^63
+        assert_eq!(
+            product(&mut rig, 0x1b, 1 << 63),
+            (1u128 << 67) ^ (1 << 66) ^ (1 << 64) ^ (1 << 63)
+        );
+        // Immediate bits other than 0 and 4 are ignored.
+        rig.h.cpu.xmm[0] = lanes64([5, 9]);
+        rig.h.cpu.xmm[1] = lanes64([7, 11]);
+        rig.reset();
+        assert_eq!(
+            exec_imm(&mut rig, "pclmulqdq xmm0, xmm1, 0", 0xee),
+            Stop::Halted
+        );
+        // 0b101 * 0b111 = 0b111 ^ (0b111 << 2) = 0b11011
+        assert_eq!(rig.h.cpu.xmm[0], 0b11011, "low quadword of both operands");
+    }
+
+    #[test]
+    fn enable_rules_apply() {
+        let mut rig = Rig::new();
+        for asm in [
+            "aesenc xmm0, xmm1",
+            "aesimc xmm0, xmm1",
+            "aeskeygenassist xmm0, xmm1, 0",
+            "pclmulqdq xmm0, xmm1, 0",
+        ] {
+            rig.reset();
+            rig.h.cpu.cr4 &= !CR4_OSFXSR;
+            assert_eq!(rig.exec(asm), ud(), "{asm} without OSFXSR");
+            rig.reset();
+            rig.h.cpu.cr0 |= CR0_EM;
+            assert_eq!(rig.exec(asm), ud(), "{asm} with CR0.EM");
+            rig.reset();
+            rig.h.cpu.cr0 |= CR0_TS;
+            assert_eq!(rig.exec(asm), nm(), "{asm} with CR0.TS");
+        }
+    }
+
+    #[test]
+    fn jit_matches_the_interpreter() {
+        for asm in [
+            "aesenc xmm0, xmm1",
+            "aesenclast xmm0, [rsi]",
+            "aesdec xmm0, xmm1",
+            "aesdeclast xmm0, xmm1",
+            "aesimc xmm0, xmm1",
+            "aeskeygenassist xmm0, xmm1, 0",
+            "pclmulqdq xmm0, xmm1, 0",
+        ] {
+            assert_jit_matches_interpreter(code(asm), |h| {
+                h.cpu.cr4 |= CR4_OSFXSR;
+                h.cpu.gpr[RSI] = DATA;
+                h.cpu.xmm[0] = block("00112233445566778899aabbccddeeff");
+                h.cpu.xmm[1] = block("0f1571c947d9e8590cb7add6af7f6798");
+                h.write(DATA, &h.cpu.xmm[1].to_le_bytes());
+            });
+        }
+    }
+}
+
 const SNIPPETS: &[(&str, &[u8])] = &[
     ("movddup xmm0, xmm1", &[0xf2, 0x0f, 0x12, 0xc1, 0xf4]),
     ("movddup xmm0, [rsi]", &[0xf2, 0x0f, 0x12, 0x06, 0xf4]),
@@ -3216,5 +3547,72 @@ const SNIPPETS: &[(&str, &[u8])] = &[
         ".byte 0x66, 0x0f, 0x38, 0xf0, 0xc3",
         &[0x66, 0x0f, 0x38, 0xf0, 0xc3, 0xf4],
     ),
+    ("aesenc xmm0, xmm1", &[0x66, 0x0f, 0x38, 0xdc, 0xc1, 0xf4]),
+    ("aesenc xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0xdc, 0x06, 0xf4]),
+    (
+        "aesenclast xmm0, xmm1",
+        &[0x66, 0x0f, 0x38, 0xdd, 0xc1, 0xf4],
+    ),
+    (
+        "aesenclast xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0xdd, 0x06, 0xf4],
+    ),
+    ("aesdec xmm0, xmm1", &[0x66, 0x0f, 0x38, 0xde, 0xc1, 0xf4]),
+    ("aesdec xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0xde, 0x06, 0xf4]),
+    (
+        "aesdeclast xmm0, xmm1",
+        &[0x66, 0x0f, 0x38, 0xdf, 0xc1, 0xf4],
+    ),
+    (
+        "aesdeclast xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0xdf, 0x06, 0xf4],
+    ),
+    ("aesimc xmm0, xmm1", &[0x66, 0x0f, 0x38, 0xdb, 0xc1, 0xf4]),
+    ("aesimc xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0xdb, 0x06, 0xf4]),
+    (
+        "aeskeygenassist xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0xdf, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "aeskeygenassist xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0xdf, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "pclmulqdq xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x44, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "pclmulqdq xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x44, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "aeskeygenassist xmm2, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0xdf, 0xd1, 0x00, 0xf4],
+    ),
+    (
+        "pshufd xmm2, xmm2, 255",
+        &[0x66, 0x0f, 0x70, 0xd2, 0xff, 0xf4],
+    ),
+    (
+        "movdqa xmm3, xmm1; pslldq xmm3, 4; pxor xmm1, xmm3; pslldq xmm3, 4; pxor xmm1, xmm3; pslldq xmm3, 4; pxor xmm1, xmm3; pxor xmm1, xmm2",
+        &[
+            0x66, 0x0f, 0x6f, 0xd9, 0x66, 0x0f, 0x73, 0xfb, 0x04, 0x66, 0x0f, 0xef, 0xcb, 0x66,
+            0x0f, 0x73, 0xfb, 0x04, 0x66, 0x0f, 0xef, 0xcb, 0x66, 0x0f, 0x73, 0xfb, 0x04, 0x66,
+            0x0f, 0xef, 0xcb, 0x66, 0x0f, 0xef, 0xca, 0xf4,
+        ],
+    ),
+    ("pxor xmm0, xmm4", &[0x66, 0x0f, 0xef, 0xc4, 0xf4]),
+    ("aesenc xmm0, xmm4", &[0x66, 0x0f, 0x38, 0xdc, 0xc4, 0xf4]),
+    (
+        "aesenclast xmm0, xmm4",
+        &[0x66, 0x0f, 0x38, 0xdd, 0xc4, 0xf4],
+    ),
+    ("aesimc xmm5, xmm4", &[0x66, 0x0f, 0x38, 0xdb, 0xec, 0xf4]),
+    ("aesdec xmm0, xmm4", &[0x66, 0x0f, 0x38, 0xde, 0xc4, 0xf4]),
+    (
+        "aesdeclast xmm0, xmm4",
+        &[0x66, 0x0f, 0x38, 0xdf, 0xc4, 0xf4],
+    ),
+    ("aesimc xmm2, xmm1", &[0x66, 0x0f, 0x38, 0xdb, 0xd1, 0xf4]),
     // SNIPPETS-END
 ];
