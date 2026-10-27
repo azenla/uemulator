@@ -11,6 +11,7 @@ mod fpu;
 pub(crate) mod mem;
 mod protection;
 mod sse;
+mod svm;
 mod sys;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -284,6 +285,8 @@ pub(crate) struct Cpu {
     pub spec_ctrl: u64,
     /// XCR0, the enabled extended-state components (xgetbv/xsetbv). Bit 0 (x87) is always set.
     pub xcr0: u64,
+    /// AMD SVM: host/guest switching state (see `svm.rs`).
+    pub svm: svm::Svm,
     /// MONITOR address and whether a monitor is armed for the next MWAIT.
     pub monitor_address: u64,
     pub monitor_armed: bool,
@@ -434,6 +437,7 @@ impl Cpu {
             tsc_aux: 0,
             spec_ctrl: 0,
             xcr0: xsave::XCR0_X87,
+            svm: svm::Svm::new(),
             monitor_address: 0,
             monitor_armed: false,
             rng_state: DEFAULT_RANDOM_SEED,
@@ -511,7 +515,7 @@ impl Cpu {
 
     /// The TSC is just guest time in nanoseconds.
     pub fn tsc(&self) -> u64 {
-        self.now_ns()
+        self.now_ns().wrapping_add(self.svm_tsc_offset())
     }
 
     /// Logs `msg` at most once per `key`. Callers keep their key ranges disjoint by adding the
@@ -568,7 +572,10 @@ impl Cpu {
             return BeforeStep::Exit(reason);
         }
         // has_pending() is a cheap pre-check; pending_interrupt() does the acknowledge.
+        // A guest may intercept physical interrupts (and takes its virtual ones) before the host does.
+        self.svm_before_step();
         if self.eflags & flags::IF != 0
+            && self.svm.gif
             && !self.interrupt_shadow
             && self.dev.pic.has_pending()
             && let Some(vector) = self.pending_interrupt()
@@ -595,8 +602,17 @@ impl Cpu {
                 vector,
                 error_code,
                 software,
-            }) => self.deliver_event(vector, error_code, software),
+            }) => {
+                if self.svm_exception_exit(vector, error_code, software) {
+                    return None;
+                }
+                match self.deliver_event(vector, error_code, software) {
+                    Some(ExitReason::TripleFault) if self.svm_shutdown_exit() => None,
+                    other => other,
+                }
+            }
             Err(Exception::Exit(reason)) => Some(reason),
+            Err(Exception::Vmexit) => None,
         }
     }
 

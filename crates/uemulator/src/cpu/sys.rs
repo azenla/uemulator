@@ -111,8 +111,10 @@ const CR4_SUPPORTED: u64 = CR4_TSD
     | CR4_SMEP
     | CR4_SMAP;
 
+pub(super) const CR4_SUPPORTED_BITS: u64 = CR4_SUPPORTED;
+
 /// Address widths reported by CPUID 0x8000_0008. CR3 and the canonical-address checks follow them.
-const PHYSICAL_ADDRESS_BITS: u32 = 40;
+pub(super) const PHYSICAL_ADDRESS_BITS: u32 = 40;
 const VIRTUAL_ADDRESS_BITS: u32 = 48;
 
 /// CR3 bits kept on write: physical address bits 51:12 plus PWT (bit 3) and PCD (bit 4).
@@ -123,6 +125,7 @@ const CR3_MASK: u64 = 0x000f_ffff_ffff_f018;
 const CR3_NO_FLUSH: u64 = 1 << 63;
 /// CR3 bits kept with CR4.PCIDE: the address plus the whole 12-bit PCID.
 const CR3_MASK_PCID: u64 = 0x000f_ffff_ffff_ffff;
+pub(super) const CR3_RESERVED_BITS: u64 = CR3_RESERVED;
 const CR3_RESERVED: u64 = !0u64 << PHYSICAL_ADDRESS_BITS;
 /// CR8 holds the 4-bit task priority; it is stored but no APIC consumes it. Higher bits are
 /// reserved.
@@ -147,8 +150,8 @@ const DEBUG_REGISTER_COUNT: usize = 8;
 pub(crate) const EFER_SCE: u64 = 1 << 0;
 /// wrmsr to EFER faults if any bit outside this set is 1. LMA is accepted in the value but
 /// never stored: it is recomputed from CR0.PG and EFER.LME on CR0 writes.
-const EFER_WRMSR_ALLOWED: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE;
-const EFER_WRMSR_STORED: u64 = EFER_SCE | EFER_LME | EFER_NXE;
+const EFER_WRMSR_ALLOWED: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | super::svm::EFER_SVME;
+const EFER_WRMSR_STORED: u64 = EFER_SCE | EFER_LME | EFER_NXE | super::svm::EFER_SVME;
 
 const EFLAGS_ID: u64 = 1 << 21;
 /// Bit 1 of EFLAGS always reads as 1.
@@ -221,7 +224,11 @@ const CPUID_LEAF_ADDRESS_SIZES: u32 = 0x8000_0008;
 /// Highest standard leaf. Leaves 2-6 are within range and read as zero (no cache or thermal
 /// descriptors; Linux only consults them on Intel).
 const CPUID_MAX_STANDARD_LEAF: u32 = CPUID_LEAF_XSTATE;
-const CPUID_MAX_EXTENDED_LEAF: u32 = 0x8000_0008;
+const CPUID_MAX_EXTENDED_LEAF: u32 = CPUID_LEAF_SVM;
+/// SVM revision and features.
+const CPUID_LEAF_SVM: u32 = 0x8000_000a;
+/// Leaf 0x8000_0001 ECX bit 2: AMD SVM.
+const EXT_FEATURE_SVM: u32 = 1 << 2;
 
 /// Vendor string "AuthenticAMD" is returned in EBX, EDX, ECX order.
 const VENDOR_EBX: u32 = u32::from_le_bytes(*b"Auth");
@@ -506,7 +513,7 @@ impl Cpu {
             CPUID_LEAF_EXT_FEATURES => (
                 CPUID_SIGNATURE,
                 0,
-                EXT_FEATURE_LAHF_LM | EXT_FEATURE_ABM,
+                EXT_FEATURE_LAHF_LM | EXT_FEATURE_SVM | EXT_FEATURE_ABM,
                 EXT_FEATURE_SYSCALL
                     | EXT_FEATURE_NX
                     | EXT_FEATURE_RDTSCP
@@ -530,6 +537,8 @@ impl Cpu {
             CPUID_LEAF_L2_CACHE_TLB => (0x6400_6400, 0x6400_4200, 0x0200_6140, 0),
             CPUID_LEAF_ADVANCED_POWER => (0, 0, 0, APM_INVARIANT_TSC),
             CPUID_LEAF_ADDRESS_SIZES => (CPUID_ADDRESS_SIZES, EXT_ADDRESS_EBX, 0, 0),
+            // revision 1, number of ASIDs, features
+            CPUID_LEAF_SVM => (1, super::svm::SVM_ASIDS, 0, super::svm::SVM_FEATURES),
             _ => (0, 0, 0, 0),
         };
         self.gpr[RAX] = eax as u64;
@@ -555,6 +564,8 @@ impl Cpu {
             MSR_GS_BASE => self.seg[SEG_GS].base,
             MSR_KERNEL_GS_BASE => self.kgsbase,
             MSR_TSC_AUX => self.tsc_aux,
+            super::svm::MSR_VM_CR => self.svm.vm_cr,
+            super::svm::MSR_VM_HSAVE_PA => self.svm.hsave_pa,
             MSR_SPEC_CTRL => self.spec_ctrl,
             MSR_ARCH_CAPABILITIES => ARCH_CAPABILITIES,
             MSR_SYSENTER_CS..=MSR_SYSENTER_EIP => self.sysenter[(msr - MSR_SYSENTER_CS) as usize],
@@ -592,7 +603,11 @@ impl Cpu {
         match msr {
             MSR_PAT => self.pat = v,
             MSR_EFER => {
-                if v & !EFER_WRMSR_ALLOWED != 0 {
+                // SVME cannot be set while the firmware has disabled SVM in VM_CR
+                if v & !EFER_WRMSR_ALLOWED != 0
+                    || (v & super::svm::EFER_SVME != 0
+                        && self.svm.vm_cr & super::svm::VM_CR_SVMDIS != 0)
+                {
                     return Err(Exception::general_protection(0));
                 }
                 self.efer = (self.efer & !EFER_WRMSR_STORED) | (v & EFER_WRMSR_STORED);
@@ -605,6 +620,19 @@ impl Cpu {
             MSR_GS_BASE => self.seg[SEG_GS].base = v,
             MSR_KERNEL_GS_BASE => self.kgsbase = v,
             MSR_TSC_AUX => self.tsc_aux = v,
+            super::svm::MSR_VM_CR => {
+                if v & !super::svm::VM_CR_WRITABLE != 0 {
+                    return Err(Exception::general_protection(0));
+                }
+                self.svm.vm_cr = v;
+            }
+            super::svm::MSR_VM_HSAVE_PA => {
+                // a 4 KiB aligned physical address inside the address space
+                if v & (PAGE_SIZE - 1) != 0 || v >> PHYSICAL_ADDRESS_BITS != 0 {
+                    return Err(Exception::general_protection(0));
+                }
+                self.svm.hsave_pa = v;
+            }
             MSR_SPEC_CTRL => {
                 if v & !SPEC_CTRL_WRITABLE != 0 {
                     return Err(Exception::general_protection(0));
@@ -956,6 +984,12 @@ impl Cpu {
         const MODRM_XGETBV: u8 = 0xd0;
         const MODRM_XSETBV: u8 = 0xd1;
         const MODRM_RDTSCP: u8 = 0xf9;
+        const MODRM_VMRUN: u8 = 0xd8;
+        const MODRM_VMLOAD: u8 = 0xda;
+        const MODRM_VMSAVE: u8 = 0xdb;
+        const MODRM_STGI: u8 = 0xdc;
+        const MODRM_CLGI: u8 = 0xdd;
+        const MODRM_INVLPGA: u8 = 0xdf;
         const MODRM_MONITOR: u8 = 0xc8;
         const MODRM_MWAIT: u8 = 0xc9;
         const MODRM_CLAC: u8 = 0xca;
@@ -1005,6 +1039,13 @@ impl Cpu {
                     self.need_cpl0()?;
                     core::mem::swap(&mut self.seg[SEG_GS].base, &mut self.kgsbase);
                 }
+                // SVM instructions set RIP themselves (vmrun loads the guest's)
+                MODRM_VMRUN => return self.vmrun(next),
+                MODRM_VMLOAD => return self.vmload_vmsave(false, next),
+                MODRM_VMSAVE => return self.vmload_vmsave(true, next),
+                MODRM_STGI => return self.stgi_clgi(true, next),
+                MODRM_CLGI => return self.stgi_clgi(false, next),
+                MODRM_INVLPGA => return self.invlpga(next),
                 MODRM_XGETBV => self.xgetbv()?,
                 MODRM_MONITOR => self.monitor()?,
                 MODRM_MWAIT => self.mwait()?,
@@ -1700,7 +1741,7 @@ mod sys_tests {
         fn extended_leaf_0_reports_the_max_extended_leaf_and_vendor() {
             let mut h = blank();
             let [eax, ebx, ecx, edx] = cpuid(&mut h, 0x8000_0000, 0);
-            assert_eq!(eax, 0x8000_0008);
+            assert_eq!(eax, 0x8000_000a);
             assert_eq!(
                 [ebx, edx, ecx].map(u32::to_le_bytes).concat(),
                 b"AuthenticAMD"
@@ -1716,12 +1757,22 @@ mod sys_tests {
         }
 
         #[test]
-        fn extended_leaf_1_ecx_has_only_lahf_in_long_mode_and_abm() {
+        fn extended_leaf_1_ecx_has_lahf_in_long_mode_svm_and_abm() {
             const LAHF_LM: u32 = 1 << 0;
+            const SVM: u32 = 1 << 2;
             const ABM: u32 = 1 << 5;
             let mut h = blank();
             let [_, _, ecx, _] = cpuid(&mut h, 0x8000_0001, 0);
-            assert_eq!(ecx, LAHF_LM | ABM);
+            assert_eq!(ecx, LAHF_LM | SVM | ABM);
+        }
+
+        #[test]
+        fn leaf_0x8000000a_describes_svm() {
+            let mut h = blank();
+            let [revision, asids, ecx, features] = cpuid(&mut h, 0x8000_000a, 0);
+            assert_eq!((revision, asids, ecx), (1, 64, 0));
+            // nested paging, next-RIP save, VMCB clean bits, flush by ASID
+            assert_eq!(features, (1 << 0) | (1 << 3) | (1 << 5) | (1 << 6));
         }
 
         #[test]
@@ -1807,7 +1858,7 @@ mod sys_tests {
             let mut h = blank();
             for leaf in [
                 0x8000_0009,
-                0x8000_000a,
+                0x8000_000b,
                 0x8000_001a,
                 0x8000_001d,
                 0x8000_001e,
@@ -2105,6 +2156,28 @@ mod sys_tests {
         }
 
         #[test]
+        fn svm_msrs_and_efer_svme() {
+            let mut h = blank();
+            // EFER.SVME is writable and preserved
+            let efer = h.cpu.rdmsr(TEST_MSR_EFER).unwrap();
+            h.cpu.wrmsr(TEST_MSR_EFER, efer | (1 << 12)).unwrap();
+            assert_ne!(h.cpu.efer & (1 << 12), 0);
+            // VM_CR takes its five defined bits; VM_HSAVE_PA needs a 4 KiB aligned physical address
+            h.cpu.wrmsr(0xc001_0114, 0b1_1111).unwrap();
+            assert_eq!(h.cpu.rdmsr(0xc001_0114).unwrap(), 0b1_1111);
+            assert_gp0(h.cpu.wrmsr(0xc001_0114, 1 << 5));
+            h.cpu.wrmsr(0xc001_0117, 0x20_0000).unwrap();
+            assert_eq!(h.cpu.rdmsr(0xc001_0117).unwrap(), 0x20_0000);
+            assert_gp0(h.cpu.wrmsr(0xc001_0117, 0x20_0008));
+            assert_gp0(h.cpu.wrmsr(0xc001_0117, 1 << 45));
+            // with VM_CR.SVMDIS set (firmware disabled SVM) EFER.SVME cannot be turned on
+            let mut h = blank();
+            h.cpu.wrmsr(0xc001_0114, 1 << 4).unwrap();
+            let efer = h.cpu.rdmsr(TEST_MSR_EFER).unwrap();
+            assert_gp0(h.cpu.wrmsr(TEST_MSR_EFER, efer | (1 << 12)));
+        }
+
+        #[test]
         fn spec_ctrl_stores_ibrs_stibp_ssbd_and_rejects_reserved_bits() {
             let mut h = blank();
             assert_eq!(h.cpu.rdmsr(MSR_SPEC_CTRL).unwrap(), 0);
@@ -2231,7 +2304,7 @@ mod sys_tests {
         #[test]
         fn efer_reserved_bits_raise_gp0() {
             let mut h = blank();
-            for bit in [1, 2, 3, 4, 5, 6, 7, 9, 12, 13, 14, 15, 32, 63] {
+            for bit in [1, 2, 3, 4, 5, 6, 7, 9, 13, 14, 15, 32, 63] {
                 let before = h.cpu.efer;
                 assert_gp0(h.cpu.wrmsr(TEST_MSR_EFER, 1u64 << bit));
                 assert_eq!(h.cpu.efer, before, "bit {bit}");

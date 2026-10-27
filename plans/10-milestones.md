@@ -13,7 +13,9 @@
 - `jit` feature (default on) gates `libc`/`windows-sys`; `--no-default-features` is dependency-free and interpreter-only.
 - x86_64 host JIT done (see 06): same inlined subset as aarch64, verified in lockstep. Exercised on macOS x86_64 under Rosetta; Linux and Windows x86_64 hosts compile but are untested.
 
-- Instruction extensions done (see 03, "Instruction extensions"): POPCNT/LZCNT, CMPXCHG16B, SSE3, SSSE3 (XMM forms), SSE4.1, SSE4.2 (incl. CRC32 and pcmp[ei]str[im]), PCLMULQDQ, AES-NI, MOVBE and FSGSBASE are implemented and advertised in CPUID (leaf 1 ECX, 0x80000001 ECX, leaf 7). The Alpine boot now executes cmpxchg16b, popcnt, pshufb and palignr in the kernel. Not advertised: VMX/SVM.
+- Instruction extensions done (see 03, "Instruction extensions"): POPCNT/LZCNT, CMPXCHG16B, SSE3, SSSE3 (XMM forms), SSE4.1, SSE4.2 (incl. CRC32 and pcmp[ei]str[im]), PCLMULQDQ, AES-NI, MOVBE and FSGSBASE are implemented and advertised in CPUID (leaf 1 ECX, 0x80000001 ECX, leaf 7). The Alpine boot now executes cmpxchg16b, popcnt, pshufb and palignr in the kernel. Not advertised: VMX.
+
+- SVM done for 64-bit guests (see 03): vmrun/vmload/vmsave/stgi/clgi/invlpga, intercepts, event injection, nested paging, TSC offset; tested with hand-built VMCBs (interpreter and JIT) and unproven against a real nested hypervisor.
 
 - ERMS/FSRM done: byte-sized rep slices make `rep movsb` copy-heavy guest workloads ~12x faster (03).
 

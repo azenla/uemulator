@@ -64,6 +64,9 @@ pub(crate) enum Exception {
     },
     /// Not a guest exception: ends the run loop with this reason.
     Exit(ExitReason),
+    /// An SVM #VMEXIT already switched the CPU back to the host: the instruction that raised it is
+    /// fully accounted for and nothing is delivered.
+    Vmexit,
 }
 
 impl Exception {
@@ -166,6 +169,8 @@ impl Cpu {
             match self.deliver(vector, error_code, software) {
                 Ok(()) => return None,
                 Err(Exception::Exit(reason)) => return Some(reason),
+                // a nested-paging fault while delivering switched to the host already
+                Err(Exception::Vmexit) => return None,
                 Err(Exception::Fault {
                     vector: nested_vector,
                     error_code: nested_error,

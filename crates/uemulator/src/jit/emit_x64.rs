@@ -1394,7 +1394,8 @@ impl<'a> Gen<'a> {
             // nop, prefetchw (0f 0d), and the 0f 18..1f hint/nop group: nothing to emit. 0x90
             // with REX.B is xchg r8, rax.
             0x90 | 0x10d | 0x118..=0x11f => {
-                if insn.op == 0x90 && insn.rex & GUEST_REX_B != 0 {
+                // `f3 90` is pause: an SVM guest can intercept it, so it goes through `exec`
+                if insn.op == 0x90 && (insn.rex & GUEST_REX_B != 0 || insn.rep != 0) {
                     return false;
                 }
             }

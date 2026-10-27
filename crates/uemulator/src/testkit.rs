@@ -240,6 +240,8 @@ impl Harness {
                     };
                 }
                 Err(Exception::Exit(reason)) => return Stop::Exit(format!("{reason:?}")),
+                // an SVM #VMEXIT switched back to the host; execution simply continues there
+                Err(Exception::Vmexit) => {}
             }
         }
         Stop::Limit

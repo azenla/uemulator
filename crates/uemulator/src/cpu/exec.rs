@@ -1092,6 +1092,9 @@ impl Cpu {
         let osz = i.opsize;
         let op = i.op;
         let rex = i.rex_present;
+        if self.svm.guest.is_some() {
+            self.svm_intercept(i, next)?;
+        }
         if i.vex {
             return self.exec_vex(i, next);
         }
@@ -13863,6 +13866,7 @@ mod exec_tests {
         const LONG_MODE: u64 = 1 << 29;
         const LAHF_SAHF: u64 = 1;
         const LZCNT_ABM: u64 = 1 << 5;
+        const SVM: u64 = 1 << 2;
         let [_, _, ecx, edx] = cpuid(1, 0);
         for (bit, name) in [
             (TSC, "tsc"),
@@ -13889,7 +13893,11 @@ mod exec_tests {
         assert_ne!(edx & NX, 0);
         assert_ne!(edx & LONG_MODE, 0);
         assert_ne!(ecx & LAHF_SAHF, 0, "lahf/sahf work in 64-bit mode");
-        assert_eq!(ecx & !(LAHF_SAHF | LZCNT_ABM), 0, "no svm, ...");
+        assert_eq!(
+            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM),
+            0,
+            "nothing beyond lahf, svm and abm"
+        );
     }
 
     #[test]

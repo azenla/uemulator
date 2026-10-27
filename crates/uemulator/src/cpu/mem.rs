@@ -166,7 +166,9 @@ impl Cpu {
         let mut level = TOP_LEVEL;
         loop {
             let index = (linear >> (PAGE_SHIFT + LEVEL_INDEX_BITS * level)) & LEVEL_INDEX_MASK;
-            let pte_address = table + index * PTE_BYTES;
+            // With nested paging the guest's page tables are in guest-physical memory too.
+            let guest_pte_address = table + index * PTE_BYTES;
+            let pte_address = self.nested_translate(guest_pte_address, AccessKind::Read, true)?;
             let Some(mut pte) = self.read_ram_u64(pte_address) else {
                 return Err(self.page_fault(linear, access, user, false, false));
             };
@@ -215,13 +217,17 @@ impl Cpu {
                 }
                 if updated != pte {
                     pte = updated;
+                    // Updating Accessed/Dirty is a write to the page table.
+                    let pte_address =
+                        self.nested_translate(guest_pte_address, AccessKind::Write, true)?;
                     self.ram[pte_address as usize..][..PTE_BYTES as usize]
                         .copy_from_slice(&pte.to_le_bytes());
                 }
                 let leaf_shift = PAGE_SHIFT + LEVEL_INDEX_BITS * level;
                 let leaf_offset_mask = (1u64 << leaf_shift) - 1;
                 let leaf_base = pte & PTE_ADDRESS_MASK & !leaf_offset_mask;
-                let page_pa = leaf_base | (linear & leaf_offset_mask & !PAGE_OFFSET_MASK);
+                let guest_page = leaf_base | (linear & leaf_offset_mask & !PAGE_OFFSET_MASK);
+                let page_pa = self.nested_translate(guest_page, access, false)?;
                 let mut tlb_flags = 0;
                 if writable {
                     tlb_flags |= TLB_FLAG_WRITABLE;
@@ -239,6 +245,8 @@ impl Cpu {
             }
             if pte & PTE_ACCESSED == 0 {
                 pte |= PTE_ACCESSED;
+                let pte_address =
+                    self.nested_translate(guest_pte_address, AccessKind::Write, true)?;
                 self.ram[pte_address as usize..][..PTE_BYTES as usize]
                     .copy_from_slice(&pte.to_le_bytes());
             }
@@ -333,7 +341,7 @@ impl Cpu {
 
     /// Reads `size` bytes (at most 8, all inside one page) at a physical address: RAM, else
     /// MMIO, else all ones for unmapped space.
-    fn phys_read(&mut self, pa: u64, size: u8) -> u64 {
+    pub(super) fn phys_read(&mut self, pa: u64, size: u8) -> u64 {
         let start = pa as usize;
         let len = size as usize;
         if let Some(src) = self.ram.get(start..start + len) {
@@ -351,7 +359,7 @@ impl Cpu {
     }
 
     /// Counterpart of `phys_read`; writes to unmapped space are dropped.
-    fn phys_write(&mut self, pa: u64, size: u8, val: u64) {
+    pub(super) fn phys_write(&mut self, pa: u64, size: u8, val: u64) {
         let start = pa as usize;
         let len = size as usize;
         if start + len <= self.ram.len() {

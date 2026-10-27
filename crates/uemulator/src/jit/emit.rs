@@ -1802,7 +1802,8 @@ impl<'a> Gen<'a> {
             }
             // nop, prefetchw, prefetch/hint-nop group (`xchg r8, rax` with REX.B is not a nop)
             0x90 | 0x10d | 0x118..=0x11f => {
-                if insn.op == 0x90 && insn.rex & REX_B != 0 {
+                // `f3 90` is pause: an SVM guest can intercept it, so it goes through `exec`
+                if insn.op == 0x90 && (insn.rex & REX_B != 0 || insn.rep != 0) {
                     return false;
                 }
             }
