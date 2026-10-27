@@ -888,7 +888,7 @@ mod guest_view {
         let printed = printed_cmdline(|config| config);
         assert_eq!(printed, DEFAULT_CMDLINE);
         assert!(printed.contains("console=hvc0"));
-        assert!(printed.contains("earlyprintk=serial,ttyS0"));
+        assert!(!printed.contains("earlyprintk"));
     }
 
     #[test]

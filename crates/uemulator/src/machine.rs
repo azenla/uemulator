@@ -88,8 +88,8 @@ pub enum ConsoleKind {
     /// 16550 UART at COM1 (`ttyS0`).
     Serial,
     /// virtio-console (`hvc0`); the only kind that delivers `ConsoleHandle::resize` to the guest.
-    /// The default. The UART is present either way and carries early boot text (`earlyprintk`),
-    /// but this needs a kernel whose `virtio_console` driver is built in (an initrd that only
+    /// The default. The UART is present either way but stays silent during boot,
+    /// so this needs a kernel whose `virtio_console` driver is built in (an initrd that only
     /// loads it as a module has no console until then); pick `Serial` for such kernels.
     #[default]
     Virtio,

@@ -34,11 +34,8 @@ impl Distro {
     pub fn cmdline(self) -> &'static str {
         match self {
             Distro::Debian => "",
-            // Alpine's virt kernel is built without `earlyprintk=`, so with the default hvc0
-            // console everything before the virtio-console driver loads (including the banner)
-            // would be lost; `earlycon=` is built in and reaches the same UART.
             Distro::Alpine => {
-                "earlycon=uart8250,io,0x3f8 ip=dhcp alpine_repo=https://dl-cdn.alpinelinux.org/alpine/latest-stable/main modloop=https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/netboot/modloop-virt"
+                "ip=dhcp alpine_repo=https://dl-cdn.alpinelinux.org/alpine/latest-stable/main modloop=https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/netboot/modloop-virt"
             }
             Distro::Fedora => {
                 "ip=dhcp rd.neednet=1 inst.text inst.repo=https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Server/x86_64/os/"
@@ -361,13 +358,10 @@ mod tests {
     }
 
     #[test]
-    fn alpine_gets_earlycon_because_its_kernel_has_no_earlyprintk() {
-        assert!(
-            Distro::Alpine
-                .cmdline()
-                .contains("earlycon=uart8250,io,0x3f8")
-        );
-        assert!(!Distro::Debian.cmdline().contains("earlycon"));
+    fn no_distro_enables_an_early_console() {
+        for distro in [Distro::Debian, Distro::Alpine, Distro::Fedora] {
+            assert!(!distro.cmdline().contains("earlycon"));
+        }
     }
 
     #[test]
