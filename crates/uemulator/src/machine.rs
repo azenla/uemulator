@@ -384,7 +384,8 @@ impl Vcpu {
             poll
         });
         if self.jit != JitMode::Off {
-            cpu.jit = crate::jit::Jit::new().map(Box::new);
+            // Lockstep compares state after every block, so blocks must not chain into each other.
+            cpu.jit = crate::jit::Jit::new(verify_twin.is_none()).map(Box::new);
         }
         if self.debug {
             cpu.trace = Some(Default::default());

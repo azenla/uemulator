@@ -239,14 +239,15 @@ pub(crate) fn reads_guest_clock(op: u16) -> bool {
     matches!(op, OP_RDTSC | OP_RDMSR | 0xe4..=0xe7 | 0xec..=0xef)
 }
 
-/// The instructions both emitters lower with their own exit sequence (`try_inline` returns true
-/// and the block stops): jcc rel8/rel32, jmp rel8/rel32, call rel32, ret. All of them are also
-/// `ends_block`. Keep in step with the terminal arms of `try_inline`.
+/// The instructions an emitter may lower with its own exit sequence (`try_inline` returns true
+/// and the block stops): jcc rel8/rel32, jmp rel8/rel32, call rel32, ret, and near indirect
+/// call/jmp (`ff /2`, `ff /4`; the aarch64 backend lowers those, the x86_64 one leaves them to
+/// the interpreter helper, which also ends the block). All of them are also `ends_block`. Keep in step with the terminal arms of `try_inline`.
 pub(crate) fn is_inline_terminator(insn: &Insn) -> bool {
     matches!(
         insn.op,
         0x70..=0x7f | 0x180..=0x18f | 0xe9 | 0xeb | 0xe8 | 0xc3
-    )
+    ) || (insn.op == 0xff && matches!(insn.reg & 7, 2 | 4))
 }
 
 /// True if the block must end after `insn`. The set is an allow-list of what the block compilers

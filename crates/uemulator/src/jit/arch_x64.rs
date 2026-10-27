@@ -12,6 +12,9 @@ pub(crate) struct Prologue {
     pub exit_ok: u64,
     /// Absolute address of the failure exit (rax = helper status, rcx = failing instruction index).
     pub exit_fail: u64,
+    /// Block-to-block transfer stub. This backend does not chain yet, so there is none (0) and
+    /// `Jit::new` hands the emitter no chain address.
+    pub chain: u64,
 }
 
 /// Pushed in this order and popped in reverse. This is the Win64 callee-saved set (RSI/RDI are
@@ -22,7 +25,7 @@ const SAVED_REGS: [u8; 8] = [RBX, RBP, RSI, RDI, R12, R13, R14, R15];
 /// function pointer: it sets up the frame, pins the `Cpu` pointer and TLB base for the block (see
 /// `emit_x64`), then jumps to `code`. Blocks never return themselves; they jump to `exit_ok` or
 /// `exit_fail` below.
-pub(crate) fn prologue(base: u64) -> Prologue {
+pub(crate) fn prologue(base: u64, _jump_cache_base: u64) -> Prologue {
     let mut a = Asm::new(base);
     for r in SAVED_REGS {
         a.push(r);
@@ -56,10 +59,11 @@ pub(crate) fn prologue(base: u64) -> Prologue {
         code: a.code,
         exit_ok,
         exit_fail,
+        chain: 0,
     }
 }
 
-pub(crate) fn addrs(exit_ok: u64, exit_fail: u64) -> Addrs {
+pub(crate) fn addrs(exit_ok: u64, exit_fail: u64, _chain: Option<u64>) -> Addrs {
     Addrs {
         exec: helpers::helper_exec as *const () as usize as u64,
         ld: helpers::helper_load_via_out as *const () as usize as u64,

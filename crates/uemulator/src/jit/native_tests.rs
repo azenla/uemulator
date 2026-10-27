@@ -30,7 +30,12 @@ fn cpu_running(code: &[u8]) -> Cpu {
 }
 
 fn new_jit() -> Jit {
-    Jit::new().expect("the host has a JIT")
+    Jit::new(true).expect("the host has a JIT")
+}
+
+/// For tests of one block's accounting: the block returns to the caller instead of chaining on.
+fn new_unchained_jit() -> Jit {
+    Jit::new(false).expect("the host has a JIT")
 }
 
 /// Translates the block at `CODE_BASE` (identity-mapped, so physical == linear).
@@ -52,7 +57,7 @@ fn a_new_jit_places_its_first_block_after_an_aligned_prologue() {
     assert_eq!(jit.blocks_start % HEADER_ALIGN, 0);
     assert!(jit.blocks_start > 0);
     assert!(jit.blocks.is_empty());
-    assert!(jit.jump_cache.iter().all(|&slot| slot == 0));
+    assert!(jit.jump_cache.iter().all(|slot| slot.code_addr == 0));
     assert_eq!(jit.stats(), JitStats::default());
 }
 
@@ -417,7 +422,7 @@ fn reset_discards_every_block_and_rewinds_to_the_first_block_slot() {
     jit.reset();
     assert!(jit.blocks.is_empty());
     assert!(jit.page_blocks.is_empty());
-    assert!(jit.jump_cache.iter().all(|&slot| slot == 0));
+    assert!(jit.jump_cache.iter().all(|slot| slot.code_addr == 0));
     assert_eq!(jit.used_bytes, jit.blocks_start);
     assert_eq!(jit.stats().resets, 1);
     assert_eq!(jit.lookup(CODE_BASE, CODE_BASE), None);
@@ -462,7 +467,7 @@ fn a_buffer_with_exactly_the_headroom_free_is_not_flushed() {
 fn step_block_runs_a_block_and_accounts_for_its_instructions() {
     let _guard = serialize_jit_tests();
     let mut cpu = cpu_running(&[&ADD_THEN_JMP_NEXT[..], &nops(1)[..]].concat());
-    cpu.jit = Some(Box::new(new_jit()));
+    cpu.jit = Some(Box::new(new_unchained_jit()));
     cpu.gpr[0] = 1;
     cpu.gpr[1] = 2;
     // `Cpu::run` counts the first instruction before calling in.
@@ -548,4 +553,136 @@ fn step_block_reuses_the_cached_block_on_the_second_run() {
         cpu.step_block().unwrap();
     }
     assert_eq!(cpu.jit.as_ref().unwrap().stats().translated, 1);
+}
+
+// mov ecx, 100; 1: sub ecx, 1; jnz 1b; hlt
+const COUNTDOWN_LOOP: [u8; 11] = [
+    0xb9, 0x64, 0x00, 0x00, 0x00, 0x83, 0xe9, 0x01, 0x75, 0xfb, 0xf4,
+];
+const RSP_INDEX: usize = 4;
+/// mov (1) + 100 * (sub, jnz) + hlt (1).
+const COUNTDOWN_LOOP_INSNS: u64 = 202;
+// mov eax, 7; call 1f; add eax, 1; hlt; 1: add eax, eax; ret
+const CALL_AND_RETURN: [u8; 17] = [
+    0xb8, 0x07, 0x00, 0x00, 0x00, 0xe8, 0x04, 0x00, 0x00, 0x00, 0x83, 0xc0, 0x01, 0xf4, 0x01, 0xc0,
+    0xc3,
+];
+
+/// `Cpu::run`'s per-step bookkeeping around one `step_block` call.
+fn step_once(cpu: &mut Cpu) {
+    cpu.interrupt_shadow = false;
+    cpu.icount += 1;
+    cpu.step_block().unwrap();
+}
+
+/// Calls `step_block` until the guest halts; returns how many calls it took.
+fn steps_to_halt(cpu: &mut Cpu) -> usize {
+    for calls in 1..=1000 {
+        step_once(cpu);
+        if cpu.halted {
+            return calls;
+        }
+    }
+    panic!("never halted: {}", cpu.dump_regs());
+}
+
+/// Runs the countdown loop a few iterations, so its blocks exist and chain into each other,
+/// and stops mid-loop.
+fn warm_up_loop(cpu: &mut Cpu) {
+    cpu.next_event = 20;
+    while cpu.icount < 20 {
+        step_once(cpu);
+    }
+    assert!(!cpu.halted);
+    cpu.next_event = u64::MAX;
+}
+
+#[test]
+fn chained_blocks_run_a_whole_loop_without_returning_to_the_caller() {
+    let _guard = serialize_jit_tests();
+    let mut chained = cpu_running(&COUNTDOWN_LOOP);
+    chained.jit = Some(Box::new(new_jit()));
+    chained.next_event = u64::MAX;
+    // Only blocks that do not exist yet send the chain back to the caller (to be translated).
+    let chained_calls = steps_to_halt(&mut chained);
+    assert!(chained_calls <= 3, "{chained_calls}");
+    assert_eq!(chained.gpr[1], 0);
+    assert_eq!(chained.icount, COUNTDOWN_LOOP_INSNS);
+
+    let mut unchained = cpu_running(&COUNTDOWN_LOOP);
+    unchained.jit = Some(Box::new(new_unchained_jit()));
+    unchained.next_event = u64::MAX;
+    assert!(steps_to_halt(&mut unchained) > 100);
+    assert_eq!(unchained.icount, COUNTDOWN_LOOP_INSNS);
+}
+
+#[test]
+fn a_chain_stops_at_the_event_deadline_and_resumes_without_losing_instructions() {
+    let _guard = serialize_jit_tests();
+    let mut cpu = cpu_running(&COUNTDOWN_LOOP);
+    cpu.jit = Some(Box::new(new_jit()));
+    warm_up_loop(&mut cpu);
+    cpu.next_event = cpu.icount + 50;
+    let deadline = cpu.next_event;
+    step_once(&mut cpu);
+    assert!(!cpu.halted);
+    assert!(
+        cpu.icount >= deadline && cpu.icount < deadline + 4,
+        "{} vs {deadline}",
+        cpu.icount
+    );
+    // Every retired instruction is counted once and the next one is not pre-charged: ecx says
+    // how many iterations ran.
+    let iterations = 100 - cpu.gpr[1];
+    assert_eq!(cpu.icount, 1 + 2 * iterations);
+    cpu.next_event = u64::MAX;
+    steps_to_halt(&mut cpu);
+    assert_eq!(cpu.icount, COUNTDOWN_LOOP_INSNS);
+}
+
+#[test]
+fn a_chained_call_and_return_find_their_blocks_through_the_jump_cache() {
+    let _guard = serialize_jit_tests();
+    let mut cpu = cpu_running(&CALL_AND_RETURN);
+    cpu.jit = Some(Box::new(new_jit()));
+    cpu.next_event = u64::MAX;
+    steps_to_halt(&mut cpu);
+    assert_eq!(cpu.gpr[0], 15);
+    // Run it again from the top: now the call, the callee and the return all hit the cache and
+    // the whole sequence is a single call.
+    cpu.halted = false;
+    cpu.rip = CODE_BASE;
+    cpu.gpr[RSP_INDEX] = STACK_TOP;
+    assert_eq!(steps_to_halt(&mut cpu), 1);
+    assert_eq!(cpu.gpr[0], 15);
+    assert_eq!(cpu.jit.as_ref().unwrap().stats().translated, 3);
+}
+
+#[test]
+fn a_chain_does_not_enter_a_block_whose_page_was_invalidated() {
+    let _guard = serialize_jit_tests();
+    let mut cpu = cpu_running(&COUNTDOWN_LOOP);
+    cpu.jit = Some(Box::new(new_jit()));
+    warm_up_loop(&mut cpu);
+    let translated = cpu.jit.as_ref().unwrap().stats().translated;
+    cpu.jit
+        .as_mut()
+        .unwrap()
+        .invalidate_page(CODE_BASE >> PAGE_SHIFT);
+    steps_to_halt(&mut cpu);
+    assert!(
+        cpu.jit.as_ref().unwrap().stats().translated > translated,
+        "the stale blocks were retranslated, not chained into"
+    );
+}
+
+#[test]
+fn chain_exit_after_an_rdtsc_does_not_charge_the_prepaid_instructions_twice() {
+    let _guard = serialize_jit_tests();
+    // mov ecx, 3; 1: sub ecx, 1; rdtsc; jnz... rdtsc clobbers eax/edx only, flags survive.
+    // mov ecx, 3; 1: rdtsc; sub ecx, 1; jnz 1b; hlt
+    let code = [
+        0xb9, 0x03, 0x00, 0x00, 0x00, 0x0f, 0x31, 0x83, 0xe9, 0x01, 0x75, 0xf8, 0xf4,
+    ];
+    assert_jit_matches_interpreter(&code, |_| {});
 }

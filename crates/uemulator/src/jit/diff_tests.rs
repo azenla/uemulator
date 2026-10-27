@@ -327,12 +327,12 @@ mod translation {
     }
 
     #[test]
-    fn adc_byte_moves_and_cpuid_are_not_lowered_inline() {
+    fn adc_and_cpuid_are_not_lowered_inline_but_a_byte_move_is() {
         let result = check(&HELPER_ONLY_FORMS);
         let stats = stats_of(&result);
         assert_eq!(stats.translated, 1);
         assert_eq!(stats.total, 4);
-        assert_eq!(stats.inlined, 0);
+        assert_eq!(stats.inlined, 1, "only mov al, bl");
     }
 
     #[test]

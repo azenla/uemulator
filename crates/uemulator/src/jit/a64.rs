@@ -324,6 +324,10 @@ impl Asm {
     pub fn eor(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
         self.reg3(0x4a00_0000, rd, rn, rm, is64);
     }
+    /// High 64 bits of the signed 128-bit product.
+    pub fn smulh(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.reg3(0x9b40_7c00, rd, rn, rm, false);
+    }
     pub fn mul(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
         self.reg3(0x1b00_7c00, rd, rn, rm, is64);
     }
@@ -402,6 +406,25 @@ impl Asm {
     }
     pub fn asr_imm(&mut self, rd: u32, rn: u32, shift: u32) {
         self.sbfm(rd, rn, shift, XREG_BITS - 1, true);
+    }
+    /// `ubfx rd, rn, #lsb, #width`: the field zero-extended into `rd`.
+    pub fn ubfx(&mut self, rd: u32, rn: u32, lsb: u32, width: u32, is64: bool) {
+        self.ubfm(rd, rn, lsb, lsb + width - 1, is64);
+    }
+
+    /// Immediate shifts at either register width (the 64-bit-only `lsl_imm` family above is the
+    /// common case; these exist for 8/16/32-bit operand sizes done in W registers).
+    pub fn lsl_imm_sized(&mut self, rd: u32, rn: u32, shift: u32, is64: bool) {
+        let bits = if is64 { XREG_BITS } else { WREG_BITS };
+        self.ubfm(rd, rn, (bits - shift) & (bits - 1), bits - 1 - shift, is64);
+    }
+    pub fn lsr_imm_sized(&mut self, rd: u32, rn: u32, shift: u32, is64: bool) {
+        let bits = if is64 { XREG_BITS } else { WREG_BITS };
+        self.ubfm(rd, rn, shift, bits - 1, is64);
+    }
+    pub fn asr_imm_sized(&mut self, rd: u32, rn: u32, shift: u32, is64: bool) {
+        let bits = if is64 { XREG_BITS } else { WREG_BITS };
+        self.sbfm(rd, rn, shift, bits - 1, is64);
     }
     pub fn uxtb(&mut self, rd: u32, rn: u32) {
         self.ubfm(rd, rn, 0, 7, false);

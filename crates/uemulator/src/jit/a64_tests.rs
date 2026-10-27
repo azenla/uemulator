@@ -1747,3 +1747,27 @@ fn store_register_offset_writes_only_the_selected_width() {
     );
     assert_eq!(&buffer[8..13], &[0x88, 0x77, 0x66, 0x55, 0xff]);
 }
+
+/// The bitfield extract and the W-register immediate shifts used for 8/16/32-bit operands.
+#[rustfmt::skip]
+#[test]
+fn bitfield_extract_and_sized_shift_encodings_match_the_assembler() {
+    let cases: &[EncodeCase] = &[
+        ("ubfx x0, x1, #8, #8", |a| { a.ubfx(0, 1, 8, 8, true); }, &[0xd3483c20]),
+        ("ubfx w2, w3, #1, #1", |a| { a.ubfx(2, 3, 1, 1, false); }, &[0x53010462]),
+        ("ubfx x4, x5, #63, #1", |a| { a.ubfx(4, 5, 63, 1, true); }, &[0xd37ffca4]),
+        ("lsl w0, w1, #24", |a| { a.lsl_imm_sized(0, 1, 24, false); }, &[0x53081c20]),
+        ("lsl w0, w1, #16", |a| { a.lsl_imm_sized(0, 1, 16, false); }, &[0x53103c20]),
+        ("lsl w2, w3, #1", |a| { a.lsl_imm_sized(2, 3, 1, false); }, &[0x531f7862]),
+        ("lsl x0, x1, #5", |a| { a.lsl_imm_sized(0, 1, 5, true); }, &[0xd37be820]),
+        ("lsr w0, w1, #24", |a| { a.lsr_imm_sized(0, 1, 24, false); }, &[0x53187c20]),
+        ("lsr w4, w5, #31", |a| { a.lsr_imm_sized(4, 5, 31, false); }, &[0x531f7ca4]),
+        ("asr w0, w1, #31", |a| { a.asr_imm_sized(0, 1, 31, false); }, &[0x131f7c20]),
+        ("asr w2, w3, #1", |a| { a.asr_imm_sized(2, 3, 1, false); }, &[0x13017c62]),
+        ("asr x6, x7, #63", |a| { a.asr_imm_sized(6, 7, 63, true); }, &[0x937ffce6]),
+        ("smulh x0, x1, x2", |a| { a.smulh(0, 1, 2); }, &[0x9b427c20]),
+        ("smulh x28, x29, x30", |a| { a.smulh(28, 29, 30); }, &[0x9b5e7fbc]),
+        ("smulh x3, x3, x4", |a| { a.smulh(3, 3, 4); }, &[0x9b447c63]),
+    ];
+    check_encodings(cases);
+}

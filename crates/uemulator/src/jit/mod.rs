@@ -113,7 +113,7 @@ mod stub {
     pub(crate) struct Jit;
 
     impl Jit {
-        pub fn new() -> Option<Jit> {
+        pub fn new(_chaining: bool) -> Option<Jit> {
             None
         }
         pub fn invalidate_page(&mut self, _ppn: u64) {}

@@ -39,6 +39,15 @@ fn nzcv_after(kind: FlagKind, size: u8, a: u64, b: u64) -> (u64, Nzcv) {
             (result, a >= b, ((a ^ b) & (a ^ result)) & sign != 0)
         }
         FlagKind::Logic => ((a & b) & mask, false, false),
+        // The host op is `adds`/`subs` with the immediate 1; the caller passes b = 1.
+        FlagKind::Inc => {
+            let result = a.wrapping_add(1) & mask;
+            (result, false, (!(a ^ 1) & (a ^ result)) & sign != 0)
+        }
+        FlagKind::Dec => {
+            let result = a.wrapping_sub(1) & mask;
+            (result, false, ((a ^ 1) & (a ^ result)) & sign != 0)
+        }
     };
     (
         result,
@@ -120,6 +129,8 @@ fn lazy_op(kind: FlagKind) -> LazyFlagsOp {
         FlagKind::Add => LazyFlagsOp::Add,
         FlagKind::Sub => LazyFlagsOp::Sub,
         FlagKind::Logic => LazyFlagsOp::Logic,
+        FlagKind::Inc => LazyFlagsOp::Inc,
+        FlagKind::Dec => LazyFlagsOp::Dec,
     }
 }
 
@@ -146,6 +157,37 @@ fn every_mapped_condition_matches_the_x86_flags_the_same_operation_produces() {
                     }
                 }
             }
+        }
+    }
+}
+
+/// `inc`/`dec` keep CF whatever it was, so every condition the map offers must hold for both
+/// incoming carries; the ones that read CF must not be offered at all.
+#[test]
+fn inc_and_dec_conditions_are_right_for_either_incoming_carry() {
+    for kind in [FlagKind::Inc, FlagKind::Dec] {
+        for size in [4u8, 8] {
+            for a in OPERAND_VALUES {
+                let (result, nzcv) = nzcv_after(kind, size, a, 1);
+                for carry in [0, 1] {
+                    let eflags = flags::compute(lazy_op(kind), size, result, carry, 0, 0);
+                    for condition in 0..16u8 {
+                        let expected = x86_condition_holds(condition, eflags);
+                        match cond_map(kind, condition) {
+                            Some(CondMap::Cond(host)) => assert_eq!(
+                                aarch64_condition_holds(host, &nzcv),
+                                expected,
+                                "{kind:?} size {size} {a:#x} carry {carry}: condition {condition}"
+                            ),
+                            Some(_) => panic!("{kind:?} condition {condition} is not constant"),
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
+        for condition in [2, 3, 6, 7, 10, 11] {
+            assert!(cond_map(kind, condition).is_none(), "{kind:?} {condition}");
         }
     }
 }
@@ -288,6 +330,7 @@ const DUMMY_ADDRESSES: Addrs = Addrs {
     cond: 0,
     exit_ok: 0,
     exit_fail: 0,
+    chain: 0,
 };
 
 fn and_constant_result(constant: u64, input: u64) -> (u64, usize) {

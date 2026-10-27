@@ -218,6 +218,11 @@ access_tests! {
     stosq_at_every_page_offset => (STOSQ_TO_RSI, 3, 8, true),
     setcc_to_memory_at_every_page_offset => (SETE_TO_MEMORY, 0, 1, true),
     pop_to_memory_at_every_page_offset => (POP_MEMORY, 0, 8, true),
+    push_memory_at_every_page_offset => (PUSH_MEMORY_QWORD, 0, 8, false),
+    cmov_from_memory_at_every_page_offset => (CMOVNE_FROM_MEMORY_DWORD, 0, 4, false),
+    imul_from_memory_at_every_page_offset => (IMUL_FROM_MEMORY_DWORD, 0, 4, false),
+    imul_immediate_from_memory_at_every_page_offset => (IMUL_IMMEDIATE_FROM_MEMORY_QWORD, 0, 8, false),
+    test_immediate_memory_byte_at_every_page_offset => (TEST_IMMEDIATE_MEMORY_BYTE, 0, 1, false),
 }
 
 /// Read-modify-write instructions: the access is a write for permission purposes, and a straddling
@@ -255,6 +260,18 @@ read_modify_write_tests! {
     neg_memory_at_every_page_offset => (NEG_MEMORY_WORD, 2),
     not_memory_at_every_page_offset => (NOT_MEMORY_BYTE, 1),
     bts_memory_at_every_page_offset => (BTS_MEMORY_IMM, 8),
+    add_register_to_memory_byte_at_every_page_offset => (ADD_REGISTER_TO_MEMORY_BYTE, 1),
+    add_high_register_to_memory_byte_at_every_page_offset => (ADD_HIGH_REGISTER_TO_MEMORY_BYTE, 1),
+    or_immediate_to_memory_word_at_every_page_offset => (OR_IMMEDIATE_TO_MEMORY_WORD, 2),
+    xor_register_to_memory_word_at_every_page_offset => (XOR_REGISTER_TO_MEMORY_WORD, 2),
+    sub_immediate_from_memory_dword_at_every_page_offset => (SUB_IMMEDIATE_FROM_MEMORY_DWORD, 4),
+    and_immediate_to_memory_byte_at_every_page_offset => (AND_IMMEDIATE_TO_MEMORY_BYTE, 1),
+    inc_memory_byte_at_every_page_offset => (INC_MEMORY_BYTE, 1),
+    dec_memory_word_at_every_page_offset => (DEC_MEMORY_WORD, 2),
+    shr_immediate_memory_dword_at_every_page_offset => (SHR_IMMEDIATE_MEMORY_DWORD, 4),
+    sar_cl_memory_qword_at_every_page_offset => (SAR_CL_MEMORY_QWORD, 8),
+    neg_memory_dword_at_every_page_offset => (NEG_MEMORY_DWORD, 4),
+    not_memory_qword_at_every_page_offset => (NOT_MEMORY_QWORD, 8),
 }
 
 /// cmpxchg8b: the engines must agree at every offset. Whether a failed comparison still counts as
@@ -832,6 +849,41 @@ const NOT_MEMORY_BYTE: [u8; 2] = [0xf6, 0x16];
 
 // bts qword ptr [rsi], 3
 const BTS_MEMORY_IMM: [u8; 5] = [0x48, 0x0f, 0xba, 0x2e, 0x03];
+
+// push qword ptr [rsi]
+const PUSH_MEMORY_QWORD: [u8; 2] = [0xff, 0x36];
+// cmovne eax, [rsi]
+const CMOVNE_FROM_MEMORY_DWORD: [u8; 3] = [0x0f, 0x45, 0x06];
+// imul eax, [rsi]
+const IMUL_FROM_MEMORY_DWORD: [u8; 3] = [0x0f, 0xaf, 0x06];
+// imul rax, [rsi], 7
+const IMUL_IMMEDIATE_FROM_MEMORY_QWORD: [u8; 4] = [0x48, 0x6b, 0x06, 0x07];
+// test byte ptr [rsi], 4
+const TEST_IMMEDIATE_MEMORY_BYTE: [u8; 3] = [0xf6, 0x06, 0x04];
+// add byte ptr [rsi], al
+const ADD_REGISTER_TO_MEMORY_BYTE: [u8; 2] = [0x00, 0x06];
+// add [rsi], ah
+const ADD_HIGH_REGISTER_TO_MEMORY_BYTE: [u8; 2] = [0x00, 0x26];
+// or word ptr [rsi], 0x1234
+const OR_IMMEDIATE_TO_MEMORY_WORD: [u8; 5] = [0x66, 0x81, 0x0e, 0x34, 0x12];
+// xor [rsi], ax
+const XOR_REGISTER_TO_MEMORY_WORD: [u8; 3] = [0x66, 0x31, 0x06];
+// sub dword ptr [rsi], 5
+const SUB_IMMEDIATE_FROM_MEMORY_DWORD: [u8; 3] = [0x83, 0x2e, 0x05];
+// and byte ptr [rsi], 0x7f
+const AND_IMMEDIATE_TO_MEMORY_BYTE: [u8; 3] = [0x80, 0x26, 0x7f];
+// inc byte ptr [rsi]
+const INC_MEMORY_BYTE: [u8; 2] = [0xfe, 0x06];
+// dec word ptr [rsi]
+const DEC_MEMORY_WORD: [u8; 3] = [0x66, 0xff, 0x0e];
+// shr dword ptr [rsi], 3
+const SHR_IMMEDIATE_MEMORY_DWORD: [u8; 3] = [0xc1, 0x2e, 0x03];
+// sar qword ptr [rsi], cl
+const SAR_CL_MEMORY_QWORD: [u8; 3] = [0x48, 0xd3, 0x3e];
+// neg dword ptr [rsi]
+const NEG_MEMORY_DWORD: [u8; 2] = [0xf7, 0x1e];
+// not qword ptr [rsi]
+const NOT_MEMORY_QWORD: [u8; 3] = [0x48, 0xf7, 0x16];
 
 // sete [rsi]
 const SETE_TO_MEMORY: [u8; 3] = [0x0f, 0x94, 0x06];

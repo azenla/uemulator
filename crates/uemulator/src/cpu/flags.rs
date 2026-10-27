@@ -26,8 +26,8 @@ pub(crate) const ARITH: u64 = CF | PF | AF | ZF | SF | OF;
 /// materialized in `Cpu::eflags`.
 ///
 /// The JIT writes the discriminant with a 16-bit store together with `Cpu::lazy_size`, so it
-/// must stay `repr(u8)`, and the variants it emits (Add, Sub, Logic) must not be renumbered
-/// without checking `jit/emit*.rs`.
+/// must stay `repr(u8)`, and the variants it emits (Add, Sub, Logic, Inc, Dec, SzpCfOf) must not
+/// be renumbered without checking `jit/emit*.rs`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(u8)]
 pub(crate) enum LazyFlagsOp {
@@ -40,7 +40,20 @@ pub(crate) enum LazyFlagsOp {
     Logic,
     Inc,
     Dec,
+    /// SF/ZF/PF from the result, AF clear, and CF and OF taken from `lazy_src` bits 0 and 1
+    /// (worked out by the generated code). That is exactly what a shift by a non-zero count
+    /// (`Cpu::shift_rotate`) and `imul` (`Cpu::imul_truncated`) leave, which the interpreter
+    /// materializes eagerly: only the JIT produces this op.
+    #[cfg_attr(
+        not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))),
+        allow(dead_code)
+    )]
+    SzpCfOf,
 }
+
+/// Bit positions inside `lazy_src` for `LazyFlagsOp::SzpCfOf`.
+pub(crate) const SZP_CF_OF_SRC_CF_BIT: u32 = 0;
+pub(crate) const SZP_CF_OF_SRC_OF_BIT: u32 = 1;
 
 /// Value mask for an operand `size` in bytes; anything other than 1, 2 or 4 means 8.
 pub(crate) fn mask(size: u8) -> u64 {
@@ -130,6 +143,16 @@ pub(crate) fn compute(
                 f |= AF;
             }
             if result == sign_bit {
+                f |= OF;
+            }
+            f
+        }
+        LazyFlagsOp::SzpCfOf => {
+            let mut f = szp(result, size);
+            if src >> SZP_CF_OF_SRC_CF_BIT & 1 != 0 {
+                f |= CF;
+            }
+            if src >> SZP_CF_OF_SRC_OF_BIT & 1 != 0 {
                 f |= OF;
             }
             f
@@ -629,6 +652,19 @@ mod tests {
                 compute(LazyFlagsOp::Logic, 1, dirty(0x81, 1), 0xffff, 0xff, 0),
                 SF | PF
             );
+        }
+
+        #[test]
+        fn szp_cf_of_takes_cf_and_of_from_src_and_the_rest_from_the_result() {
+            assert_eq!(compute(LazyFlagsOp::SzpCfOf, 4, 0, 0, 0, 0), ZF | PF);
+            assert_eq!(compute(LazyFlagsOp::SzpCfOf, 4, 0, 1, 0, 0), ZF | PF | CF);
+            assert_eq!(compute(LazyFlagsOp::SzpCfOf, 4, 0, 2, 0, 0), ZF | PF | OF);
+            assert_eq!(
+                compute(LazyFlagsOp::SzpCfOf, 1, dirty(0x80, 1), 3, 0, 0),
+                SF | CF | OF
+            );
+            // AF stays clear whatever the result.
+            assert_eq!(compute(LazyFlagsOp::SzpCfOf, 1, 0x10, 0, 0, 0) & AF, 0);
         }
 
         #[test]

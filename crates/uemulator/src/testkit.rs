@@ -185,7 +185,7 @@ impl Harness {
     /// interpreted.
     pub fn enable_jit(&mut self) -> bool {
         self._jit_turn = Some(crate::jit::serialize_jit_tests());
-        self.cpu.jit = crate::jit::Jit::new().map(Box::new);
+        self.cpu.jit = crate::jit::Jit::new(true).map(Box::new);
         self.cpu.jit.is_some()
     }
 
@@ -211,6 +211,9 @@ impl Harness {
     /// undelivered. After a `Fault`, `run` may be called again only after the test repairs state.
     pub fn run(&mut self, max_insns: u64) -> Stop {
         let start = self.cpu.icount;
+        // Chained JIT blocks keep running until `icount` reaches this, so the budget bounds
+        // them the way the event tick bounds them in `Cpu::run`.
+        self.cpu.next_event = start + max_insns;
         while self.cpu.icount - start < max_insns {
             self.cpu.interrupt_shadow = false;
             self.cpu.icount += 1;
