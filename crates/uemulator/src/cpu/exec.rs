@@ -31,9 +31,12 @@ const REX_B: u8 = 1;
 const REP_REPE: u8 = 1;
 const REP_REPNE: u8 = 2;
 
-/// A rep string instruction returns to the run loop after this many iterations (RIP unchanged,
+/// A rep string instruction returns to the run loop after moving this many bytes (RIP unchanged,
 /// so it resumes where it left off) so pending interrupts and device events are still serviced.
-const REP_ITERATIONS_PER_SLICE: u64 = 4096;
+/// Measured in bytes, not iterations: with ERMS/FSRM the kernel's memcpy and clear_page are
+/// `rep movsb`/`rep stosb`, and counting elements gave them an eighth of the bytes per slice of
+/// the `rep movsq` they replace, which is eight times the run-loop round trips.
+const REP_BYTES_PER_SLICE: u64 = 32768;
 
 const VECTOR_BREAKPOINT: u8 = 3;
 
@@ -802,6 +805,7 @@ impl Cpu {
         };
         let rep = i.rep != 0;
         let compares = matches!(op, 0xa6 | 0xa7 | 0xae | 0xaf);
+        let slice = REP_BYTES_PER_SLICE / size as u64;
         let mut iterations = 0;
         loop {
             if rep && self.gpr[GPR_RCX] & amask == 0 {
@@ -809,13 +813,13 @@ impl Cpu {
             }
             if rep && matches!(op, 0xa4 | 0xa5 | 0xaa | 0xab) && !i.addr32 && self.eflags & DF == 0
             {
-                let done = self.rep_bulk(i, op, size, REP_ITERATIONS_PER_SLICE - iterations)?;
+                let done = self.rep_bulk(i, op, size, slice - iterations)?;
                 if done > 0 {
                     iterations += done;
                     if self.gpr[GPR_RCX] == 0 {
                         break;
                     }
-                    if iterations >= REP_ITERATIONS_PER_SLICE {
+                    if iterations >= slice {
                         self.icount += iterations;
                         return Ok(());
                     }
@@ -886,7 +890,7 @@ impl Cpu {
                     break;
                 }
             }
-            if iterations >= REP_ITERATIONS_PER_SLICE && self.gpr[GPR_RCX] & amask != 0 {
+            if iterations >= slice && self.gpr[GPR_RCX] & amask != 0 {
                 // RIP stays on the instruction; the run loop re-executes it after servicing events.
                 self.icount += iterations;
                 return Ok(());
@@ -18194,4 +18198,70 @@ mod code {
     // hlt
     pub(super) const REP_STOSB_COUNTED: &[u8] = &[0xf3, 0xaa, 0xf4];
 }
+}
+
+#[cfg(test)]
+mod rep_slice_tests {
+    //! Large `rep movsb`/`rep stosb` (the ERMS/FSRM idiom) cross several `REP_BYTES_PER_SLICE`
+    //! slices, each ending with RIP still on the instruction.
+    use super::*;
+    use crate::testkit::{CODE_BASE, Harness, RAX, RCX, RDI, RSI, SCRATCH, Stop};
+
+    const SOURCE: u64 = 0x20_0000;
+    const DESTINATION: u64 = 0x40_0000;
+    // rep movsb; hlt / rep stosb; hlt
+    const REP_MOVSB: &[u8] = &[0xf3, 0xa4, 0xf4];
+    const REP_STOSB: &[u8] = &[0xf3, 0xaa, 0xf4];
+
+    fn pattern(length: usize) -> Vec<u8> {
+        (0..length).map(|k| (k * 7 + (k >> 8)) as u8).collect()
+    }
+
+    #[test]
+    fn rep_movsb_copies_many_slices_and_pages_exactly() {
+        let _ = SCRATCH;
+        for length in [1usize, 4095, 4096, 4097, 32768, 32769, 100_003, 262_144] {
+            let mut h = Harness::new(REP_MOVSB);
+            let data = pattern(length);
+            h.write(SOURCE, &data);
+            h.write(DESTINATION - 8, &[0xee; 8]);
+            h.write(DESTINATION + length as u64, &[0xee; 8]);
+            h.cpu.gpr[RSI] = SOURCE;
+            h.cpu.gpr[RDI] = DESTINATION;
+            h.cpu.gpr[RCX] = length as u64;
+            assert_eq!(h.run(10_000_000), Stop::Halted, "length {length}");
+            assert_eq!(h.read(DESTINATION, length), data, "length {length}");
+            assert_eq!(h.read(DESTINATION - 8, 8), vec![0xee; 8], "no write below");
+            assert_eq!(
+                h.read(DESTINATION + length as u64, 8),
+                vec![0xee; 8],
+                "no write above"
+            );
+            assert_eq!(h.cpu.gpr[RCX], 0);
+            assert_eq!(h.cpu.gpr[RSI], SOURCE + length as u64);
+            assert_eq!(h.cpu.gpr[RDI], DESTINATION + length as u64);
+            assert_eq!(h.cpu.rip, CODE_BASE + 3, "stopped after the hlt");
+        }
+    }
+
+    #[test]
+    fn rep_stosb_fills_many_slices_and_stops_at_the_slice_boundary_with_rip_on_the_instruction() {
+        let length = 3 * REP_BYTES_PER_SLICE as usize + 17;
+        let mut h = Harness::new(REP_STOSB);
+        h.cpu.gpr[RAX] = 0x5a;
+        h.cpu.gpr[RDI] = DESTINATION;
+        h.cpu.gpr[RCX] = length as u64;
+        // one instruction step: returns after a slice with rip unchanged and rcx partly consumed
+        h.cpu.icount += 1;
+        h.cpu.step().unwrap();
+        assert_eq!(
+            h.cpu.rip, CODE_BASE,
+            "the instruction resumes where it left off"
+        );
+        assert_eq!(h.cpu.gpr[RCX], length as u64 - REP_BYTES_PER_SLICE);
+        // each slice charges its bytes to the instruction counter, hence the large budget
+        assert_eq!(h.run(10_000_000), Stop::Halted);
+        assert_eq!(h.read(DESTINATION, length), vec![0x5a; length]);
+        assert_eq!(h.read(DESTINATION + length as u64, 1), vec![0]);
+    }
 }

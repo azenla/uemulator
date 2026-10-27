@@ -323,12 +323,14 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
     | FEATURE_AVX
     | FEATURE_F16C;
 
-/// Leaf 7 subleaf 0 EBX bit 0: rdfsbase, rdgsbase, wrfsbase, wrgsbase. ERMS/FSRM (bits 9 and 4)
-/// stay clear on purpose: they make the kernel's memcpy and clear_page use `rep movsb`/`rep stosb`,
-/// and even with the page-at-a-time `Cpu::rep_bulk` that is slower here than the `rep movsq` it
-/// uses today (measured with ERMS set: no-initrd Alpine boot 1.3 s -> 1.5 s, initrd boot 4.7 s ->
-/// 5.0 s CPU), because each slice of at most `REP_ITERATIONS_PER_SLICE` bytes re-enters the
-/// instruction through the run loop.
+/// Leaf 7 subleaf 0 EBX bit 0: rdfsbase, rdgsbase, wrfsbase, wrgsbase.
+///
+/// ERMS (EBX bit 9) and FSRM (EDX bit 4) make the kernel's memcpy, clear_page and copy_user use
+/// `rep movsb`/`rep stosb` for everything, which is only a win because `Cpu::rep_bulk` turns each
+/// page of such an instruction into one host copy and `REP_BYTES_PER_SLICE` lets one run-loop
+/// round trip cover 32 KiB. An earlier attempt (with a slice counted in elements, so 4 KiB for
+/// bytes) was slower than `rep movsq`; measured with the byte-sized slice: a `dd` of 2 GB
+/// zero -> null (all copy_to_user) went from 3.6 s to 0.3 s, boot and the rest unchanged.
 const STRUCTURED_FEATURE_FSGSBASE: u32 = 1 << 0;
 /// rdseed.
 const STRUCTURED_FEATURE_RDSEED: u32 = 1 << 18;
@@ -344,7 +346,10 @@ const STRUCTURED_FEATURE_INVPCID: u32 = 1 << 10;
 const STRUCTURED_FEATURE_SMAP: u32 = 1 << 20;
 /// Leaf 7 ECX bit 2: UMIP.
 const STRUCTURED_ECX_UMIP: u32 = 1 << 2;
+/// ERMS: fast `rep movsb`/`rep stosb`.
+const STRUCTURED_FEATURE_ERMS: u32 = 1 << 9;
 const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE
+    | STRUCTURED_FEATURE_ERMS
     | STRUCTURED_FEATURE_SMEP
     | STRUCTURED_FEATURE_AVX2
     | STRUCTURED_FEATURE_INVPCID
@@ -365,7 +370,10 @@ const STRUCTURED_FEATURE_L1D_FLUSH: u32 = 1 << 28;
 const STRUCTURED_FEATURE_ARCH_CAPABILITIES: u32 = 1 << 29;
 /// SSBD bit in IA32_SPEC_CTRL.
 const STRUCTURED_FEATURE_SSBD: u32 = 1 << 31;
-const STRUCTURED_EDX: u32 = STRUCTURED_FEATURE_SPEC_CTRL
+/// FSRM: fast short `rep movsb`.
+const STRUCTURED_FEATURE_FSRM: u32 = 1 << 4;
+const STRUCTURED_EDX: u32 = STRUCTURED_FEATURE_FSRM
+    | STRUCTURED_FEATURE_SPEC_CTRL
     | STRUCTURED_FEATURE_STIBP
     | STRUCTURED_FEATURE_L1D_FLUSH
     | STRUCTURED_FEATURE_ARCH_CAPABILITIES
@@ -1618,9 +1626,10 @@ mod sys_tests {
         }
 
         #[test]
-        fn leaf_7_subleaf_0_advertises_only_fsgsbase_and_speculation_control() {
+        fn leaf_7_subleaf_0_features() {
             const FSGSBASE: u32 = 1 << 0;
             const RDSEED: u32 = 1 << 18;
+            const ERMS: u32 = 1 << 9;
             const BMI1: u32 = 1 << 3;
             const BMI2: u32 = 1 << 8;
             const SMEP: u32 = 1 << 7;
@@ -1629,13 +1638,12 @@ mod sys_tests {
             const SMAP: u32 = 1 << 20;
             const UMIP: u32 = 1 << 2;
             let mut h = blank();
-            // EAX is the highest subleaf. ERMS and FSRM stay clear (see sys.rs), as do SMEP, SMAP,
-            // PCID, BMI, AVX2 and everything else.
+            // EAX is the highest subleaf; EDX is the speculation-control set plus FSRM.
             assert_eq!(
                 cpuid(&mut h, 7, 0),
                 [
                     0,
-                    FSGSBASE | BMI1 | BMI2 | RDSEED | SMEP | AVX2 | INVPCID | SMAP,
+                    FSGSBASE | BMI1 | BMI2 | RDSEED | ERMS | SMEP | AVX2 | INVPCID | SMAP,
                     UMIP,
                     STRUCTURED_EDX
                 ]

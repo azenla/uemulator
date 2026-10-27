@@ -42,7 +42,7 @@ Interpreter and JIT both call the same `flags::compute_all(cc_op, dst, src, src2
 Start from the fork's identity (read `target/i386/cpu.c` "XTCG CPU" model for the exact leaves) and then **subtract** to what we implement. Initial advertised set:
 
 - Leaf 0/1: vendor AuthenticAMD family 0x14 (the fork says 0x15, but Linux blacklists 0x15 for RETBLEED and installs return thunks; see "Speculation control") model 0, FPU, VME no, PSE, TSC, MSR, PAE, CX8, SEP no (syscall only), MTRR, PGE, CMOV, PAT, PSE36 no, CLFLUSH, MMX, FXSR, SSE, SSE2; **APIC clear**, SSE3 later after implementing, **hypervisor bit clear**
-- Leaf 7 subleaf 0: only FSGSBASE (EBX bit 0); EAX = 0. No SMEP, SMAP, AVX2, BMI, ERMS/FSRM, PCID, LA57
+- Leaf 7 subleaf 0: FSGSBASE, BMI1, AVX2, SMEP, BMI2, ERMS, INVPCID, RDSEED, SMAP (EBX); UMIP (ECX); FSRM and the speculation-control bits (EDX); EAX = 0. No LA57, PKU, CET, SHA, AVX-512 (each feature has its section below)
 - Leaf 1 ECX: SSE3, PCLMULQDQ, SSSE3, CX16, SSE4.1, SSE4.2, MOVBE, POPCNT, AES; 0x80000001 ECX adds ABM (LZCNT). MONITOR/MWAIT, VMX/SVM, XSAVE/OSXSAVE, AVX, RDRAND and the hypervisor bit stay clear
 - Leaf 0x80000001: SYSCALL, NX, LM, (RDTSCP)
 - Leaf 0x80000007: invariant TSC set so the kernel trusts the TSC
@@ -62,7 +62,7 @@ Dispatch: `Cpu::sse` hands everything outside the `0F` map (0F 38, 0F 3A) and ev
 - PCLMULQDQ and AES-NI (aesenc/last, aesdec/last, aesimc, aeskeygenassist), tested with FIPS-197 appendix B and C.1 end to end.
 - FSGSBASE: F3 0F AE /0../3 register forms, gated by CR4.FSGSBASE (bit 16, accepted by mov cr4), canonical check on writes.
 
-Left out on purpose: ERMS/FSRM (the kernel would switch memcpy and clear_page to `rep movsb`/`stosb`, which `string_op` runs one byte per iteration instead of eight: advertise only together with a bulk fast path there), MONITOR/MWAIT, AVX/AVX2/FMA/F16C (VEX vector forms). The JIT runs all of the above through `helper_exec` (none is a block ender); `testkit::assert_jit_matches_interpreter` cases cover representative forms. Several encodings are prefix-dependent (F3 0F B8 POPCNT vs JMPE, F3 0F BD LZCNT vs BSR, F3 0F BC still BSF, 0F 38 F0/F1 MOVBE vs CRC32 by F2, F3 0F AE FSGSBASE vs the fences): any inline JIT lowering of the neighbouring opcodes must check `insn.rep` and `insn.p66`, or it silently diverges from the interpreter.
+The JIT runs all of the above through `helper_exec` (none is a block ender, except that group 7 syncs the clock for rdtscp); `testkit::assert_jit_matches_interpreter` cases cover representative forms. Several encodings are prefix-dependent (F3 0F B8 POPCNT vs JMPE, F3 0F BD LZCNT vs BSR, F3 0F BC still BSF, 0F 38 F0/F1 MOVBE vs CRC32 by F2, F3 0F AE FSGSBASE vs the fences): any inline JIT lowering of the neighbouring opcodes must check `insn.rep` and `insn.p66`, or it silently diverges from the interpreter.
 
 
 ## Speculation control (mitigations)
@@ -121,3 +121,7 @@ Gathers (VSIB): the decoder keeps SIB index 4 for the 0F38 90-93 opcodes (it is 
 `sse_fma.rs`: FMA3 (132/213/231 of madd/msub/nmadd/nmsub, packed and scalar, and maddsub/msubadd) rounds once: the exact product of the two significands (at most 106 bits) is one term of `add_terms`, the same routine the legacy adder uses, so DAZ/FTZ/rounding mode/flags behave like the other soft-float instructions. NaN selection takes the first NaN in operand order (destination, vvvv, r/m), quieted; infinity times zero is invalid. Tested bit-for-bit against the host's `mul_add` for every form, with subnormals and forced cancellations. F16C: `vcvtph2ps` is exact (all 65536 inputs checked), `vcvtps2ph` rounds under imm8[1:0] or MXCSR.RC (imm8[2]) with overflow/underflow/precision flags (checked against an independent table-search reference in all four modes). The compare predicates beyond the legacy eight (imm8 8..31: the 32 SDM names, with the `_S` forms signalling on quiet NaNs) are all tested.
 
 Not implemented: AVX-512 (EVEX), VAES/VPCLMULQDQ (the 256-bit forms of AES/PCLMUL are #UD), VPOPCNT, GFNI, SHA, AVX-VNNI. The JIT runs every VEX instruction through its interpreter helper.
+
+## ERMS and FSRM
+
+Advertised (CPUID.7.0:EBX bit 9, EDX bit 4). With them Linux uses `rep movsb`/`rep stosb` for memcpy, clear_page and every `copy_to/from_user`. That is only fast because `rep_bulk` handles a page of such an instruction as one host copy or fill, and because the run-loop slice is `REP_BYTES_PER_SLICE` (32 KiB) of data rather than a count of elements: counting elements gave a `rep movsb` an eighth of the bytes per round trip of the `rep movsq` it replaces, which is why the first attempt measured slower. Measured now on Alpine (interpreter + JIT): boot to shell 1.2 s either way; `dd if=/dev/zero of=/dev/null bs=64k count=30000` (2 GB through copy_to_user) 3.6 s without, 0.3 s with. Tests: `rep_slice_tests` in `exec.rs` (copies across slice and page boundaries, resume with RIP on the instruction).
