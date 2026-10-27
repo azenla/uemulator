@@ -23,11 +23,12 @@ fn bytes(words: &[u32]) -> Vec<u8> {
 
 const FRAME_POINTER: u32 = 29;
 const LINK_REGISTER: u32 = 30;
-/// 16-byte aligned frame: fp/lr, then x19..x24 in pairs, then 16 bytes of padding.
-const FRAME_SIZE: i32 = 80;
+/// 16-byte aligned frame: fp/lr, then the callee-saved registers the blocks use. Those are x19 and
+/// x20 (`CPU`, `TLB_BASE`) and x22 and x23 (slow-path state, see `emit.rs`); nothing uses x21 or
+/// x24 and above, so they are left alone.
+const FRAME_SIZE: i32 = 48;
 const SAVE_X19_X20: i32 = 16;
-const SAVE_X21_X22: i32 = 32;
-const SAVE_X23_X24: i32 = 48;
+const SAVE_X22_X23: i32 = 32;
 
 /// Builds `extern "C" fn(cpu: *mut Cpu, block: u64) -> u64` (the call in `Cpu::step_block`).
 /// It saves the callee-saved registers the blocks use, latches `CPU` and `TLB_BASE`, and jumps
@@ -37,8 +38,7 @@ pub(crate) fn prologue(base: u64) -> Prologue {
     let mut asm = Asm::new(base);
     asm.stp_pre(FRAME_POINTER, LINK_REGISTER, a64::SP, -FRAME_SIZE);
     asm.stp_off(19, 20, a64::SP, SAVE_X19_X20);
-    asm.stp_off(21, 22, a64::SP, SAVE_X21_X22);
-    asm.stp_off(23, 24, a64::SP, SAVE_X23_X24);
+    asm.stp_off(22, 23, a64::SP, SAVE_X22_X23);
     asm.mov(CPU, 0);
     asm.ldr(
         TLB_BASE,
@@ -56,8 +56,7 @@ pub(crate) fn prologue(base: u64) -> Prologue {
     asm.orr(0, 0, 1, true);
     // Normal block exit: x0 already holds the finished exit code.
     let exit_ok = asm.here();
-    asm.ldp_off(23, 24, a64::SP, SAVE_X23_X24);
-    asm.ldp_off(21, 22, a64::SP, SAVE_X21_X22);
+    asm.ldp_off(22, 23, a64::SP, SAVE_X22_X23);
     asm.ldp_off(19, 20, a64::SP, SAVE_X19_X20);
     asm.ldp_post(FRAME_POINTER, LINK_REGISTER, a64::SP, FRAME_SIZE);
     asm.ret();
@@ -74,6 +73,8 @@ pub(crate) fn addrs(exit_ok: u64, exit_fail: u64) -> Addrs {
         exec: helpers::helper_exec as *const () as usize as u64,
         ld: helpers::helper_load as *const () as usize as u64,
         st: helpers::helper_store as *const () as usize as u64,
+        ld_stack: helpers::helper_load_stack as *const () as usize as u64,
+        st_stack: helpers::helper_store_stack as *const () as usize as u64,
         cond: helpers::helper_cond as *const () as usize as u64,
         exit_ok,
         exit_fail,

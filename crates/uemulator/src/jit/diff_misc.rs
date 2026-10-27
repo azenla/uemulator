@@ -1,0 +1,399 @@
+//! Code that straddles page boundaries, instructions of unusual length, and instructions the JIT
+//! always runs through the interpreter (SSE, x87, system instructions) mixed with inline ones.
+
+use super::diff_tests::*;
+use crate::testkit::*;
+
+const CR4_OSFXSR: u64 = 1 << 9;
+const CR4_OSXMMEXCPT: u64 = 1 << 10;
+
+/// The default seeds plus the CR4 bits that let SSE instructions execute (otherwise #UD) and
+/// distinguishable vector registers.
+fn sse_setup(harness: &mut Harness) {
+    seed_registers_and_memory(harness);
+    harness.cpu.cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
+    for (index, xmm) in harness.cpu.xmm.iter_mut().enumerate() {
+        *xmm = 0x0123_4567_89ab_cdef_0011_2233_4455_6677
+            ^ ((index as u128) * 0x0101_0101_0101_0101_0101_0101_0101_0101);
+    }
+}
+
+#[test]
+fn cross_straddling_mov_imm32() {
+    // jmp f; .org 3582; f: mov eax, 0x11223344; mov ebx, 0x55667788; hlt
+    check(&parts(&[
+        Part::Bytes(&[0xe9, 0xf9, 0x0d]),
+        Part::Fill(0x00, 3579),
+        Part::Bytes(&[
+            0xb8, 0x44, 0x33, 0x22, 0x11, 0xbb, 0x88, 0x77, 0x66, 0x55, 0xf4,
+        ]),
+    ]));
+}
+
+#[test]
+fn cross_straddling_movabs_imm64() {
+    // jmp f; .org 3578; f: movabs rax, 0x1122334455667788; hlt
+    check(&parts(&[
+        Part::Bytes(&[0xe9, 0xf5, 0x0d]),
+        Part::Fill(0x00, 3575),
+        Part::Bytes(&[
+            0x48, 0xb8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0xf4,
+        ]),
+    ]));
+}
+
+#[test]
+fn cross_straddling_modrm_with_disp32() {
+    // jmp f; .org 3581; f: mov rax, [rbx + 0x100]; hlt
+    check(&parts(&[
+        Part::Bytes(&[0xe9, 0xf8, 0x0d]),
+        Part::Fill(0x00, 3578),
+        Part::Bytes(&[0x48, 0x8b, 0x83, 0x00, 0x01, 0x00, 0x00, 0xf4]),
+    ]));
+}
+
+#[test]
+fn cross_straddling_instruction_with_one_byte_on_the_first_page() {
+    // jmp f; .org 3583; f: cpuid; hlt
+    check(&parts(&[
+        Part::Bytes(&[0xe9, 0xfa, 0x0d]),
+        Part::Fill(0x00, 3580),
+        Part::Bytes(&[0x0f, 0xa2, 0xf4]),
+    ]));
+}
+
+#[test]
+fn cross_straddling_instruction_in_a_loop() {
+    // mov ecx, 50; jmp f; .org 3580; f: add eax, 0x01020304; dec ecx; jnz f; hlt
+    check(&parts(&[
+        Part::Bytes(&[0xb9, 0x32, 0x00, 0x00, 0x00, 0xe9, 0xf2, 0x0d]),
+        Part::Fill(0x00, 3572),
+        Part::Bytes(&[0x05, 0x04, 0x03, 0x02, 0x01, 0xff, 0xc9, 0x75, 0xf7, 0xf4]),
+    ]));
+}
+
+#[test]
+fn cross_nops_up_to_exactly_the_page_boundary() {
+    // .fill 3584, 1, 0x90; mov eax, 5; hlt
+    check(&parts(&[
+        Part::Fill(0x90, 3584),
+        Part::Bytes(&[0xb8, 0x05, 0x00, 0x00, 0x00, 0xf4]),
+    ]));
+}
+
+#[test]
+fn cross_nops_to_one_byte_before_the_boundary_then_a_two_byte_instruction() {
+    // .fill 3583, 1, 0x90; cpuid; hlt
+    check(&parts(&[
+        Part::Fill(0x90, 3583),
+        Part::Bytes(&[0x0f, 0xa2, 0xf4]),
+    ]));
+}
+
+#[test]
+fn cross_taken_jump_lands_on_the_last_byte_of_a_page() {
+    // jmp t; .org 3583; t: nop; mov eax, 7; hlt
+    check(&parts(&[
+        Part::Bytes(&[0xe9, 0xfa, 0x0d]),
+        Part::Fill(0x00, 3580),
+        Part::Bytes(&[0x90, 0xb8, 0x07, 0x00, 0x00, 0x00, 0xf4]),
+    ]));
+}
+
+#[test]
+fn cross_ret_on_the_last_byte_of_a_page() {
+    // call f; mov eax, 3; hlt; .org 3583; f: ret
+    check(&parts(&[
+        Part::Bytes(&[
+            0xe8, 0xfa, 0x0d, 0x00, 0x00, 0xb8, 0x03, 0x00, 0x00, 0x00, 0xf4,
+        ]),
+        Part::Fill(0x00, 3572),
+        Part::Bytes(&[0xc3]),
+    ]));
+}
+
+#[test]
+fn cross_jcc_straddling_the_boundary() {
+    // cmp rax, rax; jmp f; .org 3583; f: je 1f; mov ecx, 1; 1: hlt
+    check(&parts(&[
+        Part::Bytes(&[0x48, 0x39, 0xc0, 0xe9, 0xf7, 0x0d]),
+        Part::Fill(0x00, 3577),
+        Part::Bytes(&[0x74, 0x05, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xf4]),
+    ]));
+}
+
+#[test]
+fn cross_call_rel32_straddling_the_boundary() {
+    // jmp f; .org 3581; f: call g; hlt; g: ret
+    check(&parts(&[
+        Part::Bytes(&[0xe9, 0xf8, 0x0d]),
+        Part::Fill(0x00, 3578),
+        Part::Bytes(&[0xe8, 0x01, 0x00, 0x00, 0x00, 0xf4, 0xc3]),
+    ]));
+}
+
+#[test]
+fn cross_loop_body_spanning_two_pages() {
+    // mov ecx, 30; jmp f; .org 3560; f: add rax, rcx; xor rdx, rax; .fill 20, 1, 0x90
+    // dec ecx; jnz f; hlt
+    check(&parts(&[
+        Part::Bytes(&[0xb9, 0x1e, 0x00, 0x00, 0x00, 0xe9, 0xde, 0x0d]),
+        Part::Fill(0x00, 3552),
+        Part::Bytes(&[
+            0x48, 0x01, 0xc8, 0x48, 0x31, 0xc2, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xff, 0xc9,
+            0x75, 0xe2, 0xf4,
+        ]),
+    ]));
+}
+
+#[test]
+fn cross_cmp_and_jcc_split_by_the_boundary() {
+    // jmp f; .org 3582; f: cmp rax, rcx; jb 1f; mov rdx, 1; 1: hlt
+    check(&parts(&[
+        Part::Bytes(&[0xe9, 0xf9, 0x0d]),
+        Part::Fill(0x00, 3579),
+        Part::Bytes(&[
+            0x48, 0x39, 0xc8, 0x72, 0x07, 0x48, 0xc7, 0xc2, 0x01, 0x00, 0x00, 0x00, 0xf4,
+        ]),
+    ]));
+}
+
+#[test]
+fn cross_flags_flow_across_the_boundary() {
+    // jmp f; .org 3580; f: add rax, rcx; adc rdx, 0; adc rbx, 0; hlt
+    check(&parts(&[
+        Part::Bytes(&[0xe9, 0xf7, 0x0d]),
+        Part::Fill(0x00, 3577),
+        Part::Bytes(&[
+            0x48, 0x01, 0xc8, 0x48, 0x83, 0xd2, 0x00, 0x48, 0x83, 0xd3, 0x00, 0xf4,
+        ]),
+    ]));
+}
+
+#[test]
+fn cross_memory_operand_instruction_straddling_with_a_fault_free_access() {
+    // jmp f; .org 3580; f: add [rbx], rax; mov [rbx + 8], rcx; hlt
+    check(&parts(&[
+        Part::Bytes(&[0xe9, 0xf7, 0x0d]),
+        Part::Fill(0x00, 3577),
+        Part::Bytes(&[0x48, 0x01, 0x03, 0x48, 0x89, 0x4b, 0x08, 0xf4]),
+    ]));
+}
+
+#[test]
+fn instruction_of_the_maximum_length_with_redundant_prefixes() {
+    // .fill 14, 1, 0x66; nop; hlt
+    check(&[
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x90,
+        0xf4,
+    ]);
+}
+
+// An instruction longer than 15 bytes raises #GP(0) (SDM vol. 2, 2.3.11), not #UD.
+#[test]
+fn sixteen_byte_instruction_raises_general_protection() {
+    // .fill 15, 1, 0x66; nop; hlt
+    check_stop(
+        &[
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x90, 0xf4,
+        ],
+        fault(13, Some(0)),
+    );
+}
+
+#[test]
+fn sse_integer_instructions_between_inline_instructions() {
+    // add rax, rcx; movdqa xmm0, [rbx]; paddd xmm0, xmm0; movdqu [rbx + 16], xmm0
+    // sub rax, rcx; pxor xmm1, xmm1; movq xmm2, rax; movd ebx, xmm0; hlt
+    check_with(
+        &[
+            0x48, 0x01, 0xc8, 0x66, 0x0f, 0x6f, 0x03, 0x66, 0x0f, 0xfe, 0xc0, 0xf3, 0x0f, 0x7f,
+            0x43, 0x10, 0x48, 0x29, 0xc8, 0x66, 0x0f, 0xef, 0xc9, 0x66, 0x48, 0x0f, 0x6e, 0xd0,
+            0x66, 0x0f, 0x7e, 0xc3, 0xf4,
+        ],
+        sse_setup,
+    );
+}
+
+#[test]
+fn sse_registers_survive_inline_blocks() {
+    // movq xmm0, rax; movq xmm1, rcx; jmp 1f; nop; 1: paddq xmm0, xmm1; movq rdx, xmm0
+    // hlt
+    check_with(
+        &[
+            0x66, 0x48, 0x0f, 0x6e, 0xc0, 0x66, 0x48, 0x0f, 0x6e, 0xc9, 0xeb, 0x01, 0x90, 0x66,
+            0x0f, 0xd4, 0xc1, 0x66, 0x48, 0x0f, 0x7e, 0xc2, 0xf4,
+        ],
+        sse_setup,
+    );
+}
+
+#[test]
+fn sse_scalar_double_arithmetic() {
+    // cvtsi2sd xmm0, rax; cvtsi2sd xmm1, rcx; addsd xmm0, xmm1; mulsd xmm0, xmm1
+    // cvttsd2si rdx, xmm0; hlt
+    check_with(
+        &[
+            0xf2, 0x48, 0x0f, 0x2a, 0xc0, 0xf2, 0x48, 0x0f, 0x2a, 0xc9, 0xf2, 0x0f, 0x58, 0xc1,
+            0xf2, 0x0f, 0x59, 0xc1, 0xf2, 0x48, 0x0f, 0x2c, 0xd0, 0xf4,
+        ],
+        sse_setup,
+    );
+}
+
+#[test]
+fn sse_shuffle_and_compare() {
+    // movdqa xmm0, [rbx]; pshufd xmm1, xmm0, 0x1b; pcmpeqb xmm2, xmm2; pmovmskb eax, xmm1
+    // hlt
+    check_with(
+        &[
+            0x66, 0x0f, 0x6f, 0x03, 0x66, 0x0f, 0x70, 0xc8, 0x1b, 0x66, 0x0f, 0x74, 0xd2, 0x66,
+            0x0f, 0xd7, 0xc1, 0xf4,
+        ],
+        sse_setup,
+    );
+}
+
+#[test]
+fn x87_basic_arithmetic_through_the_helper() {
+    // fninit; fld1; fldpi; faddp st(1), st; fstp qword ptr [rbx]; fld qword ptr [rbx]
+    // fchs; fstp dword ptr [rbx + 8]; hlt
+    check(&[
+        0xdb, 0xe3, 0xd9, 0xe8, 0xd9, 0xeb, 0xde, 0xc1, 0xdd, 0x1b, 0xdd, 0x03, 0xd9, 0xe0, 0xd9,
+        0x5b, 0x08, 0xf4,
+    ]);
+}
+
+#[test]
+fn x87_control_and_status_words() {
+    // fninit; fnstcw word ptr [rbx]; fnstsw ax; fld1; fnstsw word ptr [rbx + 2]; hlt
+    check(&[
+        0xdb, 0xe3, 0xd9, 0x3b, 0xdf, 0xe0, 0xd9, 0xe8, 0xdd, 0x7b, 0x02, 0xf4,
+    ]);
+}
+
+#[test]
+fn pause_and_fences_are_nops() {
+    // pause; lfence; mfence; sfence; nop; hlt
+    check(&[
+        0xf3, 0x90, 0x0f, 0xae, 0xe8, 0x0f, 0xae, 0xf0, 0x0f, 0xae, 0xf8, 0x90, 0xf4,
+    ]);
+}
+
+#[test]
+fn cli_and_sti_toggle_the_interrupt_flag() {
+    // cli; pushfq; pop rax; sti; pushfq; pop rcx; nop; hlt
+    check(&[0xfa, 0x9c, 0x58, 0xfb, 0x9c, 0x59, 0x90, 0xf4]);
+}
+
+#[test]
+fn sti_then_a_block_of_instructions_then_hlt() {
+    // sti; add rax, rcx; add rax, rcx; hlt
+    check(&[0xfb, 0x48, 0x01, 0xc8, 0x48, 0x01, 0xc8, 0xf4]);
+}
+
+#[test]
+fn mov_segment_registers_from_a_valid_selector() {
+    // mov ax, 0x18; mov ds, ax; mov es, ax; mov ss, ax; mov bx, ds; mov cx, es; hlt
+    check(&[
+        0x66, 0xb8, 0x18, 0x00, 0x66, 0x8e, 0xd8, 0x66, 0x8e, 0xc0, 0x66, 0x8e, 0xd0, 0x8c, 0xdb,
+        0x8c, 0xc1, 0xf4,
+    ]);
+}
+
+#[test]
+fn mov_from_segment_registers_zero_extends() {
+    // mov eax, 0x12345678; mov eax, cs; mov rbx, ds; mov ecx, ss; hlt
+    check(&[
+        0xb8, 0x78, 0x56, 0x34, 0x12, 0x8c, 0xc8, 0x48, 0x8c, 0xdb, 0x8c, 0xd1, 0xf4,
+    ]);
+}
+
+#[test]
+fn push_and_pop_segment_registers() {
+    // push fs; pop fs; push gs; pop gs; hlt
+    check(&[
+        0x66, 0x0f, 0xa0, 0x66, 0x0f, 0xa1, 0x66, 0x0f, 0xa8, 0x66, 0x0f, 0xa9, 0xf4,
+    ]);
+}
+
+#[test]
+fn wrmsr_fs_base_changes_what_following_fs_accesses_see() {
+    // mov ecx, 0xc0000100; mov eax, 0x400800; xor edx, edx; wrmsr; mov rax, fs:[0]; hlt
+    check(&[
+        0xb9, 0x00, 0x01, 0x00, 0xc0, 0xb8, 0x00, 0x08, 0x40, 0x00, 0x31, 0xd2, 0x0f, 0x30, 0x64,
+        0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xf4,
+    ]);
+}
+
+#[test]
+fn rdmsr_efer_and_wrmsr_back() {
+    // mov ecx, 0xc0000080; rdmsr; wrmsr; rdmsr; hlt
+    check(&[
+        0xb9, 0x80, 0x00, 0x00, 0xc0, 0x0f, 0x32, 0x0f, 0x30, 0x0f, 0x32, 0xf4,
+    ]);
+}
+
+#[test]
+fn mov_to_and_from_cr2_and_cr3() {
+    // mov rax, cr2; mov rcx, 0x1234; mov cr2, rcx; mov rdx, cr2; mov r8, cr3; mov cr3, r8
+    // hlt
+    check(&[
+        0x0f, 0x20, 0xd0, 0x48, 0xc7, 0xc1, 0x34, 0x12, 0x00, 0x00, 0x0f, 0x22, 0xd1, 0x0f, 0x20,
+        0xd2, 0x41, 0x0f, 0x20, 0xd8, 0x41, 0x0f, 0x22, 0xd8, 0xf4,
+    ]);
+}
+
+#[test]
+fn mov_from_cr0_and_cr4_and_cr8() {
+    // mov rax, cr0; mov rcx, cr4; mov rdx, cr8; hlt
+    check(&[
+        0x0f, 0x20, 0xc0, 0x0f, 0x20, 0xe1, 0x44, 0x0f, 0x20, 0xc2, 0xf4,
+    ]);
+}
+
+#[test]
+fn lgdt_and_sgdt_roundtrip() {
+    // sgdt [rbx]; lgdt [rbx]; sgdt [rbx + 16]; sidt [rbx + 32]; hlt
+    check(&[
+        0x0f, 0x01, 0x03, 0x0f, 0x01, 0x13, 0x0f, 0x01, 0x43, 0x10, 0x0f, 0x01, 0x4b, 0x20, 0xf4,
+    ]);
+}
+
+#[test]
+fn nop_sleds_of_every_length() {
+    // nop; xchg ax, ax; nop dword ptr [rax]; nop dword ptr [rax + rax]
+    // nop word ptr [rax + rax]; nop qword ptr [rax + rax + 0x12345678]; hlt
+    check(&[
+        0x90, 0x66, 0x90, 0x0f, 0x1f, 0x00, 0x0f, 0x1f, 0x04, 0x00, 0x66, 0x0f, 0x1f, 0x04, 0x00,
+        0x48, 0x0f, 0x1f, 0x84, 0x00, 0x78, 0x56, 0x34, 0x12, 0xf4,
+    ]);
+}
+
+#[test]
+fn unaligned_accesses_of_every_size_are_fine() {
+    // mov rax, [rbx + 1]; mov eax, [rbx + 3]; mov ax, [rbx + 7]; mov [rbx + 13], rax
+    // mov [rbx + 21], eax; mov [rbx + 31], ax; hlt
+    check(&[
+        0x48, 0x8b, 0x43, 0x01, 0x8b, 0x43, 0x03, 0x66, 0x8b, 0x43, 0x07, 0x48, 0x89, 0x43, 0x0d,
+        0x89, 0x43, 0x15, 0x66, 0x89, 0x43, 0x1f, 0xf4,
+    ]);
+}
+
+#[test]
+fn memory_operand_with_all_four_scale_factors() {
+    // mov rax, [rbx + rcx*1]; mov rdx, [rbx + rcx*2]; mov rsi, [rbx + rcx*4]
+    // mov r8, [rbx + rcx*8]; hlt
+    check(&[
+        0x48, 0x8b, 0x04, 0x0b, 0x48, 0x8b, 0x14, 0x4b, 0x48, 0x8b, 0x34, 0x8b, 0x4c, 0x8b, 0x04,
+        0xcb, 0xf4,
+    ]);
+}
+
+#[test]
+fn flags_register_image_has_the_reserved_bit_set() {
+    // pushfq; pop rax; hlt
+    check(&[0x9c, 0x58, 0xf4]);
+}

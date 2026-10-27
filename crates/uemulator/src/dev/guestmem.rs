@@ -29,6 +29,14 @@ impl<'a> GuestMem<'a> {
         }
     }
 
+    /// True if `len` bytes at `phys_addr` are all RAM. Lets a device validate a guest-supplied
+    /// buffer once up front instead of finding out per access.
+    pub fn contains(&self, phys_addr: u64, len: u64) -> bool {
+        phys_addr
+            .checked_add(len)
+            .is_some_and(|end| end <= self.ram.len() as u64)
+    }
+
     /// Out-of-range reads fail instead of faulting: a bad guest descriptor must not panic the host.
     pub fn read(&self, phys_addr: u64, buf: &mut [u8]) -> bool {
         match usize::try_from(phys_addr)
@@ -98,3 +106,7 @@ impl<'a> GuestMem<'a> {
 pub(crate) fn test_mem(ram: &mut [u8]) -> GuestMem<'_> {
     GuestMem::new(ram, &[])
 }
+
+#[cfg(test)]
+#[path = "guestmem_tests.rs"]
+mod tests;

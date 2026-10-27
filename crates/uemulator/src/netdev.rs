@@ -66,3 +66,289 @@ impl NetHandle {
         self.inner.0.lock().unwrap().to_guest.pop_front()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    const SHORT_TIMEOUT: Duration = Duration::from_millis(5);
+    const NEVER_EXPIRES: Duration = Duration::from_secs(30);
+    const REASONABLE: Duration = Duration::from_secs(10);
+
+    /// A frame whose first two bytes identify it.
+    fn frame(id: usize) -> Vec<u8> {
+        vec![(id >> 8) as u8, id as u8, 0xaa]
+    }
+
+    fn id_of(frame: &[u8]) -> usize {
+        ((frame[0] as usize) << 8) | frame[1] as usize
+    }
+
+    mod host_to_guest {
+        use super::*;
+
+        #[test]
+        fn frames_reach_the_guest_in_order_and_unmodified() {
+            let net = NetHandle::default();
+            assert!(net.send_frame(b"first"));
+            assert!(net.send_frame(b"second frame"));
+            assert_eq!(net.guest_recv().as_deref(), Some(&b"first"[..]));
+            assert_eq!(net.guest_recv().as_deref(), Some(&b"second frame"[..]));
+            assert_eq!(net.guest_recv(), None);
+        }
+
+        #[test]
+        fn has_pending_tracks_the_queue() {
+            let net = NetHandle::default();
+            assert!(!net.has_pending());
+            net.send_frame(b"x");
+            assert!(net.has_pending());
+            net.guest_recv();
+            assert!(!net.has_pending());
+        }
+
+        #[test]
+        fn the_frame_is_copied_so_the_sender_may_reuse_its_buffer() {
+            let net = NetHandle::default();
+            let mut buffer = vec![1u8, 2, 3];
+            net.send_frame(&buffer);
+            buffer.fill(9);
+            assert_eq!(net.guest_recv().unwrap(), [1, 2, 3]);
+        }
+
+        #[test]
+        fn empty_and_jumbo_frames_are_queued_as_they_are() {
+            let net = NetHandle::default();
+            let jumbo = vec![0x5au8; 70_000];
+            assert!(net.send_frame(&[]));
+            assert!(net.send_frame(&jumbo));
+            assert_eq!(net.guest_recv().unwrap(), Vec::<u8>::new());
+            assert_eq!(net.guest_recv().unwrap(), jumbo);
+        }
+
+        #[test]
+        fn frames_are_not_merged_or_split() {
+            let net = NetHandle::default();
+            net.send_frame(b"ab");
+            net.send_frame(b"cd");
+            assert_eq!(net.guest_recv().unwrap(), b"ab");
+            assert_eq!(net.guest_recv().unwrap(), b"cd");
+        }
+
+        #[test]
+        fn a_full_queue_rejects_the_new_frame_and_keeps_the_old_ones() {
+            let net = NetHandle::default();
+            for id in 0..QUEUE_FRAMES {
+                assert!(net.send_frame(&frame(id)), "frame {id} must fit");
+            }
+            assert!(!net.send_frame(&frame(QUEUE_FRAMES)));
+            assert!(!net.send_frame(&frame(QUEUE_FRAMES + 1)));
+            // The first frame is still first, the rejected ones never appear.
+            for id in 0..QUEUE_FRAMES {
+                assert_eq!(id_of(&net.guest_recv().unwrap()), id);
+            }
+            assert_eq!(net.guest_recv(), None);
+        }
+
+        #[test]
+        fn a_slot_freed_by_the_guest_accepts_a_frame_again_at_the_back() {
+            let net = NetHandle::default();
+            for id in 0..QUEUE_FRAMES {
+                net.send_frame(&frame(id));
+            }
+            assert!(!net.send_frame(&frame(9999)));
+            assert_eq!(id_of(&net.guest_recv().unwrap()), 0);
+            assert!(net.send_frame(&frame(9999)));
+            assert!(!net.send_frame(&frame(10_000)));
+            let mut last = 0;
+            while let Some(received) = net.guest_recv() {
+                last = id_of(&received);
+            }
+            assert_eq!(last, 9999);
+        }
+
+        #[test]
+        fn the_two_directions_have_separate_queues() {
+            let net = NetHandle::default();
+            for id in 0..QUEUE_FRAMES {
+                net.send_frame(&frame(id));
+            }
+            // A full host-to-guest queue does not block the guest's own sends.
+            net.guest_send(b"from guest".to_vec());
+            assert_eq!(net.try_recv_frame().as_deref(), Some(&b"from guest"[..]));
+        }
+    }
+
+    mod guest_to_host {
+        use super::*;
+
+        #[test]
+        fn frames_reach_the_host_in_order() {
+            let net = NetHandle::default();
+            net.guest_send(b"one".to_vec());
+            net.guest_send(b"two".to_vec());
+            assert_eq!(net.try_recv_frame().as_deref(), Some(&b"one"[..]));
+            assert_eq!(net.try_recv_frame().as_deref(), Some(&b"two"[..]));
+            assert_eq!(net.try_recv_frame(), None);
+        }
+
+        #[test]
+        fn try_recv_never_blocks() {
+            let net = NetHandle::default();
+            let started = Instant::now();
+            assert_eq!(net.try_recv_frame(), None);
+            assert!(started.elapsed() < REASONABLE);
+        }
+
+        #[test]
+        fn a_full_queue_drops_the_oldest_frame() {
+            let net = NetHandle::default();
+            for id in 0..QUEUE_FRAMES + 5 {
+                net.guest_send(frame(id));
+            }
+            let mut ids = Vec::new();
+            while let Some(received) = net.try_recv_frame() {
+                ids.push(id_of(&received));
+            }
+            assert_eq!(ids.len(), QUEUE_FRAMES);
+            assert_eq!(ids.first(), Some(&5));
+            assert_eq!(ids.last(), Some(&(QUEUE_FRAMES + 4)));
+            assert!(ids.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        }
+
+        #[test]
+        fn exactly_the_cap_loses_nothing() {
+            let net = NetHandle::default();
+            for id in 0..QUEUE_FRAMES {
+                net.guest_send(frame(id));
+            }
+            assert_eq!(id_of(&net.try_recv_frame().unwrap()), 0);
+        }
+
+        #[test]
+        fn recv_with_a_frame_queued_returns_it_without_waiting() {
+            let net = NetHandle::default();
+            net.guest_send(b"ready".to_vec());
+            let started = Instant::now();
+            assert_eq!(
+                net.recv_frame(NEVER_EXPIRES).as_deref(),
+                Some(&b"ready"[..])
+            );
+            assert!(started.elapsed() < REASONABLE);
+        }
+
+        #[test]
+        fn recv_with_nothing_queued_times_out_with_none() {
+            let net = NetHandle::default();
+            let started = Instant::now();
+            assert_eq!(net.recv_frame(SHORT_TIMEOUT), None);
+            assert!(started.elapsed() < REASONABLE);
+        }
+
+        #[test]
+        fn a_zero_timeout_polls() {
+            let net = NetHandle::default();
+            assert_eq!(net.recv_frame(Duration::ZERO), None);
+            net.guest_send(b"x".to_vec());
+            assert!(net.recv_frame(Duration::ZERO).is_some());
+        }
+
+        #[test]
+        fn a_blocked_receiver_wakes_when_the_guest_sends() {
+            let net = NetHandle::default();
+            let receiver = {
+                let net = net.clone();
+                std::thread::spawn(move || net.recv_frame(NEVER_EXPIRES))
+            };
+            net.guest_send(b"wake".to_vec());
+            assert_eq!(receiver.join().unwrap().as_deref(), Some(&b"wake"[..]));
+        }
+
+        #[test]
+        fn one_wakeup_serves_one_frame_when_two_receivers_wait() {
+            let net = NetHandle::default();
+            let spawn_receiver = |net: NetHandle| {
+                std::thread::spawn(move || net.recv_frame(Duration::from_millis(200)))
+            };
+            let first = spawn_receiver(net.clone());
+            let second = spawn_receiver(net.clone());
+            net.guest_send(b"only one".to_vec());
+            let results = [first.join().unwrap(), second.join().unwrap()];
+            assert_eq!(results.iter().filter(|frame| frame.is_some()).count(), 1);
+        }
+    }
+
+    mod sharing {
+        use super::*;
+
+        #[test]
+        fn clones_share_both_queues() {
+            let net = NetHandle::default();
+            let clone = net.clone();
+            clone.send_frame(b"down");
+            assert_eq!(net.guest_recv().unwrap(), b"down");
+            net.guest_send(b"up".to_vec());
+            assert_eq!(clone.try_recv_frame().unwrap(), b"up");
+        }
+
+        #[test]
+        fn separate_handles_are_independent() {
+            let (first, second) = (NetHandle::default(), NetHandle::default());
+            first.send_frame(b"x");
+            first.guest_send(b"y".to_vec());
+            assert!(!second.has_pending());
+            assert_eq!(second.try_recv_frame(), None);
+        }
+
+        #[test]
+        fn a_producing_guest_thread_and_a_receiving_host_thread_exchange_every_frame() {
+            const TOTAL: usize = 500;
+            let net = NetHandle::default();
+            let producer = {
+                let net = net.clone();
+                std::thread::spawn(move || {
+                    for id in 0..TOTAL {
+                        net.guest_send(frame(id));
+                    }
+                })
+            };
+            let mut ids = Vec::new();
+            let started = Instant::now();
+            while ids.len() < TOTAL && started.elapsed() < REASONABLE {
+                if let Some(received) = net.recv_frame(SHORT_TIMEOUT) {
+                    ids.push(id_of(&received));
+                }
+            }
+            producer.join().unwrap();
+            assert_eq!(ids, (0..TOTAL).collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn a_host_thread_sending_and_a_guest_thread_receiving_exchange_every_frame() {
+            const TOTAL: usize = 500;
+            let net = NetHandle::default();
+            let sender = {
+                let net = net.clone();
+                std::thread::spawn(move || {
+                    for id in 0..TOTAL {
+                        // The queue is bounded; retry until the guest side makes room.
+                        while !net.send_frame(&frame(id)) {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            };
+            let mut ids = Vec::new();
+            let started = Instant::now();
+            while ids.len() < TOTAL && started.elapsed() < REASONABLE {
+                match net.guest_recv() {
+                    Some(received) => ids.push(id_of(&received)),
+                    None => std::thread::yield_now(),
+                }
+            }
+            sender.join().unwrap();
+            assert_eq!(ids, (0..TOTAL).collect::<Vec<_>>());
+        }
+    }
+}

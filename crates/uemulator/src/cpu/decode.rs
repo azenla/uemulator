@@ -63,7 +63,9 @@ pub(crate) const NO_REG: u8 = 0xff;
 /// No segment-override prefix.
 pub(crate) const NO_SEG: u8 = 0xff;
 
-/// Architectural instruction length limit; a longer encoding is #UD.
+/// Architectural instruction length limit. A longer encoding is #GP(0), raised by
+/// `Cpu::fetch_decode` when the 15-byte window is used up without a complete instruction (see
+/// `DecodeErr::Truncated`).
 const MAX_INSN_LEN: usize = 15;
 
 const PREFIX_OPERAND_SIZE: u8 = 0x66;
@@ -112,8 +114,9 @@ pub(crate) enum DecodeErr {
     /// The byte slice ended in the middle of the instruction. The caller supplies more bytes
     /// (an instruction may straddle a page boundary) and retries; at the full 15 bytes it is #UD.
     Truncated,
-    /// Not decodable as an instruction in 64-bit mode (opcode removed in long mode, or longer
-    /// than 15 bytes). Becomes #UD.
+    /// Not decodable as an instruction in 64-bit mode (opcode removed in long mode, or an
+    /// undefined encoding). Becomes #UD. An over-long encoding is not this case: `fetch_decode`
+    /// turns it into #GP(0).
     Invalid,
 }
 
@@ -256,9 +259,15 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Insn, DecodeErr> {
         index: NO_REG,
         ..Default::default()
     };
-    let mut rexw = false;
-    let mut op = loop {
+    let mut rex = 0u8;
+    // 40-4f are always REX here (never inc/dec). A REX only counts when it directly precedes the
+    // opcode: a legacy prefix after it drops it, and of two REX bytes in a row the last one wins.
+    let op = loop {
         let b = r.u8()?;
+        if (REX_FIRST..=REX_LAST).contains(&b) {
+            rex = b;
+            continue;
+        }
         match b {
             PREFIX_OPERAND_SIZE => i.p66 = true,
             PREFIX_ADDRESS_SIZE => i.addr32 = true,
@@ -273,15 +282,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Insn, DecodeErr> {
             PREFIX_SEG_GS => i.seg = SEG_GS as u8,
             _ => break b,
         }
+        rex = 0;
     };
-    // 40-4f are always REX here (never inc/dec). Only a REX directly before the opcode is
-    // honored; a REX followed by a legacy prefix is not re-scanned for prefixes.
-    if (REX_FIRST..=REX_LAST).contains(&op) {
-        i.rex = op;
-        i.rex_present = true;
-        rexw = op & REX_W != 0;
-        op = r.u8()?;
-    }
+    i.rex = rex;
+    i.rex_present = rex != 0;
+    let rexw = rex & REX_W != 0;
     let mut map = MAP_ONE_BYTE;
     let mut opb = op;
     if op == OPCODE_ESCAPE_0F {
@@ -403,3 +408,7 @@ mod tests {
         assert_eq!(decode(&[0x8b, 0x04]).unwrap_err(), DecodeErr::Truncated);
     }
 }
+
+#[cfg(test)]
+#[path = "decode_tests.rs"]
+mod decode_tests;

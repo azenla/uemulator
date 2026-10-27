@@ -63,9 +63,21 @@ pub(crate) struct Jit {
     page_blocks: HashMap<u64, Vec<u32>>,
     /// Offset of the first block, just past the prologue. `reset` rewinds to here.
     blocks_start: usize,
+    stats: JitStats,
+}
+
+/// Translation counters, read by tests to check that the cache is used and invalidated as
+/// intended (`Jit::stats`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct JitStats {
+    /// Blocks compiled, including ones compiled again after an invalidation or a reset.
     pub translated: u64,
+    /// Guest instructions lowered inline, i.e. not through `helper_exec`.
     pub inlined: u64,
+    /// Guest instructions compiled, inline or not.
     pub total: u64,
+    /// Times the whole code buffer was flushed because it was full.
     pub resets: u64,
 }
 
@@ -92,11 +104,13 @@ impl Jit {
             jump_cache: vec![0; 1 << JUMP_CACHE_BITS],
             page_blocks: HashMap::new(),
             blocks_start,
-            translated: 0,
-            inlined: 0,
-            total: 0,
-            resets: 0,
+            stats: JitStats::default(),
         })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn stats(&self) -> JitStats {
+        self.stats
     }
 
     /// Called from `Cpu::code_written` when a guest write hits a page that has blocks. The
@@ -117,7 +131,7 @@ impl Jit {
         self.page_blocks.clear();
         self.jump_cache.iter_mut().for_each(|slot| *slot = 0);
         self.used_bytes = self.blocks_start;
-        self.resets += 1;
+        self.stats.resets += 1;
     }
 
     pub fn lookup(&self, rip: u64, phys_addr: u64) -> Option<u64> {
@@ -131,7 +145,8 @@ impl Jit {
 
     /// Decodes up to `MAX_INSNS` instructions at `rip` (physical `phys_addr`), compiles them and
     /// returns the host address of the block. A block never spans a page boundary, except the
-    /// single-instruction block for an instruction that itself straddles one.
+    /// single-instruction block for an instruction that itself straddles one. `rip` must be
+    /// `cpu.rip`: that case decodes through `Cpu::fetch_decode`, which reads it.
     pub fn translate(&mut self, cpu: &mut Cpu, rip: u64, phys_addr: u64) -> Result<u64, Exception> {
         if self.used_bytes + CODE_HEADROOM > self.exec_mem.len() {
             self.reset();
@@ -192,15 +207,10 @@ impl Jit {
                 }
             }
         }
-        // Not reachable today: the first loop iteration always pushes an instruction, returns, or
-        // takes the `Truncated` arm above. Kept as a guard so a block is never empty.
-        if insns.is_empty() {
-            let insn = cpu.fetch_decode()?;
-            insn_rips.push(rip);
-            end_rip = rip + insn.len as u64;
-            insns.push(insn);
-            crosses_page = true;
-        }
+        // The first iteration always runs (`MAX_INSNS > 0`, at least one byte is left in the page)
+        // and either pushes an instruction, returns, or takes the first-instruction `Truncated`
+        // arm, so a block is never empty. An empty one would compile to "jump to `rip`" and spin.
+        debug_assert!(!insns.is_empty());
         // Makes guest stores to this page take the slow path so `code_written` sees them.
         cpu.mark_code(phys_addr);
         let mut pages = vec![phys_addr >> PAGE_SHIFT];
@@ -217,8 +227,8 @@ impl Jit {
         let code_addr = self.exec_mem.base() + self.used_bytes as u64;
         let (code, inlined) =
             arch::compile_block(code_addr, &self.addrs, &insns, &insn_rips, end_rip);
-        self.inlined += inlined as u64;
-        self.total += insns.len() as u64;
+        self.stats.inlined += inlined as u64;
+        self.stats.total += insns.len() as u64;
         self.exec_mem.write_bytes(self.used_bytes, &code);
         self.used_bytes += code.len();
         let index = self.blocks.len() as u32;
@@ -233,7 +243,7 @@ impl Jit {
             self.page_blocks.entry(page).or_default().push(index);
         }
         self.jump_cache[jump_cache_hash(rip)] = index + 1;
-        self.translated += 1;
+        self.stats.translated += 1;
         Ok(code_addr)
     }
 }
@@ -290,3 +300,7 @@ impl Cpu {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "native_tests.rs"]
+mod tests;

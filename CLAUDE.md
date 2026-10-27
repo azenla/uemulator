@@ -13,7 +13,7 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 
 ## Rules
 
-- Cargo workspace: `crates/uemulator-uefi` (`no_std` UEFI app, empty on hosted targets), `crates/uemulator` (library; `no_std` + `alloc` on `target_os = "uefi"`; the default `jit` feature pulls in `libc` on unix and `windows-sys` on Windows, `--no-default-features` has zero dependencies and is interpreter-only) and `crates/uemulator-cli` (clap, ureq; may use crates freely). Tests live in the library crate.
+- Cargo workspace: `crates/uemulator-uefi` (`no_std` UEFI app; on hosted targets only its hardware-independent modules build, which is what `cargo test -p uemulator-uefi` runs), `crates/uemulator` (library; `no_std` + `alloc` on `target_os = "uefi"`; the default `jit` feature pulls in `libc` on unix and `windows-sys` on Windows, `--no-default-features` has zero dependencies and is interpreter-only) and `crates/uemulator-cli` (clap, ureq; may use crates freely). Tests live next to the code in each crate; the library's shared helpers are in `crates/uemulator/src/testkit.rs`.
 - `lib.rs` is the entire public API: `EmulatedMachine::new(cfg)` then `start()`. Everything else is `pub(crate)`.
 - The library never touches stdio, never calls `process::exit`, holds no global mutable state, never panics on guest behavior. Guest faults are guest exceptions.
 - Comment what is surprising, looks obscure, or is named something non-obvious: hardware quirks, ordering constraints, invariants the JIT relies on, why a value is what it is. Cite the SDM section or the QEMU behavior when that is the real source. Don't restate what the code says.
@@ -25,10 +25,18 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 - Advertise a CPUID bit only together with the tests for the instructions behind it.
 - Debug-profile is optimized (`opt-level = 3`) because the kernel decompressor is ~1e9 guest instructions.
 
+## Tests
+
+- Unit tests only: no network, no cached kernels or initrds, nothing under `~/.uemulator`. A test that needs a guest builds a tiny one: `testkit::FakeKernel` makes a valid bzImage whose 64-bit entry point is hand-assembled code (`echo 'mov rax, 5; hlt' | hack/asm.sh` prints the bytes).
+- `testkit::Harness` runs a snippet on one CPU, interpreter or JIT, with undelivered faults reported as `Stop::Fault`; `testkit::run_machine` boots a fake kernel on a full `EmulatedMachine`.
+- Anything the JIT compiles gets a case that runs `testkit::assert_jit_matches_interpreter`. The interpreter is the oracle.
+- Fixing a bug: write the failing test first.
+- Under Rosetta (`--target x86_64-apple-darwin`) tests that run generated code take turns through `jit::serialize_jit_tests`; Rosetta's translation cache goes stale when one thread frees a code buffer and another maps one at the same address. `testkit::Harness::enable_jit` holds it for you; take it yourself when you use `Jit::new` directly.
+- Real-kernel lockstep check (not a test, needs a kernel you supply): `--verify` on the CLI.
+
 ## Debugging
 
 - `--debug` on the CLI dumps CPU state and scans guest RAM for the kernel log ring buffer on exit.
 - `--verify` runs the JIT in lockstep with the interpreter and stops at the first diverging block; use it after any change under `crates/uemulator/src/jit/`.
 - `--time <unix>` fixes the RTC; guest behavior must not depend on it, so a time-dependent failure is an emulator bug.
-- Slow lockstep test: `cargo test --release -- --ignored`.
 - On an Apple Silicon Mac the x86_64 JIT runs under Rosetta: `cargo test --release -p uemulator --target x86_64-apple-darwin` (`rustup target add x86_64-apple-darwin`).

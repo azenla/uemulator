@@ -1,20 +1,15 @@
-use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
 use uefi::CStr16;
 use uefi::proto::console::text::{Key, ScanCode};
+
+use crate::text;
 
 /// Guest output waits here until the next poll, so the firmware is called once per burst
 /// rather than once per byte.
 static PENDING: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// Bytes of a UTF-8 sequence cut off at the end of the last write, completed by the next one.
 static UTF8_TAIL: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-
-/// UTF-16 code units are collected in a buffer of this capacity and handed to the firmware as soon
-/// as `OUTPUT_FLUSH_THRESHOLD` is reached. The gap leaves room for the largest step (CR plus a
-/// surrogate pair) and the terminating NUL, so the buffer never grows.
-const OUTPUT_BUFFER_UNITS: usize = 512;
-const OUTPUT_FLUSH_THRESHOLD: usize = 500;
 
 /// Output callback for the guest console; never calls the firmware.
 pub fn queue(bytes: &[u8]) {
@@ -35,41 +30,17 @@ pub fn print(text: &str) {
     write_now(text.as_bytes());
 }
 
-/// Converts UTF-8 to the firmware's UTF-16 with LF turned into CR LF, as its console needs.
+/// Writes `bytes` (UTF-8, possibly cut inside a sequence) to the firmware console.
 fn write_now(bytes: &[u8]) {
-    let mut tail = UTF8_TAIL.lock();
-    tail.extend_from_slice(bytes);
-    let valid = match core::str::from_utf8(&tail) {
-        Ok(s) => s.len(),
-        // `error_len() == None` means the input ends inside a sequence: keep it for the next write.
-        Err(e) if e.error_len().is_none() => e.valid_up_to(),
-        // Not UTF-8 at all: pass the bytes through as Latin-1 rather than stall.
-        Err(_) => tail.len(),
+    let text = {
+        let mut tail = UTF8_TAIL.lock();
+        text::take_text(&mut tail, bytes)
     };
-    let text: String = match core::str::from_utf8(&tail[..valid]) {
-        Ok(s) => s.into(),
-        Err(_) => tail[..valid].iter().map(|&b| b as char).collect(),
-    };
-    tail.drain(..valid);
-    drop(tail);
-    let mut units: Vec<u16> = Vec::with_capacity(OUTPUT_BUFFER_UNITS);
-    for c in text.chars() {
-        if c == '\n' {
-            units.push(b'\r' as u16);
-        }
-        let mut buf = [0u16; 2];
-        units.extend_from_slice(c.encode_utf16(&mut buf));
-        if units.len() >= OUTPUT_FLUSH_THRESHOLD {
-            emit(&mut units);
-        }
-    }
-    emit(&mut units);
+    text::to_firmware_units(&text, emit);
 }
 
 fn emit(units: &mut Vec<u16>) {
-    // A NUL would end the string early.
-    units.retain(|&u| u != 0);
-    units.push(0);
+    text::terminate(units);
     if let Ok(s) = CStr16::from_u16_with_nul(units) {
         uefi::system::with_stdout(|out| {
             let _ = out.output_string_lossy(s);

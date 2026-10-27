@@ -10,7 +10,8 @@
 //! - `TLB_BASE` (x20): `Cpu::tlb_active_base`, latched once on entry. A block therefore never
 //!   runs across a CPL change; every instruction that changes CPL ends the block.
 //! - `SAVED_ADDRESS` (x22) and `SAVED_NZCV` (x23): hold the access address and the host flags
-//!   across a slow-path helper call. x21 and x24 are saved by the prologue but unused.
+//!   across a slow-path helper call. Together with x19/x20 these are the only callee-saved
+//!   registers the code touches, so they are the only ones the prologue saves.
 //! - x0..x6 and x16 are caller-saved scratch: x0/x1 are the ALU operands and the helper
 //!   argument/return registers, `ADDRESS` (x2) the guest linear address being accessed,
 //!   `SCRATCH_A..C` (x3..x5) temporaries of address arithmetic and the TLB probe, `VALUE` (x6)
@@ -37,7 +38,7 @@ use std::mem::{offset_of, size_of};
 
 use super::a64::*;
 use super::helpers::*;
-use crate::cpu::decode::{Insn, NO_REG, NO_SEG};
+use crate::cpu::decode::{Insn, NO_REG};
 use crate::cpu::flags::LazyFlagsOp;
 use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TlbEntry};
 
@@ -128,8 +129,16 @@ struct LiveFlags {
 }
 
 enum SlowAccess {
-    Load { dst: u32, size: u8, signed: bool },
-    Store { size: u8 },
+    Load {
+        dst: u32,
+        size: u8,
+        signed: bool,
+        stack: bool,
+    },
+    Store {
+        size: u8,
+        stack: bool,
+    },
 }
 
 /// An out-of-line memory access, emitted after the block body by `emit_slows`. Entered when the
@@ -241,13 +250,6 @@ fn cond_map(kind: FlagKind, condition: u8) -> Option<CondMap> {
     }
 }
 
-/// Instructions that read guest time, which is derived from `Cpu::icount`: rdtsc, and in/out,
-/// which pass the current time to the device.
-fn reads_clock(op: u16) -> bool {
-    // 0f 31 rdtsc; e4..e7 in/out with imm8 port; ec..ef in/out with dx port
-    matches!(op, 0x131 | 0xe4..=0xe7 | 0xec..=0xef)
-}
-
 /// The register embedded in the low three opcode bits (push/pop/mov r, imm), extended by REX.B.
 fn opcode_register(insn: &Insn) -> u8 {
     (insn.op as u8 & OPCODE_REG_MASK) | ((insn.rex & REX_B) << REX_B_REG_SHIFT)
@@ -266,6 +268,9 @@ pub(crate) struct Addrs {
     pub exec: u64,
     pub ld: u64,
     pub st: u64,
+    /// Variants of `ld`/`st` for push/pop/call/ret, which fault with #SS instead of #GP.
+    pub ld_stack: u64,
+    pub st_stack: u64,
     pub cond: u64,
     /// The exit stubs in the prologue at the start of the code buffer, reached with a direct
     /// branch (`Asm::b_abs`).
@@ -282,6 +287,10 @@ pub(crate) struct Gen<'a> {
     /// storing instruction, rip after it).
     smc_exits: Vec<(Label, u32, u64)>,
     live: Option<LiveFlags>,
+    /// Instructions of this block already added to `Cpu::icount` ahead of an rdtsc-like helper
+    /// (the block index of the last one). Exact at translation time because a block is
+    /// straight-line code: every instruction before a reachable one has executed.
+    prepaid_insns: u32,
     /// Number of instructions lowered inline (not via `helper_exec`), for `Jit::inlined` statistics.
     pub inlined: u32,
 }
@@ -295,6 +304,7 @@ impl<'a> Gen<'a> {
             slow_paths: Vec::new(),
             smc_exits: Vec::new(),
             live: None,
+            prepaid_insns: 0,
             inlined: 0,
         }
     }
@@ -336,17 +346,19 @@ impl<'a> Gen<'a> {
         // Address of the decoded instruction, baked into the code: `Jit::translate` keeps the
         // owning slice alive in the `Block` for as long as this code can run.
         let insn = &self.insns[index] as *const Insn as u64;
-        if index > 0 && reads_clock(self.insns[index].op) {
+        if reads_guest_clock(self.insns[index].op) && index as u32 > self.prepaid_insns {
             // `Cpu::icount` is only advanced when the block exits, but these instructions read
-            // the clock now. Pay for the `index` instructions already executed (the first one
-            // was counted by `run`) and tell `step_block` not to count them again. It is
-            // overwritten, not accumulated, so a second rdtsc in the same block would add
-            // `index` to `icount` again without a matching deduction.
+            // the clock now. Pay for the instructions executed since the last payment (the
+            // first one of the block was counted by `run`) and record the running total in
+            // `prepaid_icount`, which `step_block` subtracts from the block's count. Paying the
+            // full `index` again for a second rdtsc would double-count the first payment.
+            let owed = index as u32 - self.prepaid_insns;
             self.asm.ldr(SCRATCH_B, CPU, ICOUNT_OFFSET);
-            self.asm.add_imm(SCRATCH_B, SCRATCH_B, index as u32, true);
+            self.asm.add_imm(SCRATCH_B, SCRATCH_B, owed, true);
             self.asm.str(SCRATCH_B, CPU, ICOUNT_OFFSET);
             self.asm.mov_imm(SCRATCH_B, index as u64);
             self.asm.str(SCRATCH_B, CPU, PREPAID_ICOUNT_OFFSET);
+            self.prepaid_insns = index as u32;
         }
         // helper_exec(cpu, insn, rip) -> status
         self.asm.mov(0, CPU);
@@ -410,6 +422,16 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// `rd = rn & constant` (64-bit). A constant that is not an encodable bitmask immediate is
+    /// materialised in `CALL_TARGET`, which nothing else uses while a probe runs; `and_imm`
+    /// emits nothing in that case, so ignoring its result would silently drop the mask.
+    fn and_constant(&mut self, rd: u32, rn: u32, constant: u64) {
+        if !self.asm.and_imm(rd, rn, constant, true) {
+            self.asm.mov_imm(CALL_TARGET, constant);
+            self.asm.and(rd, rn, CALL_TARGET, true);
+        }
+    }
+
     /// Inline soft-TLB lookup for an access of `size` bytes at `ADDRESS`; branches to `slow` on a
     /// miss. On a hit `SCRATCH_A` points at the TLB entry. `tag_offset` selects the read or
     /// write tag.
@@ -429,15 +451,14 @@ impl<'a> Gen<'a> {
         let tag = SCRATCH_B;
         let page = SCRATCH_C;
         self.asm.lsr_imm(entry, ADDRESS, PAGE_SHIFT);
-        self.asm
-            .and_imm(entry, entry, (TLB_ENTRIES_PER_MODE - 1) as u64, true);
+        self.and_constant(entry, entry, (TLB_ENTRIES_PER_MODE - 1) as u64);
         self.asm.add_lsl(entry, TLB_BASE, entry, TLB_ENTRY_SHIFT);
         self.asm.ldr(tag, entry, tag_offset);
         if size == 1 {
-            self.asm.and_imm(page, ADDRESS, !PAGE_MASK, true);
+            self.and_constant(page, ADDRESS, !PAGE_MASK);
         } else {
             self.asm.add_imm(page, ADDRESS, size as u32 - 1, true);
-            self.asm.and_imm(page, page, !PAGE_MASK, true);
+            self.and_constant(page, page, !PAGE_MASK);
         }
         self.asm.eor(page, tag, page, true);
         self.asm.cbnz(page, slow, true);
@@ -446,6 +467,23 @@ impl<'a> Gen<'a> {
     /// Loads `size` bytes at `ADDRESS` into `dst` (zero- or sign-extended to 64 bits). The slow
     /// path preserves `ADDRESS` and the host flags but, being a call, nothing else.
     fn mem_load(&mut self, dst: u32, size: u8, signed: bool, insn_index: u32, rip: u64) {
+        self.load_access(dst, size, signed, insn_index, rip, false);
+    }
+
+    /// `mem_load` for an implicit stack access: only the slow path differs (#SS, not #GP).
+    fn stack_load(&mut self, dst: u32, insn_index: u32, rip: u64) {
+        self.load_access(dst, 8, false, insn_index, rip, true);
+    }
+
+    fn load_access(
+        &mut self,
+        dst: u32,
+        size: u8,
+        signed: bool,
+        insn_index: u32,
+        rip: u64,
+        stack: bool,
+    ) {
         let entry = self.asm.label();
         let resume = self.asm.label();
         self.tlb_probe(size, TLB_TAG_READ_OFFSET, entry);
@@ -456,7 +494,12 @@ impl<'a> Gen<'a> {
         self.slow_paths.push(SlowPath {
             entry,
             resume,
-            access: SlowAccess::Load { dst, size, signed },
+            access: SlowAccess::Load {
+                dst,
+                size,
+                signed,
+                stack,
+            },
             insn_index,
             rip,
         });
@@ -467,6 +510,15 @@ impl<'a> Gen<'a> {
     /// path then invalidates those blocks (`Cpu::code_written`) and sets `block_exit_requested`,
     /// which `smc_check` must poll after the store.
     fn mem_store(&mut self, size: u8, insn_index: u32, rip: u64) {
+        self.store_access(size, insn_index, rip, false);
+    }
+
+    /// `mem_store` for an implicit stack access; see `stack_load`.
+    fn stack_store(&mut self, insn_index: u32, rip: u64) {
+        self.store_access(8, insn_index, rip, true);
+    }
+
+    fn store_access(&mut self, size: u8, insn_index: u32, rip: u64, stack: bool) {
         let entry = self.asm.label();
         let resume = self.asm.label();
         self.tlb_probe(size, TLB_TAG_WRITE_OFFSET, entry);
@@ -476,7 +528,7 @@ impl<'a> Gen<'a> {
         self.slow_paths.push(SlowPath {
             entry,
             resume,
-            access: SlowAccess::Store { size },
+            access: SlowAccess::Store { size, stack },
             insn_index,
             rip,
         });
@@ -510,13 +562,22 @@ impl<'a> Gen<'a> {
             self.asm.mov(SAVED_ADDRESS, ADDRESS);
             let fail = self.asm.label();
             match slow.access {
-                SlowAccess::Load { dst, size, signed } => {
+                SlowAccess::Load {
+                    dst,
+                    size,
+                    signed,
+                    stack,
+                } => {
                     // helper_load(cpu, address, size, rip) -> (value in x0, status in x1)
                     self.asm.mov(0, CPU);
                     self.asm.mov(1, ADDRESS);
                     self.asm.mov_imm(2, size as u64);
                     self.asm.mov_imm(3, slow.rip);
-                    self.call(self.addrs.ld);
+                    self.call(if stack {
+                        self.addrs.ld_stack
+                    } else {
+                        self.addrs.ld
+                    });
                     self.asm.cbnz(1, fail, true);
                     if signed {
                         match size {
@@ -536,7 +597,7 @@ impl<'a> Gen<'a> {
                     self.asm.mov(0, 1);
                     self.fail_exit(slow.insn_index);
                 }
-                SlowAccess::Store { size } => {
+                SlowAccess::Store { size, stack } => {
                     // helper_store(cpu, address, size, value, rip) -> status. The address is copied
                     // to x1 before x2 is overwritten with the size.
                     self.asm.mov(3, VALUE);
@@ -544,7 +605,11 @@ impl<'a> Gen<'a> {
                     self.asm.mov_imm(2, size as u64);
                     self.asm.mov_imm(4, slow.rip);
                     self.asm.mov(0, CPU);
-                    self.call(self.addrs.st);
+                    self.call(if stack {
+                        self.addrs.st_stack
+                    } else {
+                        self.addrs.st
+                    });
                     self.asm.cbnz(0, fail, true);
                     self.asm.msr_nzcv(SAVED_NZCV);
                     self.asm.mov(ADDRESS, SAVED_ADDRESS);
@@ -558,7 +623,10 @@ impl<'a> Gen<'a> {
     }
 
     /// Records the flags of the ALU instruction just emitted: the result is in x0, the second
-    /// operand in x1.
+    /// operand in x1. For logic ops the interpreter stores 0 in `lazy_src` while this stores the
+    /// operand; that is equivalent because `flags::compute` derives a Logic result from the
+    /// result alone (CF and OF are cleared), and `inc`/`dec` take their carry-in from the
+    /// materialised flags, not from the previous `lazy_src` (`diff_flags` checks all consumers).
     fn store_lazy_op(&mut self, kind: FlagKind, operand_size: u8) {
         let lazy_op = match kind {
             FlagKind::Add => LazyFlagsOp::Add,
@@ -576,9 +644,10 @@ impl<'a> Gen<'a> {
     }
 
     /// Whether a memory operand can use the inline access path: 64-bit address size (a 67 prefix
-    /// would need 32-bit wrapping), no segment base other than FS/GS, and no LOCK prefix.
+    /// would need 32-bit wrapping) and no LOCK prefix. Every segment override is fine:
+    /// `effective_address` adds the FS/GS bases and 64-bit mode ignores the rest.
     fn memory_inlinable(insn: &Insn) -> bool {
-        !insn.addr32 && (insn.seg == NO_SEG || insn.seg <= SEG_GS as u8) && !insn.lock
+        !insn.addr32 && !insn.lock
     }
 
     /// Emits `dst = dst <alu_op> src` at `operand_size` (4 or 8) and records its flags.
@@ -988,7 +1057,7 @@ impl<'a> Gen<'a> {
                 self.load_gpr(ADDRESS, RSP);
                 self.asm.sub_imm(ADDRESS, ADDRESS, PUSH_POP_SIZE, true);
                 self.load_gpr(VALUE, reg);
-                self.mem_store(8, insn_index, rip);
+                self.stack_store(insn_index, rip);
                 self.store_gpr(RSP, ADDRESS);
                 is_store = true;
             }
@@ -997,7 +1066,7 @@ impl<'a> Gen<'a> {
             0x58..=0x5f if !insn.p66 => {
                 let reg = opcode_register(&insn);
                 self.load_gpr(ADDRESS, RSP);
-                self.mem_load(VALUE, 8, false, insn_index, rip);
+                self.stack_load(VALUE, insn_index, rip);
                 self.asm.add_imm(ADDRESS, ADDRESS, PUSH_POP_SIZE, true);
                 self.store_gpr(RSP, ADDRESS);
                 self.store_gpr(reg, VALUE);
@@ -1027,7 +1096,7 @@ impl<'a> Gen<'a> {
                 self.load_gpr(ADDRESS, RSP);
                 self.asm.sub_imm(ADDRESS, ADDRESS, PUSH_POP_SIZE, true);
                 self.asm.mov_imm(VALUE, next_rip);
-                self.mem_store(8, insn_index, rip);
+                self.stack_store(insn_index, rip);
                 self.store_gpr(RSP, ADDRESS);
                 self.set_rip(next_rip.wrapping_add(insn.imm as u64));
                 self.exit_ok(retired);
@@ -1037,7 +1106,7 @@ impl<'a> Gen<'a> {
             // ret
             0xc3 => {
                 self.load_gpr(ADDRESS, RSP);
-                self.mem_load(VALUE, 8, false, insn_index, rip);
+                self.stack_load(VALUE, insn_index, rip);
                 self.asm.add_imm(ADDRESS, ADDRESS, PUSH_POP_SIZE, true);
                 self.store_gpr(RSP, ADDRESS);
                 self.asm.str(VALUE, CPU, RIP_OFFSET);
@@ -1087,11 +1156,6 @@ impl<'a> Gen<'a> {
     }
 }
 
-/// The instructions `try_inline` lowers that end the block themselves (they emit their own
-/// exit): jcc, jmp, call, ret. All of them are also `ends_block`.
-fn is_inline_terminator(insn: &Insn) -> bool {
-    matches!(
-        insn.op,
-        0x70..=0x7f | 0x180..=0x18f | 0xe9 | 0xeb | 0xe8 | 0xc3
-    )
-}
+#[cfg(test)]
+#[path = "emit_tests.rs"]
+mod tests;

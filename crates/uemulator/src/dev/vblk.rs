@@ -41,6 +41,7 @@ const CONFIG_SIZE: usize = 24;
 const SEG_MAX: u32 = 126;
 
 /// Cap on the data bytes moved by one request, bounding host allocation for a hostile descriptor.
+/// A larger request is answered with IOERR; QEMU likewise fails what it cannot map.
 const MAX_REQUEST_BYTES: usize = 16 << 20;
 
 pub(crate) struct VirtioBlk {
@@ -59,35 +60,44 @@ impl VirtioBlk {
         self.disk.backend.len() / SECTOR_SIZE
     }
 
+    /// Offset of `sector` and whether `len` bytes from there stay inside the disk.
+    fn range_in_disk(&self, sector: u64, len: usize) -> Option<u64> {
+        let offset = sector.checked_mul(SECTOR_SIZE)?;
+        let end = offset.checked_add(len as u64)?;
+        (end <= self.disk.backend.len()).then_some(offset)
+    }
+
+    /// A data length the device will transfer: whole sectors, within `MAX_REQUEST_BYTES`.
+    fn valid_transfer_len(len: usize) -> bool {
+        len.is_multiple_of(SECTOR_SIZE as usize) && len <= MAX_REQUEST_BYTES
+    }
+
     /// Executes one request synchronously and returns the number of bytes written into the
     /// chain including the status byte (the used-ring `len`). A chain too short to hold a
     /// header and a status byte is completed with length 0 and no status.
     fn request(&mut self, mem: &mut GuestMem, chain: &Chain) -> u32 {
-        let readable = chain.read_all(mem, MAX_REQUEST_BYTES + REQUEST_HEADER_SIZE);
+        let readable_bytes = chain.readable();
         let writable_bytes = chain.writable();
-        if readable.len() < REQUEST_HEADER_SIZE || writable_bytes == 0 {
+        if readable_bytes < REQUEST_HEADER_SIZE || writable_bytes == 0 {
             return 0;
         }
-        let request_type = u32::from_le_bytes(readable[0..4].try_into().unwrap());
+        let header = chain.read_all(mem, REQUEST_HEADER_SIZE);
+        let request_type = u32::from_le_bytes(header[0..4].try_into().unwrap());
         let sector = u64::from_le_bytes(
-            readable[HEADER_SECTOR_OFFSET..HEADER_SECTOR_OFFSET + 8]
+            header[HEADER_SECTOR_OFFSET..HEADER_SECTOR_OFFSET + 8]
                 .try_into()
                 .unwrap(),
         );
         // Everything writable except the trailing status byte is data for the driver.
-        let data_capacity = writable_bytes - 1;
+        let in_len = writable_bytes - 1;
+        let out_len = readable_bytes - REQUEST_HEADER_SIZE;
         let mut written = 0usize;
+        // Lengths are checked before anything is allocated or read, so a request beyond the
+        // limit is refused as a whole instead of being cut short and reported as done.
         let status: u8 = match request_type {
-            REQUEST_IN => {
-                let offset = sector.saturating_mul(SECTOR_SIZE);
-                let len = data_capacity.min(MAX_REQUEST_BYTES);
-                if offset
-                    .checked_add(len as u64)
-                    .is_none_or(|end| end > self.disk.backend.len())
-                {
-                    STATUS_IOERR
-                } else {
-                    let mut buf = vec![0u8; len];
+            REQUEST_IN => match self.range_in_disk(sector, in_len) {
+                Some(offset) if Self::valid_transfer_len(in_len) => {
+                    let mut buf = vec![0u8; in_len];
                     match self.disk.backend.read_at(offset, &mut buf) {
                         Ok(()) => {
                             written = chain.write_at(mem, 0, &buf);
@@ -96,22 +106,26 @@ impl VirtioBlk {
                         Err(_) => STATUS_IOERR,
                     }
                 }
-            }
-            REQUEST_OUT => {
-                let data = &readable[REQUEST_HEADER_SIZE..];
-                let offset = sector.saturating_mul(SECTOR_SIZE);
-                if self.disk.backend.read_only()
-                    || offset
-                        .checked_add(data.len() as u64)
-                        .is_none_or(|end| end > self.disk.backend.len())
+                _ => STATUS_IOERR,
+            },
+            REQUEST_OUT => match self.range_in_disk(sector, out_len) {
+                Some(offset)
+                    if Self::valid_transfer_len(out_len) && !self.disk.backend.read_only() =>
                 {
-                    STATUS_IOERR
-                } else if self.disk.backend.write_at(offset, data).is_ok() {
-                    STATUS_OK
-                } else {
-                    STATUS_IOERR
+                    let data = chain.read_all(mem, REQUEST_HEADER_SIZE + out_len);
+                    if self
+                        .disk
+                        .backend
+                        .write_at(offset, &data[REQUEST_HEADER_SIZE..])
+                        .is_ok()
+                    {
+                        STATUS_OK
+                    } else {
+                        STATUS_IOERR
+                    }
                 }
-            }
+                _ => STATUS_IOERR,
+            },
             REQUEST_FLUSH => {
                 if self.disk.backend.flush().is_ok() {
                     STATUS_OK
@@ -120,12 +134,12 @@ impl VirtioBlk {
                 }
             }
             REQUEST_GET_ID => {
-                written = chain.write_at(mem, 0, &self.id[..data_capacity.min(ID_BYTES)]);
+                written = chain.write_at(mem, 0, &self.id[..in_len.min(ID_BYTES)]);
                 STATUS_OK
             }
             _ => STATUS_UNSUPP,
         };
-        chain.write_at(mem, data_capacity, &[status]);
+        chain.write_at(mem, in_len, &[status]);
         (written + 1) as u32
     }
 }
@@ -170,131 +184,5 @@ impl VirtioDev for VirtioBlk {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::virtio::testutil::*;
-    use super::super::virtio::{DESC_F_NEXT, DESC_F_WRITE};
-    use super::*;
-    use crate::dev::guestmem::test_mem;
-
-    const DESC: u64 = 0x1000;
-    const AVAIL: u64 = 0x2000;
-    const USED: u64 = 0x3000;
-
-    fn submit(
-        dev: &mut VirtioBlk,
-        q: &mut Queue,
-        ram: &mut [u8],
-        ty: u32,
-        sector: u64,
-        data: Option<&[u8]>,
-        dlen: u32,
-    ) -> u8 {
-        let hdr = 0x4000usize;
-        ram[hdr..hdr + 4].copy_from_slice(&ty.to_le_bytes());
-        ram[hdr + HEADER_SECTOR_OFFSET..hdr + REQUEST_HEADER_SIZE]
-            .copy_from_slice(&sector.to_le_bytes());
-        put_desc(
-            ram,
-            DESC,
-            0,
-            hdr as u64,
-            REQUEST_HEADER_SIZE as u32,
-            DESC_F_NEXT,
-            1,
-        );
-        let mut next = 1u16;
-        if let Some(d) = data {
-            ram[0x5000..0x5000 + d.len()].copy_from_slice(d);
-            put_desc(ram, DESC, 1, 0x5000, d.len() as u32, DESC_F_NEXT, 2);
-            next = 2;
-        } else if dlen > 0 {
-            put_desc(ram, DESC, 1, 0x5000, dlen, DESC_F_NEXT | DESC_F_WRITE, 2);
-            next = 2;
-        }
-        put_desc(ram, DESC, next, 0x6000, 1, DESC_F_WRITE, 0);
-        ram[0x6000] = 0xff;
-        post(ram, AVAIL, q.size, 0);
-        let mut mem = test_mem(ram);
-        assert!(dev.kick(0, std::slice::from_mut(q), &mut mem));
-        ram[0x6000]
-    }
-
-    #[test]
-    fn read_write_flush_roundtrip() {
-        let mut ram = vec![0u8; 0x10000];
-        let mut dev = VirtioBlk::new(Disk::memory(vec![0u8; 8192]));
-        let mut q = setup_queue(&mut ram, DESC, AVAIL, USED, 16);
-        let payload: Vec<u8> = (0..1024u32).map(|i| i as u8).collect();
-        assert_eq!(
-            submit(
-                &mut dev,
-                &mut q,
-                &mut ram,
-                REQUEST_OUT,
-                2,
-                Some(&payload),
-                0
-            ),
-            STATUS_OK
-        );
-        assert_eq!(
-            submit(&mut dev, &mut q, &mut ram, REQUEST_FLUSH, 0, None, 0),
-            STATUS_OK
-        );
-        ram[0x5000..0x5400].fill(0);
-        assert_eq!(
-            submit(&mut dev, &mut q, &mut ram, REQUEST_IN, 2, None, 1024),
-            STATUS_OK
-        );
-        assert_eq!(&ram[0x5000..0x5400], &payload[..]);
-        assert_eq!(used_idx(&ram, USED), 3);
-        assert_eq!(
-            submit(&mut dev, &mut q, &mut ram, REQUEST_IN, 100, None, 512),
-            STATUS_IOERR
-        );
-        assert_eq!(
-            submit(&mut dev, &mut q, &mut ram, 99, 0, None, 0),
-            STATUS_UNSUPP
-        );
-        assert_eq!(dev.capacity(), 16);
-    }
-
-    #[test]
-    fn read_only_rejects_writes() {
-        struct Ro;
-        impl crate::disk::BlockBackend for Ro {
-            fn len(&self) -> u64 {
-                4096
-            }
-            fn read_at(&mut self, _: u64, b: &mut [u8]) -> std::io::Result<()> {
-                b.fill(7);
-                Ok(())
-            }
-            fn write_at(&mut self, _: u64, _: &[u8]) -> std::io::Result<()> {
-                Ok(())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-            fn read_only(&self) -> bool {
-                true
-            }
-        }
-        let mut ram = vec![0u8; 0x10000];
-        let mut dev = VirtioBlk::new(Disk::from_backend(Ro));
-        assert_ne!(dev.features() & VIRTIO_BLK_F_RO, 0);
-        let mut q = setup_queue(&mut ram, DESC, AVAIL, USED, 16);
-        assert_eq!(
-            submit(
-                &mut dev,
-                &mut q,
-                &mut ram,
-                REQUEST_OUT,
-                0,
-                Some(&[1u8; 512]),
-                0
-            ),
-            STATUS_IOERR
-        );
-    }
-}
+#[path = "vblk_tests.rs"]
+mod tests;

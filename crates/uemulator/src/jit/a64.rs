@@ -354,6 +354,7 @@ impl Asm {
 
     /// Returns false, emitting nothing, when `imm` is not a valid bitmask immediate; the
     /// caller must then materialise the constant in a register itself.
+    #[must_use]
     fn logic_imm(&mut self, op: u32, rd: u32, rn: u32, imm: u64, is64: bool) -> bool {
         match encode_bitmask(imm, is64) {
             Some(bitmask) => {
@@ -366,6 +367,7 @@ impl Asm {
     }
 
     /// See `logic_imm` for the meaning of the result.
+    #[must_use]
     pub fn and_imm(&mut self, rd: u32, rn: u32, imm: u64, is64: bool) -> bool {
         self.logic_imm(0x1200_0000, rd, rn, imm, is64)
     }
@@ -542,6 +544,7 @@ mod tests {
     use crate::sys::ExecMem;
 
     fn run(f: impl FnOnce(&mut Asm), a0: u64, a1: u64) -> u64 {
+        let _guard = crate::jit::serialize_jit_tests();
         let m = ExecMem::new(16384).unwrap();
         let mut a = Asm::new(m.base());
         f(&mut a);
@@ -673,3 +676,7 @@ mod tests {
         assert_eq!(buf[2] & 0xff, 0xab);
     }
 }
+
+#[cfg(test)]
+#[path = "a64_tests.rs"]
+mod encoding_tests;

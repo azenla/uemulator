@@ -53,6 +53,12 @@ const LAHF_SAHF_FLAGS: u64 = SF | ZF | AF | PF | CF;
 const SHIFT_COUNT_MASK: u64 = 0x1f;
 const SHIFT_COUNT_MASK_64BIT: u64 = 0x3f;
 
+/// Offset of the 16-bit I/O permission bitmap base in a 64-bit TSS.
+const TSS64_IO_MAP_BASE_OFFSET: u64 = 102;
+
+/// ENTER takes its nesting level modulo 32.
+const ENTER_LEVEL_MASK: u16 = 31;
+
 /// `log_once` key space for unimplemented opcodes; other callers (mem.rs, sys.rs) use other bases.
 const UNIMPLEMENTED_OPCODE_LOG_BASE: u64 = 0x4000_0000;
 
@@ -112,10 +118,29 @@ fn sign_extend(value: u64, bits: u32) -> i64 {
     ((value << shift) as i64) >> shift
 }
 
+/// The flag state `Cpu::save_flags` captures: `eflags` plus the deferred-arithmetic fields.
+#[derive(Clone, Copy)]
+struct FlagsSnapshot {
+    eflags: u64,
+    lazy_op: LazyFlagsOp,
+    lazy_size: u8,
+    lazy_dst: u64,
+    lazy_src: u64,
+    lazy_src2: u64,
+}
+
 /// A null selector has index 0 and TI 0 whatever its RPL. A selector with TI set and index 0
 /// refers to LDT entry 0 and is not null, so TI stays part of the comparison.
 fn selector_is_null(sel: u16) -> bool {
     sel & !SELECTOR_RPL_MASK == 0
+}
+
+/// Descriptor type bit 10 of a code segment: conforming (callable from less privileged code and
+/// exempt from the DPL checks).
+const SEG_TYPE_CONFORMING: u32 = 1 << 10;
+
+fn is_conforming_code(seg: &Seg) -> bool {
+    seg.is_code() && seg.flags & SEG_TYPE_CONFORMING != 0
 }
 
 /// Error code for a selector-related fault: the selector with RPL cleared (EXT bit 0).
@@ -143,6 +168,41 @@ fn shift_count_mask(size: u8) -> u64 {
         SHIFT_COUNT_MASK_64BIT
     } else {
         SHIFT_COUNT_MASK
+    }
+}
+
+/// Result and carry of shld (`left`) or shrd for a nonzero `count` already masked to the
+/// operand's range, with `a` the destination and `b` the source.
+///
+/// A 16-bit operand with a count of 17..=31 is undefined in the SDM. Intel hardware shifts the
+/// 48-bit value A:B:A, which is what this does (QEMU's `gen_shiftd_rm_T1` implements the same); it
+/// also gives the ordinary result for counts up to 16, and keeps `bits - count` from underflowing.
+fn double_shift(left: bool, a: u64, b: u64, count: u32, size: u8) -> (u64, u64) {
+    let m = mask(size);
+    if size == 2 {
+        // Bits of the shifted value above bit 63 are lost, but only bits 47:32 (left) or 15:0
+        // (right) of the result are used.
+        let wide = (a << 32) | (b << 16) | a;
+        return if left {
+            (
+                ((wide << count) >> 32) & m,
+                ((wide << (count - 1)) >> 47) & 1,
+            )
+        } else {
+            ((wide >> count) & m, (wide >> (count - 1)) & 1)
+        };
+    }
+    let bits = size as u32 * 8;
+    if left {
+        (
+            ((a << count) | (b >> (bits - count))) & m,
+            (a >> (bits - count)) & 1,
+        )
+    } else {
+        (
+            ((a >> count) | (b << (bits - count))) & m,
+            (a >> (count - 1)) & 1,
+        )
     }
 }
 
@@ -269,16 +329,50 @@ impl Cpu {
         }
     }
 
+    fn save_flags(&self) -> FlagsSnapshot {
+        FlagsSnapshot {
+            eflags: self.eflags,
+            lazy_op: self.lazy_op,
+            lazy_size: self.lazy_size,
+            lazy_dst: self.lazy_dst,
+            lazy_src: self.lazy_src,
+            lazy_src2: self.lazy_src2,
+        }
+    }
+
+    /// Stores the result of a read-modify-write instruction that has already updated the flags.
+    /// If the store faults the flags are put back: the instruction is restarted after the fault
+    /// and adc/sbb/rcl/rcr would otherwise read the carry the failed attempt left behind.
+    fn store_result(
+        &mut self,
+        loc: Loc,
+        size: u8,
+        i: &Insn,
+        v: u64,
+        saved: FlagsSnapshot,
+    ) -> ExecResult<()> {
+        let result = self.store_operand(loc, size, i, v);
+        if result.is_err() {
+            self.eflags = saved.eflags;
+            self.lazy_op = saved.lazy_op;
+            self.lazy_size = saved.lazy_size;
+            self.lazy_dst = saved.lazy_dst;
+            self.lazy_src = saved.lazy_src;
+            self.lazy_src2 = saved.lazy_src2;
+        }
+        result
+    }
+
     /// GPR_RSP is only updated after the store succeeds so a fault leaves it unchanged.
     pub fn push(&mut self, size: u8, v: u64) -> ExecResult<()> {
         let sp = self.gpr[GPR_RSP].wrapping_sub(size as u64);
-        self.write(sp, size, v)?;
+        self.write_stack(sp, size, v)?;
         self.gpr[GPR_RSP] = sp;
         Ok(())
     }
 
     pub fn pop(&mut self, size: u8) -> ExecResult<u64> {
-        let v = self.read(self.gpr[GPR_RSP], size)?;
+        let v = self.read_stack(self.gpr[GPR_RSP], size)?;
         self.gpr[GPR_RSP] = self.gpr[GPR_RSP].wrapping_add(size as u64);
         Ok(v)
     }
@@ -507,7 +601,13 @@ impl Cpu {
                             >> (128 - 2 * bits)
                     };
                     let divisor = sign_extend(src, bits) as i128;
-                    let (q, r) = (dividend / divisor, dividend % divisor);
+                    // i128::MIN / -1 overflows the host division itself (a panic, not a wrap). It
+                    // is the one quotient that cannot fit any operand size, so it is #DE too.
+                    let (Some(q), Some(r)) =
+                        (dividend.checked_div(divisor), dividend.checked_rem(divisor))
+                    else {
+                        return Err(Exception::divide_error());
+                    };
                     let limit = 1i128 << (bits - 1);
                     if q >= limit || q < -limit {
                         return Err(Exception::divide_error());
@@ -594,6 +694,12 @@ impl Cpu {
         } else {
             size as u64
         };
+        // Only the index registers an instruction uses are written back; with the 67 prefix that
+        // is a 32-bit write, which zeroes the upper half. An unused one keeps its upper half.
+        let advance = |index: u64| {
+            let moved = index.wrapping_add(step);
+            if i.addr32 { moved & DWORD_MASK } else { moved }
+        };
         let rep = i.rep != 0;
         let compares = matches!(op, 0xa6 | 0xa7 | 0xae | 0xaf);
         let mut iterations = 0;
@@ -610,20 +716,20 @@ impl Cpu {
                 0xa4 | 0xa5 => {
                     let v = self.read(src, size)?;
                     self.write(dst, size, v)?;
-                    self.gpr[GPR_RSI] = self.gpr[GPR_RSI].wrapping_add(step);
-                    self.gpr[GPR_RDI] = self.gpr[GPR_RDI].wrapping_add(step);
+                    self.gpr[GPR_RSI] = advance(self.gpr[GPR_RSI]);
+                    self.gpr[GPR_RDI] = advance(self.gpr[GPR_RDI]);
                 }
                 // stos
                 0xaa | 0xab => {
                     let v = self.read_gpr(0, size, true);
                     self.write(dst, size, v)?;
-                    self.gpr[GPR_RDI] = self.gpr[GPR_RDI].wrapping_add(step);
+                    self.gpr[GPR_RDI] = advance(self.gpr[GPR_RDI]);
                 }
                 // lods
                 0xac | 0xad => {
                     let v = self.read(src, size)?;
                     self.write_gpr(0, size, true, v);
-                    self.gpr[GPR_RSI] = self.gpr[GPR_RSI].wrapping_add(step);
+                    self.gpr[GPR_RSI] = advance(self.gpr[GPR_RSI]);
                 }
                 // cmps: flags of [rsi] - [rdi]
                 0xa6 | 0xa7 => {
@@ -636,8 +742,8 @@ impl Cpu {
                         b,
                         0,
                     );
-                    self.gpr[GPR_RSI] = self.gpr[GPR_RSI].wrapping_add(step);
-                    self.gpr[GPR_RDI] = self.gpr[GPR_RDI].wrapping_add(step);
+                    self.gpr[GPR_RSI] = advance(self.gpr[GPR_RSI]);
+                    self.gpr[GPR_RDI] = advance(self.gpr[GPR_RDI]);
                 }
                 // scas: flags of rAX - [rdi]
                 _ => {
@@ -650,12 +756,8 @@ impl Cpu {
                         b,
                         0,
                     );
-                    self.gpr[GPR_RDI] = self.gpr[GPR_RDI].wrapping_add(step);
+                    self.gpr[GPR_RDI] = advance(self.gpr[GPR_RDI]);
                 }
-            }
-            if i.addr32 {
-                self.gpr[GPR_RSI] &= DWORD_MASK;
-                self.gpr[GPR_RDI] &= DWORD_MASK;
             }
             if !rep {
                 break;
@@ -680,26 +782,55 @@ impl Cpu {
         Ok(())
     }
 
-    /// Loads DS/ES/FS/GS/SS (`idx` is a `SEG_*` index) from a selector in 64-bit mode. A null
-    /// selector is allowed everywhere except SS at CPL 3. Does not check DPL/RPL against CPL.
+    /// Loads DS/ES/FS/GS/SS (`idx` is a `SEG_*` index) from a selector in 64-bit mode, with the
+    /// privilege checks of `mov sreg` made against the current CPL. Nothing is loaded on a fault.
     pub fn load_data_seg(&mut self, idx: usize, sel: u16) -> ExecResult<()> {
+        // A null SS is only usable when it names the current privilege level.
+        if idx == SEG_SS && selector_is_null(sel) && (sel & SELECTOR_RPL_MASK) as u8 != self.cpl {
+            return Err(Exception::general_protection(0));
+        }
+        let seg = self.checked_data_seg(idx, sel, self.cpl)?;
+        self.seg[idx] = seg;
+        Ok(())
+    }
+
+    /// Validates `sel` for DS/ES/FS/GS/SS against privilege level `cpl` and returns the segment
+    /// to load, leaving the CPU untouched (iretq and far return validate before they commit).
+    /// `cpl` is the current CPL for `mov sreg` and the one being returned to for iretq/retf.
+    ///
+    /// A null selector is allowed everywhere except SS at CPL 3. Otherwise (SDM 3A 5.4):
+    /// system descriptors and execute-only code are #GP for a data register; data and
+    /// non-conforming code need DPL >= max(CPL, RPL), conforming code is exempt; SS must be
+    /// writable data with RPL = DPL = CPL; a missing segment is #SS for SS and #NP otherwise.
+    fn checked_data_seg(&mut self, idx: usize, sel: u16, cpl: u8) -> ExecResult<Seg> {
         if selector_is_null(sel) {
-            if idx == SEG_SS && self.cpl == USER_CPL {
+            if idx == SEG_SS && cpl == USER_CPL {
                 return Err(Exception::general_protection(0));
             }
-            self.seg[idx] = Seg {
+            return Ok(Seg {
                 sel,
                 ..Default::default()
-            };
-            return Ok(());
+            });
         }
         let s = self.load_desc_seg(sel, false)?;
-        // System descriptors and execute-only code segments cannot be loaded into a data register.
-        if s.flags & SEG_NON_SYSTEM == 0 || (s.is_code() && s.flags & SEG_TYPE_READ_WRITE == 0) {
-            return Err(Exception::general_protection(selector_error_code(sel)));
+        let rpl = (sel & SELECTOR_RPL_MASK) as u8;
+        let privilege_violation = Exception::general_protection(selector_error_code(sel));
+        if s.flags & SEG_NON_SYSTEM == 0 {
+            return Err(privilege_violation);
+        }
+        if idx == SEG_SS {
+            if s.is_code() || s.flags & SEG_TYPE_READ_WRITE == 0 || rpl != cpl || s.dpl() != cpl {
+                return Err(privilege_violation);
+            }
+        } else {
+            if s.is_code() && s.flags & SEG_TYPE_READ_WRITE == 0 {
+                return Err(privilege_violation);
+            }
+            if !is_conforming_code(&s) && (s.dpl() < cpl || s.dpl() < rpl) {
+                return Err(privilege_violation);
+            }
         }
         if !s.present() {
-            // A missing stack segment is #SS, any other data segment #NP.
             return Err(Exception::fault(
                 if idx == SEG_SS {
                     VECTOR_STACK_FAULT
@@ -709,13 +840,57 @@ impl Cpu {
                 Some(selector_error_code(sel)),
             ));
         }
-        self.seg[idx] = s;
-        Ok(())
+        Ok(s)
     }
 
-    /// 64-bit iretq: pops RIP, CS, RFLAGS, GPR_RSP, SS (always all five in 64-bit mode). Only the
-    /// 8-byte operand size is implemented. CPL is switched before SS is loaded because the null-SS
-    /// rule depends on the new CPL; it is restored if the SS load faults.
+    /// Validates the code segment selector popped by iretq or a far return (SDM 3A IRET/RET):
+    /// present 64-bit code, RPL not below the current CPL, and DPL equal to RPL for
+    /// non-conforming code or at most RPL for conforming code. Nothing is loaded.
+    fn checked_return_code_seg(&mut self, cs: u16) -> ExecResult<Seg> {
+        if selector_is_null(cs) {
+            return Err(Exception::general_protection(0));
+        }
+        let s = self.load_desc_seg(cs, false)?;
+        let rpl = (cs & SELECTOR_RPL_MASK) as u8;
+        let privilege_violation = Exception::general_protection(selector_error_code(cs));
+        let dpl_matches = if is_conforming_code(&s) {
+            s.dpl() <= rpl
+        } else {
+            s.dpl() == rpl
+        };
+        if !s.is_code() || rpl < self.cpl || !dpl_matches {
+            return Err(privilege_violation);
+        }
+        if !s.present() {
+            return Err(Exception::fault(
+                VECTOR_SEGMENT_NOT_PRESENT,
+                Some(selector_error_code(cs)),
+            ));
+        }
+        // Compatibility mode is not implemented, so a code segment without CS.L cannot be entered.
+        if !s.long() {
+            return Err(privilege_violation);
+        }
+        Ok(s)
+    }
+
+    /// After a return to an outer ring, DS/ES/FS/GS that hold a data or non-conforming code
+    /// segment with DPL below the new CPL are replaced by null selectors, so the less privileged
+    /// code cannot keep using them. A register that is already null is left as it is, which keeps
+    /// the FS/GS bases.
+    fn null_inaccessible_data_segments(&mut self, new_cpl: u8) {
+        for register in [SEG_ES, SEG_DS, SEG_FS, SEG_GS] {
+            let s = self.seg[register];
+            if !selector_is_null(s.sel) && s.dpl() < new_cpl && !is_conforming_code(&s) {
+                self.seg[register] = Seg::default();
+            }
+        }
+    }
+
+    /// 64-bit iretq: pops RIP, CS, RFLAGS, RSP, SS (always all five in 64-bit mode). Only the
+    /// 8-byte operand size is implemented. Every check is made before any state changes, so a
+    /// fault leaves CS, SS, CPL, RSP, RIP and the flags as they were. The SS checks are made
+    /// against the CPL being returned to.
     fn iretq(&mut self, i: &Insn) -> ExecResult<()> {
         const FRAME_CS: u64 = 8;
         const FRAME_RFLAGS: u64 = 16;
@@ -725,30 +900,19 @@ impl Cpu {
             return Err(Exception::invalid_opcode());
         }
         let sp = self.gpr[GPR_RSP];
-        let rip = self.read(sp, 8)?;
-        let cs = self.read(sp + FRAME_CS, 8)? as u16;
-        let new_rflags = self.read(sp + FRAME_RFLAGS, 8)?;
-        let new_rsp = self.read(sp + FRAME_RSP, 8)?;
-        let ss = self.read(sp + FRAME_SS, 8)? as u16;
-        let new_cs = self.load_desc_seg(cs, true)?;
-        if !new_cs.is_code() || !new_cs.long() {
-            return Err(Exception::general_protection(selector_error_code(cs)));
-        }
+        let rip = self.read_stack(sp, 8)?;
+        let cs = self.read_stack(sp.wrapping_add(FRAME_CS), 8)? as u16;
+        let new_rflags = self.read_stack(sp.wrapping_add(FRAME_RFLAGS), 8)?;
+        let new_cs = self.checked_return_code_seg(cs)?;
+        let new_rsp = self.read_stack(sp.wrapping_add(FRAME_RSP), 8)?;
+        let ss = self.read_stack(sp.wrapping_add(FRAME_SS), 8)? as u16;
         let new_cpl = (cs & SELECTOR_RPL_MASK) as u8;
-        // iret can only return to the same or a less privileged level.
-        if new_cpl < self.cpl {
-            return Err(Exception::general_protection(selector_error_code(cs)));
-        }
+        let new_ss = self.checked_data_seg(SEG_SS, ss, new_cpl)?;
         let old_cpl = self.cpl;
-        // CS stays modified if the SS load below faults; only the CPL is rolled back.
         self.seg[SEG_CS] = new_cs;
-        self.seg[SEG_CS].sel = cs;
+        self.seg[SEG_SS] = new_ss;
         // set_cpl also switches to the user or supervisor half of the soft TLB.
         self.set_cpl(new_cpl);
-        if let Err(e) = self.load_data_seg(SEG_SS, ss) {
-            self.set_cpl(old_cpl);
-            return Err(e);
-        }
         // IF and IOPL are gated by the CPL iretq started at, not the one it returns to.
         let loadable = self.loadable_eflags(old_cpl);
         let current = self.eflags_full();
@@ -756,24 +920,16 @@ impl Cpu {
         self.lazy_op = LazyFlagsOp::Eflags;
         self.gpr[GPR_RSP] = new_rsp;
         self.rip = rip;
-        if new_cpl != 0 {
-            // Returning to an outer ring: data segment registers the new CPL cannot use are nulled.
-            for reg in [SEG_ES, SEG_DS, SEG_FS, SEG_GS] {
-                let s = self.seg[reg];
-                if !selector_is_null(s.sel)
-                    && s.dpl() < new_cpl
-                    && s.flags & SEG_TYPE_EXECUTABLE == 0
-                {
-                    self.seg[reg] = Seg::default();
-                }
-            }
+        if new_cpl > old_cpl {
+            self.null_inaccessible_data_segments(new_cpl);
         }
         Ok(())
     }
 
     /// Far return (0xca/0xcb) with `imm` extra bytes released after CS. Only the 8-byte operand
-    /// size (REX.W) is implemented. For a return to an outer ring GPR_RSP:SS sit above the released
-    /// bytes.
+    /// size (REX.W) is implemented. For a return to an outer ring RSP:SS sit above the released
+    /// bytes, and the bytes are released from the new stack as well. Validation comes before any
+    /// state change, as for `iretq`.
     fn far_return(&mut self, i: &Insn, imm: u64) -> ExecResult<()> {
         // Frame: rip, cs, `imm` released bytes, then (outer-ring returns only) rsp and ss.
         // FRAME_RSP and FRAME_SS are offsets from RSP before `imm` is added.
@@ -784,26 +940,22 @@ impl Cpu {
             return Err(Exception::invalid_opcode());
         }
         let sp = self.gpr[GPR_RSP];
-        let rip = self.read(sp, 8)?;
-        let cs = self.read(sp + FRAME_CS, 8)? as u16;
-        let new_cs = self.load_desc_seg(cs, true)?;
-        if !new_cs.is_code() || !new_cs.long() {
-            return Err(Exception::general_protection(selector_error_code(cs)));
-        }
+        let rip = self.read_stack(sp, 8)?;
+        let cs = self.read_stack(sp.wrapping_add(FRAME_CS), 8)? as u16;
+        let new_cs = self.checked_return_code_seg(cs)?;
         let new_cpl = (cs & SELECTOR_RPL_MASK) as u8;
-        if new_cpl < self.cpl {
-            return Err(Exception::general_protection(selector_error_code(cs)));
-        }
-        if new_cpl != self.cpl {
-            let new_rsp = self.read(sp + FRAME_RSP + imm, 8)?;
-            let ss = self.read(sp + FRAME_SS + imm, 8)? as u16;
+        if new_cpl == self.cpl {
             self.seg[SEG_CS] = new_cs;
-            self.set_cpl(new_cpl);
-            self.load_data_seg(SEG_SS, ss)?;
-            self.gpr[GPR_RSP] = new_rsp;
+            self.gpr[GPR_RSP] = sp.wrapping_add(FRAME_RSP).wrapping_add(imm);
         } else {
+            let new_rsp = self.read_stack(sp.wrapping_add(FRAME_RSP).wrapping_add(imm), 8)?;
+            let ss = self.read_stack(sp.wrapping_add(FRAME_SS).wrapping_add(imm), 8)? as u16;
+            let new_ss = self.checked_data_seg(SEG_SS, ss, new_cpl)?;
             self.seg[SEG_CS] = new_cs;
-            self.gpr[GPR_RSP] = sp.wrapping_add(FRAME_RSP + imm);
+            self.seg[SEG_SS] = new_ss;
+            self.set_cpl(new_cpl);
+            self.gpr[GPR_RSP] = new_rsp.wrapping_add(imm);
+            self.null_inaccessible_data_segments(new_cpl);
         }
         self.rip = rip;
         Ok(())
@@ -833,9 +985,10 @@ impl Cpu {
                         let loc = self.modrm_location(i, next);
                         let a = self.load_operand(loc, size, i)?;
                         let b = self.read_gpr(i.reg, size, rex);
+                        let saved = self.save_flags();
                         let r = self.alu(operation, a, b, size);
                         if operation != ALU_CMP {
-                            self.store_operand(loc, size, i, r)?;
+                            self.store_result(loc, size, i, r, saved)?;
                         }
                     }
                     2 | 3 => {
@@ -905,9 +1058,10 @@ impl Cpu {
                 let loc = self.modrm_location(i, next);
                 let a = self.load_operand(loc, size, i)?;
                 let operation = i.reg & 7;
+                let saved = self.save_flags();
                 let r = self.alu(operation, a, i.imm as u64, size);
                 if operation != ALU_CMP {
-                    self.store_operand(loc, size, i, r)?;
+                    self.store_result(loc, size, i, r, saved)?;
                 }
             }
             // test r/m, r
@@ -944,10 +1098,12 @@ impl Cpu {
             // mov r/m, sreg: a memory destination is always 16 bits, a register one takes the
             // operand size (upper bits zeroed).
             0x8c => {
-                if i.reg as usize > SEG_GS {
+                // REX.R extends ModRM.reg, but the segment register field is only 3 bits.
+                let idx = (i.reg & 7) as usize;
+                if idx > SEG_GS {
                     return Err(Exception::invalid_opcode());
                 }
-                let v = self.seg[i.reg as usize].sel as u64;
+                let v = self.seg[idx].sel as u64;
                 let loc = self.modrm_location(i, next);
                 let size = if i.md == 3 { osz } else { 2 };
                 self.store_operand(loc, size, i, v)?;
@@ -975,12 +1131,15 @@ impl Cpu {
                     self.interrupt_shadow = true;
                 }
             }
-            // pop r/m
+            // pop r/m (only /0; the other encodings are XOP)
             0x8f => {
+                if i.reg & 7 != 0 {
+                    return Err(Exception::invalid_opcode());
+                }
                 let sz = stack_operand_size(i);
                 let loc = self.modrm_location(i, next);
                 let sp = self.gpr[GPR_RSP];
-                let v = self.read(sp, sz)?;
+                let v = self.read_stack(sp, sz)?;
                 self.gpr[GPR_RSP] = sp.wrapping_add(sz as u64);
                 // A memory destination addressed through GPR_RSP uses the value after the pop.
                 let loc = match loc {
@@ -1116,39 +1275,60 @@ impl Cpu {
                     _ => self.gpr[GPR_RCX] & BYTE_MASK,
                 };
                 let a = self.load_operand(loc, size, i)?;
+                let saved = self.save_flags();
                 let r = self.shift_rotate(i.reg & 7, a, count, size);
-                self.store_operand(loc, size, i, r)?;
+                self.store_result(loc, size, i, r, saved)?;
             }
             // ret / ret imm16
             0xc2 | 0xc3 => {
-                let target = self.read(self.gpr[GPR_RSP], 8)?;
+                let target = self.read_stack(self.gpr[GPR_RSP], 8)?;
                 let extra = if op == 0xc2 { i.imm as u64 } else { 0 };
                 self.gpr[GPR_RSP] = self.gpr[GPR_RSP].wrapping_add(8 + extra);
                 self.rip = target;
                 return Ok(());
             }
-            // mov r/m, imm
+            // mov r/m, imm. Only /0 is defined (c6 /7 and c7 /7 are xabort/xbegin, which need RTM).
             0xc6 | 0xc7 => {
+                if i.reg & 7 != 0 {
+                    return Err(Exception::invalid_opcode());
+                }
                 let size = if op == 0xc6 { 1 } else { osz };
                 let loc = self.modrm_location(i, next);
                 self.store_operand(loc, size, i, i.imm as u64)?;
             }
-            // enter: only nesting level 0 (the level is taken modulo 32)
+            // enter: the nesting level is taken modulo 32. Registers are committed only after the
+            // last push, so a fault leaves RSP and RBP as they were (the pushes already made
+            // stay in memory, as on hardware).
             0xc8 => {
-                if i.imm2 & 31 != 0 {
-                    return Err(self.unimplemented_opcode(i));
+                let size = stack_operand_size(i);
+                let width = size as u64;
+                let level = i.imm2 & ENTER_LEVEL_MASK;
+                let mut sp = self.gpr[GPR_RSP].wrapping_sub(width);
+                self.write_stack(sp, size, self.gpr[GPR_RBP])?;
+                let frame_pointer = sp;
+                if level > 0 {
+                    // Copy the enclosing frames' pointers down the chain, then push our own.
+                    let mut outer = self.gpr[GPR_RBP];
+                    for _ in 1..level {
+                        outer = outer.wrapping_sub(width);
+                        let enclosing = self.read_stack(outer, size)?;
+                        sp = sp.wrapping_sub(width);
+                        self.write_stack(sp, size, enclosing)?;
+                    }
+                    sp = sp.wrapping_sub(width);
+                    self.write_stack(sp, size, frame_pointer)?;
                 }
-                let bp = self.gpr[GPR_RBP];
-                self.push(8, bp)?;
-                self.gpr[GPR_RBP] = self.gpr[GPR_RSP];
-                self.gpr[GPR_RSP] = self.gpr[GPR_RSP].wrapping_sub(i.imm as u64);
+                self.gpr[GPR_RBP] = frame_pointer;
+                self.gpr[GPR_RSP] = sp.wrapping_sub(i.imm as u64);
             }
-            // leave: GPR_RSP is only committed after the load of GPR_RBP succeeded
+            // leave: GPR_RSP is only committed after the load of GPR_RBP succeeded. With a 66
+            // prefix it pops a word into BP and leaves the rest of RBP alone.
             0xc9 => {
+                let size = stack_operand_size(i);
                 let bp = self.gpr[GPR_RBP];
-                let v = self.read(bp, 8)?;
-                self.gpr[GPR_RSP] = bp.wrapping_add(8);
-                self.gpr[GPR_RBP] = v;
+                let v = self.read_stack(bp, size)?;
+                self.gpr[GPR_RSP] = bp.wrapping_add(size as u64);
+                self.write_gpr(GPR_RBP as u8, size, true, v);
             }
             // far ret imm16 / far ret
             0xca | 0xcb => {
@@ -1174,9 +1354,10 @@ impl Cpu {
                 });
             }
             0xcf => return self.iretq(i),
-            // xlat: al = [rbx + al]
+            // xlat: al = [rbx + al]; with the 67 prefix the sum is formed and wrapped at 32 bits
             0xd7 => {
-                let a = self.gpr[GPR_RBX].wrapping_add(self.gpr[GPR_RAX] & BYTE_MASK);
+                let a =
+                    self.gpr[GPR_RBX].wrapping_add(self.gpr[GPR_RAX] & BYTE_MASK) & address_mask(i);
                 let v = self.read(self.linear_address(i, a), 1)?;
                 self.write_gpr(0, 1, true, v);
             }
@@ -1251,8 +1432,9 @@ impl Cpu {
                         let loc = self.modrm_location(i, next);
                         let a = self.load_operand(loc, size, i)?;
                         let r = 0u64.wrapping_sub(a) & mask(size);
+                        let saved = self.save_flags();
                         self.set_lazy_flags(LazyFlagsOp::Sub, size, r, a & mask(size), 0);
-                        self.store_operand(loc, size, i, r)?;
+                        self.store_result(loc, size, i, r, saved)?;
                     }
                     _ => self.mul_div(i, next, size)?,
                 }
@@ -1299,8 +1481,9 @@ impl Cpu {
                         } else {
                             (a.wrapping_sub(1) & mask(size), LazyFlagsOp::Dec)
                         };
+                        let saved = self.save_flags();
                         self.set_lazy_flags(lazy_op, size, r, cf, 0);
-                        self.store_operand(loc, size, i, r)?;
+                        self.store_result(loc, size, i, r, saved)?;
                     }
                     GROUP5_CALL_NEAR if op == 0xff => {
                         // The target is read before the push so `call [rsp+x]` sees the old GPR_RSP.
@@ -1327,11 +1510,33 @@ impl Cpu {
         Ok(())
     }
 
-    /// in/out. Only the CPL > IOPL check is done; the TSS I/O permission bitmap is not consulted.
-    fn port_io(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
-        if self.cpl > self.iopl() {
+    /// #GP(0) unless an I/O access of `size` bytes at `port` is permitted. At CPL <= IOPL it
+    /// always is; otherwise every bit the access covers in the TSS I/O permission bitmap must be
+    /// clear, and the bitmap must lie inside the TSS limit (SDM 3A 20.5; QEMU `check_io`).
+    fn check_io_permission(&mut self, port: u16, size: u8) -> ExecResult<()> {
+        if self.cpl <= self.iopl() {
+            return Ok(());
+        }
+        let tss_limit = self.tr.limit as u64;
+        // The 16-bit map base is the last field of the fixed part of the TSS.
+        if tss_limit < TSS64_IO_MAP_BASE_OFFSET + 1 {
             return Err(Exception::general_protection(0));
         }
+        let map_base = self.read_sys(self.tr.base.wrapping_add(TSS64_IO_MAP_BASE_OFFSET), 2)?;
+        let byte_offset = map_base + (port as u64 >> 3);
+        // The bits are read as a 16-bit word because an access can straddle a bitmap byte.
+        if byte_offset + 1 > tss_limit {
+            return Err(Exception::general_protection(0));
+        }
+        let word = self.read_sys(self.tr.base.wrapping_add(byte_offset), 2)?;
+        if (word >> (port & 7)) & ((1 << size) - 1) != 0 {
+            return Err(Exception::general_protection(0));
+        }
+        Ok(())
+    }
+
+    /// in/out with an imm8 or DX port.
+    fn port_io(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
         let op = i.op;
         let size = if op & 1 == 0 {
             1
@@ -1346,6 +1551,7 @@ impl Cpu {
         } else {
             self.gpr[GPR_RDX] as u16
         };
+        self.check_io_permission(port, size)?;
         let now = self.now_ns();
         if op & 2 == 0 {
             let v = self.dev.io_in(port, size, now);
@@ -1498,14 +1704,7 @@ impl Cpu {
                 let bits = osz as u32 * 8;
                 let c = (count & shift_count_mask(osz)) as u32;
                 if c != 0 {
-                    let m = mask(osz);
-                    let (r, cf) = if op < 0x1a8 {
-                        let r = ((a << c) | (b >> (bits - c))) & m;
-                        (r, (a >> (bits - c)) & 1)
-                    } else {
-                        let r = ((a >> c) | (b << (bits - c))) & m;
-                        (r, (a >> (c - 1)) & 1)
-                    };
+                    let (r, cf) = double_shift(op < 0x1a8, a, b, c, osz);
                     // OF is set when the sign bit changed.
                     let of = ((r ^ a) >> (bits - 1)) & 1;
                     let mut f = szp_flags(r, osz);
@@ -1515,8 +1714,9 @@ impl Cpu {
                     if of != 0 {
                         f |= OF;
                     }
+                    let saved = self.save_flags();
                     self.set_eflags_arith(f);
-                    self.store_operand(loc, osz, i, r)?;
+                    self.store_result(loc, osz, i, r, saved)?;
                 }
             }
             // group 15 (fences, fxsave, ldmxcsr, ...)
@@ -1537,12 +1737,13 @@ impl Cpu {
                 let dest = self.load_operand(loc, size, i)?;
                 let acc = self.read_gpr(0, size, true);
                 let m = mask(size);
+                let saved = self.save_flags();
                 self.set_lazy_flags(LazyFlagsOp::Sub, size, acc.wrapping_sub(dest) & m, dest, 0);
                 if acc == dest {
                     let src = self.read_gpr(i.reg, size, rex);
-                    self.store_operand(loc, size, i, src)?;
+                    self.store_result(loc, size, i, src, saved)?;
                 } else {
-                    self.store_operand(loc, size, i, dest)?;
+                    self.store_result(loc, size, i, dest, saved)?;
                     self.write_gpr(0, size, true, dest);
                 }
             }
@@ -1552,8 +1753,9 @@ impl Cpu {
                 let loc = self.modrm_location(i, next);
                 let dest = self.load_operand(loc, size, i)?;
                 let src = self.read_gpr(i.reg, size, rex);
+                let saved = self.save_flags();
                 let sum = self.alu(ALU_ADD, dest, src, size);
-                self.store_operand(loc, size, i, sum)?;
+                self.store_result(loc, size, i, sum, saved)?;
                 self.write_gpr(i.reg, size, rex, dest);
             }
             // movnti
@@ -1635,3 +1837,7 @@ impl Cpu {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "exec_tests.rs"]
+mod exec_tests;

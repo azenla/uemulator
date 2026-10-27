@@ -10,7 +10,9 @@ pub(crate) use alloc::sync::Arc;
 #[cfg(target_os = "uefi")]
 pub(crate) use uefi_stubs::{Condvar, Mutex};
 
-#[cfg(target_os = "uefi")]
+// Also built for tests so the stand-ins' logic runs on the host; nothing outside the tests uses
+// them there.
+#[cfg(any(target_os = "uefi", test))]
 mod uefi_stubs {
     use core::cell::UnsafeCell;
     use core::convert::Infallible;
@@ -76,5 +78,109 @@ mod uefi_stubs {
         }
 
         pub fn notify_one(&self) {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uefi_stubs::{Condvar, Mutex};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const THREADS: usize = 4;
+    const INCREMENTS_PER_THREAD: usize = 5_000;
+
+    #[test]
+    fn a_new_mutex_holds_the_default_value() {
+        let mutex: Mutex<u32> = Mutex::default();
+        assert_eq!(*mutex.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn the_guard_reads_and_writes_the_value() {
+        let mutex = Mutex::<Vec<u8>>::default();
+        mutex.lock().unwrap().push(7);
+        mutex.lock().unwrap().push(8);
+        assert_eq!(*mutex.lock().unwrap(), [7, 8]);
+    }
+
+    #[test]
+    fn the_lock_is_released_when_the_guard_drops() {
+        let mutex = Mutex::<u32>::default();
+        for round in 1..=3 {
+            let mut guard = mutex.lock().unwrap();
+            *guard += 1;
+            assert_eq!(*guard, round);
+        }
+    }
+
+    #[test]
+    fn the_lock_is_released_when_the_holder_panics() {
+        let mutex = Arc::new(Mutex::<u32>::default());
+        let crashing = mutex.clone();
+        let result = std::thread::spawn(move || {
+            let mut guard = crashing.lock().unwrap();
+            *guard = 5;
+            panic!("holder dies");
+        })
+        .join();
+        assert!(result.is_err());
+        // No poisoning on the stand-in, and no deadlock: the guard's drop ran during unwinding.
+        assert_eq!(*mutex.lock().unwrap(), 5);
+    }
+
+    #[test]
+    fn the_spinlock_gives_mutual_exclusion_across_threads() {
+        let mutex = Arc::new(Mutex::<usize>::default());
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let mutex = mutex.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..INCREMENTS_PER_THREAD {
+                        // A non-atomic read-modify-write: lost updates show up if the lock leaks.
+                        let mut guard = mutex.lock().unwrap();
+                        let current = *guard;
+                        std::hint::black_box(current);
+                        *guard = current + 1;
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(*mutex.lock().unwrap(), THREADS * INCREMENTS_PER_THREAD);
+    }
+
+    #[test]
+    fn wait_timeout_returns_at_once_with_the_guard_still_holding_the_lock() {
+        let mutex = Mutex::<u32>::default();
+        let condvar = Condvar;
+        let guard = mutex.lock().unwrap();
+        let (mut guard, ()) = condvar
+            .wait_timeout(guard, Duration::from_secs(3600))
+            .unwrap();
+        *guard = 9;
+        drop(guard);
+        assert_eq!(*mutex.lock().unwrap(), 9);
+    }
+
+    #[test]
+    fn notify_does_nothing_and_does_not_fail() {
+        let condvar = Condvar;
+        condvar.notify_one();
+        condvar.notify_one();
+    }
+
+    #[test]
+    fn hosted_builds_use_the_std_types() {
+        // The call shapes the shared code relies on compile against both implementations.
+        let mutex = super::Mutex::new(1u8);
+        let condvar = super::Condvar::new();
+        let guard = mutex.lock().unwrap();
+        let (guard, _) = condvar.wait_timeout(guard, Duration::ZERO).unwrap();
+        assert_eq!(*guard, 1);
+        let shared = super::Arc::new(2u8);
+        assert_eq!(*shared, 2);
     }
 }

@@ -1,5 +1,5 @@
 use super::decode::{self, DecodeErr, Insn};
-use super::exception::{Exception, VECTOR_PAGE_FAULT};
+use super::exception::{Exception, VECTOR_GENERAL_PROTECTION, VECTOR_PAGE_FAULT};
 use super::flags::*;
 use super::*;
 use crate::dev::guestmem::GuestMem;
@@ -19,6 +19,9 @@ const PTE_DIRTY: u64 = 1 << 6;
 /// Makes a PDPT entry a 1 GiB leaf or a PD entry a 2 MiB leaf.
 const PTE_PAGE_SIZE: u64 = 1 << 7;
 const PTE_NO_EXECUTE: u64 = 1 << 63;
+/// In a 2 MiB or 1 GiB leaf the PAT bit moves here (bit 7 is page size); the address bits
+/// between it and the leaf's alignment are reserved.
+const PTE_LARGE_PAGE_PAT: u64 = 1 << 12;
 /// Physical address bits 40-51, reserved because CPUID 0x80000008 advertises 40 address bits.
 const PTE_RESERVED_MASK: u64 = 0x000f_ff00_0000_0000;
 const PTE_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -38,9 +41,12 @@ const PF_USER: u32 = 1 << 2;
 const PF_RESERVED: u32 = 1 << 3;
 const PF_INSTRUCTION_FETCH: u32 = 1 << 4;
 
-/// `log_once` key bases for unmapped physical accesses; the page number is added to them.
-const LOG_KEY_UNMAPPED_READ: u64 = 0x1000;
-const LOG_KEY_UNMAPPED_WRITE: u64 = 0x2000;
+/// `log_once` key bases for unmapped physical accesses; the page number (at most 40 bits) is
+/// added to them. They sit in the top bits so no page number can reach another namespace, and
+/// stay clear of the bases other callers use (opcodes in `exec.rs`, MSRs in `sys.rs`), which are
+/// all below 2^34.
+const LOG_KEY_UNMAPPED_READ: u64 = 1 << 62;
+const LOG_KEY_UNMAPPED_WRITE: u64 = 1 << 61;
 
 /// Slot of `linear` in `Cpu::tlb`: direct-mapped by page number, in the user half if `user`.
 /// The JIT's inline probe computes the same index.
@@ -48,6 +54,18 @@ const LOG_KEY_UNMAPPED_WRITE: u64 = 0x2000;
 fn tlb_slot(linear: u64, user: bool) -> usize {
     ((user as usize) << TLB_INDEX_BITS)
         | ((linear >> PAGE_SHIFT) as usize & (TLB_ENTRIES_PER_MODE - 1))
+}
+
+/// See `Cpu::read_stack`.
+fn stack_fault_for_non_canonical(exception: Exception) -> Exception {
+    match exception {
+        Exception::Fault {
+            vector: VECTOR_GENERAL_PROTECTION,
+            error_code: Some(0),
+            ..
+        } => Exception::stack_fault(0),
+        other => other,
+    }
 }
 
 impl Cpu {
@@ -132,6 +150,10 @@ impl Cpu {
     /// tables are read straight from RAM, never through the TLB; a table outside RAM counts
     /// as not present. Sets Accessed on every level touched, and Dirty on a write, but only
     /// after the permission check passed.
+    ///
+    /// Only long-mode (4-level) paging exists: CR4.PAE and EFER.LME are assumed set, whatever
+    /// the guest wrote to them, and 32-bit/PAE/5-level formats are not walked. `Cpu::new`
+    /// starts the guest in long mode and nothing in the emulator leaves it.
     fn walk(&mut self, linear: u64, access: AccessKind, user: bool) -> ExecResult<(u64, u8)> {
         let write = access == AccessKind::Write;
         let nxe = self.efer & EFER_NXE != 0;
@@ -150,10 +172,19 @@ impl Cpu {
             if pte & PTE_PRESENT == 0 {
                 return Err(self.page_fault(linear, access, user, false, false));
             }
-            if pte & PTE_RESERVED_MASK != 0 || (!nxe && pte & PTE_NO_EXECUTE != 0) {
+            let leaf = level == 0 || (pte & PTE_PAGE_SIZE != 0 && level <= 2);
+            // The page-size bit must be clear in a PML4 entry, and a large leaf must not have
+            // address bits below its alignment (PAT aside).
+            let below_leaf_alignment = (1u64 << (PAGE_SHIFT + LEVEL_INDEX_BITS * level)) - 1;
+            let reserved = pte & PTE_RESERVED_MASK != 0
+                || (!nxe && pte & PTE_NO_EXECUTE != 0)
+                || (level == TOP_LEVEL && pte & PTE_PAGE_SIZE != 0)
+                || (leaf
+                    && level > 0
+                    && pte & below_leaf_alignment & PTE_ADDRESS_MASK & !PTE_LARGE_PAGE_PAT != 0);
+            if reserved {
                 return Err(self.page_fault(linear, access, user, true, true));
             }
-            let leaf = level == 0 || (pte & PTE_PAGE_SIZE != 0 && level <= 2);
             writable &= pte & PTE_WRITABLE != 0;
             user_allowed &= pte & PTE_USER != 0;
             no_execute |= pte & PTE_NO_EXECUTE != 0;
@@ -360,6 +391,15 @@ impl Cpu {
         let page = (pa >> PAGE_SHIFT) as usize;
         if page < self.page_has_code.len() && self.page_has_code[page] == 0 {
             self.page_has_code[page] = 1;
+            // `code_written` clears a page's flag without un-listing it, so a page that is
+            // rewritten and retranslated over and over would grow the list without bound.
+            if self.pages_with_code.len() >= self.page_has_code.len() {
+                let flags = &self.page_has_code;
+                self.pages_with_code
+                    .retain(|&listed| flags[listed as usize] != 0);
+                self.pages_with_code.sort_unstable();
+                self.pages_with_code.dedup();
+            }
             self.pages_with_code.push(page as u32);
             let ram_base = self.ram_base;
             for entry in self.tlb.iter_mut() {
@@ -459,6 +499,18 @@ impl Cpu {
         self.mem_write(linear, size, val, false)
     }
 
+    /// Implicit stack accesses (push, pop, call, ret, ...). The only #GP(0) a data access can
+    /// raise is for a non-canonical address, which through SS is reported as #SS(0) instead.
+    pub fn read_stack(&mut self, linear: u64, size: u8) -> ExecResult<u64> {
+        self.read(linear, size)
+            .map_err(stack_fault_for_non_canonical)
+    }
+
+    pub fn write_stack(&mut self, linear: u64, size: u8, val: u64) -> ExecResult<()> {
+        self.write(linear, size, val)
+            .map_err(stack_fault_for_non_canonical)
+    }
+
     /// Access by the CPU itself (see `translate`), independent of CPL.
     pub fn read_sys(&mut self, linear: u64, size: u8) -> ExecResult<u64> {
         self.mem_read(linear, size, true)
@@ -468,6 +520,13 @@ impl Cpu {
         self.mem_write(linear, size, val, true)
     }
 
+    /// Implicit supervisor store to the stack, as interrupt delivery does: non-canonical is
+    /// #SS(0), like `write_stack`.
+    pub fn write_sys_stack(&mut self, linear: u64, size: u8, val: u64) -> ExecResult<()> {
+        self.write_sys(linear, size, val)
+            .map_err(stack_fault_for_non_canonical)
+    }
+
     pub fn read128(&mut self, linear: u64) -> ExecResult<u128> {
         let low = self.read(linear, 8)?;
         let high = self.read(linear.wrapping_add(8), 8)?;
@@ -475,9 +534,13 @@ impl Cpu {
     }
 
     pub fn write128(&mut self, linear: u64, v: u128) -> ExecResult<()> {
-        // Probe both ends first: the stores below must not start if the second half faults.
+        // Probe both pages first: the stores below must not start if the second one faults.
+        // The probe uses the page base, like a straddling `write`, so CR2 agrees.
         self.translate(linear, AccessKind::Write, false)?;
-        self.translate(linear.wrapping_add(15), AccessKind::Write, false)?;
+        let last_page = linear.wrapping_add(15) & !PAGE_OFFSET_MASK;
+        if last_page != linear & !PAGE_OFFSET_MASK {
+            self.translate(last_page, AccessKind::Write, false)?;
+        }
         self.write(linear, 8, v as u64)?;
         self.write(linear.wrapping_add(8), 8, (v >> 64) as u64)
     }
@@ -512,7 +575,11 @@ impl Cpu {
                 Ok(insn)
             }
             Err(DecodeErr::Invalid) => Err(Exception::invalid_opcode()),
-            Err(DecodeErr::Truncated) if len == MAX_INSN_LEN => Err(Exception::invalid_opcode()),
+            // The 15-byte window ended mid-instruction: it is longer than the architectural
+            // limit, which is #GP(0) (an undecodable opcode stays #UD).
+            Err(DecodeErr::Truncated) if len == MAX_INSN_LEN => {
+                Err(Exception::general_protection(0))
+            }
             // The instruction runs into the next page. It is not cached, because its validity
             // depends on two pages; both get marked as code instead.
             Err(DecodeErr::Truncated) => {
@@ -533,9 +600,14 @@ impl Cpu {
                         self.mark_code(next_page_pa);
                         Ok(insn)
                     }
-                    Err(_) => Err(Exception::invalid_opcode()),
+                    Err(DecodeErr::Truncated) => Err(Exception::general_protection(0)),
+                    Err(DecodeErr::Invalid) => Err(Exception::invalid_opcode()),
                 }
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "mem_tests.rs"]
+mod tests;

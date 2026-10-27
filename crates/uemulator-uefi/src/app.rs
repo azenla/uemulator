@@ -7,11 +7,12 @@ use core::time::Duration;
 use uefi::fs::FileSystem;
 use uefi::prelude::*;
 use uefi::proto::loaded_image::LoadedImage;
-use uefi::runtime::ResetType;
+use uefi::runtime::{Daylight, ResetType};
 use uemulator::{EmulatedMachine, ExitReason, JitMode, MachineConfig};
 
 use crate::config::{Accel, CONFIG_FILE, Config};
 use crate::console;
+use crate::unix_time::FirmwareTime;
 
 /// The vCPU calls the poll hook every few thousand instructions; the firmware is only asked
 /// for input on every this-many of them.
@@ -22,22 +23,6 @@ const IDLE_STALL: Duration = Duration::from_micros(200);
 /// (error), so it can be read.
 const EXIT_MESSAGE_DELAY: Duration = Duration::from_secs(1);
 const ERROR_MESSAGE_DELAY: Duration = Duration::from_secs(10);
-
-// Constants of the days-from-civil algorithm in `unix_time`.
-const SECS_PER_MINUTE: i64 = 60;
-const SECS_PER_HOUR: i64 = 3600;
-const SECS_PER_DAY: i64 = 86400;
-const MONTHS_PER_YEAR: i64 = 12;
-const FEBRUARY: i64 = 2;
-const MARCH: i64 = 3;
-const DAYS_PER_YEAR: i64 = 365;
-/// A 400-year era of the Gregorian calendar.
-const YEARS_PER_ERA: i64 = 400;
-const DAYS_PER_ERA: i64 = 146097;
-/// Days from 0000-03-01, the start of era 0, to 1970-01-01.
-const DAYS_FROM_ERA_START_TO_UNIX_EPOCH: i64 = 719468;
-/// Days in any five consecutive months of a year that starts in March (31, 30, 31, 30, 31).
-const DAYS_PER_FIVE_MONTHS: i64 = 153;
 
 #[entry]
 fn efi_main() -> Status {
@@ -174,27 +159,19 @@ fn run() -> Result<ExitReason, String> {
     Ok(reason)
 }
 
-/// The firmware's real-time clock as seconds since the Unix epoch. The time zone is ignored.
+/// The firmware's real-time clock as seconds since the Unix epoch, with its time zone and daylight
+/// saving fields applied.
 fn unix_time() -> Option<u64> {
     let time = uefi::runtime::get_time().ok()?;
-    let (year, month, day) = (time.year() as i64, time.month() as i64, time.day() as i64);
-    // Days-from-civil (Howard Hinnant): the year starts in March so the leap day is the last day
-    // of the year, which makes the month-to-day-of-year step a fixed formula.
-    let year = if month <= FEBRUARY { year - 1 } else { year };
-    let era = year.div_euclid(YEARS_PER_ERA);
-    let year_of_era = year.rem_euclid(YEARS_PER_ERA);
-    let months_since_march = if month >= MARCH {
-        month - MARCH
-    } else {
-        month + MONTHS_PER_YEAR - MARCH
-    };
-    let day_of_year = (DAYS_PER_FIVE_MONTHS * months_since_march + 2) / 5 + day - 1;
-    let day_of_era =
-        year_of_era * DAYS_PER_YEAR + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * DAYS_PER_ERA + day_of_era - DAYS_FROM_ERA_START_TO_UNIX_EPOCH;
-    let secs = days * SECS_PER_DAY
-        + time.hour() as i64 * SECS_PER_HOUR
-        + time.minute() as i64 * SECS_PER_MINUTE
-        + time.second() as i64;
-    u64::try_from(secs).ok()
+    FirmwareTime {
+        year: time.year(),
+        month: time.month(),
+        day: time.day(),
+        hour: time.hour(),
+        minute: time.minute(),
+        second: time.second(),
+        time_zone: time.time_zone(),
+        in_daylight: time.daylight().contains(Daylight::IN_DAYLIGHT),
+    }
+    .unix_seconds()
 }

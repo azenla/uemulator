@@ -64,6 +64,8 @@ pub(crate) fn addrs(exit_ok: u64, exit_fail: u64) -> Addrs {
         exec: helpers::helper_exec as *const () as usize as u64,
         ld: helpers::helper_load_via_out as *const () as usize as u64,
         st: helpers::helper_store_x64 as *const () as usize as u64,
+        ld_stack: helpers::helper_load_stack_via_out as *const () as usize as u64,
+        st_stack: helpers::helper_store_stack_x64 as *const () as usize as u64,
         cond: helpers::helper_cond as *const () as usize as u64,
         exit_ok,
         exit_fail,

@@ -8,6 +8,8 @@ mod fpu;
 pub(crate) mod mem;
 mod sse;
 mod sys;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -202,7 +204,7 @@ pub(crate) const TLB_ENTRIES_PER_MODE: usize = 1 << TLB_INDEX_BITS;
 #[derive(Clone, Copy)]
 pub(crate) struct DecodeCacheEntry {
     pub gpa: u64,
-    pub generation: u32,
+    pub generation: u64,
     pub insn: Insn,
 }
 
@@ -303,8 +305,9 @@ pub(crate) struct Cpu {
     pub tlb: Vec<TlbEntry>,
     pub decode_cache: Vec<DecodeCacheEntry>,
     /// Bumping it invalidates the whole decode cache at once. Starts at 1 so the zeroed
-    /// entries (generation 0) never match.
-    pub decode_cache_generation: u32,
+    /// entries (generation 0) never match. 64 bits wide so it cannot wrap back to a value
+    /// that stale entries still carry (a u32 would after about 4e9 flushes).
+    pub decode_cache_generation: u64,
     /// One byte per guest physical page: nonzero while a cached decode or a JIT block was
     /// built from that page. Stores to such pages take the slow path and call `code_written`.
     /// Devices see it through `GuestMem` for the same purpose.
@@ -328,8 +331,6 @@ pub(crate) struct Cpu {
     pub poll: Option<PollFn>,
     /// Keys already reported by `log_once`.
     pub logged: alloc::collections::BTreeSet<u64>,
-    /// Unused.
-    pub exc_depth: u32,
     /// Number of `flush_decode` calls, for `dump`.
     pub flushes: u64,
     /// Wall-clock mode: halting really sleeps instead of skipping ahead.
@@ -451,7 +452,6 @@ impl Cpu {
             log,
             poll: None,
             logged: Default::default(),
-            exc_depth: 0,
             flushes: 0,
             realtime: false,
             last_block_insns: 0,
@@ -544,7 +544,7 @@ impl Cpu {
             && let Some(vector) = self.pending_interrupt()
         {
             self.halted = false;
-            if let Some(reason) = self.deliver_event(vector, None, false) {
+            if let Some(reason) = self.deliver_hardware_interrupt(vector) {
                 return BeforeStep::Exit(reason);
             }
         }
@@ -655,15 +655,26 @@ impl Cpu {
                     .translate(start, mem::AccessKind::Exec, true)
                     .unwrap_or(0) as usize
                     & !(PAGE_OFFSET_MASK as usize);
-                let differing_offsets: Vec<usize> = (0..PAGE_SIZE as usize)
-                    .filter(|&offset| {
-                        self.ram[page_base + offset] != shadow.ram[page_base + offset]
-                    })
-                    .take(MAX_DIFFERING_OFFSETS)
-                    .collect();
+                // The faulting code may sit in the last RAM page or outside RAM (MMIO, where
+                // `translate` fell back to 0), so every slice here is bounds-checked: a panic in
+                // the diagnostics would hide the divergence being reported.
+                let page = page_base..page_base + PAGE_SIZE as usize;
+                let differing_offsets: Vec<usize> =
+                    match (self.ram.get(page.clone()), shadow.ram.get(page.clone())) {
+                        (Some(main_page), Some(shadow_page)) => (0..main_page.len())
+                            .filter(|&offset| main_page[offset] != shadow_page[offset])
+                            .take(MAX_DIFFERING_OFFSETS)
+                            .collect(),
+                        _ => Vec::new(),
+                    };
                 let code_offset = page_base + (start & PAGE_OFFSET_MASK) as usize;
-                let main_bytes = self.ram[code_offset..][..DIVERGENCE_CODE_BYTES].to_vec();
-                let shadow_bytes = shadow.ram[code_offset..][..DIVERGENCE_CODE_BYTES].to_vec();
+                let code_bytes = |ram: &[u8]| {
+                    ram.get(code_offset..code_offset + DIVERGENCE_CODE_BYTES)
+                        .map(<[u8]>::to_vec)
+                        .unwrap_or_default()
+                };
+                let main_bytes = code_bytes(&self.ram);
+                let shadow_bytes = code_bytes(&shadow.ram);
                 if let Some(l) = &self.log {
                     l(&format!(
                         "page diffs at {differing_offsets:x?}; main bytes {main_bytes:02x?}; shadow bytes {shadow_bytes:02x?}"
@@ -784,7 +795,7 @@ impl Cpu {
         None
     }
 
-    fn step(&mut self) -> ExecResult<()> {
+    pub(crate) fn step(&mut self) -> ExecResult<()> {
         let insn = self.fetch_decode()?;
         if let Some(trace) = &mut self.trace {
             if trace.len() >= TRACE_CAPACITY {
@@ -886,6 +897,9 @@ impl Cpu {
         s
     }
 }
+
+#[cfg(test)]
+mod cpu_tests;
 
 #[cfg(test)]
 mod tests {

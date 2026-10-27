@@ -11,7 +11,7 @@ use std::mem::{offset_of, size_of};
 
 use super::helpers::*;
 use super::x64::*;
-use crate::cpu::decode::{Insn, NO_REG, NO_SEG};
+use crate::cpu::decode::{Insn, NO_REG};
 use crate::cpu::flags::LazyFlagsOp;
 use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TlbEntry};
 
@@ -106,15 +106,18 @@ const ALU_CMP: u8 = 7;
 /// `test`: and without writeback. Not a real group-1 number; must stay outside 0..=7.
 const ALU_TEST: u8 = 8;
 
-// Opcodes that read the guest clock (`Insn::op`; 0x100 and up are `0f xx`).
-const OP_RDTSC: u16 = 0x131;
-const OP_IN_OUT_IMM8: std::ops::RangeInclusive<u16> = 0xe4..=0xe7;
-const OP_IN_OUT_DX: std::ops::RangeInclusive<u16> = 0xec..=0xef;
-
 /// A TLB-miss path, emitted out of line after the block body.
 enum SlowKind {
-    Ld { dst: u8, size: u8, signed: bool },
-    St { size: u8 },
+    Ld {
+        dst: u8,
+        size: u8,
+        signed: bool,
+        stack: bool,
+    },
+    St {
+        size: u8,
+        stack: bool,
+    },
 }
 
 struct Slow {
@@ -149,6 +152,9 @@ pub(crate) struct Addrs {
     pub exec: u64,
     pub ld: u64,
     pub st: u64,
+    /// Variants of `ld`/`st` for push/pop/call/ret, which fault with #SS instead of #GP.
+    pub ld_stack: u64,
+    pub st_stack: u64,
     pub cond: u64,
     pub exit_ok: u64,
     pub exit_fail: u64,
@@ -165,6 +171,9 @@ pub(crate) struct Gen<'a> {
     smc: Vec<(Label, u32, u64)>,
     /// Host flags currently equal the guest flags (set by the last inlined ALU op).
     live: bool,
+    /// Block index of the last instruction whose clock read was paid for in advance; see
+    /// `Gen::helper` and the field of the same name in `emit.rs`.
+    prepaid_insns: u32,
     /// Number of guest instructions lowered inline (not through `helper_exec`), for statistics.
     pub inlined: u32,
 }
@@ -178,6 +187,7 @@ impl<'a> Gen<'a> {
             slows: Vec::new(),
             smc: Vec::new(),
             live: false,
+            prepaid_insns: 0,
             inlined: 0,
         }
     }
@@ -219,12 +229,16 @@ impl<'a> Gen<'a> {
         // The run loop already counted one instruction for the block. These instructions see guest
         // time, which derives from `icount`, so add the ones before this now and tell
         // `step_block` through `prepaid_icount` not to count them again.
-        if insn_index > 0 && reads_guest_clock(self.insns[insn_index].op) {
+        if reads_guest_clock(self.insns[insn_index].op) && insn_index as u32 > self.prepaid_insns {
+            // Pay only for the instructions executed since the last payment and record the
+            // running total in `prepaid_icount`; see the same code in `emit.rs`.
+            let owed = insn_index as u32 - self.prepaid_insns;
             self.a.ld(SCRATCH_D, mem(CPU, ICOUNT));
-            self.a.alu_ri(ADD, SCRATCH_D, insn_index as i32, true);
+            self.a.alu_ri(ADD, SCRATCH_D, owed as i32, true);
             self.a.st(mem(CPU, ICOUNT), SCRATCH_D, 8);
             self.a.mov_imm(SCRATCH_D, insn_index as u64);
             self.a.st(mem(CPU, PREPAID_ICOUNT), SCRATCH_D, 8);
+            self.prepaid_insns = insn_index as u32;
         }
         self.a.mov_rr(ARGS[0], CPU, true);
         self.a.mov_imm(ARGS[1], insn);
@@ -300,6 +314,23 @@ impl<'a> Gen<'a> {
     /// Load `size` bytes at `ADDR` into `dst`. A TLB miss runs the helper out of line and resumes
     /// after the load with `ADDR` intact.
     fn mem_load(&mut self, dst: u8, size: u8, signed: bool, insn_index: u32, rip: u64) {
+        self.load_access(dst, size, signed, insn_index, rip, false);
+    }
+
+    /// `mem_load` for an implicit stack access: only the slow path differs (#SS, not #GP).
+    fn stack_load(&mut self, dst: u8, insn_index: u32, rip: u64) {
+        self.load_access(dst, 8, false, insn_index, rip, true);
+    }
+
+    fn load_access(
+        &mut self,
+        dst: u8,
+        size: u8,
+        signed: bool,
+        insn_index: u32,
+        rip: u64,
+        stack: bool,
+    ) {
         let slow = self.a.label();
         let resume = self.a.label();
         self.tlb_probe(size, TLB_TAG_READ, slow);
@@ -311,7 +342,12 @@ impl<'a> Gen<'a> {
         self.slows.push(Slow {
             slow,
             resume,
-            kind: SlowKind::Ld { dst, size, signed },
+            kind: SlowKind::Ld {
+                dst,
+                size,
+                signed,
+                stack,
+            },
             insn_index,
             rip,
         });
@@ -320,6 +356,15 @@ impl<'a> Gen<'a> {
     /// Store the low `size` bytes of `VALUE` at `ADDR`. The write tag is invalidated for pages
     /// holding translated code, so stores to code always miss and reach `Cpu::code_written`.
     fn mem_store(&mut self, size: u8, insn_index: u32, rip: u64) {
+        self.store_access(size, insn_index, rip, false);
+    }
+
+    /// `mem_store` for an implicit stack access; see `stack_load`.
+    fn stack_store(&mut self, insn_index: u32, rip: u64) {
+        self.store_access(8, insn_index, rip, true);
+    }
+
+    fn store_access(&mut self, size: u8, insn_index: u32, rip: u64, stack: bool) {
         let slow = self.a.label();
         let resume = self.a.label();
         self.tlb_probe(size, TLB_TAG_WRITE, slow);
@@ -329,7 +374,7 @@ impl<'a> Gen<'a> {
         self.slows.push(Slow {
             slow,
             resume,
-            kind: SlowKind::St { size },
+            kind: SlowKind::St { size, stack },
             insn_index,
             rip,
         });
@@ -367,19 +412,32 @@ impl<'a> Gen<'a> {
             self.a.mov_rr(ARGS[1], SAVED_ADDR, true);
             let fail = self.a.label();
             match slow.kind {
-                SlowKind::Ld { dst, size, signed } => {
+                SlowKind::Ld {
+                    dst,
+                    size,
+                    signed,
+                    stack,
+                } => {
                     self.a.mov_imm(ARGS[2], size as u64);
                     self.a.lea(ARGS[3], mem(RSP, OUT));
-                    self.call(self.addrs.ld);
+                    self.call(if stack {
+                        self.addrs.ld_stack
+                    } else {
+                        self.addrs.ld
+                    });
                     self.a.test_rr(ACC, ACC, true);
                     self.a.jcc(NE, fail);
                     self.a.ld_ext(dst, mem(RSP, OUT), size, signed);
                 }
-                SlowKind::St { size } => {
+                SlowKind::St { size, stack } => {
                     self.a.mov_rr(SAVED_VALUE, VALUE, true);
                     self.a.mov_imm(ARGS[2], size as u64);
                     self.a.mov_rr(ARGS[3], SAVED_VALUE, true);
-                    self.call(self.addrs.st);
+                    self.call(if stack {
+                        self.addrs.st_stack
+                    } else {
+                        self.addrs.st
+                    });
                     self.a.test_rr(ACC, ACC, true);
                     self.a.jcc(NE, fail);
                 }
@@ -394,6 +452,10 @@ impl<'a> Gen<'a> {
 
     /// Record the just-emitted ALU op in the lazy flags: result in `ACC`, second operand in
     /// `OPERAND`. `lazy_op` and `lazy_size` are adjacent bytes, written with one 16-bit store.
+    /// For logic ops the interpreter stores 0 in `lazy_src` while this stores the operand; that is
+    /// equivalent because `flags::compute` derives a Logic result from the result alone, and
+    /// `inc`/`dec` take their carry-in from the materialised flags (`diff_flags` checks every
+    /// consumer).
     fn store_lazy_op(&mut self, op: LazyFlagsOp, osz: u8) {
         self.a
             .st_imm16(mem(CPU, LAZY_OP), (op as u32 | (osz as u32) << 8) as u16);
@@ -402,9 +464,10 @@ impl<'a> Gen<'a> {
         self.live = true;
     }
 
-    /// Memory operands the inline path handles: 64-bit addressing, no lock prefix.
+    /// Memory operands the inline path handles: 64-bit addressing, no lock prefix. Every segment
+    /// override is fine: `ea` applies the FS/GS bases and 64-bit mode ignores the rest.
     fn mem_ok(insn: &Insn) -> bool {
-        !insn.addr32 && (insn.seg == NO_SEG || insn.seg as usize <= SEG_GS) && !insn.lock
+        !insn.addr32 && !insn.lock
     }
 
     /// `alu_op` is a group-1 number or `ALU_TEST`. Loads both operands (the memory operand first,
@@ -754,7 +817,7 @@ impl<'a> Gen<'a> {
                 self.ld_gpr(ADDR, GUEST_RSP);
                 self.a.lea(ADDR, mem(ADDR, -8));
                 self.ld_gpr(VALUE, r);
-                self.mem_store(8, insn_index, rip);
+                self.stack_store(insn_index, rip);
                 self.st_gpr(GUEST_RSP, ADDR);
                 store = true;
             }
@@ -762,7 +825,7 @@ impl<'a> Gen<'a> {
             0x58..=0x5f if !insn.p66 => {
                 let r = (insn.op as u8 & 7) | ((insn.rex & GUEST_REX_B) << 3);
                 self.ld_gpr(ADDR, GUEST_RSP);
-                self.mem_load(VALUE, 8, false, insn_index, rip);
+                self.stack_load(VALUE, insn_index, rip);
                 self.a.lea(ADDR, mem(ADDR, 8));
                 self.st_gpr(GUEST_RSP, ADDR);
                 self.st_gpr(r, VALUE);
@@ -793,7 +856,7 @@ impl<'a> Gen<'a> {
                 self.ld_gpr(ADDR, GUEST_RSP);
                 self.a.lea(ADDR, mem(ADDR, -8));
                 self.a.mov_imm(VALUE, next);
-                self.mem_store(8, insn_index, rip);
+                self.stack_store(insn_index, rip);
                 self.st_gpr(GUEST_RSP, ADDR);
                 self.set_rip(next.wrapping_add(insn.imm as u64));
                 self.exit_ok(retired);
@@ -803,7 +866,7 @@ impl<'a> Gen<'a> {
             // ret
             0xc3 => {
                 self.ld_gpr(ADDR, GUEST_RSP);
-                self.mem_load(VALUE, 8, false, insn_index, rip);
+                self.stack_load(VALUE, insn_index, rip);
                 self.a.lea(ADDR, mem(ADDR, 8));
                 self.st_gpr(GUEST_RSP, ADDR);
                 self.a.st(mem(CPU, RIP), VALUE, 8);
@@ -832,7 +895,7 @@ impl<'a> Gen<'a> {
             };
             let terminal = ends_block(&self.insns[index]);
             if self.try_inline(index, rip, next) {
-                if is_inline_term(&self.insns[index]) {
+                if is_inline_terminator(&self.insns[index]) {
                     self.emit_slows();
                     return;
                 }
@@ -852,18 +915,4 @@ impl<'a> Gen<'a> {
 
 fn has_fs_gs_override(insn: &Insn) -> bool {
     matches!(insn.seg as usize, SEG_FS | SEG_GS)
-}
-
-/// Instructions whose result depends on guest time (`Cpu::now_ns` is derived from `icount`).
-fn reads_guest_clock(op: u16) -> bool {
-    op == OP_RDTSC || OP_IN_OUT_IMM8.contains(&op) || OP_IN_OUT_DX.contains(&op)
-}
-
-/// Instructions `try_inline` lowers that end the block themselves: jcc, jmp, call, ret. Keep in
-/// step with the terminal arms there.
-fn is_inline_term(insn: &Insn) -> bool {
-    matches!(
-        insn.op,
-        0x70..=0x7f | 0x180..=0x18f | 0xe9 | 0xeb | 0xe8 | 0xc3
-    )
 }

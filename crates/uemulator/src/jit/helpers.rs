@@ -82,6 +82,49 @@ pub(crate) extern "C" fn helper_load(
     }
 }
 
+/// `helper_load` for the implicit stack accesses of push/pop/call/ret: a non-canonical address is
+/// #SS(0), not #GP(0) (`Cpu::read_stack`).
+#[cfg(target_arch = "aarch64")]
+pub(crate) extern "C" fn helper_load_stack(
+    cpu: &mut Cpu,
+    linear_addr: u64,
+    size: u64,
+    rip: u64,
+) -> LoadResult {
+    cpu.rip = rip;
+    match cpu.read_stack(linear_addr, size as u8) {
+        Ok(value) => LoadResult {
+            val: value,
+            status: STATUS_OK,
+        },
+        Err(exception) => {
+            cpu.pending = Some(exception);
+            LoadResult {
+                val: 0,
+                status: STATUS_EXCEPTION,
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) extern "C" fn helper_store_stack(
+    cpu: &mut Cpu,
+    linear_addr: u64,
+    size: u64,
+    value: u64,
+    rip: u64,
+) -> u64 {
+    cpu.rip = rip;
+    match cpu.write_stack(linear_addr, size as u8, value) {
+        Ok(()) => STATUS_OK,
+        Err(exception) => {
+            cpu.pending = Some(exception);
+            STATUS_EXCEPTION
+        }
+    }
+}
+
 /// Slow-path store; returns `STATUS_OK` or `STATUS_EXCEPTION`, never `STATUS_EXIT_REQUESTED`: the
 /// emitters poll `block_exit_requested` themselves (`smc_check`) after an inlined instruction
 /// that stores, including when the store went through this helper.
@@ -125,6 +168,42 @@ pub(crate) extern "C" fn helper_load_via_out(
     }
 }
 
+/// Stack flavor of `helper_load_via_out`; see `helper_load_stack`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) extern "C" fn helper_load_stack_via_out(
+    cpu: &mut Cpu,
+    linear_addr: u64,
+    size: u64,
+    out: *mut u64,
+) -> u64 {
+    match cpu.read_stack(linear_addr, size as u8) {
+        Ok(value) => {
+            unsafe { *out = value };
+            STATUS_OK
+        }
+        Err(exception) => {
+            cpu.pending = Some(exception);
+            STATUS_EXCEPTION
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) extern "C" fn helper_store_stack_x64(
+    cpu: &mut Cpu,
+    linear_addr: u64,
+    size: u64,
+    value: u64,
+) -> u64 {
+    match cpu.write_stack(linear_addr, size as u8, value) {
+        Ok(()) => STATUS_OK,
+        Err(exception) => {
+            cpu.pending = Some(exception);
+            STATUS_EXCEPTION
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub(crate) extern "C" fn helper_store_x64(
     cpu: &mut Cpu,
@@ -145,6 +224,29 @@ pub(crate) extern "C" fn helper_store_x64(
 /// guest flags. Used when the emitter cannot test host flags directly.
 pub(crate) extern "C" fn helper_cond(cpu: &mut Cpu, cc: u64) -> u64 {
     cpu.condition_holds(cc as u8) as u64
+}
+
+/// `Insn::op` of `rdtsc` and `rdmsr` (`0f 31`, `0f 32`; `decode` puts the `0f` map in bits 8+).
+const OP_RDTSC: u16 = 0x131;
+const OP_RDMSR: u16 = 0x132;
+
+/// Instructions whose result depends on guest time, which `Cpu::now_ns` derives from `icount`:
+/// rdtsc, rdmsr (the TSC MSR), and in/out (which pass the time to the device). `icount` is only
+/// brought up to date when a block exits, so both emitters pay for the instructions ahead of
+/// one of these before calling the helper (see `Gen::helper`).
+pub(crate) fn reads_guest_clock(op: u16) -> bool {
+    // e4..e7 in/out with an imm8 port; ec..ef in/out with the port in dx
+    matches!(op, OP_RDTSC | OP_RDMSR | 0xe4..=0xe7 | 0xec..=0xef)
+}
+
+/// The instructions both emitters lower with their own exit sequence (`try_inline` returns true
+/// and the block stops): jcc rel8/rel32, jmp rel8/rel32, call rel32, ret. All of them are also
+/// `ends_block`. Keep in step with the terminal arms of `try_inline`.
+pub(crate) fn is_inline_terminator(insn: &Insn) -> bool {
+    matches!(
+        insn.op,
+        0x70..=0x7f | 0x180..=0x18f | 0xe9 | 0xeb | 0xe8 | 0xc3
+    )
 }
 
 /// True if the block must end after `insn`. The set is an allow-list of what the block compilers
@@ -170,7 +272,7 @@ pub(crate) fn ends_block(insn: &Insn) -> bool {
         | 0xcf
         | 0xf4 => true,
         // ins/outs, movs/cmps, stos/lods/scas, in/out imm8, in/out dx, cli, sti, popf,
-        // mov sreg, enter
+        // mov sreg
         0x6c..=0x6f
         | 0xa4..=0xa7
         | 0xaa..=0xaf
@@ -179,8 +281,7 @@ pub(crate) fn ends_block(insn: &Insn) -> bool {
         | 0xfa
         | 0xfb
         | 0x9d
-        | 0x8e
-        | 0xc8 => true,
+        | 0x8e => true,
         // group 5: call/jmp indirect, near and far
         0xff => matches!(insn.reg & 7, 2..=5),
         // syscall, clts, sysret, ud2, jcc rel32, pop fs, pop gs, mov to/from cr/dr, wrmsr,
@@ -198,3 +299,7 @@ pub(crate) fn ends_block(insn: &Insn) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "helpers_tests.rs"]
+mod tests;

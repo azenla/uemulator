@@ -1,4 +1,5 @@
 use super::guestmem::GuestMem;
+use super::size_mask;
 use super::virtio::{
     COMMON_CFG_OFFSET, DEVICE_CFG_OFFSET, DEVICE_TYPE_BLOCK, DEVICE_TYPE_CONSOLE, DEVICE_TYPE_NET,
     ISR_OFFSET, NOTIFY_OFF_MULTIPLIER, NOTIFY_OFFSET, REGION_SIZE, Transport,
@@ -16,8 +17,14 @@ const BAR_SIZE: u64 = 4 * REGION_SIZE;
 /// kernel takes `int_line` as the IRQ. Never 0, `mmio_write` uses 0 for "no interrupt".
 const LEGACY_IRQS: [u8; 3] = [9, 10, 11];
 
-/// Config mechanism #1 ports (0xCF8 address, 0xCFC data window, 4 bytes wide).
+/// Config mechanism #1 ports: the address dword at 0xCF8..=0xCFB and the data window at
+/// 0xCFC..=0xCFF. Either may be accessed as a byte, word or dword; the low two bits of the
+/// port are the byte lane. Port 0xCF9 is also the reset control register, which `Devices`
+/// claims before it gets here.
 pub(crate) const CONFIG_ADDRESS_PORT: u16 = 0xcf8;
+pub(crate) const CONFIG_DATA_PORT: u16 = 0xcfc;
+const BYTES_PER_DWORD: usize = 4;
+const BYTE_LANE_MASK: u16 = 3;
 const CONFIG_ADDRESS_ENABLE: u32 = 1 << 31;
 const CONFIG_ADDRESS_BUS_SHIFT: u32 = 16;
 const CONFIG_ADDRESS_DEVFN_SHIFT: u32 = 8;
@@ -110,7 +117,7 @@ struct PciFunction {
 }
 
 pub(crate) struct PciHost {
-    /// Last value written to 0xCF8.
+    /// Value of the address dword at 0xCF8.
     config_address: u32,
     funcs: Vec<PciFunction>,
 }
@@ -296,7 +303,7 @@ impl PciHost {
             ((addr >> CONFIG_ADDRESS_DEVFN_SHIFT) & 0xff) as u8,
             (addr & CONFIG_ADDRESS_REGISTER_MASK) as usize,
         );
-        let ones = u32::MAX >> (32 - 8 * size as u32);
+        let ones = size_mask(size as u8);
         if bus != 0 {
             return ones;
         }
@@ -312,18 +319,25 @@ impl PciHost {
     }
 
     pub fn io_in(&self, port: u16, size: u8) -> u32 {
-        if port == CONFIG_ADDRESS_PORT {
-            return self.config_address;
+        let lane = (port.wrapping_sub(CONFIG_ADDRESS_PORT) & BYTE_LANE_MASK) as usize;
+        if port < CONFIG_DATA_PORT {
+            return (self.config_address >> (8 * lane)) & size_mask(size);
         }
         if self.config_address & CONFIG_ADDRESS_ENABLE == 0 {
-            return u32::MAX >> (32 - 8 * size as u32);
+            return size_mask(size);
         }
-        self.config_read(self.config_address, size as usize, (port & 3) as usize)
+        self.config_read(self.config_address, size as usize, lane)
     }
 
     pub fn io_out(&mut self, port: u16, size: u8, val: u32) {
-        if port == CONFIG_ADDRESS_PORT {
-            self.config_address = val;
+        let lane = (port.wrapping_sub(CONFIG_ADDRESS_PORT) & BYTE_LANE_MASK) as usize;
+        // An access reaching past the dword is clamped; the rest would belong to the next port.
+        let bytes = (size as usize).min(BYTES_PER_DWORD - lane);
+        if port < CONFIG_DATA_PORT {
+            // A narrow write replaces only its own bytes of the address register.
+            let mask = (size_mask(bytes as u8) as u64) << (8 * lane);
+            let merged = (self.config_address as u64 & !mask) | ((val as u64) << (8 * lane) & mask);
+            self.config_address = merged as u32;
             return;
         }
         let bus = (self.config_address >> CONFIG_ADDRESS_BUS_SHIFT) & 0xff;
@@ -331,10 +345,9 @@ impl PciHost {
             return;
         }
         let devfn = ((self.config_address >> CONFIG_ADDRESS_DEVFN_SHIFT) & 0xff) as u8;
-        let reg =
-            (self.config_address & CONFIG_ADDRESS_REGISTER_MASK) as usize + (port & 3) as usize;
+        let reg = (self.config_address & CONFIG_ADDRESS_REGISTER_MASK) as usize + lane;
         if let Some(f) = self.funcs.iter_mut().find(|f| f.devfn == devfn) {
-            f.write_config(reg, size as usize, val);
+            f.write_config(reg, bytes, val);
         }
     }
 
@@ -342,6 +355,20 @@ impl PciHost {
         self.funcs
             .iter_mut()
             .find_map(|f| f.bar0_offset(phys_addr).map(|offset| (f, offset)))
+    }
+
+    /// IRQ numbers the functions can be wired to.
+    pub fn interrupt_lines() -> [u8; 3] {
+        LEGACY_IRQS
+    }
+
+    /// Whether any function wired to `irq` is still asserting its interrupt: the ISR has a bit
+    /// set (it clears on read) and the guest has not disabled INTx. The PIC needs this to drop a
+    /// level-triggered line once the driver has acknowledged the device.
+    pub fn line_asserted(&self, irq: u8) -> bool {
+        self.funcs
+            .iter()
+            .any(|f| f.int_line == irq && f.intx_enabled() && f.transport.isr != 0)
     }
 
     /// None if no BAR decodes `phys_addr`.
@@ -378,77 +405,5 @@ impl PciHost {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::console::ConsoleHandle;
-    use crate::dev::vcons::VirtioConsole;
-
-    const CONFIG_DATA_PORT: u16 = 0xcfc;
-
-    fn host() -> PciHost {
-        PciHost::new(vec![Transport::new(Box::new(VirtioConsole::new(
-            ConsoleHandle::default(),
-        )))])
-    }
-
-    fn config_address(slot: u32, reg: u32) -> u32 {
-        CONFIG_ADDRESS_ENABLE | slot << (CONFIG_ADDRESS_DEVFN_SHIFT + DEVFN_SLOT_SHIFT) | reg
-    }
-
-    fn rd(h: &mut PciHost, slot: u32, reg: u32) -> u32 {
-        h.io_out(CONFIG_ADDRESS_PORT, 4, config_address(slot, reg));
-        h.io_in(CONFIG_DATA_PORT, 4)
-    }
-
-    #[test]
-    fn enumerate_and_size_bar() {
-        let mut h = host();
-        assert_eq!(
-            rd(&mut h, 0, CFG_VENDOR_ID as u32) & 0xffff,
-            VENDOR_INTEL as u32
-        );
-        // Dword at 8 is revision, prog_if, subclass, class: the upper half is the class code.
-        assert_eq!(rd(&mut h, 0, CFG_REVISION as u32) >> 16, 0x0600);
-        assert_eq!(
-            rd(&mut h, 1, CFG_VENDOR_ID as u32),
-            VENDOR_VIRTIO as u32 | ((VIRTIO_PCI_DEVICE_ID_BASE + DEVICE_TYPE_CONSOLE) as u32) << 16
-        );
-        assert_eq!(rd(&mut h, 2, CFG_VENDOR_ID as u32), u32::MAX);
-        let bar = rd(&mut h, 1, CFG_BAR0 as u32);
-        h.io_out(CONFIG_ADDRESS_PORT, 4, config_address(1, CFG_BAR0 as u32));
-        h.io_out(CONFIG_DATA_PORT, 4, u32::MAX);
-        assert_eq!(h.io_in(CONFIG_DATA_PORT, 4), !(BAR_SIZE as u32 - 1));
-        h.io_out(CONFIG_DATA_PORT, 4, bar);
-        assert_eq!(h.io_in(CONFIG_DATA_PORT, 4), bar);
-        let mut caps = Vec::new();
-        let mut p = rd(&mut h, 1, CFG_CAPABILITIES_POINTER as u32) & 0xff;
-        while p != 0 {
-            let w = rd(&mut h, 1, p);
-            caps.push((w >> 24) as u8);
-            p = (w >> 8) & 0xff;
-        }
-        assert_eq!(
-            caps,
-            vec![
-                VIRTIO_PCI_CAP_COMMON_CFG,
-                VIRTIO_PCI_CAP_NOTIFY_CFG,
-                VIRTIO_PCI_CAP_ISR_CFG,
-                VIRTIO_PCI_CAP_DEVICE_CFG
-            ]
-        );
-    }
-
-    #[test]
-    fn bar_decode_follows_command() {
-        let mut h = host();
-        assert!(h.mmio_read(MMIO_BASE + 0x14, 1).is_none());
-        h.io_out(
-            CONFIG_ADDRESS_PORT,
-            4,
-            config_address(1, CFG_COMMAND as u32),
-        );
-        h.io_out(CONFIG_DATA_PORT, 2, COMMAND_MEMORY_SPACE as u32);
-        // BAR0 offset 0x12 is the common config num_queues field; the console has 2 queues.
-        assert_eq!(h.mmio_read(MMIO_BASE + 0x12, 2), Some(2));
-    }
-}
+#[path = "pci_tests.rs"]
+mod tests;

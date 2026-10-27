@@ -34,6 +34,76 @@ pub(crate) fn probe() -> bool {
     crate::sys::jit_probe()
 }
 
+/// Held by tests while generated code runs. Rosetta (macOS x86_64 on Apple Silicon) keeps a
+/// translation cache keyed by address; when one thread unmaps a code buffer and another thread
+/// maps a new one at the same address while generated code runs, it can execute the stale
+/// translation (wrong register values, SIGBUS). A standalone probe that maps, writes, runs and
+/// unmaps a tiny function on 8 threads reproduces it without any emulator code, while rewriting
+/// one long-lived buffer from 8 threads, or doing the same on a single thread, never fails. So it
+/// is a Rosetta limitation, not an emulator bug: a real machine has one `Jit` per process and
+/// native x86_64 hosts have coherent instruction caches. Tests there take turns; native hosts
+/// need no lock and get an empty guard.
+#[cfg(test)]
+pub(crate) fn serialize_jit_tests() -> JitTestGuard {
+    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+    {
+        use std::cell::Cell;
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        thread_local!(static HELD: Cell<bool> = const { Cell::new(false) });
+        // Reentrant: a test thread that already has its turn (a harness holding the lock for its
+        // lifetime, or a test that took it explicitly) must not deadlock on a second request.
+        if HELD.with(Cell::get) {
+            return JitTestGuard::default();
+        }
+        let lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        HELD.with(|held| held.set(true));
+        JitTestGuard {
+            _lock: Some(lock),
+            clear_held: Some(|| HELD.with(|held| held.set(false))),
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "macos")))]
+    {
+        JitTestGuard::default()
+    }
+}
+
+/// Proof that this thread has its turn at running generated code; see `serialize_jit_tests`.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct JitTestGuard {
+    _lock: Option<std::sync::MutexGuard<'static, ()>>,
+    clear_held: Option<fn()>,
+}
+
+#[cfg(test)]
+impl Drop for JitTestGuard {
+    fn drop(&mut self) {
+        if let Some(clear_held) = self.clear_held.take() {
+            clear_held();
+        }
+    }
+}
+
+#[cfg(test)]
+mod diff_alu;
+#[cfg(test)]
+mod diff_flags;
+#[cfg(test)]
+mod diff_flow;
+#[cfg(test)]
+mod diff_memory;
+#[cfg(test)]
+mod diff_misc;
+#[cfg(test)]
+mod diff_mov;
+#[cfg(test)]
+mod diff_random;
+#[cfg(test)]
+mod diff_smc;
+#[cfg(test)]
+mod diff_tests;
+
 #[cfg(not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))))]
 mod stub {
     use crate::cpu::Cpu;

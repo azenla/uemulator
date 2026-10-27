@@ -1,129 +1,10 @@
+//! Everything that touches the CPU: instructions the compiler has no intrinsic for, and the
+//! world-switch stubs. The register layouts and constants live in `defs`.
+
 use core::arch::asm;
 use core::mem::offset_of;
 
-/// Guest general-purpose registers, in x86 encoding order. The layout is read by offset from the
-/// world-switch stubs below. The VMCB holds the guest's rax and rsp on SVM, and the VMCS holds
-/// rsp on VMX, so those slots are not touched by the SVM stub (rax, rsp) or the VMX stub (rsp).
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct Gprs {
-    pub rax: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rbx: u64,
-    pub rsp: u64,
-    pub rbp: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-}
-
-pub const MSR_TSC: u32 = 0x10;
-pub const MSR_FEATURE_CONTROL: u32 = 0x3a;
-pub const MSR_PAT: u32 = 0x277;
-pub const MSR_SYSENTER_CS: u32 = 0x174;
-pub const MSR_SYSENTER_ESP: u32 = 0x175;
-pub const MSR_SYSENTER_EIP: u32 = 0x176;
-pub const MSR_EFER: u32 = 0xc000_0080;
-pub const MSR_STAR: u32 = 0xc000_0081;
-pub const MSR_LSTAR: u32 = 0xc000_0082;
-pub const MSR_CSTAR: u32 = 0xc000_0083;
-pub const MSR_SFMASK: u32 = 0xc000_0084;
-pub const MSR_FS_BASE: u32 = 0xc000_0100;
-pub const MSR_GS_BASE: u32 = 0xc000_0101;
-pub const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
-
-/// MSRs the guest reads and writes without a VM exit (cleared in the MSR permission map on SVM and
-/// the MSR bitmap on VMX). Every one is either switched by hardware (VMCB/VMCS fields, VMLOAD and
-/// VMSAVE, or the VMX MSR lists) or has no host state to protect; the TSC is not offset, so the
-/// guest sees the host's.
-pub const PASS_THROUGH_MSRS: [u32; 12] = [
-    MSR_TSC,
-    MSR_STAR,
-    MSR_LSTAR,
-    MSR_CSTAR,
-    MSR_SFMASK,
-    MSR_FS_BASE,
-    MSR_GS_BASE,
-    MSR_KERNEL_GS_BASE,
-    MSR_SYSENTER_CS,
-    MSR_SYSENTER_ESP,
-    MSR_SYSENTER_EIP,
-    MSR_PAT,
-];
-
-/// The two ranges of MSR numbers that the SVM MSR permission map and the VMX MSR bitmap cover:
-/// `0..=MSR_LOW_RANGE_END` and the same length starting at `MSR_HIGH_RANGE_START`. Other MSRs
-/// always exit.
-pub const MSR_LOW_RANGE_END: u32 = 0x1fff;
-pub const MSR_HIGH_RANGE_START: u32 = 0xc000_0000;
-pub const MSR_HIGH_RANGE_END: u32 = 0xc000_1fff;
-
-pub const EFER_SCE: u64 = 1;
-pub const EFER_LME: u64 = 1 << 8;
-pub const EFER_LMA: u64 = 1 << 10;
-pub const EFER_NXE: u64 = 1 << 11;
-pub const EFER_SVME: u64 = 1 << 12;
-
-pub const RFLAGS_IF: u64 = 1 << 9;
-/// RFLAGS bit 1 reads as one and must be one in guest state.
-pub const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
-
-pub const CR0_PE: u64 = 1 << 0;
-pub const CR0_MP: u64 = 1 << 1;
-pub const CR0_ET: u64 = 1 << 4;
-pub const CR0_NE: u64 = 1 << 5;
-pub const CR0_WP: u64 = 1 << 16;
-pub const CR0_PG: u64 = 1 << 31;
-pub const CR4_PAE: u64 = 1 << 5;
-
-/// CR0 and CR4 as the 64-bit Linux boot protocol enters the kernel: paging on, long mode, PAE.
-pub const GUEST_ENTRY_CR0: u64 = CR0_PG | CR0_WP | CR0_NE | CR0_ET | CR0_MP | CR0_PE;
-pub const GUEST_ENTRY_CR4: u64 = CR4_PAE;
-
-/// DR7 and DR6 reset values.
-pub const DR7_RESET: u64 = 0x400;
-pub const DR6_RESET: u64 = 0xffff_0ff0;
-
-/// IA32_PAT reset value: WB, WT, UC-, UC repeated for entries 0-3 and 4-7.
-pub const PAT_RESET: u64 = 0x0007_0406_0007_0406;
-
-/// Segment limit of a flat 4 GiB segment.
-pub const FLAT_SEGMENT_LIMIT: u32 = 0xffff_ffff;
-/// Limit of the LDTR and TR the guest starts with.
-pub const SYSTEM_SEGMENT_LIMIT: u32 = 0xffff;
-
-/// Interrupt and exception injection encoding shared by VMX (VM-entry interruption-information)
-/// and SVM (EVENTINJ): vector in bits 7:0, type in 10:8, "has error code" in bit 11, valid in 31.
-pub const EVENT_TYPE_SHIFT: u32 = 8;
-pub const EVENT_TYPE_HARDWARE_EXCEPTION: u32 = 3;
-pub const EVENT_ERROR_CODE_VALID: u32 = 1 << 11;
-pub const EVENT_VALID: u32 = 1 << 31;
-
-pub const VECTOR_INVALID_OPCODE: u32 = 6;
-pub const VECTOR_GENERAL_PROTECTION: u32 = 13;
-
-pub const CPUID_LEAF_VENDOR: u32 = 0;
-pub const CPUID_LEAF_FEATURES: u32 = 1;
-pub const CPUID_LEAF_EXT_MAX: u32 = 0x8000_0000;
-pub const CPUID_LEAF_EXT_FEATURES: u32 = 0x8000_0001;
-pub const CPUID_LEAF_BRAND_STRING_FIRST: u32 = 0x8000_0002;
-pub const CPUID_LEAF_BRAND_STRING_LAST: u32 = 0x8000_0004;
-pub const CPUID_LEAF_EXT_POWER_MANAGEMENT: u32 = 0x8000_0007;
-pub const CPUID_LEAF_EXT_ADDRESS_SIZES: u32 = 0x8000_0008;
-pub const CPUID_LEAF_SVM: u32 = 0x8000_000a;
-
-/// CPUID.1:ECX bit 5.
-pub const CPUID_1_ECX_VMX: u32 = 1 << 5;
-/// CPUID.80000001h:ECX bit 2.
-pub const CPUID_EXT1_ECX_SVM: u32 = 1 << 2;
+pub use super::defs::*;
 
 pub fn cpuid(leaf: u32, sub: u32) -> [u32; 4] {
     let r = core::arch::x86_64::__cpuid_count(leaf, sub);
@@ -166,14 +47,6 @@ macro_rules! cr {
 cr!(cr0, set_cr0, "cr0");
 cr!(cr3, "cr3");
 cr!(cr4, set_cr4, "cr4");
-
-/// The 10-byte memory operand of SGDT, SIDT, LGDT and LIDT.
-#[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
-pub struct DescriptorTableRegister {
-    pub limit: u16,
-    pub base: u64,
-}
 
 // SGDT and SIDT write through the pointer, so unlike the register reads they omit `nomem`.
 pub fn sgdt() -> DescriptorTableRegister {
@@ -238,28 +111,7 @@ pub fn interrupts_enabled() -> bool {
     f & RFLAGS_IF != 0
 }
 
-const FXSAVE_AREA_SIZE: usize = 512;
-const FXSAVE_FCW_OFFSET: usize = 0;
-const FXSAVE_MXCSR_OFFSET: usize = 24;
-/// x87 control word after FINIT and MXCSR after reset.
-const FCW_RESET: u16 = 0x37f;
-const MXCSR_RESET: u32 = 0x1f80;
-
-/// The guest's x87/SSE state as an FXSAVE image (16-byte aligned, as FXSAVE requires). Firmware
-/// code that runs between VM exits (interrupt handlers, `Stall`) clobbers XMM, so the event loop
-/// restores the guest's image before every entry and saves it after every exit.
-#[repr(C, align(16))]
-pub struct FpuState(pub [u8; FXSAVE_AREA_SIZE]);
-
 impl FpuState {
-    pub fn reset() -> Self {
-        let mut s = FpuState([0; FXSAVE_AREA_SIZE]);
-        s.0[FXSAVE_FCW_OFFSET..FXSAVE_FCW_OFFSET + 2].copy_from_slice(&FCW_RESET.to_le_bytes());
-        s.0[FXSAVE_MXCSR_OFFSET..FXSAVE_MXCSR_OFFSET + 4]
-            .copy_from_slice(&MXCSR_RESET.to_le_bytes());
-        s
-    }
-
     pub fn save(&mut self) {
         unsafe {
             asm!("fxsave64 [{}]", in(reg) self.0.as_mut_ptr(), options(nostack, preserves_flags))

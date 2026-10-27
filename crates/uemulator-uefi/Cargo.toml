@@ -7,9 +7,9 @@ edition.workspace = true
 [[bin]]
 name = "uemulator-uefi"
 path = "src/main.rs"
-test = false
 
-# Only built for the UEFI targets; on any other target the crate is empty.
+# Only built for the UEFI targets; on any other target the crate is empty, except that `cargo test`
+# compiles the hardware-independent modules.
 [target.'cfg(target_os = "uefi")'.dependencies]
 uemulator = { path = "../uemulator", default-features = false }
 uefi = { version = "0.41.0", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }

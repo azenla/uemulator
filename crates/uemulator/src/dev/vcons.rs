@@ -1,9 +1,7 @@
 use super::guestmem::GuestMem;
-use super::virtio::{Queue, VirtioDev};
+use super::virtio::{DEVICE_TYPE_CONSOLE, Queue, VirtioDev};
 use crate::console::ConsoleHandle;
 
-/// Virtio device id for a console.
-const VIRTIO_ID_CONSOLE: u16 = 3;
 /// VIRTIO_CONSOLE_F_SIZE: config space carries cols/rows and changes raise a config interrupt.
 /// The multiport feature is not offered, so there are no control queues: just port 0's pair.
 const F_SIZE: u64 = 1;
@@ -21,8 +19,10 @@ const CONFIG_ROWS_OFFSET: usize = 2;
 const CONFIG_MAX_NR_PORTS_OFFSET: usize = 4;
 const MAX_NR_PORTS: u32 = 1;
 
-/// Bytes read from one transmit chain; anything beyond is dropped.
-const MAX_TX_CHAIN_BYTES: usize = 1 << 16;
+/// Transmit data is handed to the console in pieces of this size. A chain longer than one piece
+/// is forwarded whole, never truncated: dropping console output silently is worse than briefly
+/// holding one more piece of a buffer the guest already proved is in RAM.
+const TX_CHUNK_BYTES: usize = 1 << 16;
 
 pub(crate) struct VirtioConsole {
     console: ConsoleHandle,
@@ -46,7 +46,7 @@ impl VirtioConsole {
 
 impl VirtioDev for VirtioConsole {
     fn device_type(&self) -> u16 {
-        VIRTIO_ID_CONSOLE
+        DEVICE_TYPE_CONSOLE
     }
 
     fn features(&self) -> u64 {
@@ -72,8 +72,9 @@ impl VirtioDev for VirtioConsole {
         }
         let mut any = false;
         while let Some(chain) = queues[TRANSMITQ].pop(mem) {
-            let data = chain.read_all(mem, MAX_TX_CHAIN_BYTES);
-            self.console.guest_tx_bytes(&data);
+            chain.read_chunks(mem, TX_CHUNK_BYTES, |piece| {
+                self.console.guest_tx_bytes(piece)
+            });
             queues[TRANSMITQ].push_used(mem, chain.head, 0);
             any = true;
         }
@@ -90,7 +91,9 @@ impl VirtioDev for VirtioConsole {
             let Some(chain) = queues[RECEIVEQ].pop(mem) else {
                 break;
             };
-            let data = self.console.guest_rx_bulk(chain.writable().max(1));
+            // Take only what the buffer can hold: bytes pulled from the console and not stored
+            // would be lost. A buffer with no writable space is returned empty.
+            let data = self.console.guest_rx_bulk(chain.writable());
             let written = chain.write_at(mem, 0, &data);
             queues[RECEIVEQ].push_used(mem, chain.head, written as u32);
             any = true;
@@ -104,44 +107,5 @@ impl VirtioDev for VirtioConsole {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::virtio::testutil::*;
-    use super::*;
-    use crate::dev::guestmem::test_mem;
-
-    #[test]
-    fn io_and_resize() {
-        let c = ConsoleHandle::default();
-        let mut dev = VirtioConsole::new(c.clone());
-        assert_eq!(dev.config_read(CONFIG_COLS_OFFSET), 80);
-        let mut ram = vec![0u8; 0x20000];
-        let mut qs = vec![
-            setup_queue(&mut ram, 0x1000, 0x2000, 0x3000, 8),
-            setup_queue(&mut ram, 0x8000, 0x9000, 0xa000, 8),
-        ];
-        ram[0xc000..0xc003].copy_from_slice(b"hey");
-        put_desc(&mut ram, 0x8000, 0, 0xc000, 3, 0, 0);
-        post(&mut ram, 0x9000, 8, 0);
-        let mut mem = test_mem(&mut ram);
-        assert!(dev.kick(TRANSMITQ, &mut qs, &mut mem));
-        let mut b = [0u8; 8];
-        assert_eq!(c.read(&mut b, None), 3);
-        c.write(b"ok");
-        put_desc(&mut ram, 0x1000, 0, 0xd000, 64, 2, 0);
-        post(&mut ram, 0x2000, 8, 0);
-        let mut mem = test_mem(&mut ram);
-        assert!(dev.poll(&mut qs, &mut mem));
-        assert_eq!(&ram[0xd000..0xd002], b"ok");
-        c.resize(132, 43);
-        let mut mem = test_mem(&mut ram);
-        dev.poll(&mut qs, &mut mem);
-        assert!(dev.config_event());
-        assert_eq!(
-            (
-                dev.config_read(CONFIG_COLS_OFFSET),
-                dev.config_read(CONFIG_ROWS_OFFSET)
-            ),
-            (132, 43)
-        );
-    }
-}
+#[path = "vcons_tests.rs"]
+mod tests;

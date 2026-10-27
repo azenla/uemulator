@@ -27,6 +27,8 @@ mod prelude;
 mod sync;
 #[cfg(feature = "jit")]
 mod sys;
+#[cfg(test)]
+mod testkit;
 
 pub use boot::BootState;
 pub use console::ConsoleHandle;
@@ -37,3 +39,145 @@ pub use machine::{
 };
 pub use netdev::NetHandle;
 pub use platform::{DEFAULT_CMDLINE, Platform, load_linux};
+
+#[cfg(test)]
+mod api_tests {
+    //! Compile-time pins of the public surface: a signature or derive change that would break an
+    //! embedder fails to build here.
+    use super::*;
+
+    type LoadLinux = fn(&mut [u8], &[u8], Option<&[u8]>, &str) -> Result<BootState, Error>;
+
+    fn is_send<T: Send>() {}
+    fn is_send_sync<T: Send + Sync>() {}
+    fn is_clone<T: Clone>() {}
+    fn is_copy<T: Copy>() {}
+    fn is_default<T: Default>() {}
+    fn is_debug<T: core::fmt::Debug>() {}
+    fn is_std_error<T: std::error::Error>() {}
+
+    #[test]
+    fn entry_points_have_the_documented_signatures() {
+        let _: fn(MachineConfig) -> Result<EmulatedMachine, Error> = EmulatedMachine::new;
+        let _: fn(&mut EmulatedMachine) -> Result<(), Error> = EmulatedMachine::start;
+        let _: fn(&mut EmulatedMachine) -> ExitReason = EmulatedMachine::wait;
+        let _: fn(&EmulatedMachine) = EmulatedMachine::stop;
+        let _: fn(&EmulatedMachine) -> StopHandle = EmulatedMachine::stop_handle;
+        let _: fn(&EmulatedMachine) -> ConsoleHandle = EmulatedMachine::console;
+        let _: fn(&EmulatedMachine) -> Option<NetHandle> = EmulatedMachine::net;
+        let _: fn(&StopHandle) = StopHandle::stop;
+        let _: fn() -> MachineConfig = MachineConfig::new;
+        let _: LoadLinux = load_linux;
+        let _: &str = DEFAULT_CMDLINE;
+        let _: fn(ConsoleHandle) -> Platform = Platform::new;
+    }
+
+    #[test]
+    fn handles_cross_threads_and_clone() {
+        is_send::<MachineConfig>();
+        is_send::<EmulatedMachine>();
+        is_send_sync::<ConsoleHandle>();
+        is_send_sync::<NetHandle>();
+        is_send_sync::<StopHandle>();
+        is_send_sync::<Error>();
+        is_send_sync::<ExitReason>();
+        is_clone::<ConsoleHandle>();
+        is_clone::<NetHandle>();
+        is_clone::<StopHandle>();
+        is_send::<Platform>();
+        is_send::<Disk>();
+    }
+
+    #[test]
+    fn value_types_keep_their_derives() {
+        is_copy::<JitMode>();
+        is_copy::<ClockMode>();
+        is_copy::<ConsoleKind>();
+        is_copy::<BootState>();
+        is_default::<JitMode>();
+        is_default::<ClockMode>();
+        is_default::<ConsoleKind>();
+        is_default::<BootState>();
+        is_default::<ConsoleHandle>();
+        is_default::<NetHandle>();
+        is_default::<MachineConfig>();
+        is_clone::<ExitReason>();
+        is_debug::<Error>();
+        is_debug::<ExitReason>();
+        is_debug::<BootState>();
+        is_std_error::<Error>();
+    }
+
+    #[test]
+    fn boot_state_fields_are_public() {
+        let state = BootState {
+            rip: 1,
+            rsi: 2,
+            cr3: 3,
+            gdt_base: 4,
+            gdt_limit: 5,
+            cs: 6,
+            ds: 7,
+        };
+        assert_eq!(
+            (
+                state.rip,
+                state.rsi,
+                state.cr3,
+                state.gdt_base,
+                state.gdt_limit,
+                state.cs,
+                state.ds
+            ),
+            (1, 2, 3, 4, 5, 6, 7)
+        );
+    }
+
+    #[test]
+    fn every_error_and_exit_variant_is_nameable() {
+        let errors = [
+            Error::BadKernel(String::new()),
+            Error::BadConfig(String::new()),
+            Error::JitUnavailable,
+            Error::AlreadyStarted,
+        ];
+        assert_eq!(errors.len(), 4);
+        let exits = [
+            ExitReason::Shutdown,
+            ExitReason::Reset,
+            ExitReason::TripleFault,
+            ExitReason::Stopped,
+            ExitReason::Internal(String::new()),
+        ];
+        assert_eq!(exits.len(), 5);
+    }
+
+    #[test]
+    fn a_block_backend_can_be_implemented_outside_the_crate_shape() {
+        struct Nothing;
+        impl BlockBackend for Nothing {
+            fn len(&self) -> u64 {
+                0
+            }
+            fn read_at(&mut self, _: u64, _: &mut [u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn write_at(&mut self, _: u64, _: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let _config = MachineConfig::new().disk(Disk::from_backend(Nothing));
+    }
+
+    #[test]
+    fn the_memory_limits_are_visible_to_embedders_through_the_error_message() {
+        let message = match EmulatedMachine::new(MachineConfig::new().memory_mib(1)) {
+            Err(Error::BadConfig(message)) => message,
+            other => panic!("unexpected {:?}", other.err()),
+        };
+        assert!(message.contains("64") && message.contains("3072"));
+    }
+}

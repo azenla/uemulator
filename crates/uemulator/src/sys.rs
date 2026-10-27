@@ -32,7 +32,15 @@ impl ExecMem {
     /// Makes the region writable for this thread only, copies, restores execute permission and
     /// flushes the instruction cache (see `imp`).
     pub fn write_bytes(&self, offset: usize, bytes: &[u8]) {
-        assert!(offset + bytes.len() <= self.len);
+        // `checked_add`: a wrapped sum would pass the check and write outside the mapping.
+        assert!(
+            offset
+                .checked_add(bytes.len())
+                .is_some_and(|end| end <= self.len),
+            "write of {} bytes at offset {offset:#x} is outside the {}-byte mapping",
+            bytes.len(),
+            self.len
+        );
         unsafe {
             imp::set_write_protect(false);
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), bytes.len());
@@ -206,8 +214,146 @@ pub(crate) fn jit_probe() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    const MAPPING_BYTES: usize = PROBE_MAPPING_SIZE;
+    const PAGE_ALIGNMENT: u64 = 4096;
+    const RETURNED_VALUE: u32 = 42;
+    const PATCHED_RETURN_VALUE: u32 = 43;
+
+    fn mapping() -> ExecMem {
+        ExecMem::new(MAPPING_BYTES).expect("the host must allow an executable mapping")
+    }
+
+    fn contents(mem: &ExecMem, offset: usize, len: usize) -> Vec<u8> {
+        unsafe { std::slice::from_raw_parts((mem.ptr as *const u8).add(offset), len).to_vec() }
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
-    fn probe() {
-        let _ = super::jit_probe();
+    fn probe_succeeds_on_a_host_with_a_jit_backend() {
+        assert!(jit_probe());
+    }
+
+    #[test]
+    fn a_new_mapping_is_page_aligned_zeroed_and_as_long_as_asked() {
+        let mem = mapping();
+        assert_eq!(mem.len(), MAPPING_BYTES);
+        assert_ne!(mem.base(), 0);
+        assert_eq!(mem.base() % PAGE_ALIGNMENT, 0);
+        assert!(
+            contents(&mem, 0, MAPPING_BYTES)
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+    }
+
+    #[test]
+    fn write_bytes_lands_at_the_offset_and_nowhere_else() {
+        let mem = mapping();
+        mem.write_bytes(100, &[1, 2, 3, 4]);
+        let all = contents(&mem, 0, MAPPING_BYTES);
+        assert_eq!(&all[100..104], [1, 2, 3, 4]);
+        assert!(all[..100].iter().all(|&byte| byte == 0));
+        assert!(all[104..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn writes_can_be_repeated_and_overwrite_earlier_ones() {
+        let mem = mapping();
+        mem.write_bytes(0, &[1, 1, 1, 1]);
+        mem.write_bytes(2, &[2, 2]);
+        assert_eq!(contents(&mem, 0, 4), [1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn writing_the_last_byte_and_nothing_at_the_end_are_allowed() {
+        let mem = mapping();
+        mem.write_bytes(MAPPING_BYTES - 1, &[9]);
+        mem.write_bytes(MAPPING_BYTES, &[]);
+        assert_eq!(contents(&mem, MAPPING_BYTES - 1, 1), [9]);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the")]
+    fn writing_one_byte_past_the_end_is_refused() {
+        mapping().write_bytes(MAPPING_BYTES - 1, &[1, 2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the")]
+    fn an_offset_past_the_end_is_refused() {
+        mapping().write_bytes(MAPPING_BYTES + 1, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the")]
+    fn an_offset_that_wraps_the_address_space_is_refused_not_written() {
+        // `usize::MAX + 1` wraps to 0, which a plain `+` would accept.
+        mapping().write_bytes(usize::MAX, &[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_or_absurd_mapping_is_refused_not_panicked_on() {
+        assert!(ExecMem::new(0).is_none());
+        assert!(ExecMem::new(usize::MAX / 2).is_none());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn generated_code_runs_and_can_be_patched_and_rerun() {
+        // mov eax, imm32; ret
+        let code = |value: u32| {
+            let mut bytes = vec![0xb8];
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.push(X86_RET);
+            bytes
+        };
+        let mem = mapping();
+        mem.write_bytes(0, &code(RETURNED_VALUE));
+        let entry: extern "C" fn() -> u32 = unsafe { std::mem::transmute(mem.base() as usize) };
+        assert_eq!(entry(), RETURNED_VALUE);
+        mem.write_bytes(0, &code(PATCHED_RETURN_VALUE));
+        assert_eq!(entry(), PATCHED_RETURN_VALUE);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn generated_code_runs_and_can_be_patched_and_rerun() {
+        // mov w0, #imm16; ret
+        let code = |value: u32| [0x5280_0000 | (value << 5), AARCH64_RET];
+        let mem = mapping();
+        mem.write(0, &code(RETURNED_VALUE));
+        let entry: extern "C" fn() -> u32 = unsafe { std::mem::transmute(mem.base() as usize) };
+        assert_eq!(entry(), RETURNED_VALUE);
+        mem.write(0, &code(PATCHED_RETURN_VALUE));
+        assert_eq!(entry(), PATCHED_RETURN_VALUE);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn instruction_words_are_stored_little_endian_at_a_word_offset() {
+        let mem = mapping();
+        mem.write(8, &[0x0403_0201, 0x0807_0605]);
+        assert_eq!(contents(&mem, 8, 8), [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn each_mapping_is_independent() {
+        let (first, second) = (mapping(), mapping());
+        assert_ne!(first.base(), second.base());
+        first.write_bytes(0, &[0xaa]);
+        assert_eq!(contents(&second, 0, 1), [0]);
+    }
+
+    #[test]
+    fn mappings_can_be_used_from_another_thread() {
+        let mem = mapping();
+        let handle = std::thread::spawn(move || {
+            mem.write_bytes(0, &[7]);
+            contents(&mem, 0, 1)
+        });
+        assert_eq!(handle.join().unwrap(), [7]);
     }
 }

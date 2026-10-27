@@ -47,6 +47,8 @@ pub const SHR: u8 = 5;
 pub const E: u8 = 4;
 pub const NE: u8 = 5;
 
+const REGISTER_COUNT: u8 = 16;
+
 const REX_BASE: u8 = 0x40;
 const REX_W: u8 = 1 << 3;
 const REX_R: u8 = 1 << 2;
@@ -93,6 +95,7 @@ pub fn mem(base: u8, disp: i32) -> Mem {
 /// `[base + index << scale + disp]`; `scale` is log2 (0..=3) and `index` must not be RSP, whose
 /// SIB encoding means "no index" (R12 is fine, REX.X distinguishes it).
 pub fn mem_idx(base: u8, index: u8, scale: u8, disp: i32) -> Mem {
+    debug_assert!(index != RSP && scale <= 3);
     Mem {
         base,
         index: Some((index, scale)),
@@ -151,6 +154,9 @@ impl Asm {
     /// Emits a REX prefix only when it carries a bit. `force_rex` is for byte operations on a
     /// register numbered 4..=7: without any REX they address ah/ch/dh/bh instead of spl/bpl/sil/dil.
     fn rex(&mut self, w: bool, reg: u8, index: u8, base: u8, force_rex: bool) {
+        // Every encoder funnels through here (`mov_imm`, `alu_ri`, ...); a number of 16 or more
+        // would silently alias register `n & 15` because only bit 3 is kept.
+        debug_assert!(reg < REGISTER_COUNT && index < REGISTER_COUNT && base < REGISTER_COUNT);
         let mut rex = REX_BASE;
         if w {
             rex |= REX_W;
@@ -403,6 +409,7 @@ mod tests {
     use crate::sys::ExecMem;
 
     fn run(f: impl FnOnce(&mut Asm), a0: u64, a1: u64) -> u64 {
+        let _guard = crate::jit::serialize_jit_tests();
         let m = ExecMem::new(16384).unwrap();
         let mut a = Asm::new(m.base());
         a.mov_rr(RAX, ARGS[0], true);
@@ -609,3 +616,7 @@ mod tests {
         assert_eq!(r, 1);
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "x64_tests.rs"]
+mod encoding_tests;

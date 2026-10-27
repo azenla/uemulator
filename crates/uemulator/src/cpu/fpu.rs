@@ -73,6 +73,8 @@ const EXT_REG_SIZE: u64 = 10;
 
 /// FXSAVE image (SDM layout, 512 bytes). FOP/FIP/FDP at 6..24 are not written.
 const FXSAVE_AREA_SIZE: u64 = 512;
+/// The area must be 16-byte aligned or the instruction is #GP(0).
+const FXSAVE_ALIGNMENT: u64 = 16;
 const FXSAVE_FSW_OFFSET: u64 = 2;
 /// Abridged tag word: one bit per physical register, 1 = not empty.
 const FXSAVE_FTW_OFFSET: u64 = 4;
@@ -143,6 +145,36 @@ pub(crate) fn f64_to_ext(v: f64) -> [u8; 10] {
     out[..8].copy_from_slice(&significand.to_le_bytes());
     out[8..].copy_from_slice(&(sign_exponent | if neg { EXT_SIGN } else { 0 }).to_le_bytes());
     out
+}
+
+/// What an 80-bit register holds, as FXAM reports it and as the tag word records it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExtClass {
+    /// Unnormals, pseudo-infinities and pseudo-NaNs: formats the 387 and later reject.
+    Unsupported,
+    Nan,
+    Normal,
+    Infinity,
+    Zero,
+    /// Exponent 0 with a nonzero significand. A pseudo-denormal (integer bit set) is included.
+    Denormal,
+}
+
+/// Classifies the raw bits, not an f64 conversion: an extended denormal underflows f64 to zero
+/// and would otherwise look like one.
+fn classify(raw: [u8; 10]) -> ExtClass {
+    let significand = u64::from_le_bytes(raw[..8].try_into().unwrap());
+    let exponent = u16::from_le_bytes([raw[8], raw[9]]) & !EXT_SIGN;
+    let integer_bit_set = significand & EXT_INTEGER_BIT != 0;
+    match exponent {
+        0 if significand == 0 => ExtClass::Zero,
+        0 => ExtClass::Denormal,
+        EXT_EXPONENT_SPECIAL if !integer_bit_set => ExtClass::Unsupported,
+        EXT_EXPONENT_SPECIAL if significand << 1 == 0 => ExtClass::Infinity,
+        EXT_EXPONENT_SPECIAL => ExtClass::Nan,
+        _ if integer_bit_set => ExtClass::Normal,
+        _ => ExtClass::Unsupported,
+    }
 }
 
 /// Rounds to an integral value according to an FCW.RC field value (bits above 1:0 are ignored).
@@ -324,22 +356,24 @@ impl Cpu {
                         let a = self.st_val(0);
                         self.fcom_val(a, 0.0);
                     }
-                    // fxam: C3,C2,C0 = 101 empty, 001 NaN, 011 infinity, 100 zero, 010 finite.
-                    // Denormals are not told apart from normals; C1 is the sign.
+                    // fxam: C3,C2,C0 = 101 empty, 001 NaN, 010 normal, 011 infinity, 100 zero,
+                    // 110 denormal, 000 unsupported format. C1 is the sign of ST(0), even when
+                    // the register is empty.
                     0xe5 => {
-                        let v = self.st_val(0);
-                        let neg = self.st_raw(0)[EXT_SIGN_BYTE] & EXT_SIGN_BYTE_BIT != 0;
+                        let raw = self.st_raw(0);
+                        let neg = raw[EXT_SIGN_BYTE] & EXT_SIGN_BYTE_BIT != 0;
                         let empty = self.ftw & (1 << self.top()) == 0;
                         let (c3, c2, c0) = if empty {
                             (true, false, true)
-                        } else if v.is_nan() {
-                            (false, false, true)
-                        } else if v.is_infinite() {
-                            (false, true, true)
-                        } else if v == 0.0 {
-                            (true, false, false)
                         } else {
-                            (false, true, false)
+                            match classify(raw) {
+                                ExtClass::Unsupported => (false, false, false),
+                                ExtClass::Nan => (false, false, true),
+                                ExtClass::Normal => (false, true, false),
+                                ExtClass::Infinity => (false, true, true),
+                                ExtClass::Zero => (true, false, false),
+                                ExtClass::Denormal => (true, true, false),
+                            }
                         };
                         self.set_condition_codes(c0, c2, c3);
                         self.fsw = (self.fsw & !FSW_C1) | (neg as u16 * FSW_C1);
@@ -617,8 +651,9 @@ impl Cpu {
                 // fldcw: no exception unmasking is modelled
                 5 => self.fcw = self.read(a, 2)? as u16,
                 6 => self.fnstenv(a)?,
-                // fnstcw (/7); the invalid /1 lands here too
-                _ => self.write(a, 2, self.fcw as u64)?,
+                7 => self.write(a, 2, self.fcw as u64)?,
+                // /1 is not an instruction
+                _ => return Err(Exception::invalid_opcode()),
             },
             0xdb => match r {
                 0 => {
@@ -717,13 +752,13 @@ impl Cpu {
             let tag = if self.ftw & (1 << physical) == 0 {
                 TAG_EMPTY
             } else {
-                let v = ext_to_f64(self.st[physical]);
-                if v == 0.0 {
-                    TAG_ZERO
-                } else if v.is_finite() {
-                    TAG_VALID
-                } else {
-                    TAG_SPECIAL
+                match classify(self.st[physical]) {
+                    ExtClass::Normal => TAG_VALID,
+                    ExtClass::Zero => TAG_ZERO,
+                    ExtClass::Nan
+                    | ExtClass::Infinity
+                    | ExtClass::Denormal
+                    | ExtClass::Unsupported => TAG_SPECIAL,
                 }
             };
             tag_word |= tag << (2 * physical);
@@ -785,12 +820,21 @@ impl Cpu {
         Ok(())
     }
 
-    /// Alignment (#GP for a misaligned FXSAVE area) is not checked.
+    /// #GP(0) unless the 512-byte area is 16-byte aligned, checked on the linear address before
+    /// anything is read or written.
+    fn check_fxsave_alignment(&self, a: u64) -> ExecResult<()> {
+        if a & (FXSAVE_ALIGNMENT - 1) != 0 {
+            return Err(Exception::general_protection(0));
+        }
+        Ok(())
+    }
+
     pub fn fxsave(&mut self, a: u64) -> ExecResult<()> {
         if self.cr0 & CR0_EM != 0 {
             return Err(Exception::invalid_opcode());
         }
         self.fpu_check()?;
+        self.check_fxsave_alignment(a)?;
         // Probe both ends first so a page fault is raised before any byte is written.
         self.translate(a, mem::AccessKind::Write, false)?;
         self.translate(a + FXSAVE_AREA_SIZE - 1, mem::AccessKind::Write, false)?;
@@ -815,20 +859,18 @@ impl Cpu {
         Ok(())
     }
 
-    /// x87 state and MXCSR are committed only after all their reads succeeded; XMM registers
-    /// are loaded as they are read.
+    /// Reads and validates the whole image before changing any register, so a fault or a
+    /// reserved MXCSR bit leaves the x87 and SSE state exactly as it was.
     pub fn fxrstor(&mut self, a: u64) -> ExecResult<()> {
         if self.cr0 & CR0_EM != 0 {
             return Err(Exception::invalid_opcode());
         }
         self.fpu_check()?;
+        self.check_fxsave_alignment(a)?;
         let fcw = self.read(a, 2)? as u16;
         let fsw = self.read(a + FXSAVE_FSW_OFFSET, 2)? as u16;
         let ftw = self.read(a + FXSAVE_FTW_OFFSET, 1)? as u16;
         let mxcsr = self.read(a + FXSAVE_MXCSR_OFFSET, 4)? as u32;
-        if mxcsr & !MXCSR_VALID_BITS != 0 {
-            return Err(Exception::general_protection(0));
-        }
         let mut st = [[0u8; 10]; STACK_DEPTH];
         let top = ((fsw & FSW_TOP_MASK) >> FSW_TOP_SHIFT) as usize;
         // the image stores registers in stack order; place them by physical register
@@ -838,10 +880,15 @@ impl Cpu {
                 *byte = self.read(at, 1)? as u8;
             }
         }
-        for k in 0..self.xmm.len() {
-            self.xmm[k] = self.read128(a + FXSAVE_XMM_OFFSET + k as u64 * FXSAVE_XMM_STRIDE)?;
+        let mut xmm = [0u128; 16];
+        for (k, register) in xmm.iter_mut().enumerate() {
+            *register = self.read128(a + FXSAVE_XMM_OFFSET + k as u64 * FXSAVE_XMM_STRIDE)?;
+        }
+        if mxcsr & !MXCSR_VALID_BITS != 0 {
+            return Err(Exception::general_protection(0));
         }
         self.st = st;
+        self.xmm = xmm;
         self.fcw = fcw;
         self.fsw = fsw;
         self.ftw = ftw;
@@ -849,3 +896,7 @@ impl Cpu {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "fpu_tests.rs"]
+mod fpu_tests;

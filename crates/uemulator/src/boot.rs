@@ -174,9 +174,11 @@ pub struct BootState {
 }
 
 fn put(ram: &mut [u8], addr: u64, data: &[u8]) -> Result<(), Error> {
-    let start = addr as usize;
-    ram.get_mut(start..start + data.len())
-        .ok_or_else(|| Error::BadConfig("guest memory too small".into()))?
+    let too_small = || Error::BadConfig("guest memory too small".into());
+    let start = usize::try_from(addr).map_err(|_| too_small())?;
+    let end = start.checked_add(data.len()).ok_or_else(too_small)?;
+    ram.get_mut(start..end)
+        .ok_or_else(too_small)?
         .copy_from_slice(data);
     Ok(())
 }
@@ -185,6 +187,9 @@ fn put(ram: &mut [u8], addr: u64, data: &[u8]) -> Result<(), Error> {
 /// returns the register state for the 64-bit entry (Documentation/arch/x86/boot.rst, "64-bit
 /// Boot Protocol"; `boot_params` layout follows QEMU's `x86_load_linux`). No firmware runs, so
 /// everything the kernel expects a bootloader to have set up is done here.
+///
+/// Every size and address comes from the image or the caller, so all arithmetic on them is
+/// checked and a misfit is an `Error`, never a panic.
 pub(crate) fn load(
     ram: &mut [u8],
     kernel: &[u8],
@@ -192,8 +197,11 @@ pub(crate) fn load(
     cmdline: &str,
 ) -> Result<BootState, Error> {
     let header = SetupHeader::parse(kernel)?;
-    // +1 for the NUL; RAM is zeroed so the terminator is already there.
-    if cmdline.len() + 1 > header.cmdline_max as usize {
+    // +1 for the NUL; RAM is zeroed so the terminator is already there. The command line must
+    // also end inside the usable low-memory range, or it would run into the reserved area (and,
+    // with a huge `cmdline_max`, into the kernel).
+    let cmdline_end = CMDLINE_ADDR + cmdline.len() as u64 + 1;
+    if cmdline.len() + 1 > header.cmdline_max as usize || cmdline_end > LOW_RAM_END {
         return Err(Error::BadConfig("kernel command line too long".into()));
     }
     let ram_top = ram.len() as u64;
@@ -203,15 +211,26 @@ pub(crate) fn load(
     } else {
         header.pref_address
     };
+    // The protected-mode kernel lives above the first MiB (boot.rst); below it are the structures
+    // placed here and the legacy memory map.
+    if load_addr < ONE_MIB {
+        return Err(Error::BadKernel(
+            "preferred load address of a non-relocatable kernel is below 1 MiB".into(),
+        ));
+    }
     // `init_size` is the footprint the kernel needs while it decompresses itself, which can
     // exceed the compressed payload; nothing else may live in it.
-    let kernel_end = load_addr + (header.init_size as u64).max(payload.len() as u64);
+    let kernel_end = load_addr
+        .checked_add((header.init_size as u64).max(payload.len() as u64))
+        .filter(|&end| end <= ram_top)
+        .ok_or_else(|| Error::BadConfig("guest memory too small for kernel".into()))?;
     put(ram, load_addr, payload)?;
     put(ram, CMDLINE_ADDR, cmdline.as_bytes())?;
 
     let mut boot_params = vec![0u8; BOOT_PARAMS_SIZE];
     // The header's own length byte says where it ends; boot_params has other fields past
-    // `SETUP_HEADER_END_LIMIT` that must stay zero.
+    // `SETUP_HEADER_END_LIMIT` that must stay zero. `parse` guarantees the image is longer than
+    // that limit (the payload starts at 0x400 or later).
     let copy_end =
         (HEADER_MAGIC_OFFSET + kernel[JUMP_LENGTH_OFFSET] as usize).min(SETUP_HEADER_END_LIMIT);
     boot_params[SETUP_SECTS_OFFSET..copy_end]
@@ -225,20 +244,21 @@ pub(crate) fn load(
         // Highest page-aligned spot the kernel can still reach: it cannot read an initrd above
         // `initrd_addr_max`, and RAM may end below that.
         let limit = ram_top.min(header.initrd_addr_max as u64 + 1);
-        let addr = (limit - initrd.len() as u64) & !PAGE_MASK;
-        if limit < initrd.len() as u64 || addr < kernel_end {
-            return Err(Error::BadConfig("guest memory too small for initrd".into()));
-        }
+        let addr = limit
+            .checked_sub(initrd.len() as u64)
+            .map(|unaligned| unaligned & !PAGE_MASK)
+            .filter(|&addr| addr >= kernel_end)
+            .ok_or_else(|| Error::BadConfig("guest memory too small for initrd".into()))?;
         put(ram, addr, initrd)?;
+        // `addr` is at most `initrd_addr_max`, so it and the length (below `limit`) fit in 32 bits.
         boot_params[RAMDISK_IMAGE_OFFSET..RAMDISK_IMAGE_OFFSET + 4]
             .copy_from_slice(&(addr as u32).to_le_bytes());
         boot_params[RAMDISK_SIZE_OFFSET..RAMDISK_SIZE_OFFSET + 4]
             .copy_from_slice(&(initrd.len() as u32).to_le_bytes());
-    } else if kernel_end > ram_top {
-        return Err(Error::BadConfig("guest memory too small for kernel".into()));
     }
 
     // (base, size, type). The kernel needs the low range usable for its real-mode trampoline.
+    // RAM above 1 MiB exists: the kernel was placed there.
     let e820: [(u64, u64, u32); 3] = [
         (0, LOW_RAM_END, E820_RAM),
         (LOW_RAM_END, ONE_MIB - LOW_RAM_END, E820_RESERVED),
@@ -291,46 +311,4 @@ pub(crate) fn load(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Reads `~/.cache/uemulator/linux` (not the `quick/debian/artifacts` layout the integration
-    /// tests use). Tests that need it pass without checking anything when it is missing.
-    fn cached_kernel() -> Option<Vec<u8>> {
-        let dir = std::env::var("UEMULATOR_CACHE")
-            .map(std::path::PathBuf::from)
-            .or_else(|_| {
-                std::env::var("HOME").map(|h| std::path::Path::new(&h).join(".cache/uemulator"))
-            })
-            .ok()?;
-        std::fs::read(dir.join("linux")).ok()
-    }
-
-    #[test]
-    fn rejects_garbage() {
-        assert!(SetupHeader::parse(&[0u8; BOOT_PARAMS_SIZE]).is_err());
-    }
-
-    #[test]
-    fn parses_debian_kernel() {
-        let Some(k) = cached_kernel() else { return };
-        let h = SetupHeader::parse(&k).unwrap();
-        assert_eq!(h.version, MIN_PROTOCOL_VERSION);
-        assert!(h.relocatable);
-        assert_eq!(h.pref_address, KERNEL_LOAD);
-        assert_eq!(h.xloadflags & XLF_KERNEL_64, XLF_KERNEL_64);
-    }
-
-    #[test]
-    fn loads_debian_kernel() {
-        let Some(k) = cached_kernel() else { return };
-        let mut ram = vec![0u8; 512 << 20];
-        let cmdline = "console=ttyS0";
-        let state = load(&mut ram, &k, None, cmdline).unwrap();
-        assert_eq!(state.rip, KERNEL_LOAD + ENTRY_64_OFFSET);
-        assert_eq!(
-            &ram[CMDLINE_ADDR as usize..][..cmdline.len()],
-            cmdline.as_bytes()
-        );
-    }
-}
+mod tests;

@@ -1,7 +1,7 @@
 use super::flags::*;
 use super::{
-    Cpu, ExecResult, GPR_RSP, SEG_CS, SEG_DESCRIPTOR_FLAGS_MASK, SEG_DPL_SHIFT,
-    SEG_FLAGS_FLAT_DATA, SEG_GRANULARITY, SEG_LIMIT_4GIB, SEG_SS, Seg,
+    Cpu, ExecResult, GPR_RSP, SEG_CS, SEG_DEFAULT_BIG, SEG_DESCRIPTOR_FLAGS_MASK, SEG_DPL_SHIFT,
+    SEG_FLAGS_FLAT_DATA, SEG_GRANULARITY, SEG_LIMIT_4GIB, SEG_SS, Seg, USER_CPL,
 };
 use crate::machine::ExitReason;
 
@@ -22,6 +22,9 @@ const IDT_ERROR_CODE_FLAG: u32 = 2;
 /// Clears the RPL bits of a selector, leaving index and table indicator, which is the form that
 /// segment-related error codes use.
 const SELECTOR_ERROR_CODE_MASK: u16 = 0xfffc;
+const SELECTOR_RPL_MASK: u16 = 3;
+/// Code segment type bit "conforming" (bit 10 of the descriptor's upper dword).
+const SEG_TYPE_CONFORMING: u32 = 1 << 10;
 /// Selector bits 3-15 pre-multiplied by 8: the byte offset of the descriptor in its table.
 const SELECTOR_OFFSET_MASK: u16 = 0xfff8;
 /// Selector table indicator: set selects the LDT, clear the GDT.
@@ -71,6 +74,9 @@ impl Exception {
             software: false,
         }
     }
+    pub fn stack_fault(code: u32) -> Exception {
+        Exception::fault(VECTOR_STACK_FAULT, Some(code))
+    }
     pub fn general_protection(code: u32) -> Exception {
         Exception::fault(VECTOR_GENERAL_PROTECTION, Some(code))
     }
@@ -85,15 +91,37 @@ impl Exception {
     }
 }
 
-/// The SDM's "contributory" class: #DE, #TS, #NP, #SS, #GP. #PF is classified separately.
-fn contributory(vector: u8) -> bool {
-    matches!(
-        vector,
+/// Classes of exceptions for double-fault detection (SDM Vol. 3A, "Interrupt 8 - Double Fault
+/// Exception", Table 6-5). Software interrupts and external interrupts are always benign.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FaultClass {
+    Benign,
+    /// #DE, #TS, #NP, #SS, #GP.
+    Contributory,
+    PageFault,
+}
+
+fn fault_class(vector: u8) -> FaultClass {
+    match vector {
         VECTOR_DIVIDE_ERROR
-            | VECTOR_INVALID_TSS
-            | VECTOR_SEGMENT_NOT_PRESENT
-            | VECTOR_STACK_FAULT
-            | VECTOR_GENERAL_PROTECTION
+        | VECTOR_INVALID_TSS
+        | VECTOR_SEGMENT_NOT_PRESENT
+        | VECTOR_STACK_FAULT
+        | VECTOR_GENERAL_PROTECTION => FaultClass::Contributory,
+        VECTOR_PAGE_FAULT => FaultClass::PageFault,
+        _ => FaultClass::Benign,
+    }
+}
+
+/// A second fault while delivering the first becomes #DF only for contributory-then-contributory,
+/// #PF-then-contributory and #PF-then-#PF. Contributory-then-#PF is handled serially: the #PF is
+/// simply delivered next.
+fn escalates_to_double_fault(first: FaultClass, second: FaultClass) -> bool {
+    matches!(
+        (first, second),
+        (FaultClass::Contributory, FaultClass::Contributory)
+            | (FaultClass::PageFault, FaultClass::Contributory)
+            | (FaultClass::PageFault, FaultClass::PageFault)
     )
 }
 
@@ -102,19 +130,38 @@ fn idt_error_code(vector: u8) -> u32 {
 }
 
 impl Cpu {
-    /// Delivers an exception or interrupt through the IDT. If delivery itself faults, the new
-    /// fault replaces the old one, or becomes #DF when the pair is contributory; a fault while
-    /// delivering #DF is a triple fault. Returns `Some` only when the run must end.
-    ///
-    /// A #PF raised while delivering a contributory exception escalates to #DF here too,
-    /// whereas the SDM's table (and QEMU's `check_exception`) would handle that pair serially.
+    /// Delivers an exception (or, with `software`, an `int n`/`int3`) through the IDT. If delivery
+    /// itself faults, the new fault replaces the old one, or becomes #DF per the SDM's table
+    /// (`escalates_to_double_fault`); a fault while delivering #DF is a triple fault. Returns
+    /// `Some` only when the run must end.
     pub fn deliver_event(
         &mut self,
         vector: u8,
         error_code: Option<u32>,
         software: bool,
     ) -> Option<ExitReason> {
+        self.deliver_chain(vector, error_code, software, !software)
+    }
+
+    /// Delivers an external interrupt. Like `int n` it is not an exception, so a fault while
+    /// delivering it never counts the interrupt's own vector as contributory.
+    pub fn deliver_hardware_interrupt(&mut self, vector: u8) -> Option<ExitReason> {
+        self.deliver_chain(vector, None, false, false)
+    }
+
+    fn deliver_chain(
+        &mut self,
+        vector: u8,
+        error_code: Option<u32>,
+        software: bool,
+        first_is_exception: bool,
+    ) -> Option<ExitReason> {
         let (mut vector, mut error_code, mut software) = (vector, error_code, software);
+        let mut class = if first_is_exception {
+            fault_class(vector)
+        } else {
+            FaultClass::Benign
+        };
         for _ in 0..MAX_DELIVERY_ATTEMPTS {
             match self.deliver(vector, error_code, software) {
                 Ok(()) => return None,
@@ -128,17 +175,15 @@ impl Cpu {
                         return Some(ExitReason::TripleFault);
                     }
                     software = false;
-                    let nested_is_page_fault = nested_vector == VECTOR_PAGE_FAULT;
-                    if (contributory(vector)
-                        && (contributory(nested_vector) || nested_is_page_fault))
-                        || (vector == VECTOR_PAGE_FAULT
-                            && (contributory(nested_vector) || nested_is_page_fault))
-                    {
+                    let nested_class = fault_class(nested_vector);
+                    if escalates_to_double_fault(class, nested_class) {
                         vector = VECTOR_DOUBLE_FAULT;
                         error_code = Some(0);
+                        class = FaultClass::Benign;
                     } else {
                         vector = nested_vector;
                         error_code = nested_error;
+                        class = nested_class;
                     }
                 }
             }
@@ -154,9 +199,10 @@ impl Cpu {
         if entry_offset + (IDT_ENTRY_BYTES - 1) > self.idtr.limit as u64 {
             return Err(Exception::general_protection(idt_error_code(vector)));
         }
-        let entry_address = self.idtr.base + entry_offset;
+        // The bases come straight from the guest (lidt/lgdt/ltr), so the sums may wrap.
+        let entry_address = self.idtr.base.wrapping_add(entry_offset);
         let lo = self.read_sys(entry_address, 8)?;
-        let hi = self.read_sys(entry_address + 8, 8)?;
+        let hi = self.read_sys(entry_address.wrapping_add(8), 8)?;
         // lo: offset[15:0], selector, IST in bits 32-34, attributes byte, offset[31:16];
         // hi: offset[63:32].
         let selector = (lo >> 16) as u16;
@@ -164,26 +210,47 @@ impl Cpu {
         let attributes = (lo >> 40) as u8;
         let gate_dpl = (attributes >> GATE_DPL_SHIFT) & 3;
         let gate_type = attributes & GATE_TYPE_MASK;
-        if attributes & GATE_PRESENT == 0 {
-            return Err(Exception::fault(
-                VECTOR_SEGMENT_NOT_PRESENT,
-                Some(idt_error_code(vector)),
-            ));
-        }
+        // Same order as the SDM's INT pseudocode: type, software-interrupt DPL, then present.
         if gate_type != GATE_TYPE_INTERRUPT && gate_type != GATE_TYPE_TRAP {
             return Err(Exception::general_protection(idt_error_code(vector)));
         }
         if software && gate_dpl < self.cpl {
             return Err(Exception::general_protection(idt_error_code(vector)));
         }
-        let target = (lo & 0xffff) | ((lo >> 32) & 0xffff_0000) | (hi << 32);
-        let new_cs = self.load_desc_seg(selector, true)?;
-        if !new_cs.is_code() || !new_cs.long() {
-            return Err(Exception::general_protection(
-                (selector & SELECTOR_ERROR_CODE_MASK) as u32,
+        if attributes & GATE_PRESENT == 0 {
+            return Err(Exception::fault(
+                VECTOR_SEGMENT_NOT_PRESENT,
+                Some(idt_error_code(vector)),
             ));
         }
-        let new_cpl = new_cs.dpl();
+        let target = (lo & 0xffff) | ((lo >> 32) & 0xffff_0000) | (hi << 32);
+        if selector & SELECTOR_ERROR_CODE_MASK == 0 {
+            return Err(Exception::general_protection(0));
+        }
+        let mut new_cs = self.load_desc_seg(selector, false)?;
+        let selector_error_code = (selector & SELECTOR_ERROR_CODE_MASK) as u32;
+        if !new_cs.is_code() || new_cs.dpl() > self.cpl {
+            return Err(Exception::general_protection(selector_error_code));
+        }
+        if !new_cs.present() {
+            return Err(Exception::fault(
+                VECTOR_SEGMENT_NOT_PRESENT,
+                Some(selector_error_code),
+            ));
+        }
+        // A 64-bit code segment has L set and D clear; both set is reserved.
+        if !new_cs.long() || new_cs.flags & SEG_DEFAULT_BIG != 0 {
+            return Err(Exception::general_protection(selector_error_code));
+        }
+        // A conforming handler runs at the caller's privilege level whatever its DPL; only a
+        // non-conforming one moves to its DPL (which is at most the current CPL, checked above).
+        let new_cpl = if new_cs.flags & SEG_TYPE_CONFORMING != 0 {
+            self.cpl
+        } else {
+            new_cs.dpl()
+        };
+        // The CS selector's RPL always equals the CPL.
+        new_cs.sel = (selector & !SELECTOR_RPL_MASK) | new_cpl as u16;
         let old_ss = self.seg[SEG_SS].sel as u64;
         let old_rsp = self.gpr[GPR_RSP];
         let rflags = self.eflags_full();
@@ -196,9 +263,17 @@ impl Cpu {
         };
         stack_pointer &= STACK_ALIGN_MASK;
         let old_cs = self.seg[SEG_CS].sel as u64;
+        // The pushes are supervisor accesses, except when the handler itself runs in ring 3
+        // (a conforming or same-level target, so the interrupted code was in ring 3 too): then
+        // the stack must be user-accessible, as for any other ring 3 access.
+        let user_stack = new_cpl == USER_CPL;
         let mut push = |cpu: &mut Cpu, value: u64| -> ExecResult<()> {
             stack_pointer = stack_pointer.wrapping_sub(8);
-            cpu.write_sys(stack_pointer, 8, value)
+            if user_stack {
+                cpu.write_stack(stack_pointer, 8, value)
+            } else {
+                cpu.write_sys_stack(stack_pointer, 8, value)
+            }
         };
         // 64-bit mode always pushes all five words, with or without a privilege change.
         push(self, old_ss)?;
@@ -242,7 +317,7 @@ impl Cpu {
                 Some((self.tr.sel & SELECTOR_ERROR_CODE_MASK) as u32),
             ));
         }
-        self.read_sys(self.tr.base + offset, 8)
+        self.read_sys(self.tr.base.wrapping_add(offset), 8)
     }
 
     /// Returns the descriptor's low qword and, for system descriptors (16 bytes in long mode)
@@ -259,9 +334,9 @@ impl Cpu {
                 (selector & SELECTOR_ERROR_CODE_MASK) as u32,
             ));
         }
-        let lo = self.read_sys(table_base + offset, 8)?;
+        let lo = self.read_sys(table_base.wrapping_add(offset), 8)?;
         let hi = if lo & DESCRIPTOR_S_BIT == 0 && offset + 15 <= table_limit {
-            self.read_sys(table_base + offset + 8, 8)?
+            self.read_sys(table_base.wrapping_add(offset + 8), 8)?
         } else {
             0
         };
@@ -294,3 +369,7 @@ impl Cpu {
         Ok(seg)
     }
 }
+
+#[cfg(test)]
+#[path = "exception_tests.rs"]
+mod tests;

@@ -18,6 +18,9 @@ const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 /// checked, the driver sets them and we just store them.
 const STATUS_DRIVER_OK: u8 = 4;
 const STATUS_FEATURES_OK: u8 = 8;
+/// Set by the device, never by the driver, once it hit an unrecoverable error (a malformed
+/// virtqueue); only a reset clears it.
+const STATUS_DEVICE_NEEDS_RESET: u8 = 0x40;
 const STATUS_FAILED: u8 = 0x80;
 
 /// ISR status bits; reading the ISR register returns and clears them.
@@ -90,9 +93,12 @@ pub(crate) const DESC_F_NEXT: u16 = 1;
 /// Buffer is device-writable (otherwise device-readable).
 pub(crate) const DESC_F_WRITE: u16 = 2;
 const DESC_F_INDIRECT: u16 = 4;
-/// Available ring: flags u16, idx u16, ring[size] of u16 head indices. Used ring: flags u16,
-/// idx u16, ring[size] of {id u32, len u32}. The ring flags are ignored (no interrupt
-/// suppression), and event idx is not negotiated.
+/// Available ring: flags u16, idx u16, ring[size] of u16 head indices, used_event u16. Used ring:
+/// flags u16, idx u16, ring[size] of {id u32, len u32}, avail_event u16. Only the available
+/// ring's `NO_INTERRUPT` flag is honored; the used ring flags are not read and event idx is
+/// not negotiated.
+const AVAIL_FLAGS: u64 = 0;
+const AVAIL_F_NO_INTERRUPT: u16 = 1;
 const AVAIL_IDX: u64 = 2;
 const AVAIL_RING: u64 = 4;
 const AVAIL_ENTRY_SIZE: u64 = 2;
@@ -100,6 +106,8 @@ const USED_IDX: u64 = 2;
 const USED_RING: u64 = 4;
 const USED_ENTRY_SIZE: u64 = 8;
 const USED_ENTRY_LEN: u64 = 4;
+/// Ring bytes outside the per-slot entries: flags, idx and the trailing event index.
+const RING_FIXED_BYTES: u64 = 6;
 
 /// Split-virtqueue state the driver programs through the common config registers.
 #[derive(Clone, Default)]
@@ -113,6 +121,13 @@ pub(crate) struct Queue {
     pub used: u64,
     /// Free-running count of available entries consumed; compared against the ring's `idx`.
     pub last_avail: u16,
+    /// The driver broke the virtqueue rules (overrun of the available ring, a descriptor loop,
+    /// an index or address outside the queue or RAM). The queue yields nothing more until the
+    /// device is reset; `Transport` turns this into DEVICE_NEEDS_RESET.
+    pub broken: bool,
+    /// A completion was published since the transport last looked and the driver did not
+    /// suppress interrupts for it.
+    pub interrupt_due: bool,
 }
 
 pub(crate) struct Segment {
@@ -139,6 +154,30 @@ impl Chain {
             mem.read(seg.addr, &mut out[at..]);
         }
         out
+    }
+
+    /// Total bytes in device-readable segments.
+    pub fn readable(&self) -> usize {
+        self.segs
+            .iter()
+            .filter(|seg| !seg.device_writable)
+            .map(|seg| seg.len as usize)
+            .sum()
+    }
+
+    /// Passes the device-readable bytes to `sink` in pieces of at most `chunk` bytes, so a
+    /// huge guest buffer never needs a matching host allocation.
+    pub fn read_chunks(&self, mem: &GuestMem, chunk: usize, mut sink: impl FnMut(&[u8])) {
+        let mut buf = vec![0u8; chunk.min(self.readable()).max(1)];
+        for seg in self.segs.iter().filter(|seg| !seg.device_writable) {
+            let mut done = 0usize;
+            while done < seg.len as usize {
+                let n = (seg.len as usize - done).min(buf.len());
+                mem.read(seg.addr + done as u64, &mut buf[..n]);
+                sink(&buf[..n]);
+                done += n;
+            }
+        }
     }
 
     /// Total bytes in device-writable segments.
@@ -180,44 +219,85 @@ impl Queue {
         self.enabled && self.size > 0 && self.desc != 0 && self.avail != 0 && self.used != 0
     }
 
-    /// Takes the next available chain. A malformed chain (index out of range, indirect
-    /// descriptor, loop) is cut short rather than rejected: the device sees the segments
-    /// gathered so far.
+    /// The three rings must lie wholly in RAM, otherwise every later access would silently read
+    /// zeros or drop writes.
+    fn rings_in_ram(&self, mem: &GuestMem) -> bool {
+        let size = self.size as u64;
+        mem.contains(self.desc, DESC_SIZE * size)
+            && mem.contains(self.avail, RING_FIXED_BYTES + AVAIL_ENTRY_SIZE * size)
+            && mem.contains(self.used, RING_FIXED_BYTES + USED_ENTRY_SIZE * size)
+    }
+
+    /// Takes the next available chain. A malformed queue (available index further ahead than
+    /// the ring is long, head or `next` index out of range, descriptor loop, indirect
+    /// descriptor, buffer outside RAM) is not worked around: the queue is marked `broken` and
+    /// yields nothing from then on.
     pub fn pop(&mut self, mem: &GuestMem) -> Option<Chain> {
-        if !self.ready() {
+        if !self.ready() || self.broken {
+            return None;
+        }
+        if !self.rings_in_ram(mem) {
+            self.broken = true;
             return None;
         }
         let avail_idx = mem.read_u16(self.avail + AVAIL_IDX);
-        if avail_idx == self.last_avail {
+        let pending = avail_idx.wrapping_sub(self.last_avail);
+        if pending == 0 {
+            return None;
+        }
+        // The driver can never have more than `size` entries outstanding; anything else is a
+        // stale or hostile index and would otherwise make the device chew through garbage.
+        if pending > self.size {
+            self.broken = true;
             return None;
         }
         let slot = (self.last_avail % self.size) as u64;
         let head = mem.read_u16(self.avail + AVAIL_RING + AVAIL_ENTRY_SIZE * slot);
+        let Some(segs) = self.walk_chain(mem, head) else {
+            self.broken = true;
+            return None;
+        };
         self.last_avail = self.last_avail.wrapping_add(1);
+        Some(Chain { head, segs })
+    }
+
+    /// Gathers the segments of the chain starting at `head`; None if it is malformed.
+    fn walk_chain(&self, mem: &GuestMem, head: u16) -> Option<Vec<Segment>> {
         let mut segs = Vec::new();
         let mut current = head;
-        // At most `size` descriptors in a valid chain; also stops descriptor loops.
+        // A valid chain visits each descriptor at most once, so `size` steps without reaching
+        // the end of the chain means a loop.
         for _ in 0..self.size {
             if current >= self.size {
-                break;
+                return None;
             }
             let desc = self.desc + DESC_SIZE * current as u64;
             let flags = mem.read_u16(desc + DESC_FLAGS);
             // VIRTIO_RING_F_INDIRECT_DESC is not offered.
             if flags & DESC_F_INDIRECT != 0 {
-                break;
+                return None;
+            }
+            let addr = mem.read_u64(desc + DESC_ADDR);
+            let len = mem.read_u32(desc + DESC_LEN);
+            if !mem.contains(addr, len as u64) {
+                return None;
             }
             segs.push(Segment {
-                addr: mem.read_u64(desc + DESC_ADDR),
-                len: mem.read_u32(desc + DESC_LEN),
+                addr,
+                len,
                 device_writable: flags & DESC_F_WRITE != 0,
             });
             if flags & DESC_F_NEXT == 0 {
-                break;
+                return Some(segs);
             }
             current = mem.read_u16(desc + DESC_NEXT);
         }
-        Some(Chain { head, segs })
+        None
+    }
+
+    /// Hands the most recently popped chain back to the driver as still available.
+    pub fn unpop(&mut self) {
+        self.last_avail = self.last_avail.wrapping_sub(1);
     }
 
     /// Completes the chain headed at `head`; `len` is the number of bytes the device wrote
@@ -228,6 +308,10 @@ impl Queue {
         mem.write_u32(entry, head as u32);
         mem.write_u32(entry + USED_ENTRY_LEN, len);
         mem.write_u16(self.used + USED_IDX, used_idx.wrapping_add(1));
+        // Read after publishing `idx`, as the spec orders it: the driver may toggle the flag
+        // concurrently and we must see the value that applies to this completion.
+        let suppressed = mem.read_u16(self.avail + AVAIL_FLAGS) & AVAIL_F_NO_INTERRUPT != 0;
+        self.interrupt_due |= !suppressed;
     }
 }
 
@@ -292,9 +376,11 @@ impl Transport {
         }
     }
 
-    /// Devices do no work (no kicks, no polling, no interrupts) until the driver reaches DRIVER_OK.
+    /// Devices do no work (no kicks, no polling, no interrupts) until the driver reaches
+    /// DRIVER_OK, and none again once FAILED or DEVICE_NEEDS_RESET is set.
     pub fn driver_ok(&self) -> bool {
-        self.status & STATUS_DRIVER_OK != 0 && self.status & STATUS_FAILED == 0
+        self.status & STATUS_DRIVER_OK != 0
+            && self.status & (STATUS_FAILED | STATUS_DEVICE_NEEDS_RESET) == 0
     }
 
     /// Device reset, triggered by writing 0 to the status register. `config_gen` survives.
@@ -327,14 +413,28 @@ impl Transport {
         edge
     }
 
+    /// Called after every device callback that may have touched the queues. `completed` is the
+    /// device's own "buffers were returned" answer; the interrupt is raised only if the driver
+    /// did not suppress it. A queue found broken puts the device into DEVICE_NEEDS_RESET and
+    /// notifies the driver with a configuration change, as the spec requires.
+    fn finish_device_call(&mut self, completed: bool) -> bool {
+        let interrupt_due = self.queues.iter_mut().fold(false, |due, queue| {
+            core::mem::take(&mut queue.interrupt_due) | due
+        });
+        let mut raise = completed && interrupt_due && self.set_isr(ISR_QUEUE_INTERRUPT);
+        if self.status & STATUS_DEVICE_NEEDS_RESET == 0 && self.queues.iter().any(|q| q.broken) {
+            self.status |= STATUS_DEVICE_NEEDS_RESET;
+            raise |= self.set_isr(ISR_CONFIG_CHANGE);
+        }
+        raise
+    }
+
     pub fn poll(&mut self, mem: &mut GuestMem) -> bool {
         if !self.driver_ok() {
             return false;
         }
-        let mut raise = false;
-        if self.dev.poll(&mut self.queues, mem) {
-            raise |= self.set_isr(ISR_QUEUE_INTERRUPT);
-        }
+        let completed = self.dev.poll(&mut self.queues, mem);
+        let mut raise = self.finish_device_call(completed);
         if self.dev.config_event() {
             self.config_gen = self.config_gen.wrapping_add(1);
             raise |= self.set_isr(ISR_CONFIG_CHANGE);
@@ -373,11 +473,9 @@ impl Transport {
             NOTIFY_OFFSET => {
                 // The queue is identified by the address, the written value is ignored.
                 let queue = (in_region / NOTIFY_OFF_MULTIPLIER as u64) as usize;
-                if queue < self.queues.len()
-                    && self.driver_ok()
-                    && self.dev.kick(queue, &mut self.queues, mem)
-                {
-                    return self.set_isr(ISR_QUEUE_INTERRUPT);
+                if queue < self.queues.len() && self.driver_ok() {
+                    let completed = self.dev.kick(queue, &mut self.queues, mem);
+                    return self.finish_device_call(completed);
                 }
             }
             _ => {}
@@ -449,7 +547,9 @@ impl Transport {
                 if status == 0 {
                     self.reset();
                 } else {
-                    let mut accepted = status;
+                    // The driver cannot set or clear NEEDS_RESET; only the device and a reset can.
+                    let mut accepted = (status & !STATUS_DEVICE_NEEDS_RESET)
+                        | (self.status & STATUS_DEVICE_NEEDS_RESET);
                     if accepted & STATUS_FEATURES_OK != 0 {
                         // Refuse by not latching FEATURES_OK; the driver re-reads the status to find out.
                         let wanted = self.driver_features;
@@ -514,7 +614,7 @@ pub(crate) mod testutil {
             desc,
             avail,
             used,
-            last_avail: 0,
+            ..Default::default()
         }
     }
 
@@ -538,46 +638,28 @@ pub(crate) mod testutil {
         let u = used as usize;
         u16::from_le_bytes([ram[u + 2], ram[u + 3]])
     }
+
+    /// (id, len) of used-ring slot `slot`.
+    pub fn used_entry(ram: &[u8], used: u64, slot: usize) -> (u32, u32) {
+        let at = used as usize + USED_RING as usize + USED_ENTRY_SIZE as usize * slot;
+        (
+            u32::from_le_bytes(ram[at..at + 4].try_into().unwrap()),
+            u32::from_le_bytes(ram[at + 4..at + 8].try_into().unwrap()),
+        )
+    }
+
+    /// Overwrites the available ring's free-running `idx` without queueing a head.
+    pub fn set_avail_idx(ram: &mut [u8], avail: u64, idx: u16) {
+        let at = avail as usize + AVAIL_IDX as usize;
+        ram[at..at + 2].copy_from_slice(&idx.to_le_bytes());
+    }
+
+    pub fn set_avail_flags(ram: &mut [u8], avail: u64, flags: u16) {
+        let at = avail as usize;
+        ram[at..at + 2].copy_from_slice(&flags.to_le_bytes());
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dev::guestmem::test_mem;
-    use crate::dev::vblk::VirtioBlk;
-    use crate::disk::Disk;
-
-    const STATUS_ACKNOWLEDGE: u32 = 1;
-    const STATUS_DRIVER: u32 = 2;
-
-    #[test]
-    fn extended_feature_selectors_do_not_alias() {
-        let mut t = Transport::new(Box::new(VirtioBlk::new(Disk::memory(vec![0; 4096]))));
-        let mut ram = vec![0u8; 4096];
-        let mut mem = test_mem(&mut ram);
-        let mut w = |t: &mut Transport, off: u64, size, v| t.mmio_write(off, size, v, &mut mem);
-        // Linux 6.18 negotiates 128 feature bits: it reads and writes selectors 0..=3.
-        let mut offered = [0u32; 4];
-        for sel in 0..4 {
-            w(&mut t, COMMON_DEVICE_FEATURE_SELECT, 4, sel);
-            offered[sel as usize] = t.mmio_read(COMMON_DEVICE_FEATURE, 4);
-        }
-        assert_eq!(offered[2..], [0, 0]);
-        assert_ne!(offered[1] & 1, 0, "VERSION_1 offered");
-        for sel in 0..4 {
-            w(&mut t, COMMON_DRIVER_FEATURE_SELECT, 4, sel);
-            w(&mut t, COMMON_DRIVER_FEATURE, 4, offered[sel as usize]);
-        }
-        w(
-            &mut t,
-            COMMON_DEVICE_STATUS,
-            1,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK as u32,
-        );
-        assert_ne!(
-            t.mmio_read(COMMON_DEVICE_STATUS, 1) & STATUS_FEATURES_OK as u32,
-            0,
-            "FEATURES_OK must stick"
-        );
-    }
-}
+#[path = "virtio_tests.rs"]
+mod tests;

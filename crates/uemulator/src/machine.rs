@@ -50,19 +50,24 @@ pub enum JitMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClockMode {
-    /// Guest time is derived from the instruction count and jumps ahead to the next device
-    /// deadline while the guest is halted, so runs are deterministic.
+    /// Guest time is the instruction count (one nanosecond each) plus the time skipped while
+    /// halted: with a timer pending the clock jumps straight to its deadline, with none it stands
+    /// still while the host naps 1 ms per idle poll. Runs are deterministic.
     #[default]
     Virtual,
-    /// While halted, sleeps on the host (up to 2 ms per wait) before advancing guest time by what
-    /// was slept, instead of skipping ahead at once. Guest time still counts instructions, so it
-    /// only approximates wall time. Ignored on UEFI, where the clock stays virtual.
+    /// While halted with a timer pending the host really sleeps (up to 2 ms per wait) and guest
+    /// time advances by exactly what was slept, so a 20 ms guest timeout takes at least 20 ms of
+    /// wall time. Running code is not paced: guest time still counts instructions, so this is not
+    /// the `max(virtual, wall)` clock `plans/07-devices.md` describes and only approximates wall
+    /// time. Ignored on UEFI, where the clock stays virtual, and under `verify_jit`.
     Realtime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitReason {
-    /// Never produced at present; the only guest-initiated exit besides a triple fault is `Reset`.
+    /// Reserved, never produced by this emulator: there is no ACPI or power-off device, so a
+    /// guest can only end by `Reset`, `TripleFault` or the host's `stop()`. Kept so the variant
+    /// set in `plans/01-api.md` stays source-compatible.
     Shutdown,
     /// The guest asked for a reset through the keyboard controller (port 0x64), fast A20 (0x92)
     /// or reset control (0xcf9) port; see `dev/mod.rs`. Kernels reboot on panic with `panic=-1`,
@@ -203,7 +208,12 @@ impl MachineConfig {
     }
 
     /// Runs the JIT in lockstep with a second, interpreter-only CPU and stops at the first block
-    /// where their state diverges. Very slow; for JIT development.
+    /// where their state diverges. Very slow; for JIT development. The second CPU has the same RTC
+    /// boot time and the same virtio functions in the same slots, but not their data: disk
+    /// contents and host console or network input are seen by the main CPU only, so a guest that
+    /// reads them will report a divergence. Verification always runs on virtual time, whatever
+    /// `clock` says. Without a JIT to check (`JitMode::Off`, or a host that has none) the machine
+    /// just interprets.
     #[doc(hidden)]
     pub fn verify_jit(mut self, on: bool) -> Self {
         self.verify = on;
@@ -261,9 +271,99 @@ struct Vcpu {
     devcfg: DevConfig,
 }
 
+/// Wall-clock seconds, or 0 where there is no clock (UEFI keeps its own, see `unix_time`).
+fn host_unix_time() -> u64 {
+    #[cfg(not(target_os = "uefi"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+    }
+    #[cfg(target_os = "uefi")]
+    {
+        0
+    }
+}
+
+/// Stands in for a disk on the verify twin: same capacity and read-only flag as the real one so
+/// the guest sees the same device, but no data behind it. Reads return zeros, writes vanish.
+#[cfg(not(target_os = "uefi"))]
+struct ShadowDisk {
+    len: u64,
+    read_only: bool,
+}
+
+#[cfg(not(target_os = "uefi"))]
+impl crate::disk::BlockBackend for ShadowDisk {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_at(&mut self, _offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        buf.fill(0);
+        Ok(())
+    }
+    fn write_at(&mut self, _offset: u64, _data: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn read_only(&self) -> bool {
+        self.read_only
+    }
+}
+
+/// Devices for the verify twin that look the same to the guest as `main`: same virtio functions
+/// in the same PCI slots. The twin cannot share the real backends (a disk or a host frame
+/// queue has one owner), so their data is not mirrored: the first guest read of disk contents
+/// is a legitimate divergence of this check, as is host console input.
+fn mirrored_devices(main: &DevConfig) -> DevConfig {
+    DevConfig {
+        #[cfg(not(target_os = "uefi"))]
+        disk: main.disk.as_ref().map(|disk| {
+            Disk::from_backend(ShadowDisk {
+                len: disk.backend.len(),
+                read_only: disk.backend.read_only(),
+            })
+        }),
+        net: main
+            .net
+            .as_ref()
+            .map(|(mac, _)| (*mac, NetHandle::default())),
+        virtio_console: main.virtio_console,
+    }
+}
+
+/// The interpreter-only oracle for `Cpu::run_verify`. Anything a guest can observe must be
+/// identical to the JIT-enabled CPU, or the first guest read of it shows up as a bogus JIT
+/// divergence: the RTC boot time (the twin would otherwise read the wall clock) and the
+/// device set. Time is always virtual here (`realtime` stays off) because only instruction
+/// counts, which both CPUs share, keep the two clocks equal.
+fn interpreter_twin(
+    ram: Vec<u8>,
+    boot: BootState,
+    stop: Arc<AtomicBool>,
+    boot_unix: u64,
+    devices: DevConfig,
+) -> Cpu {
+    let mut twin = Cpu::new(ram, boot, ConsoleHandle::default(), stop, None, devices);
+    twin.dev.set_boot_time(boot_unix);
+    twin.realtime = false;
+    twin
+}
+
 impl Vcpu {
     fn run(mut self) -> ExitReason {
         let console = self.console.clone();
+        // Under verify both CPUs must start from one boot time even when the caller gave none;
+        // two separate wall-clock reads could straddle a second boundary.
+        let verify_twin = self.verify.then(|| {
+            (
+                mirrored_devices(&self.devcfg),
+                self.unix_time.unwrap_or_else(host_unix_time),
+            )
+        });
         let mut cpu = Cpu::new(
             self.ram,
             self.boot,
@@ -272,10 +372,13 @@ impl Vcpu {
             self.log.clone(),
             core::mem::take(&mut self.devcfg),
         );
-        if let Some(unix_time) = self.unix_time {
-            cpu.dev.set_boot_time(unix_time);
+        let boot_unix = verify_twin
+            .as_ref()
+            .map(|(_, boot_unix)| *boot_unix)
+            .or(self.unix_time);
+        if let Some(boot_unix) = boot_unix {
+            cpu.dev.set_boot_time(boot_unix);
         }
-        cpu.realtime = self.clock == ClockMode::Realtime;
         cpu.poll = self.poll.take().map(|host_poll| {
             let poll: PollFn = Arc::new(move |idle| host_poll(&console, idle));
             poll
@@ -286,20 +389,25 @@ impl Vcpu {
         if self.debug {
             cpu.trace = Some(Default::default());
         }
-        let reason = if self.verify {
-            // The interpreter-only twin is the oracle for the JIT-enabled `cpu`. It shares the
-            // stop flag but has no console or devices wired to the host.
-            let mut interpreter_cpu = Cpu::new(
-                self.boot_ram.take().unwrap(),
-                self.boot,
-                ConsoleHandle::default(),
-                cpu.stop.clone(),
-                None,
-                DevConfig::default(),
-            );
-            cpu.run_verify(&mut interpreter_cpu)
-        } else {
-            cpu.run()
+        // Lockstep needs both CPUs to idle identically, and the twin skips to the next timer at
+        // once, so verification always runs on virtual time (a realtime main CPU sleeps in 2 ms
+        // slices and reports a bogus pre-step divergence).
+        let lockstep = verify_twin.is_some() && cpu.jit.is_some();
+        cpu.realtime = self.clock == ClockMode::Realtime && !lockstep;
+        // Lockstep needs generated code to compare; without any (`JitMode::Off`, a host without
+        // a backend) `step_block` has nothing to run, so just interpret.
+        let reason = match verify_twin {
+            Some((devices, boot_unix)) if lockstep => {
+                let mut twin = interpreter_twin(
+                    self.boot_ram.take().unwrap(),
+                    self.boot,
+                    cpu.stop.clone(),
+                    boot_unix,
+                    devices,
+                );
+                cpu.run_verify(&mut twin)
+            }
+            _ => cpu.run(),
         };
         if let (Some(l), true) = (
             &self.log,
@@ -445,3 +553,6 @@ impl EmulatedMachine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

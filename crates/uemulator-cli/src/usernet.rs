@@ -2,11 +2,20 @@
 //! echo, and UDP/TCP NAT onto ordinary host sockets. The guest sees 10.0.2.0/24 with the gateway at
 //! 10.0.2.2 (which also reaches the host's loopback) and DNS at 10.0.2.3.
 //!
+//! Echo requests to any destination are answered locally and never leave the host: the guest sees
+//! pings to 8.8.8.8 succeed even when the host is offline. That is deliberate (the gateway stays
+//! usable offline and needs no raw sockets or privileges) and means ping proves only that the
+//! virtual link works, not that a destination is reachable.
+//!
+//! DHCP serves the single address 10.0.2.15. A REQUEST for any other address gets a NAK; a REQUEST
+//! naming another server gets no answer (RFC 2131 section 3.1: it declines our offer). Datagrams
+//! from the host larger than the MTU leave as IPv4 fragments.
+//!
 //! TCP is a terminating proxy, not a packet forwarder: each guest connection becomes a host
 //! `TcpStream`. The virtual link never drops or reorders frames, so there is no retransmission
 //! timer, no congestion control, no window scaling, no SACK/timestamps, no urgent data and no
 //! TIME_WAIT. Out-of-order guest segments are dropped and answered with a duplicate ACK. IPv4
-//! fragments, IPv6 and checksums on received packets are not handled or verified.
+//! fragments from the guest, IPv6 and checksums on received packets are not handled or verified.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -49,6 +58,10 @@ const ADVERTISED_WINDOW_MAX: usize = 65535;
 /// fast host sender cannot grow `out` without bound while the guest is slow to take frames.
 const OUT_QUEUE_LIMIT: usize = 512;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Each UDP flow holds a host socket, so the count is capped to stay clear of the process's file
+/// descriptor limit (256 by default on macOS). A new flow past the cap evicts the least recently
+/// used one; the guest sees that as a lost datagram, which UDP applications already tolerate.
+const MAX_UDP_FLOWS: usize = 128;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest wait for a guest frame in the worker loop, which is also how often host sockets are
 /// polled (they are nonblocking and have no wakeup path into this thread).
@@ -84,6 +97,15 @@ const IPV4_DST: Range<usize> = 16..20;
 /// are excluded so DF packets still pass.
 const IPV4_FRAGMENT_MASK: u16 = 0x3fff;
 const IPV4_FLAG_DONT_FRAGMENT: u16 = 0x4000;
+const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
+const ETHERNET_MTU: usize = 1500;
+/// The fragment offset field counts 8-byte units, so every fragment but the last must carry a
+/// multiple of 8 bytes: 1480 here, which is also the full MTU payload.
+const IPV4_FRAGMENT_OFFSET_UNIT: usize = 8;
+const IPV4_FRAGMENT_PAYLOAD_MAX: usize =
+    (ETHERNET_MTU - IPV4_HEADER_LEN) / IPV4_FRAGMENT_OFFSET_UNIT * IPV4_FRAGMENT_OFFSET_UNIT;
+/// The 16-bit total length field includes the header.
+const IPV4_PAYLOAD_LEN_MAX: usize = u16::MAX as usize - IPV4_HEADER_LEN;
 const IPV4_TTL: u8 = 64;
 
 /// Offsets inside the ARP packet (after the Ethernet header).
@@ -137,6 +159,7 @@ const BOOTP_OP: usize = 0;
 const BOOTP_HTYPE: usize = 1;
 const BOOTP_HLEN: usize = 2;
 const BOOTP_XID: Range<usize> = 4..8;
+const BOOTP_CIADDR: Range<usize> = 12..16;
 const BOOTP_FLAGS: Range<usize> = 10..12;
 const BOOTP_YIADDR: Range<usize> = 16..20;
 const BOOTP_SIADDR: Range<usize> = 20..24;
@@ -156,6 +179,7 @@ const DHCP_OPT_SUBNET_MASK: u8 = 1;
 const DHCP_OPT_ROUTER: u8 = 3;
 const DHCP_OPT_DNS_SERVER: u8 = 6;
 const DHCP_OPT_BROADCAST_ADDRESS: u8 = 28;
+const DHCP_OPT_REQUESTED_IP: u8 = 50;
 const DHCP_OPT_LEASE_TIME: u8 = 51;
 const DHCP_OPT_MESSAGE_TYPE: u8 = 53;
 const DHCP_OPT_SERVER_ID: u8 = 54;
@@ -164,6 +188,7 @@ const DHCP_DISCOVER: u8 = 1;
 const DHCP_OFFER: u8 = 2;
 const DHCP_REQUEST: u8 = 3;
 const DHCP_ACK: u8 = 5;
+const DHCP_NAK: u8 = 6;
 const DHCP_LEASE_SECS: u32 = 24 * 60 * 60;
 
 /// Adds `data` as big-endian 16-bit words (a trailing odd byte is padded with zero) into a
@@ -213,11 +238,20 @@ fn ethernet_frame(dst: [u8; 6], src: [u8; 6], ethertype: u16, payload: &[u8]) ->
     frame
 }
 
-fn ipv4_packet(id: u16, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8> {
+/// One IPv4 packet whose flags/fragment-offset word is `flags_and_offset`. `payload` must fit the
+/// 16-bit total length.
+fn ipv4_datagram(
+    id: u16,
+    src: [u8; 4],
+    dst: [u8; 4],
+    proto: u8,
+    flags_and_offset: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let mut packet = vec![IPV4_VERSION_IHL_NO_OPTIONS, 0];
     packet.extend_from_slice(&(IPV4_HEADER_LEN as u16 + payload.len() as u16).to_be_bytes());
     packet.extend_from_slice(&id.to_be_bytes());
-    packet.extend_from_slice(&IPV4_FLAG_DONT_FRAGMENT.to_be_bytes());
+    packet.extend_from_slice(&flags_and_offset.to_be_bytes());
     packet.push(IPV4_TTL);
     packet.push(proto);
     packet.extend_from_slice(&[0, 0]);
@@ -227,6 +261,36 @@ fn ipv4_packet(id: u16, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -
     packet[IPV4_CHECKSUM].copy_from_slice(&checksum.to_be_bytes());
     packet.extend_from_slice(payload);
     packet
+}
+
+/// A single unfragmented packet with Don't Fragment set. `payload` must not exceed one MTU; use
+/// `ipv4_packets` when it might.
+fn ipv4_packet(id: u16, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8> {
+    ipv4_datagram(id, src, dst, proto, IPV4_FLAG_DONT_FRAGMENT, payload)
+}
+
+/// Splits `payload` into packets that fit the MTU. All fragments share `id`, carry More Fragments
+/// except the last, and have Don't Fragment cleared (a fragment with DF set could never be
+/// reassembled by a receiver that must not fragment further). Empty if the payload cannot fit one
+/// IPv4 packet at all.
+fn ipv4_packets(id: u16, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<Vec<u8>> {
+    if payload.len() > IPV4_PAYLOAD_LEN_MAX {
+        return Vec::new();
+    }
+    if payload.len() <= IPV4_FRAGMENT_PAYLOAD_MAX {
+        return vec![ipv4_packet(id, src, dst, proto, payload)];
+    }
+    payload
+        .chunks(IPV4_FRAGMENT_PAYLOAD_MAX)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let start = index * IPV4_FRAGMENT_PAYLOAD_MAX;
+            let offset_units = (start / IPV4_FRAGMENT_OFFSET_UNIT) as u16;
+            let more = start + chunk.len() < payload.len();
+            let flags = if more { IPV4_FLAG_MORE_FRAGMENTS } else { 0 };
+            ipv4_datagram(id, src, dst, proto, flags | offset_units, chunk)
+        })
+        .collect()
 }
 
 fn udp_segment(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, data: &[u8]) -> Vec<u8> {
@@ -383,7 +447,7 @@ fn seq_before(a: u32, b: u32) -> bool {
 }
 
 /// Flow identity from the guest's point of view.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct FlowKey {
     guest_port: u16,
     remote_ip: [u8; 4],
@@ -408,14 +472,134 @@ fn host_addr(ip: [u8; 4], port: u16) -> SocketAddr {
 /// Where traffic for `DNS_IP` goes: the host's first IPv4 nameserver.
 fn system_dns() -> SocketAddr {
     let conf = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    first_ipv4_nameserver(&conf).map_or_else(
+        || SocketAddr::from((FALLBACK_DNS, DNS_PORT)),
+        |addr| SocketAddr::from((addr, DNS_PORT)),
+    )
+}
+
+/// First `nameserver` line of a resolv.conf that holds an IPv4 address; IPv6 ones are skipped
+/// because the guest network is IPv4 only.
+fn first_ipv4_nameserver(conf: &str) -> Option<Ipv4Addr> {
     conf.lines()
         .filter_map(|line| line.strip_prefix("nameserver"))
         .filter_map(|addr| addr.trim().parse::<Ipv4Addr>().ok())
         .next()
-        .map_or_else(
-            || SocketAddr::from((FALLBACK_DNS, DNS_PORT)),
-            |addr| SocketAddr::from((addr, DNS_PORT)),
-        )
+}
+
+/// The fields of a client's BOOTP/DHCP message that decide our answer.
+struct DhcpRequest {
+    message_type: u8,
+    /// Option 50.
+    requested_ip: Option<[u8; 4]>,
+    /// Option 54: which server the client picked.
+    server_id: Option<[u8; 4]>,
+    /// Non-zero only for a client renewing an address it already holds.
+    client_ip: [u8; 4],
+}
+
+/// `None` unless this is a well-formed BOOTP request carrying the DHCP magic cookie. A truncated
+/// option ends parsing; whatever was read before it still counts.
+fn parse_dhcp_request(request: &[u8]) -> Option<DhcpRequest> {
+    if request.len() <= DHCP_OPTIONS_OFFSET
+        || request[BOOTP_OP] != BOOTP_REQUEST
+        || request[BOOTP_MAGIC_COOKIE] != DHCP_MAGIC_COOKIE
+    {
+        return None;
+    }
+    let mut parsed = DhcpRequest {
+        message_type: 0,
+        requested_ip: None,
+        server_id: None,
+        client_ip: request[BOOTP_CIADDR].try_into().ok()?,
+    };
+    let mut pos = DHCP_OPTIONS_OFFSET;
+    while pos < request.len() && request[pos] != DHCP_OPT_END {
+        if request[pos] == DHCP_OPT_PAD {
+            pos += 1;
+            continue;
+        }
+        let Some(&option_len) = request.get(pos + 1) else {
+            break;
+        };
+        let Some(value) = request.get(pos + 2..pos + 2 + option_len as usize) else {
+            break;
+        };
+        match (request[pos], value) {
+            (DHCP_OPT_MESSAGE_TYPE, [message_type, ..]) => parsed.message_type = *message_type,
+            (DHCP_OPT_REQUESTED_IP, &[a, b, c, d]) => parsed.requested_ip = Some([a, b, c, d]),
+            (DHCP_OPT_SERVER_ID, &[a, b, c, d]) => parsed.server_id = Some([a, b, c, d]),
+            _ => {}
+        }
+        pos += 2 + option_len as usize;
+    }
+    Some(parsed)
+}
+
+/// RFC 2131 section 4.3: DISCOVER gets an OFFER. REQUEST gets an ACK unless it asks for an
+/// address other than `GUEST_IP` (NAK), or names a different server, in which case the client has
+/// taken another server's offer and we stay silent. RELEASE and DECLINE are ignored (there is no lease
+/// table to update). INFORM is not implemented either, although RFC 2131 section 4.3.5 has the
+/// server answer it with an ACK carrying configuration.
+fn dhcp_reply_type(request: &DhcpRequest) -> Option<u8> {
+    match request.message_type {
+        DHCP_DISCOVER => Some(DHCP_OFFER),
+        DHCP_REQUEST => {
+            if request.server_id.is_some_and(|id| id != GATEWAY_IP) {
+                return None;
+            }
+            // Selecting/init-reboot carry option 50; renewing and rebinding carry ciaddr.
+            let wanted = request
+                .requested_ip
+                .or((request.client_ip != [0; 4]).then_some(request.client_ip));
+            match wanted {
+                Some(ip) if ip != GUEST_IP => Some(DHCP_NAK),
+                _ => Some(DHCP_ACK),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The BOOTP/DHCP reply to `request` (which must have parsed), padded to the classic minimum size.
+/// A NAK carries only the message type and server identifier, with no address (RFC 2131 table 3).
+fn dhcp_reply(request: &[u8], reply_type: u8) -> Vec<u8> {
+    let mut reply = vec![0u8; DHCP_OPTIONS_OFFSET];
+    reply[BOOTP_OP] = BOOTP_REPLY;
+    reply[BOOTP_HTYPE] = HTYPE_ETHERNET;
+    reply[BOOTP_HLEN] = HLEN_ETHERNET;
+    reply[BOOTP_XID].copy_from_slice(&request[BOOTP_XID]);
+    reply[BOOTP_FLAGS].copy_from_slice(&request[BOOTP_FLAGS]);
+    reply[BOOTP_CHADDR].copy_from_slice(&request[BOOTP_CHADDR]);
+    reply[BOOTP_MAGIC_COOKIE].copy_from_slice(&DHCP_MAGIC_COOKIE);
+    let lease_secs = DHCP_LEASE_SECS.to_be_bytes();
+    let message_type = [reply_type];
+    let options: &[(u8, &[u8])] = if reply_type == DHCP_NAK {
+        &[
+            (DHCP_OPT_MESSAGE_TYPE, &message_type),
+            (DHCP_OPT_SERVER_ID, &GATEWAY_IP),
+        ]
+    } else {
+        reply[BOOTP_YIADDR].copy_from_slice(&GUEST_IP);
+        reply[BOOTP_SIADDR].copy_from_slice(&GATEWAY_IP);
+        &[
+            (DHCP_OPT_MESSAGE_TYPE, &message_type),
+            (DHCP_OPT_SERVER_ID, &GATEWAY_IP),
+            (DHCP_OPT_LEASE_TIME, &lease_secs),
+            (DHCP_OPT_SUBNET_MASK, &SUBNET_MASK),
+            (DHCP_OPT_ROUTER, &GATEWAY_IP),
+            (DHCP_OPT_DNS_SERVER, &DNS_IP),
+            (DHCP_OPT_BROADCAST_ADDRESS, &SUBNET_BROADCAST),
+        ]
+    };
+    for (code, value) in options {
+        reply.push(*code);
+        reply.push(value.len() as u8);
+        reply.extend_from_slice(value);
+    }
+    reply.push(DHCP_OPT_END);
+    reply.resize(BOOTP_MIN_LEN, 0);
+    reply
 }
 
 struct UdpFlow {
@@ -484,7 +668,11 @@ pub struct UserNet {
     /// Frames queued for the guest, oldest first.
     out: VecDeque<Vec<u8>>,
     udp: HashMap<FlowKey, UdpFlow>,
+    udp_flow_limit: usize,
     tcp: HashMap<FlowKey, TcpFlow>,
+    /// First flow served by the previous `poll`, so the next one starts at its successor and the
+    /// per-poll queue budget is shared round-robin instead of always going to the same flows.
+    tcp_cursor: Option<FlowKey>,
     dns: SocketAddr,
     ip_id: u16,
     /// Initial sequence number of the most recent connection.
@@ -509,7 +697,9 @@ impl UserNet {
             guest_mac: GUEST_MAC,
             out: VecDeque::new(),
             udp: HashMap::new(),
+            udp_flow_limit: MAX_UDP_FLOWS,
             tcp: HashMap::new(),
+            tcp_cursor: None,
             dns: system_dns(),
             ip_id: 1,
             isn,
@@ -520,16 +710,22 @@ impl UserNet {
 
     fn emit_ip(&mut self, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) {
         self.ip_id = self.ip_id.wrapping_add(1);
-        let packet = ipv4_packet(self.ip_id, src, dst, proto, payload);
-        self.out.push_back(ethernet_frame(
-            self.guest_mac,
-            GATEWAY_MAC,
-            ETHERTYPE_IPV4,
-            &packet,
-        ));
+        for packet in ipv4_packets(self.ip_id, src, dst, proto, payload) {
+            self.out.push_back(ethernet_frame(
+                self.guest_mac,
+                GATEWAY_MAC,
+                ETHERTYPE_IPV4,
+                &packet,
+            ));
+        }
     }
 
     pub fn input(&mut self, frame: &[u8]) {
+        self.input_at(frame, Instant::now());
+    }
+
+    /// `input` with the current time supplied, so flow expiry is testable.
+    fn input_at(&mut self, frame: &[u8], now: Instant) {
         if frame.len() < ETH_HEADER_LEN {
             return;
         }
@@ -541,7 +737,7 @@ impl UserNet {
                     match ip.proto {
                         IP_PROTO_ICMP => self.icmp(&ip),
                         IP_PROTO_TCP => self.tcp_in(&ip),
-                        IP_PROTO_UDP => self.udp_in(&ip),
+                        IP_PROTO_UDP => self.udp_in(&ip, now),
                         _ => {}
                     }
                 }
@@ -593,7 +789,7 @@ impl UserNet {
         self.emit_ip(ip.dst, ip.src, IP_PROTO_ICMP, &reply);
     }
 
-    fn udp_in(&mut self, ip: &Ipv4Packet) {
+    fn udp_in(&mut self, ip: &Ipv4Packet, now: Instant) {
         let datagram = ip.payload;
         if datagram.len() < UDP_HEADER_LEN {
             return;
@@ -612,6 +808,17 @@ impl UserNet {
             remote_port: dport,
         };
         if !self.udp.contains_key(&key) {
+            // Evict before binding: at the descriptor limit the bind itself would fail.
+            if self.udp.len() >= self.udp_flow_limit {
+                let least_recent = self
+                    .udp
+                    .iter()
+                    .min_by_key(|(_, flow)| flow.last_activity)
+                    .map(|(key, _)| *key);
+                if let Some(evicted) = least_recent {
+                    self.udp.remove(&evicted);
+                }
+            }
             let target = if ip.dst == DNS_IP {
                 self.dns
             } else {
@@ -628,75 +835,30 @@ impl UserNet {
                 UdpFlow {
                     sock,
                     guest_ip: ip.src,
-                    last_activity: Instant::now(),
+                    last_activity: now,
                 },
             );
         }
         let flow = self.udp.get_mut(&key).unwrap();
-        flow.last_activity = Instant::now();
+        flow.last_activity = now;
         let _ = flow.sock.send(data);
     }
 
-    /// Hands out `GUEST_IP` to anyone: DISCOVER gets an OFFER and REQUEST gets an ACK without
-    /// checking the requested address. Other message types (RELEASE, INFORM, DECLINE) are
-    /// ignored. Replies are always broadcast because the client may not have an address yet.
+    /// Serves `GUEST_IP` (see `dhcp_reply_type` for which messages are answered). Replies are always
+    /// broadcast because the client may not have an address yet.
     fn dhcp(&mut self, request: &[u8]) {
-        if request.len() <= DHCP_OPTIONS_OFFSET
-            || request[BOOTP_OP] != BOOTP_REQUEST
-            || request[BOOTP_MAGIC_COOKIE] != DHCP_MAGIC_COOKIE
-        {
+        let Some(parsed) = parse_dhcp_request(request) else {
             return;
-        }
-        let mut message_type = 0;
-        let mut pos = DHCP_OPTIONS_OFFSET;
-        while pos + 1 < request.len() && request[pos] != DHCP_OPT_END {
-            if request[pos] == DHCP_OPT_PAD {
-                pos += 1;
-                continue;
-            }
-            let option_len = request[pos + 1] as usize;
-            if request[pos] == DHCP_OPT_MESSAGE_TYPE && option_len >= 1 && pos + 2 < request.len() {
-                message_type = request[pos + 2];
-            }
-            pos += 2 + option_len;
-        }
-        let reply_type = match message_type {
-            DHCP_DISCOVER => DHCP_OFFER,
-            DHCP_REQUEST => DHCP_ACK,
-            _ => return,
         };
-        let mut reply = vec![0u8; DHCP_OPTIONS_OFFSET];
-        reply[BOOTP_OP] = BOOTP_REPLY;
-        reply[BOOTP_HTYPE] = HTYPE_ETHERNET;
-        reply[BOOTP_HLEN] = HLEN_ETHERNET;
-        reply[BOOTP_XID].copy_from_slice(&request[BOOTP_XID]);
-        reply[BOOTP_FLAGS].copy_from_slice(&request[BOOTP_FLAGS]);
-        reply[BOOTP_YIADDR].copy_from_slice(&GUEST_IP);
-        reply[BOOTP_SIADDR].copy_from_slice(&GATEWAY_IP);
-        reply[BOOTP_CHADDR].copy_from_slice(&request[BOOTP_CHADDR]);
-        reply[BOOTP_MAGIC_COOKIE].copy_from_slice(&DHCP_MAGIC_COOKIE);
-        let options: &[(u8, &[u8])] = &[
-            (DHCP_OPT_MESSAGE_TYPE, &[reply_type]),
-            (DHCP_OPT_SERVER_ID, &GATEWAY_IP),
-            (DHCP_OPT_LEASE_TIME, &DHCP_LEASE_SECS.to_be_bytes()),
-            (DHCP_OPT_SUBNET_MASK, &SUBNET_MASK),
-            (DHCP_OPT_ROUTER, &GATEWAY_IP),
-            (DHCP_OPT_DNS_SERVER, &DNS_IP),
-            (DHCP_OPT_BROADCAST_ADDRESS, &SUBNET_BROADCAST),
-        ];
-        for (code, value) in options {
-            reply.push(*code);
-            reply.push(value.len() as u8);
-            reply.extend_from_slice(value);
-        }
-        reply.push(DHCP_OPT_END);
-        reply.resize(BOOTP_MIN_LEN, 0);
+        let Some(reply_type) = dhcp_reply_type(&parsed) else {
+            return;
+        };
         let datagram = udp_segment(
             GATEWAY_IP,
             LIMITED_BROADCAST_IP,
             DHCP_SERVER_PORT,
             DHCP_CLIENT_PORT,
-            &reply,
+            &dhcp_reply(request, reply_type),
         );
         self.ip_id = self.ip_id.wrapping_add(1);
         let packet = ipv4_packet(
@@ -837,6 +999,26 @@ impl UserNet {
 
     /// Moves data between host sockets and the guest; call regularly.
     pub fn poll(&mut self) {
+        self.poll_at(Instant::now());
+    }
+
+    /// TCP flows in the order this poll serves them: sorted for a stable cycle, starting one past
+    /// where the previous poll started. Each poll has a fixed budget of frames, so a fixed order
+    /// would let the first flows starve the rest under sustained load.
+    fn tcp_service_order(&mut self) -> Vec<FlowKey> {
+        let mut keys: Vec<FlowKey> = self.tcp.keys().copied().collect();
+        keys.sort_unstable();
+        let start = self
+            .tcp_cursor
+            .map_or(0, |previous| keys.partition_point(|key| *key <= previous));
+        let start = if start < keys.len() { start } else { 0 };
+        keys.rotate_left(start);
+        self.tcp_cursor = keys.first().copied();
+        keys
+    }
+
+    /// `poll` with the current time supplied, so flow expiry is testable.
+    fn poll_at(&mut self, now: Instant) {
         while let Ok((key, result)) = self.connect_rx.try_recv() {
             let Some(flow) = self.tcp.get_mut(&key) else {
                 continue;
@@ -863,7 +1045,10 @@ impl UserNet {
 
         let mut packets: Vec<PendingPacket> = Vec::new();
         let mut budget = OUT_QUEUE_LIMIT.saturating_sub(self.out.len());
-        for (key, flow) in self.tcp.iter_mut() {
+        for key in self.tcp_service_order() {
+            let Some(flow) = self.tcp.get_mut(&key) else {
+                continue;
+            };
             let Conn::Open(stream) = &mut flow.conn else {
                 continue;
             };
@@ -960,7 +1145,6 @@ impl UserNet {
         }
         self.tcp.retain(|_, flow| !flow.dead);
 
-        let now = Instant::now();
         let mut recv_buf = [0u8; UDP_RECV_BUF_LEN];
         for (key, flow) in self.udp.iter_mut() {
             while let Ok(n) = flow.sock.recv(&mut recv_buf) {
@@ -1019,224 +1203,4 @@ pub fn spawn(net: NetHandle) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{TcpListener, UdpSocket};
-
-    fn guest_ip_frame(dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8> {
-        let p = ipv4_packet(1, GUEST_IP, dst, proto, payload);
-        ethernet_frame(GATEWAY_MAC, GUEST_MAC, 0x0800, &p)
-    }
-
-    fn drain(un: &mut UserNet) -> Vec<Vec<u8>> {
-        std::iter::from_fn(|| un.pop_frame()).collect()
-    }
-
-    fn wait_for(un: &mut UserNet, mut pred: impl FnMut(&[u8]) -> bool) -> Vec<u8> {
-        let end = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < end {
-            un.poll();
-            while let Some(f) = un.pop_frame() {
-                if pred(&f) {
-                    return f;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        panic!("timed out waiting for frame");
-    }
-
-    fn dhcp_msg(ty: u8) -> Vec<u8> {
-        let mut d = vec![0u8; 240];
-        d[0] = 1;
-        d[1] = 1;
-        d[2] = 6;
-        d[4..8].copy_from_slice(&[1, 2, 3, 4]);
-        d[28..34].copy_from_slice(&GUEST_MAC);
-        d[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
-        d.extend_from_slice(&[53, 1, ty, 255]);
-        d
-    }
-
-    #[test]
-    fn dhcp_offer_and_ack() {
-        let mut un = UserNet::new();
-        for (req, reply) in [(1u8, 2u8), (3, 5)] {
-            let u = udp_segment([0; 4], [255; 4], 68, 67, &dhcp_msg(req));
-            let p = ipv4_packet(1, [0; 4], [255; 4], 17, &u);
-            un.input(&ethernet_frame(BROADCAST_MAC, GUEST_MAC, 0x0800, &p));
-            let out = drain(&mut un);
-            assert_eq!(out.len(), 1);
-            let ip = parse_ipv4(&out[0]).unwrap();
-            assert_eq!(ip.proto, 17);
-            let d = &ip.payload[8..];
-            assert_eq!(d[0], 2);
-            assert_eq!(d[4..8], [1, 2, 3, 4]);
-            assert_eq!(d[16..20], GUEST_IP);
-            assert_eq!(d[240..243], [53, 1, reply]);
-        }
-    }
-
-    #[test]
-    fn arp_and_ping() {
-        let mut un = UserNet::new();
-        let mut arp = vec![0, 1, 8, 0, 6, 4, 0, 1];
-        arp.extend_from_slice(&GUEST_MAC);
-        arp.extend_from_slice(&GUEST_IP);
-        arp.extend_from_slice(&[0; 6]);
-        arp.extend_from_slice(&GATEWAY_IP);
-        un.input(&ethernet_frame(BROADCAST_MAC, GUEST_MAC, 0x0806, &arp));
-        let out = drain(&mut un);
-        assert_eq!(out[0][20..22], [0, 2]);
-        assert_eq!(out[0][22..28], GATEWAY_MAC);
-
-        let mut echo = vec![8, 0, 0, 0, 0, 1, 0, 1, 9, 9];
-        let c = internet_checksum(&echo);
-        echo[2..4].copy_from_slice(&c.to_be_bytes());
-        un.input(&guest_ip_frame([8, 8, 8, 8], 1, &echo));
-        let out = drain(&mut un);
-        let ip = parse_ipv4(&out[0]).unwrap();
-        assert_eq!((ip.src, ip.dst, ip.payload[0]), ([8, 8, 8, 8], GUEST_IP, 0));
-        assert_eq!(internet_checksum(ip.payload), 0);
-    }
-
-    #[test]
-    fn udp_nat_roundtrip() {
-        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
-        server
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let port = server.local_addr().unwrap().port();
-        let mut un = UserNet::new();
-        let u = udp_segment(GUEST_IP, LOOPBACK_IP, 4000, port, b"ping");
-        un.input(&guest_ip_frame(LOOPBACK_IP, 17, &u));
-        let mut buf = [0u8; 64];
-        let (n, from) = server.recv_from(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"ping");
-        server.send_to(b"pong", from).unwrap();
-        let f = wait_for(&mut un, |f| parse_ipv4(f).is_some_and(|i| i.proto == 17));
-        let ip = parse_ipv4(&f).unwrap();
-        assert_eq!(ip.src, LOOPBACK_IP);
-        assert_eq!(u16::from_be_bytes([ip.payload[0], ip.payload[1]]), port);
-        assert_eq!(u16::from_be_bytes([ip.payload[2], ip.payload[3]]), 4000);
-        assert_eq!(&ip.payload[8..], b"pong");
-        assert_eq!(transport_checksum(ip.src, ip.dst, 17, ip.payload), 0);
-    }
-
-    struct Guest {
-        sport: u16,
-        dport: u16,
-        seq: u32,
-        ack: u32,
-    }
-
-    impl Guest {
-        fn send(&mut self, un: &mut UserNet, flags: u8, data: &[u8]) {
-            let h = TcpHeader {
-                src: GUEST_IP,
-                dst: LOOPBACK_IP,
-                sport: self.sport,
-                dport: self.dport,
-                seq: self.seq,
-                ack: self.ack,
-                flags,
-                window: 60000,
-                advertise_mss: false,
-            };
-            let s = tcp_segment(&h, data);
-            un.input(&guest_ip_frame(LOOPBACK_IP, 6, &s));
-            self.seq = self
-                .seq
-                .wrapping_add(data.len() as u32 + (flags & (SYN | FIN) != 0) as u32);
-        }
-    }
-
-    fn tcp_of(f: &[u8]) -> Option<(u8, u32, u32, Vec<u8>)> {
-        let ip = parse_ipv4(f)?;
-        if ip.proto != 6 {
-            return None;
-        }
-        let p = ip.payload;
-        assert_eq!(
-            transport_checksum(ip.src, ip.dst, 6, p),
-            0,
-            "bad tcp checksum"
-        );
-        let off = (p[12] >> 4) as usize * 4;
-        Some((
-            p[13],
-            u32::from_be_bytes(p[4..8].try_into().unwrap()),
-            u32::from_be_bytes(p[8..12].try_into().unwrap()),
-            p[off..].to_vec(),
-        ))
-    }
-
-    #[test]
-    fn tcp_proxy_echo_and_close() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            loop {
-                match s.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => s.write_all(&buf[..n]).unwrap(),
-                }
-            }
-        });
-        let mut un = UserNet::new();
-        let mut g = Guest {
-            sport: 5000,
-            dport: port,
-            seq: 1000,
-            ack: 0,
-        };
-        g.send(&mut un, SYN, &[]);
-        let f = wait_for(&mut un, |f| tcp_of(f).is_some_and(|t| t.0 == SYN | ACK));
-        let (_, srv_seq, ack, _) = tcp_of(&f).unwrap();
-        assert_eq!(ack, 1001);
-        g.ack = srv_seq.wrapping_add(1);
-        g.send(&mut un, ACK, &[]);
-
-        let payload: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
-        g.send(&mut un, ACK | PSH, &payload);
-        let mut echoed = Vec::new();
-        let mut next = g.ack;
-        while echoed.len() < payload.len() {
-            let f = wait_for(&mut un, |f| tcp_of(f).is_some_and(|t| !t.3.is_empty()));
-            let (_, seq, _, data) = tcp_of(&f).unwrap();
-            assert_eq!(seq, next, "in-order delivery");
-            next = next.wrapping_add(data.len() as u32);
-            echoed.extend_from_slice(&data);
-            g.ack = next;
-            g.send(&mut un, ACK, &[]);
-        }
-        assert_eq!(echoed, payload);
-
-        g.send(&mut un, FIN | ACK, &[]);
-        let f = wait_for(&mut un, |f| tcp_of(f).is_some_and(|t| t.0 & FIN != 0));
-        let (_, seq, _, _) = tcp_of(&f).unwrap();
-        g.ack = seq.wrapping_add(1);
-        g.send(&mut un, ACK, &[]);
-        un.poll();
-        assert!(un.tcp.is_empty(), "flow closed after both FINs are acked");
-    }
-
-    #[test]
-    fn tcp_refused_gets_rst() {
-        let port = {
-            let l = TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let mut un = UserNet::new();
-        let mut g = Guest {
-            sport: 5001,
-            dport: port,
-            seq: 7,
-            ack: 0,
-        };
-        g.send(&mut un, SYN, &[]);
-        wait_for(&mut un, |f| tcp_of(f).is_some_and(|t| t.0 & RST != 0));
-    }
-}
+mod tests;
