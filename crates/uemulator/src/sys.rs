@@ -16,6 +16,7 @@ impl ExecMem {
         self.ptr as u64
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.len
     }

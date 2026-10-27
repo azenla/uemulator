@@ -61,9 +61,9 @@ fn a_new_jit_places_its_first_block_after_an_aligned_prologue() {
     assert_eq!(jit.stats(), JitStats::default());
 }
 
-// aarch64 `b` reaches +-128 MiB from a block back to the stubs at the start of the buffer.
-const _: () = assert!(CODE_SIZE <= 128 << 20);
-const _: () = assert!(CODE_HEADROOM < CODE_SIZE);
+// aarch64 `b` reaches +-128 MiB from a block back to the stubs at the start of its segment.
+const _: () = assert!(SEGMENT_SIZE <= 128 << 20);
+const _: () = assert!(CODE_HEADROOM < SEGMENT_SIZE);
 
 #[test]
 fn lookup_misses_before_translation_and_hits_afterwards() {
@@ -135,7 +135,7 @@ fn jump_cache_hash_stays_in_range_and_folds_in_the_high_bits() {
 }
 
 #[test]
-fn translating_a_colliding_rip_evicts_the_older_block_from_the_jump_cache_only() {
+fn a_colliding_rip_evicts_the_older_block_from_the_jump_cache_but_not_from_the_block_map() {
     let _guard = serialize_jit_tests();
     let colliding_rip = CODE_BASE ^ (1 << 16) ^ 1;
     assert_eq!(jump_cache_hash(colliding_rip), jump_cache_hash(CODE_BASE));
@@ -146,18 +146,18 @@ fn translating_a_colliding_rip_evicts_the_older_block_from_the_jump_cache_only()
         .translate(&mut cpu, colliding_rip, colliding_rip)
         .unwrap();
     assert_ne!(first, second);
-    assert_eq!(jit.lookup(colliding_rip, colliding_rip), Some(second));
     assert_eq!(
-        jit.lookup(CODE_BASE, CODE_BASE),
-        None,
-        "evicted from the cache"
+        jit.jump_cache[jump_cache_hash(CODE_BASE)].code_addr,
+        second,
+        "the slot belongs to the newer block"
     );
-    assert!(jit.blocks[0].valid, "but the block itself lives on");
-    // Asking for it again translates a fresh copy; blocks are never reused or freed.
-    let third = translate_at_code_base(&mut jit, &mut cpu);
-    assert_ne!(third, first);
-    assert_eq!(jit.blocks.len(), 3);
-    assert_eq!(jit.lookup(CODE_BASE, CODE_BASE), Some(third));
+    // The older block is still found, and found again as the slot's owner, without
+    // translating a second copy of it.
+    assert_eq!(jit.lookup(CODE_BASE, CODE_BASE), Some(first));
+    assert_eq!(jit.jump_cache[jump_cache_hash(CODE_BASE)].code_addr, first);
+    assert_eq!(jit.lookup(colliding_rip, colliding_rip), Some(second));
+    assert_eq!(jit.blocks.len(), 2);
+    assert_eq!(jit.stats().translated, 2);
 }
 
 #[test]
@@ -369,8 +369,13 @@ fn the_generated_code_in_the_buffer_is_the_compiler_output_verbatim() {
     let code_addr = translate_at_code_base(&mut jit, &mut cpu);
     let block = &jit.blocks[0];
     let rips = [CODE_BASE, CODE_BASE + 3];
-    let (expected, _) =
-        arch::compile_block(code_addr, &jit.addrs, &block._insns, &rips, CODE_BASE + 4);
+    let (expected, _) = arch::compile_block(
+        code_addr,
+        &jit.segment_addrs[0],
+        &block._insns,
+        &rips,
+        CODE_BASE + 4,
+    );
     let written = unsafe { std::slice::from_raw_parts(code_addr as *const u8, expected.len()) };
     assert_eq!(written, expected.as_slice());
     assert_eq!(code_addr, jit.exec_mem.base() + jit.blocks_start as u64);
@@ -685,4 +690,44 @@ fn chain_exit_after_an_rdtsc_does_not_charge_the_prepaid_instructions_twice() {
         0xb9, 0x03, 0x00, 0x00, 0x00, 0x0f, 0x31, 0x83, 0xe9, 0x01, 0x75, 0xf8, 0xf4,
     ];
     assert_jit_matches_interpreter(&code, |_| {});
+}
+
+#[test]
+fn a_full_segment_moves_on_to_the_next_one_with_its_own_prologue_copy() {
+    let _guard = serialize_jit_tests();
+    let mut cpu = cpu_running(&[&ADD_THEN_JMP_NEXT[..], &nops(4)[..]].concat());
+    let mut jit = new_jit();
+    let first = translate_at_code_base(&mut jit, &mut cpu);
+    jit.used_bytes = SEGMENT_SIZE - CODE_HEADROOM + 1;
+    let second_rip = CODE_BASE + 5;
+    let second = jit.translate(&mut cpu, second_rip, second_rip).unwrap();
+    assert_eq!(jit.stats().resets, 0, "other segments are still free");
+    assert_eq!(
+        second,
+        jit.exec_mem.base() + (SEGMENT_SIZE + jit.blocks_start) as u64
+    );
+    assert_eq!(
+        jit.lookup(CODE_BASE, CODE_BASE),
+        Some(first),
+        "nothing was dropped"
+    );
+    assert_ne!(jit.segment_addrs[0].exit_ok, jit.segment_addrs[1].exit_ok);
+    assert_eq!(
+        jit.segment_addrs[1].exit_ok - jit.segment_addrs[0].exit_ok,
+        SEGMENT_SIZE as u64,
+        "identical prologue copies"
+    );
+}
+
+#[test]
+fn blocks_in_later_segments_run() {
+    let _guard = serialize_jit_tests();
+    let mut cpu = cpu_running(&ADD_THEN_HLT);
+    let mut jit = new_unchained_jit();
+    jit.used_bytes = SEGMENT_SIZE * (SEGMENT_COUNT - 1) + jit.blocks_start;
+    cpu.jit = Some(Box::new(jit));
+    cpu.gpr[0] = 1;
+    cpu.gpr[1] = 2;
+    steps_to_halt(&mut cpu);
+    assert_eq!(cpu.gpr[0], 3);
 }

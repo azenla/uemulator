@@ -78,22 +78,28 @@ const PAGE_MASK: u64 = (1 << PAGE_SHIFT) - 1;
 
 pub(super) const CPU: u32 = 19;
 pub(super) const TLB_BASE: u32 = 20;
-const SAVED_ADDRESS: u32 = 22;
-const SAVED_NZCV: u32 = 23;
+pub(super) const SAVED_ADDRESS: u32 = 22;
+pub(super) const SAVED_NZCV: u32 = 23;
 /// Callee-saved homes for values that must outlive a slow-path helper call: the result and
 /// second operand of a read-modify-write instruction whose store takes the slow path (its flags
 /// are recorded only after the store succeeded), a computed branch target, and a value the
 /// instruction still needs after a call (a carry-in or a shift count).
-const SAVED_RESULT: u32 = 24;
-const SAVED_OPERAND: u32 = 25;
+pub(super) const SAVED_RESULT: u32 = 24;
+pub(super) const SAVED_OPERAND: u32 = 25;
 const SAVED_EXTRA: u32 = 26;
+/// Used only by the memory thunks in the prologue (`arch_a64::thunk`): the address of the
+/// `[rip, block index]` pair of the access that called them, and their return address.
+pub(super) const SAVED_INFO: u32 = 27;
+pub(super) const SAVED_LR: u32 = 28;
+/// The slow path hands its info pair to the thunk in this register.
+const SLOW_INFO: u32 = 7;
 const ADDRESS: u32 = 2;
 const SCRATCH_A: u32 = 3;
 const SCRATCH_B: u32 = 4;
 const SCRATCH_C: u32 = 5;
-const VALUE: u32 = 6;
+pub(super) const VALUE: u32 = 6;
 /// Intra-procedure-call scratch register of AAPCS64; holds the target of `blr`.
-const CALL_TARGET: u32 = 16;
+pub(super) const CALL_TARGET: u32 = 16;
 
 /// Index of rsp in `Cpu::gpr`.
 const RSP: u8 = 4;
@@ -322,24 +328,34 @@ fn has_segment_base(insn: &Insn) -> bool {
     insn.seg == SEG_FS as u8 || insn.seg == SEG_GS as u8
 }
 
-/// Absolute addresses the generated code needs.
+/// Absolute addresses the generated code reaches with a direct `bl`/`b`: stubs and thunks that
+/// `arch_a64::prologue` places at the start of the code buffer, within the +-128 MiB of any
+/// block (`CODE_SIZE`).
+#[derive(Clone)]
 pub(crate) struct Addrs {
-    /// Helper functions in `helpers.rs`, reached with `mov_imm` + `blr` because the host binary
-    /// is arbitrarily far from the code buffer.
+    /// Tail-call stubs for `helper_exec_pair` and `helper_cond`.
     pub exec: u64,
-    pub ld: u64,
-    pub st: u64,
-    /// Variants of `ld`/`st` for push/pop/call/ret, which fault with #SS instead of #GP.
-    pub ld_stack: u64,
-    pub st_stack: u64,
     pub cond: u64,
-    /// The exit stubs in the prologue at the start of the code buffer, reached with a direct
-    /// branch (`Asm::b_abs`).
     pub exit_ok: u64,
     pub exit_fail: u64,
     /// The block-to-block transfer stub (see `arch_a64::chain_stub`), or 0 when chaining is off
     /// and every block returns to the run loop.
     pub chain: u64,
+    /// Memory-access thunks, indexed by `size_index` (1, 2, 4, 8 bytes), for the slow path of
+    /// the inline TLB probe: zero-extending loads, stores, and stores that keep x0 and x1.
+    /// Sign-extending loads exist for 1, 2 and 4 bytes. The stack variants (push/pop/call/ret)
+    /// differ only in the fault they raise for a non-canonical address.
+    pub load: [u64; 4],
+    pub load_signed: [u64; 3],
+    pub load_stack: u64,
+    pub store: [u64; 4],
+    pub store_keep: [u64; 4],
+    pub store_stack: u64,
+}
+
+/// Index of an operand size of 1, 2, 4 or 8 bytes in the `Addrs` thunk tables.
+fn size_index(size: u8) -> usize {
+    size.trailing_zeros() as usize
 }
 
 pub(crate) struct Gen<'a> {
@@ -381,9 +397,9 @@ impl<'a> Gen<'a> {
         self.asm.str(rs, CPU, GPR_OFFSET + GPR_SIZE * reg as u32);
     }
 
-    fn call(&mut self, addr: u64) {
-        self.asm.mov_imm(CALL_TARGET, addr);
-        self.asm.blr(CALL_TARGET);
+    /// Calls a stub or thunk in the prologue.
+    fn call(&mut self, stub: u64) {
+        self.asm.bl_abs(stub);
     }
 
     fn set_rip(&mut self, rip: u64) {
@@ -408,15 +424,22 @@ impl<'a> Gen<'a> {
             self.exit_ok(retired);
             return;
         }
+        self.pay_icount(retired);
+        self.asm.b_abs(self.addrs.chain);
+    }
+
+    /// Charges `Cpu::icount` for the `retired` instructions of this block that are not paid yet,
+    /// plus the successor's first (see `chain_stub`). Touches no host flags and only
+    /// `SCRATCH_A`, so a `jcc` can pay once before its conditional branch.
+    fn pay_icount(&mut self, retired: u32) {
         let owed = retired - self.prepaid_insns;
-        self.asm.ldr(0, CPU, ICOUNT_OFFSET);
-        self.asm.add_imm(0, 0, owed, true);
-        self.asm.str(0, CPU, ICOUNT_OFFSET);
+        self.asm.ldr(SCRATCH_A, CPU, ICOUNT_OFFSET);
+        self.asm.add_imm(SCRATCH_A, SCRATCH_A, owed, true);
+        self.asm.str(SCRATCH_A, CPU, ICOUNT_OFFSET);
         if self.prepaid_insns > 0 {
             // The next block's own accounting must not subtract this block's prepayment.
             self.asm.str(XZR, CPU, PREPAID_ICOUNT_OFFSET);
         }
-        self.asm.b_abs(self.addrs.chain);
     }
 
     /// `chain_exit` to a fixed guest address.
@@ -452,10 +475,10 @@ impl<'a> Gen<'a> {
             self.asm.str(SCRATCH_B, CPU, PREPAID_ICOUNT_OFFSET);
             self.prepaid_insns = index as u32;
         }
-        // helper_exec(cpu, insn, rip) -> status
+        // helper_exec_pair(cpu, [insn, rip]) -> status
+        let pair = self.asm.literal_pair(insn, rip);
         self.asm.mov(0, CPU);
-        self.asm.mov_imm(1, insn);
-        self.asm.mov_imm(2, rip);
+        self.asm.adr(1, pair);
         self.call(self.addrs.exec);
         let ok = self.asm.label();
         self.asm.cbz(0, ok, true);
@@ -669,11 +692,10 @@ impl<'a> Gen<'a> {
         let slow_paths = std::mem::take(&mut self.slow_paths);
         for slow in slow_paths {
             self.asm.bind(slow.entry);
-            // The helper call clobbers NZCV and the caller-saved registers, but a live flag
-            // state and ADDRESS must survive for the instructions after the access.
-            self.asm.mrs_nzcv(SAVED_NZCV);
-            self.asm.mov(SAVED_ADDRESS, ADDRESS);
-            let fail = self.asm.label();
+            // The thunk keeps the host flags and `ADDRESS` alive across its helper call; see
+            // `arch_a64::thunk`. On an exception it leaves the block itself.
+            let info = self.asm.literal_pair(slow.rip, slow.insn_index as u64);
+            self.asm.adr(SLOW_INFO, info);
             match slow.access {
                 SlowAccess::Load {
                     dst,
@@ -681,68 +703,34 @@ impl<'a> Gen<'a> {
                     signed,
                     stack,
                 } => {
-                    // helper_load(cpu, address, size, rip) -> (value in x0, status in x1)
-                    self.asm.mov(0, CPU);
-                    self.asm.mov(1, ADDRESS);
-                    self.asm.mov_imm(2, size as u64);
-                    self.asm.mov_imm(3, slow.rip);
-                    self.call(if stack {
-                        self.addrs.ld_stack
+                    let thunk = if stack {
+                        self.addrs.load_stack
+                    } else if signed && size < 8 {
+                        self.addrs.load_signed[size_index(size)]
                     } else {
-                        self.addrs.ld
-                    });
-                    self.asm.cbnz(1, fail, true);
-                    if signed {
-                        match size {
-                            1 => self.asm.sxtb(dst, 0, true),
-                            2 => self.asm.sxth(dst, 0, true),
-                            4 => self.asm.sxtw(dst, 0),
-                            _ => self.asm.mov(dst, 0),
-                        }
-                    } else {
+                        self.addrs.load[size_index(size)]
+                    };
+                    self.call(thunk);
+                    if dst != 0 {
                         self.asm.mov(dst, 0);
                     }
-                    self.asm.msr_nzcv(SAVED_NZCV);
-                    self.asm.mov(ADDRESS, SAVED_ADDRESS);
-                    self.asm.b(slow.resume);
-                    self.asm.bind(fail);
-                    // Move the status into the position `fail_exit` expects.
-                    self.asm.mov(0, 1);
-                    self.fail_exit(slow.insn_index);
                 }
                 SlowAccess::Store {
                     size,
                     stack,
                     preserve,
                 } => {
-                    if preserve {
-                        self.asm.mov(SAVED_RESULT, 0);
-                        self.asm.mov(SAVED_OPERAND, 1);
-                    }
-                    // helper_store(cpu, address, size, value, rip) -> status. The address is copied
-                    // to x1 before x2 is overwritten with the size.
-                    self.asm.mov(3, VALUE);
-                    self.asm.mov(1, ADDRESS);
-                    self.asm.mov_imm(2, size as u64);
-                    self.asm.mov_imm(4, slow.rip);
-                    self.asm.mov(0, CPU);
-                    self.call(if stack {
-                        self.addrs.st_stack
+                    let thunk = if stack {
+                        self.addrs.store_stack
+                    } else if preserve {
+                        self.addrs.store_keep[size_index(size)]
                     } else {
-                        self.addrs.st
-                    });
-                    self.asm.cbnz(0, fail, true);
-                    self.asm.msr_nzcv(SAVED_NZCV);
-                    self.asm.mov(ADDRESS, SAVED_ADDRESS);
-                    if preserve {
-                        self.asm.mov(0, SAVED_RESULT);
-                        self.asm.mov(1, SAVED_OPERAND);
-                    }
-                    self.asm.b(slow.resume);
-                    self.asm.bind(fail);
-                    self.fail_exit(slow.insn_index);
+                        self.addrs.store[size_index(size)]
+                    };
+                    self.call(thunk);
                 }
             }
+            self.asm.b(slow.resume);
         }
         self.asm.finish();
     }
@@ -1306,6 +1294,11 @@ impl<'a> Gen<'a> {
 
     /// Conditional branch ending the block; both outcomes exit with `retired` instructions done.
     fn jcc(&mut self, condition: u8, target: u64, next_rip: u64, retired: u32) {
+        let chaining = self.addrs.chain != 0;
+        if chaining {
+            // Both outcomes retire the same instructions, so pay once, ahead of the branch.
+            self.pay_icount(retired);
+        }
         let taken = self.asm.label();
         match self.live.and_then(|live| cond_map(live.kind, condition)) {
             Some(CondMap::Cond(cond)) => self.asm.b_cond(cond, taken),
@@ -1319,9 +1312,17 @@ impl<'a> Gen<'a> {
                 self.asm.cbnz(0, taken, true);
             }
         }
-        self.chain_to(next_rip, retired);
-        self.asm.bind(taken);
-        self.chain_to(target, retired);
+        if chaining {
+            self.asm.mov_imm(1, next_rip);
+            self.asm.b_abs(self.addrs.chain);
+            self.asm.bind(taken);
+            self.asm.mov_imm(1, target);
+            self.asm.b_abs(self.addrs.chain);
+        } else {
+            self.chain_to(next_rip, retired);
+            self.asm.bind(taken);
+            self.chain_to(target, retired);
+        }
     }
 
     /// Emits instruction `index` inline and returns true, or emits nothing and returns false if

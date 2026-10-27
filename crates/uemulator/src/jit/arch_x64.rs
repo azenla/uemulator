@@ -12,9 +12,6 @@ pub(crate) struct Prologue {
     pub exit_ok: u64,
     /// Absolute address of the failure exit (rax = helper status, rcx = failing instruction index).
     pub exit_fail: u64,
-    /// Block-to-block transfer stub. This backend does not chain yet, so there is none (0) and
-    /// `Jit::new` hands the emitter no chain address.
-    pub chain: u64,
 }
 
 /// Pushed in this order and popped in reverse. This is the Win64 callee-saved set (RSI/RDI are
@@ -59,11 +56,10 @@ pub(crate) fn prologue(base: u64, _jump_cache_base: u64) -> Prologue {
         code: a.code,
         exit_ok,
         exit_fail,
-        chain: 0,
     }
 }
 
-pub(crate) fn addrs(exit_ok: u64, exit_fail: u64, _chain: Option<u64>) -> Addrs {
+pub(crate) fn addrs(prologue: &Prologue, _chaining: bool) -> Addrs {
     Addrs {
         exec: helpers::helper_exec as *const () as usize as u64,
         ld: helpers::helper_load_via_out as *const () as usize as u64,
@@ -71,8 +67,8 @@ pub(crate) fn addrs(exit_ok: u64, exit_fail: u64, _chain: Option<u64>) -> Addrs 
         ld_stack: helpers::helper_load_stack_via_out as *const () as usize as u64,
         st_stack: helpers::helper_store_stack_x64 as *const () as usize as u64,
         cond: helpers::helper_cond as *const () as usize as u64,
-        exit_ok,
-        exit_fail,
+        exit_ok: prologue.exit_ok,
+        exit_fail: prologue.exit_fail,
     }
 }
 

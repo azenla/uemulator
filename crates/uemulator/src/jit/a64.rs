@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+const NOP_WORD: u32 = 0xd503_201f;
+
 pub(crate) const XZR: u32 = 31;
 pub(crate) const SP: u32 = 31;
 
@@ -69,8 +71,11 @@ pub(crate) type Label = usize;
 enum Fixup {
     /// `b`: 26-bit offset from bit 0.
     Imm26,
-    /// `b.cond`, `cbz`, `cbnz`: 19-bit offset from bit 5.
+    /// `b.cond`, `cbz`, `cbnz`, `ldr` (literal): 19-bit offset from bit 5.
     Imm19,
+    /// `adr`: a 21-bit byte offset split over bits 5..24 (immhi) and 29..30 (immlo). Labels are
+    /// word aligned, so immlo is always zero.
+    Adr,
 }
 
 pub(crate) struct Asm {
@@ -82,6 +87,9 @@ pub(crate) struct Asm {
     labels: Vec<Option<usize>>,
     /// Branches emitted before their target was bound: (word index, label, field to patch).
     fixes: Vec<(usize, Label, Fixup)>,
+    /// 64-bit constants to place after the code (see `literal`): the label bound to the first of
+    /// a run (if any) and the value.
+    pool: Vec<(Option<Label>, u64)>,
 }
 
 /// Encodes `val` as a logical immediate (the 13-bit N:immr:imms field) for `and`/`orr`/`eor`/
@@ -150,6 +158,7 @@ impl Asm {
             base,
             labels: Vec::new(),
             fixes: Vec::new(),
+            pool: Vec::new(),
         }
     }
 
@@ -175,14 +184,63 @@ impl Asm {
     /// only +-1 MiB and `b` +-128 MiB, far more than one block (at most `MAX_INSNS` instructions
     /// plus their out-of-line slow paths) ever spans. Panics on a label that was never bound.
     pub fn finish(&mut self) {
+        self.flush_pool();
         for &(at, label, fixup) in &self.fixes {
             let offset = self.labels[label].expect("unbound label") as i64 - at as i64;
             match fixup {
                 Fixup::Imm26 => self.code[at] |= (offset as u32) & IMM26_MASK,
-                Fixup::Imm19 => self.code[at] |= ((offset as u32) & IMM19_MASK) << IMM19_SHIFT,
+                Fixup::Imm19 | Fixup::Adr => {
+                    self.code[at] |= ((offset as u32) & IMM19_MASK) << IMM19_SHIFT
+                }
             }
         }
         self.fixes.clear();
+    }
+
+    /// Appends the literal pool, 8-byte aligned, and binds its labels. The code buffer is placed
+    /// at a 16-byte boundary, so an even word index is an 8-byte aligned address.
+    fn flush_pool(&mut self) {
+        if self.pool.is_empty() {
+            return;
+        }
+        if self.code.len() % 2 == 1 {
+            self.emit(NOP_WORD);
+        }
+        for (label, value) in std::mem::take(&mut self.pool) {
+            if let Some(label) = label {
+                self.bind(label);
+            }
+            self.emit(value as u32);
+            self.emit((value >> 32) as u32);
+        }
+    }
+
+    /// A 64-bit constant stored after the code; the label addresses it for `adr` and
+    /// `ldr_literal`. Both reach +-1 MiB, far more than one block.
+    pub fn literal(&mut self, value: u64) -> Label {
+        let label = self.label();
+        self.pool.push((Some(label), value));
+        label
+    }
+
+    /// Two consecutive 64-bit constants; the label addresses the first.
+    pub fn literal_pair(&mut self, first: u64, second: u64) -> Label {
+        let label = self.label();
+        self.pool.push((Some(label), first));
+        self.pool.push((None, second));
+        label
+    }
+
+    /// `adr rd, label`: the address of a word-aligned label.
+    pub fn adr(&mut self, rd: u32, label: Label) {
+        self.fixes.push((self.code.len(), label, Fixup::Adr));
+        self.emit(0x1000_0000 | rd);
+    }
+
+    /// `ldr xt, label`: loads the 64-bit constant at a word-aligned label.
+    pub fn ldr_literal(&mut self, rt: u32, label: Label) {
+        self.fixes.push((self.code.len(), label, Fixup::Imm19));
+        self.emit(0x5800_0000 | rt);
     }
 
     pub fn b(&mut self, label: Label) {
@@ -216,6 +274,18 @@ impl Asm {
 
     pub fn ret(&mut self) {
         self.emit(0xd65f_03c0);
+    }
+
+    /// `ret xn`: return through a register other than the link register.
+    pub fn ret_reg(&mut self, rn: u32) {
+        self.emit(0xd65f_0000 | rn << RN_SHIFT);
+    }
+
+    /// Direct call to an absolute address outside this `Asm`, reach +-128 MiB like `b_abs`.
+    pub fn bl_abs(&mut self, target: u64) {
+        let offset = (target as i64 - self.here() as i64) / 4;
+        assert!(offset.abs() < IMM26_SIGNED_LIMIT, "branch out of range");
+        self.emit(0x9400_0000 | (offset as u32 & IMM26_MASK));
     }
 
     pub fn blr(&mut self, rn: u32) {

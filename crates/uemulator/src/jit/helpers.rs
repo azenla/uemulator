@@ -57,6 +57,16 @@ pub(crate) extern "C" fn helper_exec(cpu: &mut Cpu, insn: &Insn, rip: u64) -> u6
     }
 }
 
+/// `helper_exec` as the aarch64 blocks call it: `pair` is the `[*const Insn, rip]` constant pair
+/// the block keeps next to its code, so the call site is one `adr` instead of two 64-bit
+/// immediates.
+#[cfg(target_arch = "aarch64")]
+pub(crate) extern "C" fn helper_exec_pair(cpu: &mut Cpu, pair: &[u64; 2]) -> u64 {
+    // SAFETY: the block that made the pair keeps its `Insn` slice alive (`Block::_insns`).
+    let insn = unsafe { &*(pair[0] as *const Insn) };
+    helper_exec(cpu, insn, pair[1])
+}
+
 /// Slow-path load, called when the inline TLB probe misses. Generated code does not keep
 /// `cpu.rip` current, so the faulting instruction's `rip` is passed in and stored here.
 #[cfg(target_arch = "aarch64")]

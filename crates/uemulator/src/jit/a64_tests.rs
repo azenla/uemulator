@@ -1771,3 +1771,84 @@ fn bitfield_extract_and_sized_shift_encodings_match_the_assembler() {
     ];
     check_encodings(cases);
 }
+
+#[test]
+fn adr_ldr_literal_bl_and_ret_register_encodings_match_the_assembler() {
+    // `l0: adr x7, l0; nop; adr x7, l1; nop; nop; l1: nop; bl l1; ret x28; ldr x1, l1`
+    let words = assemble(|a| {
+        let l0 = a.label();
+        a.bind(l0);
+        a.adr(7, l0);
+        nop(a);
+        let l1 = a.label();
+        a.adr(7, l1);
+        nop(a);
+        nop(a);
+        a.bind(l1);
+        nop(a);
+        a.bl_abs(BASE_ADDRESS + 5 * 4);
+        a.ret_reg(28);
+        a.ldr_literal(1, l1);
+    });
+    assert_eq!(
+        words,
+        [
+            0x1000_0007,
+            NOP_WORD,
+            0x1000_0067,
+            NOP_WORD,
+            NOP_WORD,
+            NOP_WORD,
+            0x97ff_ffff,
+            0xd65f_0380,
+            0x58ff_ffa1,
+        ]
+    );
+}
+
+#[test]
+fn literals_land_after_the_code_aligned_and_are_reachable() {
+    let mut a = Asm::new(BASE_ADDRESS);
+    let pair = a.literal_pair(0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00);
+    let single = a.literal(0xdead_beef_0bad_f00d);
+    a.adr(7, pair);
+    a.ldr_literal(1, single);
+    a.finish();
+    // Two instructions of code (adr, ldr; already an even count, so no pad), then three 64-bit
+    // constants.
+    assert_eq!(a.code.len(), 2 + 6);
+    assert_eq!(
+        &a.code[2..],
+        [
+            0x5566_7788,
+            0x1122_3344,
+            0xddee_ff00,
+            0x99aa_bbcc,
+            0x0bad_f00d,
+            0xdead_beef,
+        ]
+    );
+    // adr x7 -> word 2 (offset 2 words), ldr x1 -> word 6 (offset 5 words)
+    assert_eq!(a.code[0], 0x1000_0007 | 2 << 5);
+    assert_eq!(a.code[1], 0x5800_0001 | 5 << 5);
+}
+
+#[test]
+fn an_odd_code_length_is_padded_before_the_pool() {
+    let mut a = Asm::new(BASE_ADDRESS);
+    let value = a.literal(7);
+    a.adr(0, value);
+    a.finish();
+    assert_eq!(
+        a.code.len(),
+        4,
+        "adr, pad, and the two words of the constant"
+    );
+    assert_eq!(a.code[1], NOP_WORD, "the pad is a nop");
+    assert_eq!(
+        a.code[0],
+        0x1000_0000 | 2 << 5,
+        "the constant is two words ahead"
+    );
+    assert_eq!(&a.code[2..], [7, 0]);
+}

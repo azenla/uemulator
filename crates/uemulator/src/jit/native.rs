@@ -8,9 +8,15 @@ use crate::cpu::exception::Exception;
 use crate::cpu::mem::AccessKind;
 use crate::sys::ExecMem;
 
-/// Size of the code buffer. Must not exceed 128 MiB: on aarch64 every block reaches the shared
-/// exit stubs in the prologue with a direct `b` (`Asm::b_abs` asserts on out-of-range).
-const CODE_SIZE: usize = 128 << 20;
+/// The code buffer is a few segments, each starting with its own copy of the prologue (entry
+/// trampoline, exit/chain stubs, memory thunks). On aarch64 every block reaches those with a
+/// direct `b`/`bl` (`Asm::b_abs` asserts on out-of-range), which spans only +-128 MiB, so a
+/// segment must stay below that; several of them make a buffer big enough to hold everything a
+/// guest boot translates, instead of throwing all code away every 128 MiB and translating the
+/// hot parts again (the kernel plus an installer userspace is ~500k blocks, ~140 MiB).
+const SEGMENT_SIZE: usize = 96 << 20;
+const SEGMENT_COUNT: usize = 5;
+const CODE_SIZE: usize = SEGMENT_SIZE * SEGMENT_COUNT;
 /// Free space required before translating a block; below it the whole cache is flushed. Assumed to
 /// bound the code of one block (`MAX_INSNS` instructions); `ExecMem::write_bytes` asserts if not.
 const CODE_HEADROOM: usize = 1 << 20;
@@ -56,6 +62,10 @@ pub(crate) const JUMP_ENTRY_CODE_OFFSET: u32 = std::mem::offset_of!(JumpEntry, c
 /// stay stable.
 pub(crate) struct Block {
     rip: u64,
+    /// Physical address of the first instruction. Part of the lookup key together with `rip`: the
+    /// code embeds rip-relative constants, and a remapped virtual page must not hit a stale block.
+    phys_addr: u64,
+    code_addr: u64,
     #[cfg_attr(not(test), allow(dead_code))]
     valid: bool,
     /// Generated code calls `helper_exec` with raw pointers into this slice, so it must outlive the
@@ -74,11 +84,16 @@ pub(crate) struct Jit {
     used_bytes: usize,
     /// Host address of the prologue trampoline at offset 0 of the buffer; see `step_block`.
     pub enter_trampoline: u64,
-    addrs: arch::Addrs,
+    /// The addresses each segment's blocks are compiled against (its own prologue copy).
+    segment_addrs: Vec<arch::Addrs>,
     blocks: Vec<Block>,
     /// Direct-mapped cache indexed by `jump_cache_hash(rip)`. Both `lookup` and the chain stub
     /// read it, so it is allocated once and never resized: the stub has its address baked in.
     jump_cache: Vec<JumpEntry>,
+    /// Every live block by `(rip, phys_addr)`. The jump cache is direct-mapped and much smaller
+    /// than the working set of a boot (hundreds of thousands of blocks), so without this a
+    /// colliding rip would evict a block and the next visit would translate it all over again.
+    block_map: HashMap<(u64, u64), u32>,
     /// Physical page number -> blocks that decoded bytes from it. A block that crosses a page is
     /// listed under both.
     page_blocks: HashMap<u64, Vec<u32>>,
@@ -122,19 +137,22 @@ impl Jit {
         let exec_mem = ExecMem::new(CODE_SIZE)?;
         let base = exec_mem.base();
         let jump_cache = vec![JumpEntry::default(); 1 << JUMP_CACHE_BITS];
-        let prologue = arch::prologue(base, jump_cache.as_ptr() as u64);
-        exec_mem.write_bytes(0, &prologue.code);
-        let blocks_start = (prologue.code.len() + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
+        let mut segment_addrs = Vec::with_capacity(SEGMENT_COUNT);
+        let mut blocks_start = 0;
+        for segment in 0..SEGMENT_COUNT {
+            let segment_offset = segment * SEGMENT_SIZE;
+            let prologue = arch::prologue(base + segment_offset as u64, jump_cache.as_ptr() as u64);
+            exec_mem.write_bytes(segment_offset, &prologue.code);
+            blocks_start = (prologue.code.len() + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
+            segment_addrs.push(arch::addrs(&prologue, chaining));
+        }
         Some(Jit {
             exec_mem,
             used_bytes: blocks_start,
             enter_trampoline: base,
-            addrs: arch::addrs(
-                prologue.exit_ok,
-                prologue.exit_fail,
-                chaining.then_some(prologue.chain),
-            ),
+            segment_addrs,
             blocks: Vec::new(),
+            block_map: HashMap::new(),
             jump_cache,
             page_blocks: HashMap::new(),
             blocks_start,
@@ -155,6 +173,7 @@ impl Jit {
             for index in indices {
                 let block = &mut self.blocks[index as usize];
                 block.valid = false;
+                self.block_map.remove(&(block.rip, block.phys_addr));
                 let slot = &mut self.jump_cache[jump_cache_hash(block.rip)];
                 if slot.block == index as u64 + 1 {
                     *slot = JumpEntry::default();
@@ -167,16 +186,29 @@ impl Jit {
     /// `translate`, so no generated code is running.
     fn reset(&mut self) {
         self.blocks.clear();
+        self.block_map.clear();
         self.page_blocks.clear();
         self.jump_cache.fill(JumpEntry::default());
         self.used_bytes = self.blocks_start;
         self.stats.resets += 1;
     }
 
-    pub fn lookup(&self, rip: u64, phys_addr: u64) -> Option<u64> {
+    /// The block translated for this `(rip, phys_addr)`, if any. A jump cache miss falls back to
+    /// the block map and refills the slot.
+    pub fn lookup(&mut self, rip: u64, phys_addr: u64) -> Option<u64> {
         let slot = &self.jump_cache[jump_cache_hash(rip)];
-        (slot.code_addr != 0 && slot.rip == rip && slot.phys_addr == phys_addr)
-            .then_some(slot.code_addr)
+        if slot.code_addr != 0 && slot.rip == rip && slot.phys_addr == phys_addr {
+            return Some(slot.code_addr);
+        }
+        let index = *self.block_map.get(&(rip, phys_addr))?;
+        let code_addr = self.blocks[index as usize].code_addr;
+        self.jump_cache[jump_cache_hash(rip)] = JumpEntry {
+            rip,
+            phys_addr,
+            code_addr,
+            block: index as u64 + 1,
+        };
+        Some(code_addr)
     }
 
     /// Decodes up to `MAX_INSNS` instructions at `rip` (physical `phys_addr`), compiles them and
@@ -184,8 +216,15 @@ impl Jit {
     /// single-instruction block for an instruction that itself straddles one. `rip` must be
     /// `cpu.rip`: that case decodes through `Cpu::fetch_decode`, which reads it.
     pub fn translate(&mut self, cpu: &mut Cpu, rip: u64, phys_addr: u64) -> Result<u64, Exception> {
-        if self.used_bytes + CODE_HEADROOM > self.exec_mem.len() {
-            self.reset();
+        let mut segment = self.used_bytes / SEGMENT_SIZE;
+        if self.used_bytes + CODE_HEADROOM > (segment + 1) * SEGMENT_SIZE {
+            if segment + 1 < SEGMENT_COUNT {
+                segment += 1;
+                self.used_bytes = segment * SEGMENT_SIZE + self.blocks_start;
+            } else {
+                self.reset();
+                segment = 0;
+            }
         }
         let ram_len = cpu.ram.len() as u64;
         // Code can only execute from RAM; reported as a not-present fetch fault.
@@ -261,15 +300,23 @@ impl Jit {
         let insns: Box<[Insn]> = insns.into_boxed_slice();
         self.used_bytes = (self.used_bytes + BLOCK_ALIGN - 1) & !(BLOCK_ALIGN - 1);
         let code_addr = self.exec_mem.base() + self.used_bytes as u64;
-        let (code, inlined) =
-            arch::compile_block(code_addr, &self.addrs, &insns, &insn_rips, end_rip);
+        let (code, inlined) = arch::compile_block(
+            code_addr,
+            &self.segment_addrs[segment],
+            &insns,
+            &insn_rips,
+            end_rip,
+        );
         self.stats.inlined += inlined as u64;
         self.stats.total += insns.len() as u64;
         self.exec_mem.write_bytes(self.used_bytes, &code);
         self.used_bytes += code.len();
         let index = self.blocks.len() as u32;
+        self.block_map.insert((rip, phys_addr), index);
         self.blocks.push(Block {
             rip,
+            phys_addr,
+            code_addr,
             valid: true,
             _insns: insns,
         });
