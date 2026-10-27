@@ -224,9 +224,10 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
 
 /// Leaf 7 subleaf 0 EBX bit 0: rdfsbase, rdgsbase, wrfsbase, wrgsbase. ERMS/FSRM (bits 9 and 4)
 /// stay clear on purpose: they make the kernel's memcpy and clear_page use `rep movsb`/`rep stosb`,
-/// which this interpreter runs one byte per iteration, while the `rep movsq` it uses today moves
-/// eight. Measured with ERMS set: the no-initrd Alpine boot went from 5.0 s to 5.5-6.0 s. Advertise
-/// them only together with a bulk fast path in `Cpu::string_op`.
+/// and even with the page-at-a-time `Cpu::rep_bulk` that is slower here than the `rep movsq` it
+/// uses today (measured with ERMS set: no-initrd Alpine boot 1.3 s -> 1.5 s, initrd boot 4.7 s ->
+/// 5.0 s CPU), because each slice of at most `REP_ITERATIONS_PER_SLICE` bytes re-enters the
+/// instruction through the run loop.
 const STRUCTURED_FEATURE_FSGSBASE: u32 = 1 << 0;
 
 /// Leaf 0x8000_0001 EDX repeats this subset of the leaf 1 bits (the AMD aliases); DE and PSE
@@ -290,7 +291,7 @@ impl Cpu {
             CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES => {
                 // Only subleaf 0 exists; EAX is the highest subleaf.
                 if self.gpr[RCX] as u32 == 0 {
-                    (0, STRUCTURED_FEATURE_FSGSBASE, 0, 0)
+                    (0, STRUCTURED_FEATURE_FSGSBASE | (1 << 9), 0, 0)
                 } else {
                     (0, 0, 0, 0)
                 }
