@@ -391,12 +391,22 @@ mod cpuid_leaves {
     }
 
     #[test]
-    fn leaf_1_ecx_advertises_nothing() {
+    fn leaf_1_ecx_advertises_only_what_is_implemented() {
+        const SSE3: u32 = 1 << 0;
+        const PCLMULQDQ: u32 = 1 << 1;
+        const SSSE3: u32 = 1 << 9;
+        const CX16: u32 = 1 << 13;
+        const SSE4_1: u32 = 1 << 19;
+        const SSE4_2: u32 = 1 << 20;
+        const MOVBE: u32 = 1 << 22;
+        const POPCNT: u32 = 1 << 23;
+        const AES: u32 = 1 << 25;
         let mut h = blank();
         let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
         assert_eq!(
-            ecx, 0,
-            "no SSE3, SSSE3, SSE4, XSAVE, OSXSAVE, AVX, RDRAND or hypervisor bit"
+            ecx,
+            SSE3 | PCLMULQDQ | SSSE3 | CX16 | SSE4_1 | SSE4_2 | MOVBE | POPCNT | AES,
+            "no MONITOR, VMX, SMX, XSAVE, OSXSAVE, AVX, RDRAND or hypervisor bit"
         );
     }
 
@@ -407,9 +417,18 @@ mod cpuid_leaves {
     }
 
     #[test]
-    fn leaf_7_has_no_extended_features() {
+    fn leaf_7_subleaf_0_advertises_only_fsgsbase() {
+        const FSGSBASE: u32 = 1 << 0;
         let mut h = blank();
-        for subleaf in [0, 1, 5] {
+        // EAX is the highest subleaf. ERMS and FSRM stay clear (see sys.rs), as do SMEP, SMAP,
+        // PCID, BMI, AVX2 and everything else.
+        assert_eq!(cpuid(&mut h, 7, 0), [0, FSGSBASE, 0, 0]);
+    }
+
+    #[test]
+    fn leaf_7_has_no_other_subleaves() {
+        let mut h = blank();
+        for subleaf in [1, 2, 5, 0x8000_0000] {
             assert_eq!(cpuid(&mut h, 7, subleaf), [0, 0, 0, 0], "subleaf {subleaf}");
         }
     }
@@ -450,10 +469,12 @@ mod cpuid_leaves {
     }
 
     #[test]
-    fn extended_leaf_1_ecx_has_only_lahf_in_long_mode() {
+    fn extended_leaf_1_ecx_has_only_lahf_in_long_mode_and_abm() {
+        const LAHF_LM: u32 = 1 << 0;
+        const ABM: u32 = 1 << 5;
         let mut h = blank();
         let [_, _, ecx, _] = cpuid(&mut h, 0x8000_0001, 0);
-        assert_eq!(ecx, 1);
+        assert_eq!(ecx, LAHF_LM | ABM);
     }
 
     #[test]
@@ -1412,6 +1433,7 @@ mod control_registers {
             (8, "PCE"),
             (9, "OSFXSR"),
             (10, "OSXMMEXCPT"),
+            (16, "FSGSBASE"),
         ] {
             let (h, stop) = run_with(WRITE_CR4, |h| h.cpu.gpr[RAX] = BOOT_CR4 | 1 << bit);
             assert_eq!(stop, Stop::Halted, "{name}");
@@ -1429,7 +1451,6 @@ mod control_registers {
             (12, "LA57"),
             (13, "VMXE"),
             (14, "SMXE"),
-            (16, "FSGSBASE"),
             (17, "PCIDE"),
             (18, "OSXSAVE"),
             (19, "reserved"),
@@ -3428,5 +3449,198 @@ mod advertised_features_are_backed_by_instructions {
             EFER_LME_BIT | EFER_LMA_BIT
         );
         assert!(h.cpu.seg[SEG_CS].long());
+    }
+}
+
+mod fs_gs_base {
+    use super::*;
+    use crate::testkit::assert_jit_matches_interpreter;
+
+    const HIGH_HALF_BASE: u64 = 0xffff_8000_0000_1000;
+    const NON_CANONICAL: u64 = 0x0001_0000_0000_0000;
+
+    // rdfsbase rax
+    const RDFSBASE_64: &[u8] = &[0xf3, 0x48, 0x0f, 0xae, 0xc0, 0xf4];
+    // rdfsbase eax
+    const RDFSBASE_32: &[u8] = &[0xf3, 0x0f, 0xae, 0xc0, 0xf4];
+    // rdgsbase rax
+    const RDGSBASE_64: &[u8] = &[0xf3, 0x48, 0x0f, 0xae, 0xc8, 0xf4];
+    // rdgsbase eax
+    const RDGSBASE_32: &[u8] = &[0xf3, 0x0f, 0xae, 0xc8, 0xf4];
+    // wrfsbase rbx
+    const WRFSBASE_64: &[u8] = &[0xf3, 0x48, 0x0f, 0xae, 0xd3, 0xf4];
+    // wrfsbase ebx
+    const WRFSBASE_32: &[u8] = &[0xf3, 0x0f, 0xae, 0xd3, 0xf4];
+    // wrgsbase rbx
+    const WRGSBASE_64: &[u8] = &[0xf3, 0x48, 0x0f, 0xae, 0xdb, 0xf4];
+    // wrgsbase ebx
+    const WRGSBASE_32: &[u8] = &[0xf3, 0x0f, 0xae, 0xdb, 0xf4];
+    // rdfsbase r9
+    const RDFSBASE_R9: &[u8] = &[0xf3, 0x49, 0x0f, 0xae, 0xc1, 0xf4];
+    // wrfsbase r9
+    const WRFSBASE_R9: &[u8] = &[0xf3, 0x49, 0x0f, 0xae, 0xd1, 0xf4];
+    // wrfsbase rbx; mov rax, fs:[0]
+    const WRFSBASE_THEN_FS_LOAD: &[u8] = &[
+        0xf3, 0x48, 0x0f, 0xae, 0xd3, 0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xf4,
+    ];
+    // wrgsbase rbx; mov rax, gs:[0]
+    const WRGSBASE_THEN_GS_LOAD: &[u8] = &[
+        0xf3, 0x48, 0x0f, 0xae, 0xdb, 0x65, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xf4,
+    ];
+
+    fn enabled(h: &mut Harness) {
+        h.cpu.cr4 |= CR4_FSGSBASE;
+    }
+
+    #[test]
+    fn reads_return_the_current_bases_at_the_operand_size() {
+        let read = |code: &[u8], fs: u64, gs: u64| {
+            let h = run_ok(code, |h| {
+                enabled(h);
+                h.cpu.seg[SEG_FS].base = fs;
+                h.cpu.seg[SEG_GS].base = gs;
+                h.cpu.gpr[RAX] = u64::MAX;
+            });
+            h.cpu.gpr[RAX]
+        };
+        assert_eq!(read(RDFSBASE_64, HIGH_HALF_BASE, 0x2000), HIGH_HALF_BASE);
+        assert_eq!(read(RDGSBASE_64, HIGH_HALF_BASE, 0x2000), 0x2000);
+        // The 32-bit forms return the low half and clear the upper half of the register.
+        assert_eq!(read(RDFSBASE_32, HIGH_HALF_BASE, 0x2000), 0x1000);
+        assert_eq!(
+            read(RDGSBASE_32, 0x1000, 0xffff_8000_dead_beef),
+            0xdead_beef
+        );
+        let h = run_ok(RDFSBASE_R9, |h| {
+            enabled(h);
+            h.cpu.seg[SEG_FS].base = 0x1234;
+        });
+        assert_eq!(h.cpu.gpr[R9], 0x1234, "REX.B selects r9");
+    }
+
+    #[test]
+    fn writes_set_the_bases_and_the_32_bit_forms_zero_extend() {
+        let write = |code: &[u8], value: u64| {
+            let h = run_ok(code, |h| {
+                enabled(h);
+                h.cpu.gpr[RBX] = value;
+                h.cpu.seg[SEG_FS].base = 0x7777;
+                h.cpu.seg[SEG_GS].base = 0x8888;
+            });
+            (h.cpu.seg[SEG_FS].base, h.cpu.seg[SEG_GS].base)
+        };
+        assert_eq!(write(WRFSBASE_64, HIGH_HALF_BASE), (HIGH_HALF_BASE, 0x8888));
+        assert_eq!(write(WRGSBASE_64, 0x4000), (0x7777, 0x4000));
+        assert_eq!(
+            write(WRFSBASE_32, 0xffff_ffff_8765_4321),
+            (0x8765_4321, 0x8888)
+        );
+        assert_eq!(
+            write(WRGSBASE_32, 0xffff_ffff_8765_4321),
+            (0x7777, 0x8765_4321)
+        );
+        let h = run_ok(WRFSBASE_R9, |h| {
+            enabled(h);
+            h.cpu.gpr[R9] = 0x5555;
+        });
+        assert_eq!(h.cpu.seg[SEG_FS].base, 0x5555);
+    }
+
+    #[test]
+    fn a_non_canonical_base_is_gp0_and_changes_nothing() {
+        for code in [WRFSBASE_64, WRGSBASE_64] {
+            let h = assert_general_protection_zero(code, |h| {
+                enabled(h);
+                h.cpu.gpr[RBX] = NON_CANONICAL;
+                h.cpu.seg[SEG_FS].base = 0x7777;
+                h.cpu.seg[SEG_GS].base = 0x8888;
+            });
+            assert_eq!(
+                (h.cpu.seg[SEG_FS].base, h.cpu.seg[SEG_GS].base),
+                (0x7777, 0x8888)
+            );
+        }
+        // A 32-bit write cannot be non-canonical.
+        run_ok(WRFSBASE_32, |h| {
+            enabled(h);
+            h.cpu.gpr[RBX] = NON_CANONICAL | 0x10;
+        });
+    }
+
+    #[test]
+    fn without_cr4_fsgsbase_all_four_are_invalid_opcode() {
+        for code in [
+            RDFSBASE_64,
+            RDGSBASE_32,
+            WRFSBASE_64,
+            WRGSBASE_32,
+            RDFSBASE_R9,
+        ] {
+            assert_invalid_opcode(code, |_| {});
+        }
+    }
+
+    #[test]
+    fn they_work_in_user_mode() {
+        // hlt faults at CPL 3, so run exactly the one instruction.
+        let mut h = Harness::new(WRFSBASE_64);
+        enabled(&mut h);
+        user_mode(&mut h);
+        h.cpu.gpr[RBX] = 0x6000;
+        assert_eq!(h.run(1), Stop::Limit);
+        assert_eq!(h.cpu.rip, CODE_BASE + WRFSBASE_64.len() as u64 - 1);
+        assert_eq!(h.cpu.seg[SEG_FS].base, 0x6000);
+        let mut h = Harness::new(RDGSBASE_64);
+        enabled(&mut h);
+        user_mode(&mut h);
+        h.cpu.seg[SEG_GS].base = 0x9000;
+        assert_eq!(h.run(1), Stop::Limit);
+        assert_eq!(h.cpu.gpr[RAX], 0x9000);
+    }
+
+    #[test]
+    fn other_register_forms_of_group_15_stay_invalid() {
+        // F3 0F AE /4 (ptwrite), F2 0F AE /0 and the unprefixed register /0.
+        for code in [
+            &[0xf3, 0x0f, 0xae, 0xe0, 0xf4][..],
+            &[0xf2, 0x0f, 0xae, 0xc0, 0xf4],
+            &[0x0f, 0xae, 0xc0, 0xf4],
+        ] {
+            assert_invalid_opcode(code, enabled);
+        }
+    }
+
+    #[test]
+    fn fs_and_gs_relative_accesses_see_the_new_base() {
+        for (code, name) in [(WRFSBASE_THEN_FS_LOAD, "fs"), (WRGSBASE_THEN_GS_LOAD, "gs")] {
+            let h = run_ok(code, |h| {
+                enabled(h);
+                h.cpu.gpr[RBX] = DATA;
+                h.write_u64(DATA, 0x1122_3344_5566_7788);
+            });
+            assert_eq!(h.cpu.gpr[RAX], 0x1122_3344_5566_7788, "{name}");
+            assert_jit_matches_interpreter(code, |h| {
+                enabled(h);
+                h.cpu.gpr[RBX] = DATA;
+                h.write_u64(DATA, 0x1122_3344_5566_7788);
+            });
+        }
+    }
+
+    #[test]
+    fn the_jit_matches_for_reads_and_writes() {
+        for code in [RDFSBASE_64, RDGSBASE_32, WRFSBASE_32, WRGSBASE_64] {
+            assert_jit_matches_interpreter(code, |h| {
+                enabled(h);
+                h.cpu.gpr[RBX] = 0xffff_8000_0000_2000;
+                h.cpu.seg[SEG_FS].base = 0x1111;
+                h.cpu.seg[SEG_GS].base = 0xffff_8000_dead_0000;
+            });
+        }
+        assert_jit_matches_interpreter(WRFSBASE_64, |h| {
+            enabled(h);
+            h.cpu.gpr[RBX] = NON_CANONICAL;
+        });
+        assert_jit_matches_interpreter(RDFSBASE_64, |_| {});
     }
 }

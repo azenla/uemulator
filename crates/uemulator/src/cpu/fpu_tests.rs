@@ -1021,13 +1021,106 @@ mod integer_conversions {
     }
 
     #[test]
-    fn fisttp_is_not_implemented_because_sse3_is_not_advertised() {
-        // fld1
-        // fisttp dword ptr [rdi]
-        let code = program(&[&[0xd9, 0xe8], &[0xdb, 0x0f]]);
-        let (h, stop) = run_with(&code, |_| {});
-        assert_eq!(stop, invalid_opcode());
-        assert_eq!(h.cpu.rip, CODE_BASE + 2);
+    fn fisttp_truncates_whatever_the_rounding_control_says_and_pops() {
+        for control in [RC_NEAREST, RC_DOWN, RC_UP, RC_TRUNCATE] {
+            for (value, want) in [
+                (2.9, 2),
+                (-2.9, -2),
+                (0.99, 0),
+                (-0.5, 0),
+                (100000.99, 100000),
+                (-100000.99, -100000),
+            ] {
+                // fisttp dword ptr [rdi]
+                let h = convert(&[0xdb, 0x0f], value, control);
+                assert_eq!(
+                    i32::from_le_bytes(h.read(OUT, 4).try_into().unwrap()),
+                    want,
+                    "m32 {value} fcw={control:#x}"
+                );
+                assert_eq!(top(&h), 0, "fisttp pops");
+                assert!(is_empty(&h, 7));
+                // fisttp qword ptr [rdi]
+                let h = convert(&[0xdd, 0x0f], value, control);
+                assert_eq!(
+                    i64::from_le_bytes(h.read(OUT, 8).try_into().unwrap()),
+                    want as i64,
+                    "m64 {value} fcw={control:#x}"
+                );
+                assert_eq!(top(&h), 0);
+                if value.abs() < 30000.0 {
+                    // fisttp word ptr [rdi]
+                    let h = convert(&[0xdf, 0x0f], value, control);
+                    assert_eq!(
+                        i16::from_le_bytes(h.read(OUT, 2).try_into().unwrap()),
+                        want as i16,
+                        "m16 {value} fcw={control:#x}"
+                    );
+                    assert_eq!(top(&h), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fisttp_out_of_range_and_nan_store_the_integer_indefinite() {
+        for (value, m16, m32, m64) in [
+            (40000.5, i16::MIN as i64, 40000, 40000),
+            (3e9, i16::MIN as i64, i32::MIN as i64, 3_000_000_000),
+            (-3e9, i16::MIN as i64, i32::MIN as i64, -3_000_000_000),
+            (1e30, i16::MIN as i64, i32::MIN as i64, i64::MIN),
+            (f64::NAN, i16::MIN as i64, i32::MIN as i64, i64::MIN),
+            (
+                f64::NEG_INFINITY,
+                i16::MIN as i64,
+                i32::MIN as i64,
+                i64::MIN,
+            ),
+            // truncation, not rounding, decides whether the value is in range
+            (32767.9, 32767, 32767, 32767),
+            (-32768.9, -32768, -32768, -32768),
+        ] {
+            let h = convert(&[0xdf, 0x0f], value, RC_NEAREST);
+            assert_eq!(
+                i16::from_le_bytes(h.read(OUT, 2).try_into().unwrap()) as i64,
+                m16,
+                "m16 {value}"
+            );
+            let h = convert(&[0xdb, 0x0f], value, RC_NEAREST);
+            assert_eq!(
+                i32::from_le_bytes(h.read(OUT, 4).try_into().unwrap()) as i64,
+                m32,
+                "m32 {value}"
+            );
+            let h = convert(&[0xdd, 0x0f], value, RC_NEAREST);
+            assert_eq!(
+                i64::from_le_bytes(h.read(OUT, 8).try_into().unwrap()),
+                m64,
+                "m64 {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn dd_and_df_slash_1_register_encodings_stay_invalid() {
+        // fld1, then DD C8 and DF C8. fisttp has no register form; hardware treats these as
+        // undocumented FXCH aliases, which this emulator does not implement (it raises #UD), and
+        // this pins that rather than architectural behavior.
+        for opcode in [0xdd, 0xdf] {
+            let code = program(&[&[0xd9, 0xe8], &[opcode, 0xc8]]);
+            let (_, stop) = run_with(&code, |_| {});
+            assert_eq!(stop, invalid_opcode(), "{opcode:#x}");
+        }
+    }
+
+    #[test]
+    fn fisttp_matches_the_jit_helper() {
+        // fld qword ptr [rsi]; fisttp dword ptr [rdi]
+        let code = program(&[&[0xdd, 0x06], &[0xdb, 0x0f]]);
+        crate::testkit::assert_jit_matches_interpreter(&code, |h| {
+            init(h);
+            put_f64s(h, &[-7.75]);
+        });
     }
 
     #[test]

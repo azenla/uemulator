@@ -15,7 +15,7 @@ Table-driven, one-byte, 0F, 0F38, 0F3A maps; prefix handling (66, 67, F2, F3, RE
 
 Coverage priority (what Linux + Debian userspace uses):
 1. Integer: mov/movzx/movsx(d), lea, add/or/adc/sbb/and/sub/xor/cmp/test, inc/dec/neg/not, mul/imul/div/idiv, shifts/rotates/shld/shrd, bt*/bsf/bsr/popcnt/lzcnt/tzcnt (only if advertised), setcc/cmovcc/jcc, push/pop, call/ret/leave/enter, jmp, loop*, string ops with rep (movs/stos/lods/scas/cmps), xchg/cmpxchg/cmpxchg16b/xadd (lock is a no-op), cdq/cqo/cbw family, bswap, cpuid, rdtsc, rdtscp?, rdmsr/wrmsr, syscall/sysret, sysenter(no), swapgs, int/int3/iret(q), hlt, cli/sti, in/out/ins/outs, lgdt/lidt/ltr/lldt/sgdt/sidt/str, mov cr/dr, invlpg, wbinvd (nop), lfence/mfence/sfence, clflush, pause, ud2, xgetbv (not advertised; #UD).
-2. SSE/SSE2 integer and scalar/packed FP used by libc memcpy/strlen/etc: movdqa/u, movq/d, movaps/ups, pxor/por/pand/pandn, padd/psub, pcmpeq/gt, pmovmskb, pshufd, punpck*, packss/usb, psrl/psll/psra, shufps, paddq, pmuludq, cvt*, add/sub/mul/div/sqrt/min/max ss/sd/ps/pd, comisd/ucomisd, movmsk. SSSE3/SSE4 only if CPUID advertises them (start without).
+2. SSE/SSE2 integer and scalar/packed FP used by libc memcpy/strlen/etc: movdqa/u, movq/d, movaps/ups, pxor/por/pand/pandn, padd/psub, pcmpeq/gt, pmovmskb, pshufd, punpck*, packss/usb, psrl/psll/psra, shufps, paddq, pmuludq, cvt*, add/sub/mul/div/sqrt/min/max ss/sd/ps/pd, comisd/ucomisd, movmsk. SSE3, SSSE3 (XMM forms only), SSE4.1, SSE4.2, PCLMULQDQ and AES-NI are implemented in `cpu/sse_ext.rs` (see "Instruction extensions" below).
 3. x87: fninit, fld/fst/fstp (m32/m64/m80, st(i)), fild/fistp, fadd/fsub/fmul/fdiv family, fxch, fchs/fabs, fcom/fucom(i)(p), fnstcw/fldcw/fnstsw, fxsave/fxrstor, fwait; transcendentals later via host libm with documented precision loss.
 4. Unimplemented opcode → #UD, with a one-shot log through the log hook (opcode bytes + rip).
 
@@ -33,7 +33,7 @@ Interpreter and JIT both call the same `flags::compute_all(cc_op, dst, src, src2
 - Every faulting uop sequence is preceded by an `insn_start(rip)` that stores guest RIP to `Env` (JIT: one `str`; coalesced when there are no faulting ops in between). No unwind tables in v1.
 - Exception delivery (`exception.rs`): long mode IDT gate lookup, IST, TSS rsp0, error code push, privilege change stack switch, #DF escalation, triple fault → exit. Also real-address and protected-mode 32-bit delivery only as far as the decompressor needs.
 - `iretq`, `sysretq`, far calls/jumps through call gates (not needed) — implement iret and far jmp/ret with descriptor loads in long mode.
-- Segment loads in 64-bit mode: validate and cache base/limit/attrs for CS/SS/DS/ES; FS/GS use MSR bases (`wrfsbase` not advertised).
+- Segment loads in 64-bit mode: validate and cache base/limit/attrs for CS/SS/DS/ES; FS/GS use MSR bases (or `rdfsbase`/`wrfsbase` and the GS pair, which need CR4.FSGSBASE).
 - Page faults: CR2 + error code (P/W/U/RSVD/I), fixups via kernel `ex_table` work because RIP is exact.
 - `rdmsr`/`wrmsr` on unknown MSR → #GP (kernel uses `rdmsr_safe`).
 
@@ -42,9 +42,24 @@ Interpreter and JIT both call the same `flags::compute_all(cc_op, dst, src, src2
 Start from the fork's identity (read `target/i386/cpu.c` "XTCG CPU" model for the exact leaves) and then **subtract** to what we implement. Initial advertised set:
 
 - Leaf 0/1: vendor AuthenticAMD (fork) family 0x15 model 0, FPU, VME no, PSE, TSC, MSR, PAE, CX8, SEP no (syscall only), MTRR, PGE, CMOV, PAT, PSE36 no, CLFLUSH, MMX, FXSR, SSE, SSE2; **APIC clear**, SSE3 later after implementing, **hypervisor bit clear**
-- Leaf 7: nothing (no FSGSBASE, SMEP, SMAP, AVX2, ERMS, PCID, LA57)
+- Leaf 7 subleaf 0: only FSGSBASE (EBX bit 0); EAX = 0. No SMEP, SMAP, AVX2, BMI, ERMS/FSRM, PCID, LA57
+- Leaf 1 ECX: SSE3, PCLMULQDQ, SSSE3, CX16, SSE4.1, SSE4.2, MOVBE, POPCNT, AES; 0x80000001 ECX adds ABM (LZCNT). MONITOR/MWAIT, VMX/SVM, XSAVE/OSXSAVE, AVX, RDRAND and the hypervisor bit stay clear
 - Leaf 0x80000001: SYSCALL, NX, LM, (RDTSCP only if implemented)
 - Leaf 0x80000007: invariant TSC set so the kernel trusts the TSC
-- No XSAVE/OSXSAVE/AVX/RDRAND (kernel then uses FXSAVE/FXRSTOR and falls back for random)
+- No XSAVE/OSXSAVE/AVX/RDRAND (kernel then uses FXSAVE/FXRSTOR and falls back for random; RDRAND/RDSEED would also break the JIT lockstep verifier)
 
 Advertising a bit is a promise; add bits only together with the test that proves the instructions.
+
+## Instruction extensions
+
+Dispatch: `Cpu::sse` hands everything outside the `0F` map (0F 38, 0F 3A) and every `0F` opcode it does not know to `sse::ext` (`sse_ext.rs`, a child module that reuses the SSE2 soft-float engine and lane helpers). `Op` is the decoded operation, `Source` how the second operand is read (aligned/unaligned m128, a low part, none), and the same prologue applies the SSE enable rules (#UD for CR0.EM or CR4.OSFXSR clear, then #NM for CR0.TS), the 16-byte alignment #GP and the mandatory-prefix check; an invalid ModRM form is #UD even under CR0.TS. Pure helpers: `string_compare.rs` (pcmp[ei]str[im]: SDM invalid-element table, all aggregations and polarities) and `crypto.rs` (CRC-32C table, AES S-box generated from its GF(2^8) definition, rounds, carry-less multiply).
+
+- Integer, in `exec.rs`: POPCNT (F3 0F B8), LZCNT (F3 0F BD; plain BSR without the prefix, so the ABM bit and the arm go together), CMPXCHG16B (REX.W 0F C7 /1, #GP(0) unless 16-byte aligned, always writes), and in `sse_ext.rs` CRC32 (F2 0F 38 F0/F1) and MOVBE (0F 38 F0/F1). TZCNT (F3 0F BC) is still BSF: BMI1 is not advertised.
+- SSE3: movddup, movsldup, movshdup, lddqu, addsub/hadd/hsub (ps, pd), x87 fisttp (m16/m32/m64).
+- SSSE3: all the XMM forms. The MMX-register forms (no 66 prefix) are deliberately #UD (logged once as unimplemented): glibc and the kernel only use the XMM forms, and each MMX form needs its own lane layout. The CPUID bit describes the XMM forms.
+- SSE4.1: blends (immediate and xmm0-implicit), ptest, pmovsx/zx, pmuldq/pmulld, pmin/pmax, pextr/pinsr/extractps/insertps, round{ps,pd,ss,sd} (immediate mode, MXCSR.RC, precision suppression, SNaN quieting, DAZ), dpps/dppd (sum order `(p0+p1)+(p2+p3)`), mpsadbw, phminposuw, packusdw, pcmpeqq, movntdqa.
+- SSE4.2: pcmpgtq, CRC32, pcmpestri/pcmpestrm/pcmpistri/pcmpistrm (all imm8 modes, REX.W lengths).
+- PCLMULQDQ and AES-NI (aesenc/last, aesdec/last, aesimc, aeskeygenassist), tested with FIPS-197 appendix B and C.1 end to end.
+- FSGSBASE: F3 0F AE /0../3 register forms, gated by CR4.FSGSBASE (bit 16, accepted by mov cr4), canonical check on writes.
+
+Left out on purpose: ERMS/FSRM (the kernel would switch memcpy and clear_page to `rep movsb`/`stosb`, which `string_op` runs one byte per iteration instead of eight: advertise only together with a bulk fast path there), MONITOR/MWAIT, AVX/AVX2/BMI (VEX), RDRAND/RDSEED, XSAVE. The JIT runs all of the above through `helper_exec` (none is a block ender); `testkit::assert_jit_matches_interpreter` cases cover representative forms. Several encodings are prefix-dependent (F3 0F B8 POPCNT vs JMPE, F3 0F BD LZCNT vs BSR, F3 0F BC still BSF, 0F 38 F0/F1 MOVBE vs CRC32 by F2, F3 0F AE FSGSBASE vs the fences): any inline JIT lowering of the neighbouring opcodes must check `insn.rep` and `insn.p66`, or it silently diverges from the interpreter.
