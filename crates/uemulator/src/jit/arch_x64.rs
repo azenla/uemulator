@@ -1,9 +1,13 @@
 pub(crate) use super::emit_x64::Addrs;
-use super::emit_x64::{FRAME, Gen};
+use super::emit_x64::{CPU, FRAME, Gen, TLB_BASE};
 use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
+use super::native::{
+    JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET, JUMP_ENTRY_SHIFT, jump_cache_mask,
+};
 use super::x64::*;
-use crate::cpu::Cpu;
 use crate::cpu::decode::Insn;
+use crate::cpu::{Cpu, TLB_ENTRIES_PER_MODE, TlbEntry};
+use std::mem::{offset_of, size_of};
 
 /// Entry/exit stubs placed at the start of the code buffer, shared by all blocks.
 pub(crate) struct Prologue {
@@ -12,6 +16,8 @@ pub(crate) struct Prologue {
     pub exit_ok: u64,
     /// Absolute address of the failure exit (rax = helper status, rcx = failing instruction index).
     pub exit_fail: u64,
+    /// Block-to-block transfer stub; see `chain_stub`.
+    pub chain: u64,
 }
 
 /// Pushed in this order and popped in reverse. This is the Win64 callee-saved set (RSI/RDI are
@@ -22,17 +28,14 @@ const SAVED_REGS: [u8; 8] = [RBX, RBP, RSI, RDI, R12, R13, R14, R15];
 /// function pointer: it sets up the frame, pins the `Cpu` pointer and TLB base for the block (see
 /// `emit_x64`), then jumps to `code`. Blocks never return themselves; they jump to `exit_ok` or
 /// `exit_fail` below.
-pub(crate) fn prologue(base: u64, _jump_cache_base: u64) -> Prologue {
+pub(crate) fn prologue(base: u64, jump_cache_base: u64) -> Prologue {
     let mut a = Asm::new(base);
     for r in SAVED_REGS {
         a.push(r);
     }
     a.alu_ri(SUB, RSP, FRAME, true);
-    a.mov_rr(RBX, ARGS[0], true);
-    a.ld(
-        RBP,
-        mem(RBX, std::mem::offset_of!(Cpu, tlb_active_base) as i32),
-    );
+    a.mov_rr(CPU, ARGS[0], true);
+    a.ld(TLB_BASE, mem(CPU, offset_of!(Cpu, tlb_active_base) as i32));
     a.jmp_reg(ARGS[1]);
     // rax = helper status, rcx = index of the failing instruction. Fold into the exit code
     // `(retired << EXIT_COUNT_SHIFT) | status`: an exception means rcx instructions retired, but
@@ -51,15 +54,98 @@ pub(crate) fn prologue(base: u64, _jump_cache_base: u64) -> Prologue {
         a.pop(*r);
     }
     a.ret();
+    let chain = chain_stub(&mut a, jump_cache_base, exit_ok);
     a.finish();
     Prologue {
         code: a.code,
         exit_ok,
         exit_fail,
+        chain,
     }
 }
 
-pub(crate) fn addrs(prologue: &Prologue, _chaining: bool) -> Addrs {
+/// Registers of the chain stub's calling convention (see `Gen::chain_exit`). The scratch
+/// registers are caller-saved on both ABIs and hold nothing a block needs across the jump;
+/// rbx and rbp (`CPU`, `TLB_BASE`) are read, never written.
+const CHAIN_ICOUNT: u8 = RAX;
+const CHAIN_RIP: u8 = RCX;
+
+/// Block-to-block transfer, the equivalent of QEMU's `lookup_and_goto_ptr`. Entered by a `jmp`
+/// with `rax` = `Cpu::icount` as just stored by the block (already charged for the first
+/// instruction of the successor, as `Cpu::run` does before `step_block`) and `rcx` = the guest
+/// rip to continue at. The stack is as the prologue left it, so a successor block starts exactly
+/// like one entered from `enter`.
+///
+/// It jumps straight into the successor block when all of these hold, and otherwise leaves for
+/// the run loop with `Cpu::rip` set, which then takes the normal path (event servicing,
+/// interrupts, page walk, translation):
+/// - `icount` has not reached `Cpu::next_event`, so the device tick and interrupt check the loop
+///   does at block boundaries are not starved;
+/// - `block_exit_requested` is clear: a store of the block just left (for example the push of a
+///   `call`) hit a page holding translated code, and the successor may be stale;
+/// - the exec TLB (the half `TLB_BASE` selects, which a block never leaves) has the page, so the
+///   physical address is known without a walk and permissions were already checked;
+/// - the jump cache has a block for exactly this rip and physical address, the same key as
+///   `Jit::lookup`. Invalidation clears slots, so a hit is never stale.
+///
+/// The miss path gives back the successor's pre-charge: the loop adds it again. It reports one
+/// retired instruction in the exit code, which `step_block` counts as nothing further (it
+/// subtracts the first instruction, which `Cpu::run` already counted).
+fn chain_stub(a: &mut Asm, jump_cache_base: u64, exit_ok: u64) -> u64 {
+    const TLB_SLOT_MASK: i32 = (TLB_ENTRIES_PER_MODE - 1) as i32;
+    const PAGE_SHIFT: u8 = 12;
+    /// Sign-extends to `!0xfff` in a 64-bit `and`.
+    const PAGE_BASE_MASK: i32 = !((1 << PAGE_SHIFT) - 1);
+    const TLB_ENTRY_SHIFT: u8 = size_of::<TlbEntry>().trailing_zeros() as u8;
+    // `jump_cache_hash` in `native.rs`: rip ^ (rip >> bits), masked.
+    const JUMP_HASH_FOLD_SHIFT: u8 = 16;
+    let (entry, page, phys, slot, key) = (RDX, RSI, RDX, RSI, RDI);
+    let miss = a.label();
+    let start = a.here();
+    a.ld(entry, mem(CPU, offset_of!(Cpu, next_event) as i32));
+    a.alu_rr(CMP, CHAIN_ICOUNT, entry, true);
+    a.jcc(AE, miss);
+    a.cmp_m8_imm(mem(CPU, offset_of!(Cpu, block_exit_requested) as i32), 0);
+    a.jcc(NE, miss);
+    a.mov_rr(entry, CHAIN_RIP, true);
+    a.shift_ri(SHR, entry, PAGE_SHIFT, true);
+    a.alu_ri(AND, entry, TLB_SLOT_MASK, true);
+    a.shift_ri(SHL, entry, TLB_ENTRY_SHIFT, true);
+    a.alu_rr(ADD, entry, TLB_BASE, true);
+    a.mov_rr(page, CHAIN_RIP, true);
+    a.alu_ri(AND, page, PAGE_BASE_MASK, true);
+    a.cmp_mr(mem(entry, offset_of!(TlbEntry, tag_x) as i32), page);
+    a.jcc(NE, miss);
+    // phys = rip + addend - ram_base
+    a.ld(phys, mem(entry, offset_of!(TlbEntry, addend) as i32));
+    a.alu_rr(ADD, phys, CHAIN_RIP, true);
+    a.ld(key, mem(CPU, offset_of!(Cpu, ram_base) as i32));
+    a.alu_rr(SUB, phys, key, true);
+    a.mov_rr(slot, CHAIN_RIP, true);
+    a.shift_ri(SHR, slot, JUMP_HASH_FOLD_SHIFT, true);
+    a.alu_rr(XOR, slot, CHAIN_RIP, true);
+    a.alu_ri(AND, slot, jump_cache_mask() as i32, false);
+    a.shift_ri(SHL, slot, JUMP_ENTRY_SHIFT as u8, true);
+    a.mov_imm(key, jump_cache_base);
+    a.alu_rr(ADD, slot, key, true);
+    a.cmp_mr(mem(slot, 0), CHAIN_RIP);
+    a.jcc(NE, miss);
+    a.cmp_mr(mem(slot, JUMP_ENTRY_PHYS_OFFSET as i32), phys);
+    a.jcc(NE, miss);
+    a.ld(key, mem(slot, JUMP_ENTRY_CODE_OFFSET as i32));
+    a.test_rr(key, key, true);
+    a.jcc(E, miss);
+    a.jmp_reg(key);
+    a.bind(miss);
+    a.alu_ri(SUB, CHAIN_ICOUNT, 1, true);
+    a.st(mem(CPU, offset_of!(Cpu, icount) as i32), CHAIN_ICOUNT, 8);
+    a.st(mem(CPU, offset_of!(Cpu, rip) as i32), CHAIN_RIP, 8);
+    a.mov_imm(RAX, 1 << EXIT_COUNT_SHIFT);
+    a.jmp_abs(exit_ok);
+    start
+}
+
+pub(crate) fn addrs(prologue: &Prologue, chaining: bool) -> Addrs {
     Addrs {
         exec: helpers::helper_exec as *const () as usize as u64,
         ld: helpers::helper_load_via_out as *const () as usize as u64,
@@ -69,6 +155,7 @@ pub(crate) fn addrs(prologue: &Prologue, _chaining: bool) -> Addrs {
         cond: helpers::helper_cond as *const () as usize as u64,
         exit_ok: prologue.exit_ok,
         exit_fail: prologue.exit_fail,
+        chain: if chaining { prologue.chain } else { 0 },
     }
 }
 

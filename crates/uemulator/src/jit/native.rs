@@ -48,13 +48,10 @@ pub(crate) struct JumpEntry {
     block: u64,
 }
 
-// Read by the aarch64 chain stub (`arch_a64.rs`); the x86_64 backend does not chain yet.
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+// Read by the chain stubs in `arch_a64.rs` and `arch_x64.rs`.
 pub(crate) const JUMP_ENTRY_SHIFT: u32 = std::mem::size_of::<JumpEntry>().trailing_zeros();
 const _: () = assert!(std::mem::size_of::<JumpEntry>().is_power_of_two());
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub(crate) const JUMP_ENTRY_PHYS_OFFSET: u32 = std::mem::offset_of!(JumpEntry, phys_addr) as u32;
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub(crate) const JUMP_ENTRY_CODE_OFFSET: u32 = std::mem::offset_of!(JumpEntry, code_addr) as u32;
 
 /// One translated block. Blocks are only ever added; an invalidated block keeps its slot (and its
@@ -117,7 +114,6 @@ pub(crate) struct JitStats {
     pub resets: u64,
 }
 
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub(crate) const fn jump_cache_mask() -> u64 {
     (1 << JUMP_CACHE_BITS) - 1
 }

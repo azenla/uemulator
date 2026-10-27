@@ -251,8 +251,9 @@ pub(crate) fn reads_guest_clock(op: u16) -> bool {
 
 /// The instructions an emitter may lower with its own exit sequence (`try_inline` returns true
 /// and the block stops): jcc rel8/rel32, jmp rel8/rel32, call rel32, ret, and near indirect
-/// call/jmp (`ff /2`, `ff /4`; the aarch64 backend lowers those, the x86_64 one leaves them to
-/// the interpreter helper, which also ends the block). All of them are also `ends_block`. Keep in step with the terminal arms of `try_inline`.
+/// call/jmp (`ff /2`, `ff /4`; a form the emitter does not lower goes to the interpreter helper,
+/// which also ends the block). All of them are also `ends_block`. Keep in step with the terminal
+/// arms of `try_inline`.
 pub(crate) fn is_inline_terminator(insn: &Insn) -> bool {
     matches!(
         insn.op,

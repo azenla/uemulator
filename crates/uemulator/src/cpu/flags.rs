@@ -44,8 +44,10 @@ pub(crate) enum LazyFlagsOp {
     /// (worked out by the generated code). That is exactly what a shift by a non-zero count
     /// (`Cpu::shift_rotate`) and `imul` (`Cpu::imul_truncated`) leave, which the interpreter
     /// materializes eagerly: only the JIT produces this op.
-    // Only the aarch64 backend produces it so far.
-    #[cfg_attr(not(all(feature = "jit", target_arch = "aarch64")), allow(dead_code))]
+    #[cfg_attr(
+        not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))),
+        allow(dead_code)
+    )]
     SzpCfOf,
 }
 

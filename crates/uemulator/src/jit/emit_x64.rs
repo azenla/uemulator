@@ -1,31 +1,46 @@
-//! x86-64 block generator. Mirrors `emit.rs`; the guest flags map straight onto host flags, so a
-//! conditional jump right after an inlined ALU op tests them directly. Anything that clobbers host
-//! flags (TLB probes, helper calls) ends that window.
+//! x86-64 block generator. Mirrors `emit.rs` (read its module docs for the exit protocol and the
+//! lazy flags); the guest flags map straight onto host flags, so a conditional jump, setcc or
+//! cmovcc right after an inlined add/sub/logic/inc/dec/neg tests them directly (`Gen::live`).
+//! Anything that clobbers host flags (TLB probes, helper calls, the store of a read-modify-write
+//! instruction) ends that window; then the condition comes from the lazy flags via `helper_cond`.
 //!
 //! Instructions without an inline lowering call `helper_exec` (the interpreter). Every way out of a
-//! block jumps to a shared stub in `arch_x64::prologue` with the exit code described in
-//! `helpers.rs`: `exit_ok` with rax = `retired << EXIT_COUNT_SHIFT`, or `exit_fail` with rax = the
-//! helper status and rcx = index of the instruction that stopped the block.
+//! block jumps to a shared stub in `arch_x64::prologue`: `exit_ok` with rax = `retired <<
+//! EXIT_COUNT_SHIFT`, `exit_fail` with rax = the helper status and rcx = index of the instruction
+//! that stopped the block, or, for a control transfer to a known guest address, `chain` (see
+//! `Gen::chain_exit`), which continues straight into the successor block when it exists.
+//!
+//! Register roles. `CPU` and `TLB_BASE` live for the whole block. `ACC` and `OPERAND` hold the two
+//! operands of an ALU-style instruction (rcx doubles as the shift count), `ADDR` the guest address
+//! of the memory operand, `VALUE` what a mov-style instruction moves. Any helper call clobbers all
+//! of those and the scratch registers, so the slow paths park what must survive in the
+//! callee-saved `SAVED_*` registers (the prologue saves r12-r15 on both ABIs).
+//!
+//! Guest registers are only ever read and written through `Cpu::gpr` in memory. Byte and word
+//! writes (al, ax, ah, ...) are plain narrow stores into the little-endian register slot, which
+//! merges them without touching host flags; that is what lets flags stay live across them.
 
 use std::mem::{offset_of, size_of};
 
 use super::helpers::*;
 use super::x64::*;
 use crate::cpu::decode::{Insn, NO_REG};
-use crate::cpu::flags::LazyFlagsOp;
+use crate::cpu::flags::{LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT, SZP_CF_OF_SRC_OF_BIT};
 use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TlbEntry};
 
 // Offsets into `Cpu` baked into generated code. They come from `offset_of!`, so they always match
 // the compiled layout; what has to stay true is the shape of the `#[repr(C)]` `Cpu` and `TlbEntry`:
 // `gpr` is indexed by guest register number, `rip`/`icount`/`prepaid_icount`/`lazy_dst`/`lazy_src`
 // are u64, `block_exit_requested` is a bool (tested as a byte), and `lazy_size` immediately follows
-// the one-byte `lazy_op` (written together by `store_lazy_op`).
+// the one-byte `lazy_op` (written together by `store_lazy`).
 const GPR: i32 = offset_of!(Cpu, gpr) as i32;
+const GPR_SIZE: i32 = size_of::<u64>() as i32;
 const RIP: i32 = offset_of!(Cpu, rip) as i32;
 const ICOUNT: i32 = offset_of!(Cpu, icount) as i32;
 const BLOCK_EXIT_REQUESTED: i32 = offset_of!(Cpu, block_exit_requested) as i32;
 const PREPAID_ICOUNT: i32 = offset_of!(Cpu, prepaid_icount) as i32;
 const LAZY_OP: i32 = offset_of!(Cpu, lazy_op) as i32;
+const LAZY_SIZE_SHIFT: u32 = 8;
 const LAZY_DST: i32 = offset_of!(Cpu, lazy_dst) as i32;
 const LAZY_SRC: i32 = offset_of!(Cpu, lazy_src) as i32;
 // `Seg` is not `repr(C)`; `offset_of!` and `size_of` still report the real layout.
@@ -49,17 +64,15 @@ const PAGE_SHIFT: u8 = 12;
 /// Sign-extends to `!0xfff` in a 64-bit `and`.
 const PAGE_MASK: i32 = !((1 << PAGE_SHIFT) - 1);
 
-// Host register roles. `CPU` and `TLB_BASE` live for the whole block. `ACC`..`SCRATCH_D` and
-// `VALUE` are working registers that any helper call clobbers; the slow paths therefore stash
-// `ADDR` and `VALUE` in `SAVED_ADDR`/`SAVED_VALUE`. RBX, RBP, R12 and R13 are callee-saved on
-// both ABIs, and the prologue saves them (and the Win64 callee-saved RSI/RDI/R14/R15 too).
-const CPU: u8 = RBX;
+// Host register roles. RBX, RBP and R12..R15 are callee-saved on both ABIs and the prologue saves
+// them (and the Win64 callee-saved RSI/RDI too); everything else is clobbered by any helper call.
+pub(super) const CPU: u8 = RBX;
 /// `Cpu::tlb_active_base`, loaded once at block entry. CPL only changes inside block-terminating
 /// instructions, so it cannot go stale within a block.
-const TLB_BASE: u8 = RBP;
+pub(super) const TLB_BASE: u8 = RBP;
 /// First ALU operand and result; also the destination of a loaded first operand.
 const ACC: u8 = RAX;
-/// Second ALU operand.
+/// Second ALU operand, the shift count, and the register that carries `lazy_src` to `store_lazy`.
 const OPERAND: u8 = RCX;
 /// Guest linear address of the memory operand being accessed.
 const ADDR: u8 = RDX;
@@ -67,9 +80,9 @@ const ADDR: u8 = RDX;
 const SCRATCH_A: u8 = RSI;
 /// Scratch: the TLB addend while completing an access.
 const SCRATCH_B: u8 = RDI;
-/// Scratch: the page tag compared against the TLB entry.
+/// Scratch: the page tag compared against the TLB entry, and the carry bit of shifts and imul.
 const SCRATCH_C: u8 = R8;
-/// Scratch for 64-bit constants stored to `Cpu` (rip, icount).
+/// Scratch for 64-bit constants stored to `Cpu` (rip, icount), and the overflow bit of shifts.
 const SCRATCH_D: u8 = R10;
 /// Value being stored to memory or just loaded; moves between a guest register and memory.
 const VALUE: u8 = R9;
@@ -77,14 +90,34 @@ const VALUE: u8 = R9;
 const CALL_TARGET: u8 = R11;
 const SAVED_ADDR: u8 = R12;
 const SAVED_VALUE: u8 = R13;
+/// The result and second operand of a read-modify-write instruction whose store takes the slow
+/// path: its flags are recorded only after the store succeeded, so both must outlive the helper
+/// call. Also the home of a value that a memory access in the middle of an instruction would
+/// otherwise lose (an inc/dec carry-in, the outcome of a condition code for a cmov with a memory
+/// source); those are dead before any such store runs, hence the sharing.
+const SAVED_RESULT: u8 = R14;
+const SAVED_OPERAND: u8 = R15;
+const SAVED_CONDITION: u8 = R14;
 
 const GUEST_RAX: u8 = 0;
+const GUEST_RCX: u8 = 1;
+const GUEST_RDX: u8 = 2;
 const GUEST_RSP: u8 = 4;
 /// `Insn::rex` bit B, which extends the register number encoded in the opcode.
 const GUEST_REX_B: u8 = 1;
+const REX_B_REG_SHIFT: u8 = 3;
+const OPCODE_REG_MASK: u8 = 7;
+const MODRM_MOD_REGISTER: u8 = 3;
 /// Without a REX prefix, byte-register numbers 4..8 mean ah/ch/dh/bh (bits 8..16 of guest
 /// registers 0..4), not the low byte of rsp/rbp/rsi/rdi.
 const HIGH_BYTE_REGS: std::ops::Range<u8> = 4..8;
+const HIGH_BYTE_REG_BASE: u8 = 4;
+/// Byte offset of bits 15:8 inside a guest register slot (little-endian host).
+const HIGH_BYTE_OFFSET: i32 = 1;
+const PUSH_POP_SIZE: i32 = 8;
+
+/// Condition code 2 (B): CF.
+const CONDITION_BELOW: u64 = 2;
 
 /// Stack frame the prologue reserves below its saved registers. The eight pushes leave rsp at
 /// 8 mod 16, so the frame must be 8 mod 16 for calls from blocks to see rsp 16-byte aligned (both
@@ -106,6 +139,24 @@ const ALU_CMP: u8 = 7;
 /// `test`: and without writeback. Not a real group-1 number; must stay outside 0..=7.
 const ALU_TEST: u8 = 8;
 
+/// ModRM.reg of the shift group (c0/c1/d0..d3): rol, ror, rcl, rcr, shl, shr, sal (an alias of
+/// shl), sar.
+const SHIFT_SHL: u8 = 4;
+const SHIFT_SHR: u8 = 5;
+const SHIFT_SAL_ALIAS: u8 = 6;
+const SHIFT_SAR: u8 = 7;
+
+/// `SzpCfOf` packs CF in bit 0 and OF in bit 1 of `lazy_src`; the shift code builds that word
+/// with a scaled `lea`, which needs OF's position to be the scale.
+const _: () = assert!(SZP_CF_OF_SRC_CF_BIT == 0 && SZP_CF_OF_SRC_OF_BIT == 1);
+/// Extra bit above CF/OF in the word a shift by CL leaves in `OPERAND`: set when the masked count
+/// was not zero, i.e. when the flags change. It has to survive the destination store (a slow
+/// path keeps `OPERAND`), where the count itself would not, and is masked off before recording.
+const SHIFT_APPLIED: i32 = 1 << 2;
+const CF_OF_MASK: i32 = (1 << 2) - 1;
+/// Value of CF = OF in the `SzpCfOf` word when `imul`'s product does not fit.
+const IMUL_OVERFLOW_FLAGS: u8 = 3;
+
 /// A TLB-miss path, emitted out of line after the block body.
 enum SlowKind {
     Ld {
@@ -117,6 +168,9 @@ enum SlowKind {
     St {
         size: u8,
         stack: bool,
+        /// The caller still needs `ACC` and `OPERAND` after the store (result and operand of a
+        /// read-modify-write); the slow path parks them in `SAVED_RESULT`/`SAVED_OPERAND`.
+        preserve: bool,
     },
 }
 
@@ -133,17 +187,26 @@ struct Slow {
     rip: u64,
 }
 
+/// A register operand is its number plus whether it is the high byte of a legacy register
+/// (ah/ch/dh/bh, bits 15:8 of registers 0..=3).
 #[derive(Clone, Copy)]
 enum Dst {
-    Reg(u8),
+    Reg(u8, bool),
     Mem,
 }
 
 #[derive(Clone, Copy)]
 enum Src {
-    Reg(u8),
+    Reg(u8, bool),
     Mem,
     Imm(u64),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ShiftKind {
+    Shl,
+    Shr,
+    Sar,
 }
 
 /// Absolute addresses of the helpers and of the shared exit stubs, loaded into registers at the
@@ -158,6 +221,9 @@ pub(crate) struct Addrs {
     pub cond: u64,
     pub exit_ok: u64,
     pub exit_fail: u64,
+    /// The block-to-block transfer stub (see `arch_x64::chain_stub`), or 0 when chaining is off
+    /// and every block returns to the run loop.
+    pub chain: u64,
 }
 
 pub(crate) struct Gen<'a> {
@@ -169,13 +235,32 @@ pub(crate) struct Gen<'a> {
     slows: Vec<Slow>,
     /// Out-of-line `(label, insn_index, next rip)` exits taken when a store requested a block exit.
     smc: Vec<(Label, u32, u64)>,
-    /// Host flags currently equal the guest flags (set by the last inlined ALU op).
+    /// Host flags currently equal the guest flags (set by the last inlined flag-setting
+    /// instruction). Every instruction that emits code which may clobber them must clear this;
+    /// the memory access paths do it in `tlb_probe`.
     live: bool,
     /// Block index of the last instruction whose clock read was paid for in advance; see
     /// `Gen::helper` and the field of the same name in `emit.rs`.
     prepaid_insns: u32,
     /// Number of guest instructions lowered inline (not through `helper_exec`), for statistics.
     pub inlined: u32,
+}
+
+/// The register embedded in the low three opcode bits (push/pop/mov r, imm), extended by REX.B.
+fn opcode_register(insn: &Insn) -> u8 {
+    (insn.op as u8 & OPCODE_REG_MASK) | ((insn.rex & GUEST_REX_B) << REX_B_REG_SHIFT)
+}
+
+fn has_fs_gs_override(insn: &Insn) -> bool {
+    matches!(insn.seg as usize, SEG_FS | SEG_GS)
+}
+
+/// Memory slot of a guest register, or of its bits 15:8 for ah/ch/dh/bh.
+fn register_slot(reg: u8, high: bool) -> Mem {
+    mem(
+        CPU,
+        GPR + GPR_SIZE * reg as i32 + if high { HIGH_BYTE_OFFSET } else { 0 },
+    )
 }
 
 impl<'a> Gen<'a> {
@@ -193,11 +278,11 @@ impl<'a> Gen<'a> {
     }
 
     fn ld_gpr(&mut self, rd: u8, r: u8) {
-        self.a.ld(rd, mem(CPU, GPR + 8 * r as i32));
+        self.a.ld(rd, mem(CPU, GPR + GPR_SIZE * r as i32));
     }
 
     fn st_gpr(&mut self, r: u8, rs: u8) {
-        self.a.st(mem(CPU, GPR + 8 * r as i32), rs, 8);
+        self.a.st(mem(CPU, GPR + GPR_SIZE * r as i32), rs, 8);
     }
 
     fn call(&mut self, addr: u64) {
@@ -214,6 +299,36 @@ impl<'a> Gen<'a> {
     fn exit_ok(&mut self, retired: u32) {
         self.a.mov_imm(ACC, (retired as u64) << EXIT_COUNT_SHIFT);
         self.a.jmp_abs(self.addrs.exit_ok);
+    }
+
+    /// Ends the block by continuing at the guest address in `OPERAND` (rcx), with `retired`
+    /// instructions done. With chaining that is a jump through the chain stub, which wants rax =
+    /// `icount` as just stored and already including the successor's first instruction (see
+    /// `arch_x64::chain_stub`): the block pays for its own instructions except those paid ahead
+    /// of an rdtsc, plus that one. Without chaining it stores rip and returns to the run loop.
+    /// Clobbers the host flags, so conditional exits call it only after the branch.
+    fn chain_exit(&mut self, retired: u32) {
+        if self.addrs.chain == 0 {
+            self.a.st(mem(CPU, RIP), OPERAND, 8);
+            self.exit_ok(retired);
+            return;
+        }
+        let owed = retired - self.prepaid_insns;
+        self.a.ld(ACC, mem(CPU, ICOUNT));
+        self.a.alu_ri(ADD, ACC, owed as i32, true);
+        self.a.st(mem(CPU, ICOUNT), ACC, 8);
+        if self.prepaid_insns > 0 {
+            // The next block's own accounting must not subtract this block's prepayment.
+            self.a.mov_imm(SCRATCH_D, 0);
+            self.a.st(mem(CPU, PREPAID_ICOUNT), SCRATCH_D, 8);
+        }
+        self.a.jmp_abs(self.addrs.chain);
+    }
+
+    /// `chain_exit` to a fixed guest address.
+    fn chain_to(&mut self, rip: u64, retired: u32) {
+        self.a.mov_imm(OPERAND, rip);
+        self.chain_exit(retired);
     }
 
     /// Leave the block because the status in rax is non-zero; the epilogue wants the failing
@@ -356,15 +471,21 @@ impl<'a> Gen<'a> {
     /// Store the low `size` bytes of `VALUE` at `ADDR`. The write tag is invalidated for pages
     /// holding translated code, so stores to code always miss and reach `Cpu::code_written`.
     fn mem_store(&mut self, size: u8, insn_index: u32, rip: u64) {
-        self.store_access(size, insn_index, rip, false);
+        self.store_access(size, insn_index, rip, false, false);
     }
 
     /// `mem_store` for an implicit stack access; see `stack_load`.
     fn stack_store(&mut self, insn_index: u32, rip: u64) {
-        self.store_access(8, insn_index, rip, true);
+        self.store_access(8, insn_index, rip, true, false);
     }
 
-    fn store_access(&mut self, size: u8, insn_index: u32, rip: u64, stack: bool) {
+    /// `mem_store` for a read-modify-write instruction: `ACC` (result) and `OPERAND` are still
+    /// wanted afterwards to record the flags, so a slow-path store keeps them.
+    fn mem_store_keeping_operands(&mut self, size: u8, insn_index: u32, rip: u64) {
+        self.store_access(size, insn_index, rip, false, true);
+    }
+
+    fn store_access(&mut self, size: u8, insn_index: u32, rip: u64, stack: bool, preserve: bool) {
         let slow = self.a.label();
         let resume = self.a.label();
         self.tlb_probe(size, TLB_TAG_WRITE, slow);
@@ -374,7 +495,11 @@ impl<'a> Gen<'a> {
         self.slows.push(Slow {
             slow,
             resume,
-            kind: SlowKind::St { size, stack },
+            kind: SlowKind::St {
+                size,
+                stack,
+                preserve,
+            },
             insn_index,
             rip,
         });
@@ -387,6 +512,7 @@ impl<'a> Gen<'a> {
         self.a.cmp_m8_imm(mem(CPU, BLOCK_EXIT_REQUESTED), 0);
         self.a.jcc(NE, exit);
         self.smc.push((exit, insn_index, next));
+        self.live = false;
     }
 
     /// Emit everything deferred out of line, then resolve labels. Must be the last thing emitted
@@ -395,7 +521,8 @@ impl<'a> Gen<'a> {
     /// Slow paths call `helper_load_via_out`/`helper_store_x64` with the guest address saved in `SAVED_ADDR` (and a
     /// store's value in `SAVED_VALUE`), because the call clobbers every other working register.
     /// They restore `ADDR` before jumping back, so the inline code may only rely on `ADDR` (and
-    /// on `dst`, for loads) surviving a memory access.
+    /// on `dst`, for loads, and `ACC`/`OPERAND` for a preserving store) surviving a memory
+    /// access.
     fn emit_slows(&mut self) {
         let smc = std::mem::take(&mut self.smc);
         for (label, insn_index, next) in smc {
@@ -406,6 +533,12 @@ impl<'a> Gen<'a> {
         let slows = std::mem::take(&mut self.slows);
         for slow in slows {
             self.a.bind(slow.slow);
+            // `OPERAND` is an argument register on both ABIs, so a preserving store parks it
+            // before any argument is set up.
+            if let SlowKind::St { preserve: true, .. } = slow.kind {
+                self.a.mov_rr(SAVED_RESULT, ACC, true);
+                self.a.mov_rr(SAVED_OPERAND, OPERAND, true);
+            }
             self.a.mov_rr(SAVED_ADDR, ADDR, true);
             self.set_rip(slow.rip);
             self.a.mov_rr(ARGS[0], CPU, true);
@@ -429,7 +562,11 @@ impl<'a> Gen<'a> {
                     self.a.jcc(NE, fail);
                     self.a.ld_ext(dst, mem(RSP, OUT), size, signed);
                 }
-                SlowKind::St { size, stack } => {
+                SlowKind::St {
+                    size,
+                    stack,
+                    preserve,
+                } => {
                     self.a.mov_rr(SAVED_VALUE, VALUE, true);
                     self.a.mov_imm(ARGS[2], size as u64);
                     self.a.mov_rr(ARGS[3], SAVED_VALUE, true);
@@ -440,6 +577,10 @@ impl<'a> Gen<'a> {
                     });
                     self.a.test_rr(ACC, ACC, true);
                     self.a.jcc(NE, fail);
+                    if preserve {
+                        self.a.mov_rr(ACC, SAVED_RESULT, true);
+                        self.a.mov_rr(OPERAND, SAVED_OPERAND, true);
+                    }
                 }
             }
             self.a.mov_rr(ADDR, SAVED_ADDR, true);
@@ -450,18 +591,29 @@ impl<'a> Gen<'a> {
         self.a.finish();
     }
 
-    /// Record the just-emitted ALU op in the lazy flags: result in `ACC`, second operand in
-    /// `OPERAND`. `lazy_op` and `lazy_size` are adjacent bytes, written with one 16-bit store.
-    /// For logic ops the interpreter stores 0 in `lazy_src` while this stores the operand; that is
-    /// equivalent because `flags::compute` derives a Logic result from the result alone, and
-    /// `inc`/`dec` take their carry-in from the materialised flags (`diff_flags` checks every
-    /// consumer).
-    fn store_lazy_op(&mut self, op: LazyFlagsOp, osz: u8) {
-        self.a
-            .st_imm16(mem(CPU, LAZY_OP), (op as u32 | (osz as u32) << 8) as u16);
+    /// Record the flags of the instruction just emitted: result in `ACC`, second operand in
+    /// `OPERAND` (the carry-in for `inc`/`dec`, CF and OF packed for shifts and `imul`).
+    /// `lazy_op` and `lazy_size` are adjacent bytes, written with one 16-bit store. For logic ops
+    /// the interpreter stores 0 in `lazy_src` while this stores the operand; that is equivalent
+    /// because `flags::compute` derives a Logic result from the result alone, and `inc`/`dec`
+    /// take their carry-in from `lazy_src`, which they set themselves (`diff_flags` checks every
+    /// consumer). Does not touch host flags, and does not claim they are live: see
+    /// `store_lazy_op`.
+    fn store_lazy(&mut self, op: LazyFlagsOp, size: u8) {
+        self.a.st_imm16(
+            mem(CPU, LAZY_OP),
+            (op as u32 | (size as u32) << LAZY_SIZE_SHIFT) as u16,
+        );
         self.a.st(mem(CPU, LAZY_DST), ACC, 8);
         self.a.st(mem(CPU, LAZY_SRC), OPERAND, 8);
-        self.live = true;
+    }
+
+    /// `store_lazy` for an instruction whose result the host flags also mirror. `stored` says the
+    /// instruction wrote memory after computing its flags: the probe of that store clobbered
+    /// them, so they are no longer live.
+    fn store_lazy_op(&mut self, op: LazyFlagsOp, size: u8, stored: bool) {
+        self.store_lazy(op, size);
+        self.live = !stored;
     }
 
     /// Memory operands the inline path handles: 64-bit addressing, no lock prefix. Every segment
@@ -470,10 +622,131 @@ impl<'a> Gen<'a> {
         !insn.addr32 && !insn.lock
     }
 
-    /// `alu_op` is a group-1 number or `ALU_TEST`. Loads both operands (the memory operand first,
-    /// so a slow-path call cannot clobber the register one), runs the op on `ACC`/`OPERAND`, and
-    /// writes the result back to a register destination except for cmp and test. A memory
-    /// destination is therefore only used by cmp/test, which never store.
+    /// An immediate as the operand of an operation of `size` bytes: truncated to the width,
+    /// which only differs from the sign-extended decode for 8-byte operations.
+    fn imm_for(size: u8, imm: i64) -> u64 {
+        match size {
+            1 => imm as u8 as u64,
+            2 => imm as u16 as u64,
+            4 => imm as u32 as u64,
+            _ => imm as u64,
+        }
+    }
+
+    /// The register an instruction names with `reg` at operand `size`: without a REX prefix
+    /// byte-register numbers 4..=7 are ah, ch, dh and bh.
+    fn named_register(insn: &Insn, reg: u8, size: u8) -> (u8, bool) {
+        if size == 1 && !insn.rex_present && HIGH_BYTE_REGS.contains(&reg) {
+            (reg - HIGH_BYTE_REG_BASE, true)
+        } else {
+            (reg, false)
+        }
+    }
+
+    /// The ModRM.rm operand as a destination or source.
+    fn rm_dst(insn: &Insn, size: u8) -> Dst {
+        if insn.md == MODRM_MOD_REGISTER {
+            let (reg, high) = Self::named_register(insn, insn.rm, size);
+            Dst::Reg(reg, high)
+        } else {
+            Dst::Mem
+        }
+    }
+
+    fn rm_src(insn: &Insn, size: u8) -> Src {
+        match Self::rm_dst(insn, size) {
+            Dst::Reg(reg, high) => Src::Reg(reg, high),
+            Dst::Mem => Src::Mem,
+        }
+    }
+
+    /// The ModRM.reg operand.
+    fn reg_dst(insn: &Insn, size: u8) -> Dst {
+        let (reg, high) = Self::named_register(insn, insn.reg, size);
+        Dst::Reg(reg, high)
+    }
+
+    fn reg_src(insn: &Insn, size: u8) -> Src {
+        let (reg, high) = Self::named_register(insn, insn.reg, size);
+        Src::Reg(reg, high)
+    }
+
+    /// Loads the low `size` bytes of guest register `reg` (or its bits 15:8) into `rd`,
+    /// zero-extended. No host flag is touched.
+    fn read_reg(&mut self, rd: u8, reg: u8, high: bool, size: u8) {
+        self.a.ld_ext(rd, register_slot(reg, high), size, false);
+    }
+
+    /// Writes the low `size` bytes of `rs` to guest register `reg`: byte and word operands are
+    /// merged into the register by a narrow store, wider ones replace all of it, so a 4-byte
+    /// `rs` must already be zero-extended (a 32-bit write clears the upper half). No host flag
+    /// is touched.
+    fn write_reg(&mut self, reg: u8, high: bool, size: u8, rs: u8) {
+        self.a.st(
+            register_slot(reg, high),
+            rs,
+            if size >= 4 { 8 } else { size },
+        );
+    }
+
+    /// Loads the `size`-byte operand `dst` names into `rd`, zero-extended.
+    #[allow(clippy::too_many_arguments)]
+    fn load_dst(
+        &mut self,
+        insn: &Insn,
+        dst: Dst,
+        rd: u8,
+        size: u8,
+        next: u64,
+        insn_index: u32,
+        rip: u64,
+    ) {
+        match dst {
+            Dst::Reg(reg, high) => self.read_reg(rd, reg, high, size),
+            Dst::Mem => {
+                self.ea(insn, next);
+                self.mem_load(rd, size, false, insn_index, rip);
+            }
+        }
+    }
+
+    /// Writes `ACC` to the operand `dst` names. A memory write returns true: the caller must
+    /// follow with `smc_check`. `keep_operands` is for a read-modify-write whose flags are
+    /// recorded from `ACC` and `OPERAND` afterwards. The address is the one `load_dst` computed;
+    /// the store may fault, which is why flags are recorded only after it.
+    fn store_dst(
+        &mut self,
+        dst: Dst,
+        size: u8,
+        keep_operands: bool,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        match dst {
+            Dst::Reg(reg, high) => {
+                self.write_reg(reg, high, size, ACC);
+                false
+            }
+            Dst::Mem => {
+                self.a.mov_rr(VALUE, ACC, true);
+                if keep_operands {
+                    self.mem_store_keeping_operands(size, insn_index, rip);
+                } else {
+                    self.mem_store(size, insn_index, rip);
+                }
+                true
+            }
+        }
+    }
+
+    /// Emits `dst = dst <alu_op> src` at `size` (1, 2, 4 or 8) and records its flags. `alu_op`
+    /// is a group-1 number or `ALU_TEST`; `ALU_CMP` and `ALU_TEST` discard the result. Returns
+    /// true if it stored to memory (the caller follows with `smc_check`).
+    ///
+    /// Operand order matters: the memory operand is loaded first because its slow path calls a
+    /// helper that clobbers the working registers, and only then is the register or immediate
+    /// operand loaded. The host op runs at the operand's own width, so the host flags describe
+    /// exactly the narrow operation.
     #[allow(clippy::too_many_arguments)]
     fn alu(
         &mut self,
@@ -481,34 +754,31 @@ impl<'a> Gen<'a> {
         alu_op: u8,
         dst: Dst,
         src: Src,
-        osz: u8,
+        size: u8,
         next: u64,
         insn_index: u32,
         rip: u64,
-    ) {
-        let w = osz == 8;
+    ) -> bool {
         match (dst, src) {
-            (Dst::Mem, Src::Reg(s)) => {
-                self.ea(insn, next);
-                self.mem_load(ACC, osz, false, insn_index, rip);
-                self.ld_gpr(OPERAND, s);
+            (Dst::Mem, Src::Reg(reg, high)) => {
+                self.load_dst(insn, dst, ACC, size, next, insn_index, rip);
+                self.read_reg(OPERAND, reg, high, size);
             }
             (Dst::Mem, Src::Imm(v)) => {
-                self.ea(insn, next);
-                self.mem_load(ACC, osz, false, insn_index, rip);
+                self.load_dst(insn, dst, ACC, size, next, insn_index, rip);
                 self.a.mov_imm(OPERAND, v);
             }
-            (Dst::Reg(d), Src::Mem) => {
+            (Dst::Reg(reg, high), Src::Mem) => {
                 self.ea(insn, next);
-                self.mem_load(OPERAND, osz, false, insn_index, rip);
-                self.ld_gpr(ACC, d);
+                self.mem_load(OPERAND, size, false, insn_index, rip);
+                self.read_reg(ACC, reg, high, size);
             }
-            (Dst::Reg(d), Src::Reg(s)) => {
-                self.ld_gpr(ACC, d);
-                self.ld_gpr(OPERAND, s);
+            (Dst::Reg(dst_reg, dst_high), Src::Reg(src_reg, src_high)) => {
+                self.read_reg(ACC, dst_reg, dst_high, size);
+                self.read_reg(OPERAND, src_reg, src_high, size);
             }
-            (Dst::Reg(d), Src::Imm(v)) => {
-                self.ld_gpr(ACC, d);
+            (Dst::Reg(reg, high), Src::Imm(v)) => {
+                self.read_reg(ACC, reg, high, size);
                 self.a.mov_imm(OPERAND, v);
             }
             (Dst::Mem, Src::Mem) => unreachable!(),
@@ -521,28 +791,239 @@ impl<'a> Gen<'a> {
             ALU_SUB | ALU_CMP => (SUB, LazyFlagsOp::Sub),
             _ => (XOR, LazyFlagsOp::Logic),
         };
-        self.a.alu_rr(host_op, ACC, OPERAND, w);
-        if alu_op != ALU_CMP
+        self.a.alu_rr_sized(host_op, ACC, OPERAND, size);
+        let stored = alu_op != ALU_CMP
             && alu_op != ALU_TEST
-            && let Dst::Reg(d) = dst
-        {
-            self.st_gpr(d, ACC);
-        }
-        self.store_lazy_op(lazy_op, osz);
+            && self.store_dst(dst, size, true, insn_index, rip);
+        self.store_lazy_op(lazy_op, size, stored);
+        stored
     }
 
-    /// Immediate as the host op should see it: sign-extended to 64 bits for 64-bit operations,
-    /// truncated to 32 bits otherwise.
-    fn imm_for(osz: u8, imm: i64) -> u64 {
-        if osz == 8 {
-            imm as u64
+    /// Puts 1 or 0 into `rd` according to guest condition code `cc`: from the host flags when
+    /// they are live, otherwise from `helper_cond` over the lazy flags (which leaves the host
+    /// flags dead). `rd` must not be a register the helper call uses for arguments.
+    fn condition_to_register(&mut self, cc: u8, rd: u8) {
+        if self.live {
+            // A `mov`, never an `xor`, so the flags survive until the setcc reads them.
+            self.a.mov_imm(rd, 0);
+            self.a.setcc(cc & 15, rd);
         } else {
-            imm as u32 as u64
+            self.a.mov_rr(ARGS[0], CPU, true);
+            self.a.mov_imm(ARGS[1], cc as u64);
+            self.call(self.addrs.cond);
+            self.a.mov_rr(rd, ACC, true);
         }
+    }
+
+    /// `inc`/`dec` of a register or memory operand. x86 leaves CF alone, so the lazy flags carry
+    /// the current CF in as their second operand and the host CF is re-established from it
+    /// (`bt`) right before the instruction: after the operand's memory access, which clobbers
+    /// the host flags, CF would otherwise be lost. The carry is taken from the host flags when
+    /// they are live, else from `helper_cond`; either way before the operand load.
+    #[allow(clippy::too_many_arguments)]
+    fn inc_dec(
+        &mut self,
+        insn: &Insn,
+        decrement: bool,
+        dst: Dst,
+        size: u8,
+        next: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        self.condition_to_register(CONDITION_BELOW as u8, SAVED_CONDITION);
+        self.load_dst(insn, dst, ACC, size, next, insn_index, rip);
+        self.a.mov_rr(OPERAND, SAVED_CONDITION, true);
+        self.a.bt_ri(OPERAND, 0, false);
+        if decrement {
+            self.a.dec_r(ACC, size);
+        } else {
+            self.a.inc_r(ACC, size);
+        }
+        let stored = self.store_dst(dst, size, true, insn_index, rip);
+        self.store_lazy_op(
+            if decrement {
+                LazyFlagsOp::Dec
+            } else {
+                LazyFlagsOp::Inc
+            },
+            size,
+            stored,
+        );
+        stored
+    }
+
+    /// `neg`: flags are those of `0 - operand`, recorded as a subtraction whose second operand
+    /// is the original value.
+    fn neg(
+        &mut self,
+        insn: &Insn,
+        dst: Dst,
+        size: u8,
+        next: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        self.load_dst(insn, dst, ACC, size, next, insn_index, rip);
+        self.a.mov_rr(OPERAND, ACC, true);
+        self.a.neg_r(ACC, size);
+        let stored = self.store_dst(dst, size, true, insn_index, rip);
+        self.store_lazy_op(LazyFlagsOp::Sub, size, stored);
+        stored
+    }
+
+    /// `not`: no flags change, and neither do the host flags unless the operand is in memory.
+    fn not(
+        &mut self,
+        insn: &Insn,
+        dst: Dst,
+        size: u8,
+        next: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        self.load_dst(insn, dst, ACC, size, next, insn_index, rip);
+        self.a.not_r(ACC, size);
+        self.store_dst(dst, size, false, insn_index, rip)
+    }
+
+    /// Builds the `SzpCfOf` word for a shift that has just run on `ACC`, in `OPERAND`, plus
+    /// `extra` (a bit above CF/OF, or 0). The host CF after a shift by a count that is not zero
+    /// modulo the width is the last bit shifted out, which is what `Cpu::shift_rotate` computes
+    /// too. The host OF is not used: it is only defined for a count of 1, while the interpreter
+    /// computes it for every count: shl = MSB of the result xor CF, shr = MSB of the original,
+    /// sar = 0. For shr the caller has put a copy of the operand from before the shift in
+    /// `SCRATCH_D` (the overflow register).
+    fn shift_flags_word(&mut self, kind: ShiftKind, size: u8, extra: i32) {
+        let (carry, overflow) = (SCRATCH_C, SCRATCH_D);
+        let is64 = size == 8;
+        let top_bit = 8 * size - 1;
+        // setcc leaves the rest of the register alone, so clear it with a zero-extending move.
+        self.a.setcc(B, carry);
+        self.a.ext_rr(carry, carry, 1, false);
+        match kind {
+            ShiftKind::Shl => {
+                self.a.mov_rr(overflow, ACC, true);
+                self.a.shift_ri(SHR, overflow, top_bit, is64);
+                self.a.alu_rr(XOR, overflow, carry, false);
+            }
+            ShiftKind::Shr => self.a.shift_ri(SHR, overflow, top_bit, is64),
+            ShiftKind::Sar => {
+                self.a.lea(OPERAND, mem(carry, extra));
+                return;
+            }
+        }
+        self.a.lea(
+            OPERAND,
+            mem_idx(carry, overflow, SZP_CF_OF_SRC_OF_BIT as u8, extra),
+        );
+    }
+
+    /// `shl`/`shr`/`sar` of a 32- or 64-bit operand by an immediate (`count` is Some: already
+    /// masked and non-zero) or by CL. The flags are recorded as `LazyFlagsOp::SzpCfOf` with CF
+    /// and OF worked out by `shift_flags_word`. A CL count of zero changes neither flags nor
+    /// value, which is a branch around the flag work; the destination is still written, as the
+    /// interpreter does (a 32-bit destination zero-extends, which the zero-extending load did).
+    #[allow(clippy::too_many_arguments)]
+    fn shift(
+        &mut self,
+        insn: &Insn,
+        kind: ShiftKind,
+        dst: Dst,
+        count: Option<u32>,
+        size: u8,
+        next: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let is64 = size == 8;
+        let host_op = match kind {
+            ShiftKind::Shl => SHL,
+            ShiftKind::Shr => SHR,
+            ShiftKind::Sar => SAR,
+        };
+        let (carry, overflow) = (SCRATCH_C, SCRATCH_D);
+        self.load_dst(insn, dst, ACC, size, next, insn_index, rip);
+        match count {
+            Some(count) => {
+                if kind == ShiftKind::Shr {
+                    self.a.mov_rr(overflow, ACC, true);
+                }
+                self.a.shift_ri(host_op, ACC, count as u8, is64);
+                self.shift_flags_word(kind, size, 0);
+            }
+            None => {
+                self.a
+                    .ld(OPERAND, mem(CPU, GPR + GPR_SIZE * GUEST_RCX as i32));
+                self.a.mov_rr(carry, OPERAND, false);
+                self.a.alu_ri(AND, carry, (8 * size - 1) as i32, false);
+                let zero_count = self.a.label();
+                let merge = self.a.label();
+                self.a.jcc(E, zero_count);
+                if kind == ShiftKind::Shr {
+                    self.a.mov_rr(overflow, ACC, true);
+                }
+                self.a.shift_cl(host_op, ACC, is64);
+                self.shift_flags_word(kind, size, SHIFT_APPLIED);
+                self.a.jmp(merge);
+                self.a.bind(zero_count);
+                self.a.alu_rr(XOR, OPERAND, OPERAND, false);
+                self.a.bind(merge);
+            }
+        }
+        let stored = self.store_dst(dst, size, true, insn_index, rip);
+        if count.is_none() {
+            let unchanged = self.a.label();
+            self.a.test_ri(OPERAND, SHIFT_APPLIED, false);
+            self.a.jcc(E, unchanged);
+            self.a.alu_ri(AND, OPERAND, CF_OF_MASK, false);
+            self.store_lazy(LazyFlagsOp::SzpCfOf, size);
+            self.a.bind(unchanged);
+        } else {
+            self.store_lazy(LazyFlagsOp::SzpCfOf, size);
+        }
+        // Not mirrored by the host flags (a zero count leaves the old ones in place, which is
+        // also the right state for the CL form, but the code above clobbered them).
+        self.live = false;
+        stored
+    }
+
+    /// `imul r, r/m` and the three-operand `imul r, r/m, imm`, at 32 and 64 bits. The host
+    /// `imul` sets CF = OF when the full product does not fit, which is what the interpreter
+    /// computes; SF/ZF/PF are undefined on the host, so they come from the truncated result
+    /// (`LazyFlagsOp::SzpCfOf`).
+    fn imul(&mut self, insn: &Insn, size: u8, next: u64, insn_index: u32, rip: u64) {
+        // `0f af` multiplies the destination register (ACC) by r/m (OPERAND); the three-operand
+        // forms multiply r/m (ACC) by the immediate (OPERAND). The memory source goes first so
+        // its slow path cannot clobber the other operand.
+        let source = if insn.op == 0x1af { OPERAND } else { ACC };
+        match Self::rm_src(insn, size) {
+            Src::Reg(reg, _) => self.read_reg(source, reg, false, size),
+            _ => {
+                self.ea(insn, next);
+                self.mem_load(source, size, false, insn_index, rip);
+            }
+        }
+        if insn.op == 0x1af {
+            self.read_reg(ACC, insn.reg, false, size);
+        } else {
+            self.a.mov_imm(OPERAND, Self::imm_for(size, insn.imm));
+        }
+        self.a.imul_rr(ACC, OPERAND, size == 8);
+        // CF = OF = (the product does not fit): OPERAND = 3 or 0 for `store_lazy`.
+        let overflow = SCRATCH_C;
+        self.a.setcc(O, overflow);
+        self.a.ext_rr(overflow, overflow, 1, false);
+        self.a.mov_imm(OPERAND, IMUL_OVERFLOW_FLAGS as u64);
+        self.a.imul_rr(OPERAND, overflow, false);
+        self.st_gpr(insn.reg, ACC);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, size);
+        self.live = false;
     }
 
     /// Conditional branch ending the block. With `live` host flags the guest condition code is
-    /// also the host one; otherwise `helper_cond` evaluates it from the lazy flags.
+    /// also the host one; otherwise `helper_cond` evaluates it from the lazy flags. Both exits
+    /// run `chain_exit` after the branch, which clobbers the flags the branch has already used.
     fn jcc(&mut self, cc: u8, target: u64, next: u64, retired: u32) {
         let taken = self.a.label();
         if self.live {
@@ -554,16 +1035,15 @@ impl<'a> Gen<'a> {
             self.a.test_rr(ACC, ACC, true);
             self.a.jcc(NE, taken);
         }
-        self.set_rip(next);
-        self.exit_ok(retired);
+        self.chain_to(next, retired);
         self.a.bind(taken);
-        self.set_rip(target);
-        self.exit_ok(retired);
+        self.chain_to(target, retired);
     }
 
     /// Lower instruction `index` inline if it is a supported form. Returns false with nothing
     /// emitted otherwise (callers fall back to `helper_exec`), so every `return false` below must come
-    /// before the first emit for that arm.
+    /// before the first emit for that arm. Which forms are lowered mirrors `emit.rs`, which the
+    /// translation statistics tests rely on.
     fn try_inline(&mut self, index: usize, rip: u64, next: u64) -> bool {
         let insn: Insn = self.insns[index];
         let insn_index = index as u32;
@@ -571,204 +1051,285 @@ impl<'a> Gen<'a> {
         let osz = insn.opsize;
         // 32/64-bit operation without lock, 66 or 67 prefixes (`opsize` alone cannot tell: REX.W
         // overrides 66).
-        let plain = !insn.addr32 && !insn.lock && !insn.p66 && (osz == 4 || osz == 8);
-        let is_mem = insn.md != 3;
-        let mem_ok = Self::mem_ok(&insn);
+        let wide = !insn.addr32 && !insn.lock && !insn.p66 && (osz == 4 || osz == 8);
+        let is_mem = insn.md != MODRM_MOD_REGISTER;
+        // No 67 or LOCK prefix, so memory operands can use the inline access path.
+        let plain = Self::mem_ok(&insn);
         let rex = insn.rex_present;
         let mut store = false;
         match insn.op {
-            // ALU grid 00..3f: bits 5:3 pick the operation, bits 2:0 the form (1 = r/m, r;
-            // 3 = r, r/m; 5 = eax, imm32; the byte forms 0/2/4 are not handled). 6 and 7 are
-            // push/pop of segment registers and prefixes, excluded by `< 6`.
+            // add/or/adc/sbb/and/sub/xor/cmp: r/m8,r8 (0), r/m,r (1), r8,r/m8 (2), r,r/m (3),
+            // al,imm8 (4) and eax,imm32 (5). adc and sbb need the carry-in and go to the
+            // interpreter. 6 and 7 are push/pop of segment registers and prefixes.
             0x00..=0x3f if insn.op & 7 < 6 && plain => {
                 let alu_op = ((insn.op >> 3) & 7) as u8;
-                // adc and sbb need the guest carry, which is not in the host flags.
                 if alu_op == ALU_ADC || alu_op == ALU_SBB {
                     return false;
                 }
-                match insn.op & 7 {
-                    1 => {
-                        // A memory destination is only for cmp (no writeback, so no SMC check).
-                        if is_mem && (alu_op != ALU_CMP || !mem_ok) {
-                            return false;
-                        }
-                        let dst = if is_mem { Dst::Mem } else { Dst::Reg(insn.rm) };
-                        self.alu(
-                            &insn,
-                            alu_op,
-                            dst,
-                            Src::Reg(insn.reg),
-                            osz,
-                            next,
-                            insn_index,
-                            rip,
-                        );
-                    }
-                    3 => {
-                        if is_mem && !mem_ok {
-                            return false;
-                        }
-                        let src = if is_mem { Src::Mem } else { Src::Reg(insn.rm) };
-                        self.alu(
-                            &insn,
-                            alu_op,
-                            Dst::Reg(insn.reg),
-                            src,
-                            osz,
-                            next,
-                            insn_index,
-                            rip,
-                        );
-                    }
-                    5 => {
-                        let v = Self::imm_for(osz, insn.imm);
-                        self.alu(
-                            &insn,
-                            alu_op,
-                            Dst::Reg(GUEST_RAX),
-                            Src::Imm(v),
-                            osz,
-                            next,
-                            insn_index,
-                            rip,
-                        );
-                    }
-                    _ => return false,
-                }
+                let form = insn.op & 7;
+                let size = if form & 1 == 0 { 1 } else { osz };
+                let (dst, src) = match form {
+                    0 | 1 => (Self::rm_dst(&insn, size), Self::reg_src(&insn, size)),
+                    2 | 3 => (Self::reg_dst(&insn, size), Self::rm_src(&insn, size)),
+                    _ => (
+                        Dst::Reg(GUEST_RAX, false),
+                        Src::Imm(Self::imm_for(size, insn.imm)),
+                    ),
+                };
+                store = self.alu(&insn, alu_op, dst, src, size, next, insn_index, rip);
             }
-            // group 1: r/m, imm8 (sign-extended by the decoder) or imm32
-            0x81 | 0x83 if plain => {
+            // group 1: add/or/.../cmp r/m, imm8 (80) or imm32/sign-extended imm8 (81, 83)
+            0x80 | 0x81 | 0x83 if plain => {
                 let alu_op = insn.reg & 7;
-                if alu_op == ALU_ADC
-                    || alu_op == ALU_SBB
-                    || (is_mem && (alu_op != ALU_CMP || !mem_ok))
-                {
+                if alu_op == ALU_ADC || alu_op == ALU_SBB {
                     return false;
                 }
-                let v = Self::imm_for(osz, insn.imm);
-                let dst = if is_mem { Dst::Mem } else { Dst::Reg(insn.rm) };
-                self.alu(&insn, alu_op, dst, Src::Imm(v), osz, next, insn_index, rip);
-            }
-            // test r/m, r
-            0x85 if plain => {
-                if is_mem && !mem_ok {
-                    return false;
-                }
-                let dst = if is_mem { Dst::Mem } else { Dst::Reg(insn.rm) };
-                self.alu(
+                let size = if insn.op == 0x80 { 1 } else { osz };
+                store = self.alu(
                     &insn,
-                    ALU_TEST,
-                    dst,
-                    Src::Reg(insn.reg),
+                    alu_op,
+                    Self::rm_dst(&insn, size),
+                    Src::Imm(Self::imm_for(size, insn.imm)),
+                    size,
+                    next,
+                    insn_index,
+                    rip,
+                );
+            }
+            // test r/m, r (84, 85) and test al/eax, imm (a8, a9)
+            0x84 | 0x85 | 0xa8 | 0xa9 if plain => {
+                let size = if insn.op & 1 == 0 { 1 } else { osz };
+                let (dst, src) = if insn.op >= 0xa8 {
+                    (
+                        Dst::Reg(GUEST_RAX, false),
+                        Src::Imm(Self::imm_for(size, insn.imm)),
+                    )
+                } else {
+                    (Self::rm_dst(&insn, size), Self::reg_src(&insn, size))
+                };
+                store = self.alu(&insn, ALU_TEST, dst, src, size, next, insn_index, rip);
+            }
+            // group 3: /0 test r/m, imm; /2 not; /3 neg
+            0xf6 | 0xf7 if plain && matches!(insn.reg & 7, 0 | 2 | 3) => {
+                let size = if insn.op == 0xf6 { 1 } else { osz };
+                let dst = Self::rm_dst(&insn, size);
+                store = match insn.reg & 7 {
+                    0 => self.alu(
+                        &insn,
+                        ALU_TEST,
+                        dst,
+                        Src::Imm(Self::imm_for(size, insn.imm)),
+                        size,
+                        next,
+                        insn_index,
+                        rip,
+                    ),
+                    2 => self.not(&insn, dst, size, next, insn_index, rip),
+                    _ => self.neg(&insn, dst, size, next, insn_index, rip),
+                };
+            }
+            // group 4/5: /0 inc, /1 dec
+            0xfe | 0xff if plain && insn.reg & 7 <= 1 => {
+                let size = if insn.op == 0xfe { 1 } else { osz };
+                store = self.inc_dec(
+                    &insn,
+                    insn.reg & 7 == 1,
+                    Self::rm_dst(&insn, size),
+                    size,
+                    next,
+                    insn_index,
+                    rip,
+                );
+            }
+            // shl/shr/sar r/m, imm8 | 1 | cl at 32 and 64 bits (/6 is the alias of /4). Rotates,
+            // the byte and word sizes and a zero immediate count go to the interpreter.
+            0xc1 | 0xd1 | 0xd3 if wide && matches!(insn.reg & 7, SHIFT_SHL..=SHIFT_SAR) => {
+                let kind = match insn.reg & 7 {
+                    SHIFT_SHL | SHIFT_SAL_ALIAS => ShiftKind::Shl,
+                    SHIFT_SHR => ShiftKind::Shr,
+                    _ => ShiftKind::Sar,
+                };
+                let count = match insn.op {
+                    0xc1 => Some(insn.imm as u32 & (8 * osz as u32 - 1)),
+                    0xd1 => Some(1),
+                    _ => None,
+                };
+                if count == Some(0) {
+                    return false;
+                }
+                store = self.shift(
+                    &insn,
+                    kind,
+                    Self::rm_dst(&insn, osz),
+                    count,
                     osz,
                     next,
                     insn_index,
                     rip,
                 );
             }
-            // test eax, imm32
-            0xa9 if plain => {
-                let v = Self::imm_for(osz, insn.imm);
-                self.alu(
-                    &insn,
-                    ALU_TEST,
-                    Dst::Reg(GUEST_RAX),
-                    Src::Imm(v),
-                    osz,
-                    next,
-                    insn_index,
-                    rip,
-                );
-            }
-            // group 3 /0: test r/m, imm32
-            0xf7 if plain && insn.reg & 7 == 0 => {
-                if is_mem && !mem_ok {
-                    return false;
-                }
-                let v = Self::imm_for(osz, insn.imm);
-                let dst = if is_mem { Dst::Mem } else { Dst::Reg(insn.rm) };
-                self.alu(
-                    &insn,
-                    ALU_TEST,
-                    dst,
-                    Src::Imm(v),
-                    osz,
-                    next,
-                    insn_index,
-                    rip,
-                );
-            }
-            // mov r/m, r
-            0x89 if plain => {
-                if is_mem {
-                    if !mem_ok {
-                        return false;
+            // mov r/m8,r8 (88), r/m,r (89), r8,r/m8 (8a), r,r/m (8b)
+            0x88..=0x8b if plain => {
+                let size = if insn.op & 1 == 0 { 1 } else { osz };
+                if insn.op < 0x8a {
+                    let (src_reg, src_high) = Self::named_register(&insn, insn.reg, size);
+                    self.read_reg(VALUE, src_reg, src_high, size);
+                    match Self::rm_dst(&insn, size) {
+                        Dst::Mem => {
+                            self.ea(&insn, next);
+                            self.mem_store(size, insn_index, rip);
+                            store = true;
+                        }
+                        Dst::Reg(reg, high) => self.write_reg(reg, high, size, VALUE),
                     }
-                    self.ea(&insn, next);
-                    self.ld_gpr(VALUE, insn.reg);
-                    self.mem_store(osz, insn_index, rip);
-                    store = true;
                 } else {
-                    self.ld_gpr(VALUE, insn.reg);
-                    // A 32-bit register write clears the upper half.
-                    if osz == 4 {
-                        self.a.mov_rr(VALUE, VALUE, false);
+                    let (dst_reg, dst_high) = Self::named_register(&insn, insn.reg, size);
+                    match Self::rm_src(&insn, size) {
+                        Src::Reg(reg, high) => self.read_reg(VALUE, reg, high, size),
+                        _ => {
+                            self.ea(&insn, next);
+                            self.mem_load(VALUE, size, false, insn_index, rip);
+                        }
                     }
-                    self.st_gpr(insn.rm, VALUE);
+                    self.write_reg(dst_reg, dst_high, size, VALUE);
                 }
             }
-            // mov r, r/m
-            0x8b if plain => {
-                if is_mem {
-                    if !mem_ok {
-                        return false;
+            // group 11 /0: mov r/m8, imm8 (c6) and mov r/m, imm (c7)
+            0xc6 | 0xc7 if plain && insn.reg & 7 == 0 => {
+                let size = if insn.op == 0xc6 { 1 } else { osz };
+                let v = Self::imm_for(size, insn.imm);
+                match Self::rm_dst(&insn, size) {
+                    Dst::Mem => {
+                        self.ea(&insn, next);
+                        self.a.mov_imm(VALUE, v);
+                        self.mem_store(size, insn_index, rip);
+                        store = true;
                     }
-                    self.ea(&insn, next);
-                    self.mem_load(VALUE, osz, false, insn_index, rip);
+                    Dst::Reg(reg, high) => {
+                        self.a.mov_imm(VALUE, v);
+                        self.write_reg(reg, high, size, VALUE);
+                    }
+                }
+            }
+            // mov r8, imm8 and mov r, imm32/imm64 (register in the opcode, extended by REX.B)
+            0xb0..=0xbf if plain => {
+                let size = if insn.op < 0xb8 { 1 } else { osz };
+                let (reg, high) = Self::named_register(&insn, opcode_register(&insn), size);
+                self.a.mov_imm(VALUE, Self::imm_for(size, insn.imm));
+                self.write_reg(reg, high, size, VALUE);
+            }
+            // setcc r/m8. The condition goes into VALUE before the address is formed: for a
+            // memory destination the store's probe would clobber the host flags.
+            0x190..=0x19f if plain => {
+                self.condition_to_register((insn.op & 15) as u8, VALUE);
+                match Self::rm_dst(&insn, 1) {
+                    Dst::Reg(reg, high) => self.write_reg(reg, high, 1, VALUE),
+                    Dst::Mem => {
+                        self.ea(&insn, next);
+                        self.mem_store(1, insn_index, rip);
+                        store = true;
+                    }
+                }
+            }
+            // cmovcc r, r/m at 32 and 64 bits. The source is always read (it can fault) and a
+            // 32-bit destination is zero-extended whether or not it moves, which the host cmov
+            // does too. With live flags and a register source the host cmov reads them directly;
+            // otherwise the condition is evaluated first, into a register that survives the
+            // source's memory access, and tested afterwards.
+            0x140..=0x14f if wide => {
+                let cc = (insn.op & 15) as u8;
+                let source = Self::rm_src(&insn, osz);
+                match source {
+                    Src::Reg(reg, _) if self.live => {
+                        self.read_reg(VALUE, reg, false, osz);
+                        self.read_reg(ACC, insn.reg, false, osz);
+                        self.a.cmov_rr(cc, ACC, VALUE, osz == 8);
+                    }
+                    _ => {
+                        self.condition_to_register(cc, SAVED_CONDITION);
+                        match source {
+                            Src::Reg(reg, _) => self.read_reg(VALUE, reg, false, osz),
+                            _ => {
+                                self.ea(&insn, next);
+                                self.mem_load(VALUE, osz, false, insn_index, rip);
+                            }
+                        }
+                        self.read_reg(ACC, insn.reg, false, osz);
+                        self.a.test_rr(SAVED_CONDITION, SAVED_CONDITION, false);
+                        self.a.cmov_rr(NE, ACC, VALUE, osz == 8);
+                        self.live = false;
+                    }
+                }
+                self.st_gpr(insn.reg, ACC);
+            }
+            // imul r, r/m (0f af) and imul r, r/m, imm32 / imm8 (69, 6b) at 32 and 64 bits
+            0x1af | 0x69 | 0x6b if wide => self.imul(&insn, osz, next, insn_index, rip),
+            // group 5: /2 call near, /4 jmp near (r/m64), /6 push r/m64
+            0xff if plain && !insn.p66 && matches!(insn.reg & 7, 2 | 4 | 6) => {
+                match Self::rm_src(&insn, 8) {
+                    Src::Reg(reg, _) => self.read_reg(VALUE, reg, false, 8),
+                    _ => {
+                        self.ea(&insn, next);
+                        self.mem_load(VALUE, 8, false, insn_index, rip);
+                    }
+                }
+                match insn.reg & 7 {
+                    2 => {
+                        // The target is read before the push, so `call [rsp + n]` sees the old
+                        // rsp. It waits in a callee-saved register across the push's slow path.
+                        self.a.mov_rr(SAVED_OPERAND, VALUE, true);
+                        self.ld_gpr(ADDR, GUEST_RSP);
+                        self.a.lea(ADDR, mem(ADDR, -PUSH_POP_SIZE));
+                        self.a.mov_imm(VALUE, next);
+                        self.stack_store(insn_index, rip);
+                        self.st_gpr(GUEST_RSP, ADDR);
+                        self.a.mov_rr(OPERAND, SAVED_OPERAND, true);
+                        self.chain_exit(retired);
+                        self.inlined += 1;
+                        return true;
+                    }
+                    4 => {
+                        self.a.mov_rr(OPERAND, VALUE, true);
+                        self.chain_exit(retired);
+                        self.inlined += 1;
+                        return true;
+                    }
+                    _ => {
+                        self.ld_gpr(ADDR, GUEST_RSP);
+                        self.a.lea(ADDR, mem(ADDR, -PUSH_POP_SIZE));
+                        self.stack_store(insn_index, rip);
+                        self.st_gpr(GUEST_RSP, ADDR);
+                        store = true;
+                    }
+                }
+            }
+            // lfence, mfence, sfence: one CPU, so ordering is free
+            0x1ae if !is_mem && insn.rep == 0 && matches!(insn.reg & 7, 5..=7) => {}
+            // cdqe / cwde: sign-extend eax (ax) into rax (eax). Loads and `mov`s only, so the
+            // host flags survive.
+            0x98 if wide => {
+                if osz == 8 {
+                    self.a
+                        .ld_ext(VALUE, register_slot(GUEST_RAX, false), 4, true);
                 } else {
-                    self.ld_gpr(VALUE, insn.rm);
-                    if osz == 4 {
-                        self.a.mov_rr(VALUE, VALUE, false);
-                    }
+                    self.a
+                        .ld_ext(VALUE, register_slot(GUEST_RAX, false), 2, true);
+                    self.a.mov_rr(VALUE, VALUE, false);
                 }
-                self.st_gpr(insn.reg, VALUE);
+                self.st_gpr(GUEST_RAX, VALUE);
             }
-            // mov m8, r8
-            0x88 if is_mem && mem_ok && !insn.p66 => {
-                if !rex && HIGH_BYTE_REGS.contains(&insn.reg) {
-                    self.ld_gpr(VALUE, insn.reg - HIGH_BYTE_REGS.start);
-                    self.a.shift_ri(SHR, VALUE, 8, true);
-                } else {
-                    self.ld_gpr(VALUE, insn.reg);
+            // cqo / cdq: rdx (edx, zero-extended) gets the sign of rax (eax). The host `cdq`
+            // leaves the flags alone.
+            0x99 if wide => {
+                self.read_reg(ACC, GUEST_RAX, false, osz);
+                self.a.cdq(osz == 8);
+                if osz == 4 {
+                    self.a.mov_rr(ADDR, ADDR, false);
                 }
-                self.ea(&insn, next);
-                self.mem_store(1, insn_index, rip);
-                store = true;
-            }
-            // group 11 /0: mov r/m, imm32
-            0xc7 if plain && insn.reg & 7 == 0 => {
-                let v = Self::imm_for(osz, insn.imm);
-                if is_mem {
-                    if !mem_ok {
-                        return false;
-                    }
-                    self.ea(&insn, next);
-                    self.a.mov_imm(VALUE, v);
-                    self.mem_store(osz, insn_index, rip);
-                    store = true;
-                } else {
-                    self.a.mov_imm(VALUE, v);
-                    self.st_gpr(insn.rm, VALUE);
-                }
-            }
-            // mov r, imm (register in the opcode, extended by REX.B)
-            0xb8..=0xbf if plain => {
-                let r = (insn.op as u8 & 7) | ((insn.rex & GUEST_REX_B) << 3);
-                self.a.mov_imm(VALUE, Self::imm_for(osz, insn.imm));
-                self.st_gpr(r, VALUE);
+                self.st_gpr(GUEST_RDX, ADDR);
             }
             // lea; `ea` would add a segment base, which lea must not
-            0x8d if plain && is_mem => {
+            0x8d if wide && is_mem => {
                 if has_fs_gs_override(&insn) {
                     return false;
                 }
@@ -779,7 +1340,7 @@ impl<'a> Gen<'a> {
                 self.st_gpr(insn.reg, ADDR);
             }
             // movsxd r64, r/m32
-            0x63 if osz == 8 && !insn.addr32 && !insn.lock && !insn.p66 && (!is_mem || mem_ok) => {
+            0x63 if osz == 8 && !insn.addr32 && !insn.lock && !insn.p66 && (!is_mem || plain) => {
                 if is_mem {
                     self.ea(&insn, next);
                     self.mem_load(VALUE, 4, true, insn_index, rip);
@@ -790,7 +1351,7 @@ impl<'a> Gen<'a> {
                 self.st_gpr(insn.reg, VALUE);
             }
             // movzx (0f b6, b7) / movsx (0f be, bf) from a byte (even opcode) or word source
-            0x1b6 | 0x1b7 | 0x1be | 0x1bf if plain && (!is_mem || mem_ok) => {
+            0x1b6 | 0x1b7 | 0x1be | 0x1bf if wide && (!is_mem || plain) => {
                 let source_size: u8 = if insn.op & 1 == 0 { 1 } else { 2 };
                 let signed = insn.op >= 0x1b8;
                 if is_mem {
@@ -813,9 +1374,9 @@ impl<'a> Gen<'a> {
             // after the new rsp is computed but before it is stored, so `push rsp` pushes the
             // old value.
             0x50..=0x57 if !insn.p66 => {
-                let r = (insn.op as u8 & 7) | ((insn.rex & GUEST_REX_B) << 3);
+                let r = opcode_register(&insn);
                 self.ld_gpr(ADDR, GUEST_RSP);
-                self.a.lea(ADDR, mem(ADDR, -8));
+                self.a.lea(ADDR, mem(ADDR, -PUSH_POP_SIZE));
                 self.ld_gpr(VALUE, r);
                 self.stack_store(insn_index, rip);
                 self.st_gpr(GUEST_RSP, ADDR);
@@ -823,10 +1384,10 @@ impl<'a> Gen<'a> {
             }
             // pop r64. The register is written last so `pop rsp` ends up with the popped value.
             0x58..=0x5f if !insn.p66 => {
-                let r = (insn.op as u8 & 7) | ((insn.rex & GUEST_REX_B) << 3);
+                let r = opcode_register(&insn);
                 self.ld_gpr(ADDR, GUEST_RSP);
                 self.stack_load(VALUE, insn_index, rip);
-                self.a.lea(ADDR, mem(ADDR, 8));
+                self.a.lea(ADDR, mem(ADDR, PUSH_POP_SIZE));
                 self.st_gpr(GUEST_RSP, ADDR);
                 self.st_gpr(r, VALUE);
             }
@@ -846,20 +1407,19 @@ impl<'a> Gen<'a> {
             }
             // jmp rel32 / rel8
             0xe9 | 0xeb => {
-                self.set_rip(next.wrapping_add(insn.imm as u64));
-                self.exit_ok(retired);
+                self.chain_to(next.wrapping_add(insn.imm as u64), retired);
                 self.inlined += 1;
                 return true;
             }
-            // call rel32
+            // call rel32. The block ends here, so no `smc_check` is needed after the push: the
+            // chain stub looks at `block_exit_requested` itself.
             0xe8 => {
                 self.ld_gpr(ADDR, GUEST_RSP);
-                self.a.lea(ADDR, mem(ADDR, -8));
+                self.a.lea(ADDR, mem(ADDR, -PUSH_POP_SIZE));
                 self.a.mov_imm(VALUE, next);
                 self.stack_store(insn_index, rip);
                 self.st_gpr(GUEST_RSP, ADDR);
-                self.set_rip(next.wrapping_add(insn.imm as u64));
-                self.exit_ok(retired);
+                self.chain_to(next.wrapping_add(insn.imm as u64), retired);
                 self.inlined += 1;
                 return true;
             }
@@ -867,10 +1427,10 @@ impl<'a> Gen<'a> {
             0xc3 => {
                 self.ld_gpr(ADDR, GUEST_RSP);
                 self.stack_load(VALUE, insn_index, rip);
-                self.a.lea(ADDR, mem(ADDR, 8));
+                self.a.lea(ADDR, mem(ADDR, PUSH_POP_SIZE));
                 self.st_gpr(GUEST_RSP, ADDR);
-                self.a.st(mem(CPU, RIP), VALUE, 8);
-                self.exit_ok(retired);
+                self.a.mov_rr(OPERAND, VALUE, true);
+                self.chain_exit(retired);
                 self.inlined += 1;
                 return true;
             }
@@ -907,12 +1467,7 @@ impl<'a> Gen<'a> {
                 return;
             }
         }
-        self.set_rip(end_rip);
-        self.exit_ok(count as u32);
+        self.chain_to(end_rip, count as u32);
         self.emit_slows();
     }
-}
-
-fn has_fs_gs_override(insn: &Insn) -> bool {
-    matches!(insn.seg as usize, SEG_FS | SEG_GS)
 }

@@ -38,14 +38,20 @@ pub const SUB: u8 = 5;
 pub const XOR: u8 = 6;
 pub const CMP: u8 = 7;
 
-/// Shift operation numbers: ModRM.reg opcode extension of `0xc1`.
+/// Shift operation numbers: ModRM.reg opcode extension of `0xc1`/`0xd3`.
 pub const SHL: u8 = 4;
 pub const SHR: u8 = 5;
+pub const SAR: u8 = 7;
 
-/// Condition codes as encoded in `0f 8x` (Jcc rel32). The same numbers are the low nibble of the
-/// guest `70..7f` / `0f 80..8f` opcodes, so the JIT passes guest condition codes straight through.
+/// Condition codes as encoded in `0f 8x` (Jcc rel32), `0f 9x` (setcc) and `0f 4x` (cmovcc). The
+/// same numbers are the low nibble of the guest `70..7f` / `0f 80..8f` opcodes, so the JIT passes
+/// guest condition codes straight through. Only the ones the generated code names itself are
+/// listed.
+pub const B: u8 = 2;
+pub const AE: u8 = 3;
 pub const E: u8 = 4;
 pub const NE: u8 = 5;
+pub const O: u8 = 0;
 
 const REGISTER_COUNT: u8 = 16;
 
@@ -72,8 +78,19 @@ const BASE_DISP32_ONLY: u8 = 5;
 /// SIB.index value 4 (without REX.X) means "no index".
 const SIB_NO_INDEX: u8 = 4;
 
+/// Low bit of an opcode pair: clear for the byte form, set for the 16/32/64-bit form.
+const WIDE_FORM: u8 = 1;
 /// Low bits of the `op r/m, r` ALU opcodes: the 64/32-bit "r/m is the destination" form.
-const ALU_RM_REG: u8 = 1;
+const ALU_RM_REG: u8 = WIDE_FORM;
+
+/// ModRM.reg extensions of the unary group (`f6`/`f7`) and the inc/dec group (`fe`/`ff`).
+const UNARY_TEST: u8 = 0;
+const UNARY_NOT: u8 = 2;
+const UNARY_NEG: u8 = 3;
+const UNARY_INC: u8 = 0;
+const UNARY_DEC: u8 = 1;
+/// ModRM.reg extension of `bt r/m, imm8` (`0f ba`).
+const BT_IMMEDIATE: u8 = 4;
 
 /// A memory operand `[base + index << scale + disp]`.
 #[derive(Clone, Copy)]
@@ -326,6 +343,78 @@ impl Asm {
         self.op_rr(false, w, false, &[0x85], b, a);
     }
 
+    /// A register-to-register form that exists as an opcode pair (byte form `opcode`, wider form
+    /// `opcode | 1`) at any operand `size`. The byte form forces REX so that rsi/rdi mean
+    /// sil/dil; the 16-bit form carries the operand-size prefix.
+    fn op_rr_sized(&mut self, size: u8, opcode: u8, reg: u8, rm: u8) {
+        match size {
+            1 => self.op_rr(false, false, true, &[opcode], reg, rm),
+            2 => self.op_rr(true, false, false, &[opcode | WIDE_FORM], reg, rm),
+            4 => self.op_rr(false, false, false, &[opcode | WIDE_FORM], reg, rm),
+            _ => self.op_rr(false, true, false, &[opcode | WIDE_FORM], reg, rm),
+        }
+    }
+
+    /// `op d, s` at operand `size` (1, 2, 4 or 8) for ADD/OR/AND/SUB/XOR/CMP. Only the low
+    /// `size` bytes of the registers take part; a 4-byte result zero-extends, narrower ones
+    /// leave the upper bits of `d` alone. The flags are those of an operation of that width.
+    pub fn alu_rr_sized(&mut self, op: u8, d: u8, s: u8, size: u8) {
+        self.op_rr_sized(size, op << 3, s, d);
+    }
+
+    /// `test r, imm32` (sign-extended with `w`) at 32 or 64 bits.
+    pub fn test_ri(&mut self, r: u8, imm: i32, w: bool) {
+        self.op_rr(false, w, false, &[0xf7], UNARY_TEST, r);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    pub fn not_r(&mut self, r: u8, size: u8) {
+        self.op_rr_sized(size, 0xf6, UNARY_NOT, r);
+    }
+
+    pub fn neg_r(&mut self, r: u8, size: u8) {
+        self.op_rr_sized(size, 0xf6, UNARY_NEG, r);
+    }
+
+    /// Leaves CF alone, like the guest instruction.
+    pub fn inc_r(&mut self, r: u8, size: u8) {
+        self.op_rr_sized(size, 0xfe, UNARY_INC, r);
+    }
+
+    pub fn dec_r(&mut self, r: u8, size: u8) {
+        self.op_rr_sized(size, 0xfe, UNARY_DEC, r);
+    }
+
+    /// `bt r, imm8`: CF = bit `bit` of `r`. The other flags are undefined.
+    pub fn bt_ri(&mut self, r: u8, bit: u8, w: bool) {
+        self.op_rr(false, w, false, &[0x0f, 0xba], BT_IMMEDIATE, r);
+        self.code.push(bit);
+    }
+
+    /// `d = d * s` truncated, signed. CF and OF are set when the full product does not fit; the
+    /// other flags are undefined.
+    pub fn imul_rr(&mut self, d: u8, s: u8, w: bool) {
+        self.op_rr(false, w, false, &[0x0f, 0xaf], d, s);
+    }
+
+    /// `if cc { d = s }`. With a 32-bit operand `d` is zero-extended whether or not it moved.
+    pub fn cmov_rr(&mut self, cc: u8, d: u8, s: u8, w: bool) {
+        self.op_rr(false, w, false, &[0x0f, 0x40 | cc], d, s);
+    }
+
+    /// Shift `r` by `cl`; the CPU masks the count to 5 bits, or 6 with `w`.
+    pub fn shift_cl(&mut self, op: u8, r: u8, w: bool) {
+        self.op_rr(false, w, false, &[0xd3], op, r);
+    }
+
+    /// `edx:eax` sign extension (`cdq`) or `rdx:rax` (`cqo`). Does not touch flags.
+    pub fn cdq(&mut self, w: bool) {
+        if w {
+            self.code.push(REX_BASE | REX_W);
+        }
+        self.code.push(0x99);
+    }
+
     /// Uses the sign-extended imm8 form when the value fits. With `w` the imm32 is
     /// sign-extended to 64 bits.
     pub fn alu_ri(&mut self, op: u8, r: u8, imm: i32, w: bool) {
@@ -353,9 +442,14 @@ impl Asm {
         self.code.push(v);
     }
 
-    /// Byte register `r` is set to the E condition; REX is forced for sil/dil.
+    /// Byte register `r` is set to 1 if condition `cc` holds, else 0; the rest of the register is
+    /// left alone, and so are the flags. REX is forced for sil/dil.
+    pub fn setcc(&mut self, cc: u8, r: u8) {
+        self.op_rr(false, false, true, &[0x0f, 0x90 | cc], 0, r);
+    }
+
     pub fn sete(&mut self, r: u8) {
-        self.op_rr(false, false, true, &[0x0f, 0x94], 0, r);
+        self.setcc(E, r);
     }
 
     /// Always the rel32 form so label distances never need relaxation.
