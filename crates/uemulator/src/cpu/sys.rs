@@ -291,7 +291,7 @@ impl Cpu {
             CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES => {
                 // Only subleaf 0 exists; EAX is the highest subleaf.
                 if self.gpr[RCX] as u32 == 0 {
-                    (0, STRUCTURED_FEATURE_FSGSBASE | (1 << 9), 0, 0)
+                    (0, STRUCTURED_FEATURE_FSGSBASE, 0, 0)
                 } else {
                     (0, 0, 0, 0)
                 }
