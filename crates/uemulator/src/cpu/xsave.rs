@@ -10,6 +10,8 @@ use super::{Cpu, ExecResult, mem};
 
 pub(super) const XCR0_X87: u64 = 1 << 0;
 pub(super) const XCR0_SSE: u64 = 1 << 1;
+/// YMM_Hi128: the upper halves of YMM0-15 (`Cpu::ymm_hi`).
+pub(super) const XCR0_AVX: u64 = 1 << 2;
 /// Components xsetbv accepts. Extending this also means extending CPUID leaf 0xD and the save
 /// area layout below, or the kernel will size its buffers for state the instructions skip.
 pub(super) const XCR0_SUPPORTED: u64 = XCR0_X87 | XCR0_SSE;
@@ -18,6 +20,12 @@ pub(super) const XCR0_SUPPORTED: u64 = XCR0_X87 | XCR0_SSE;
 /// and 48 reserved bytes, all of which xrstor requires to be zero except XSTATE_BV.
 pub(super) const XSAVE_HEADER_SIZE: u64 = 64;
 pub(super) const XSAVE_AREA_SIZE: u64 = FXSAVE_AREA_SIZE + XSAVE_HEADER_SIZE;
+/// The AVX component sits right after the header (CPUID.0xD.2 reports this offset) and holds
+/// YMM0_H..YMM15_H, 16 bytes each.
+pub(super) const AVX_STATE_OFFSET: u64 = XSAVE_AREA_SIZE;
+pub(super) const AVX_STATE_SIZE: u64 = 256;
+pub(super) const XSAVE_AREA_SIZE_WITH_AVX: u64 = AVX_STATE_OFFSET + AVX_STATE_SIZE;
+const YMM_HIGH_STRIDE: u64 = 16;
 const XSAVE_ALIGNMENT: u64 = 64;
 const XSTATE_BV_OFFSET: u64 = FXSAVE_AREA_SIZE;
 const XCOMP_BV_OFFSET: u64 = XSTATE_BV_OFFSET + 8;
@@ -73,7 +81,10 @@ impl Cpu {
             return Err(Exception::general_protection(0));
         }
         let value = (self.gpr[RDX] << 32) | (self.gpr[RAX] & 0xffff_ffff);
-        if value & XCR0_X87 == 0 || value & !XCR0_SUPPORTED != 0 {
+        if value & XCR0_X87 == 0
+            || value & !XCR0_SUPPORTED != 0
+            || (value & XCR0_AVX != 0 && value & XCR0_SSE == 0)
+        {
             return Err(Exception::general_protection(0));
         }
         self.xcr0 = value;
@@ -103,12 +114,19 @@ impl Cpu {
     /// through XSTATE_BV, which saying "in use" keeps correct.
     pub(super) fn xsave(&mut self, address: u64) -> ExecResult<()> {
         let requested = self.xsave_prologue(address)?;
-        self.translate(address + XSAVE_AREA_SIZE - 1, mem::AccessKind::Write, false)?;
+        let size = enabled_area_size(self.xcr0) as u64;
+        self.translate(address + size - 1, mem::AccessKind::Write, false)?;
         self.save_legacy_region(
             address,
             requested & XCR0_X87 != 0,
             requested & XCR0_SSE != 0,
         )?;
+        if requested & XCR0_AVX != 0 {
+            for k in 0..self.ymm_hi.len() {
+                let at = address + AVX_STATE_OFFSET + k as u64 * YMM_HIGH_STRIDE;
+                self.write128(at, self.ymm_hi[k])?;
+            }
+        }
         let previous = self.read(address + XSTATE_BV_OFFSET, 8)?;
         self.write(
             address + XSTATE_BV_OFFSET,
@@ -141,15 +159,32 @@ impl Cpu {
                 LegacyRestore::Init
             }
         };
-        self.restore_legacy_region(address, component(XCR0_X87), component(XCR0_SSE))
+        // Read the AVX component before anything is committed, like the legacy region.
+        let mut ymm_hi = self.ymm_hi;
+        match component(XCR0_AVX) {
+            LegacyRestore::Skip => {}
+            LegacyRestore::Init => ymm_hi = [0; 16],
+            LegacyRestore::Load => {
+                for (k, half) in ymm_hi.iter_mut().enumerate() {
+                    *half =
+                        self.read128(address + AVX_STATE_OFFSET + k as u64 * YMM_HIGH_STRIDE)?;
+                }
+            }
+        }
+        self.restore_legacy_region(address, component(XCR0_X87), component(XCR0_SSE))?;
+        self.ymm_hi = ymm_hi;
+        Ok(())
     }
 }
 
 /// CPUID.0xD.0:EBX: bytes the XSAVE area needs for the components `xcr0` enables.
 pub(super) fn enabled_area_size(xcr0: u64) -> u32 {
-    // Only the legacy region and header exist today, and the header is always part of the area.
-    let _ = xcr0;
-    XSAVE_AREA_SIZE as u32
+    // The header is always part of the area; each further component extends it.
+    if xcr0 & XCR0_AVX != 0 {
+        XSAVE_AREA_SIZE_WITH_AVX as u32
+    } else {
+        XSAVE_AREA_SIZE as u32
+    }
 }
 
 #[cfg(test)]

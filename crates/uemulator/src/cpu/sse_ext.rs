@@ -29,7 +29,7 @@ const OPCODE_MAP_0F3A: u16 = 3;
 
 /// The operation of an instruction, decoded from (map, opcode, prefix).
 #[derive(Clone, Copy)]
-enum Op {
+pub(in crate::cpu) enum Op {
     Movddup,
     Movsldup,
     Movshdup,
@@ -86,7 +86,7 @@ enum Op {
 /// The element a pextr*/pinsr*/extractps instruction moves between a vector register and a
 /// general register or memory.
 #[derive(Clone, Copy)]
-enum LaneKind {
+pub(in crate::cpu) enum LaneKind {
     Byte,
     Word,
     /// pextrd/pinsrd, or the 64-bit pextrq/pinsrq under REX.W.
@@ -136,7 +136,7 @@ impl Op {
     }
 }
 
-fn decode_op(map: u16, opcode: u8, prefix: Prefix) -> Option<Op> {
+pub(in crate::cpu) fn decode_op(map: u16, opcode: u8, prefix: Prefix) -> Option<Op> {
     use Prefix::*;
     Some(match (map, opcode, prefix) {
         (OPCODE_MAP_0F, 0x12, F2) => Op::Movddup,
@@ -958,7 +958,9 @@ impl Cpu {
                 }
             }
             (Source::Aligned, Some(addr)) => {
-                if addr & (VECTOR_ALIGNMENT - 1) != 0 {
+                // VEX relaxes the rule for everything but vmovntdqa
+                let enforced = !self.vex_active || matches!(op, Op::LoadAligned);
+                if enforced && addr & (VECTOR_ALIGNMENT - 1) != 0 {
                     return Err(Exception::general_protection(0));
                 }
                 self.read128(addr)?

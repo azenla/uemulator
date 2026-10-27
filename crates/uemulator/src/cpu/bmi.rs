@@ -88,11 +88,18 @@ impl Cpu {
         let size = i.opsize;
         let operand_mask = mask(size);
         let bits = size as u32 * 8;
+        let op = i.op & !VEX_OP_FLAG;
+        // BMI opcodes are all in map 2/3 with specific numbers; anything else is a vector form.
+        if !matches!(
+            op,
+            OP_ANDN | OP_GROUP17 | OP_BZHI_PEXT_PDEP | OP_MULX | OP_BEXTR_SHIFTS | OP_RORX
+        ) {
+            return self.exec_vex_vector(i, next);
+        }
         // All the BMI forms are LZ (VEX.L = 0).
         if i.vex_l {
             return Err(Exception::invalid_opcode());
         }
-        let op = i.op & !VEX_OP_FLAG;
         let vvvv = self.read_gpr(i.vex_v, size, true);
         match (op, i.rep, i.p66) {
             (OP_ANDN, REP_NONE, false) => {
@@ -193,7 +200,7 @@ impl Cpu {
                 };
                 self.write_gpr(i.reg, size, true, result);
             }
-            _ => return Err(self.unimplemented_opcode(i)),
+            _ => return self.exec_vex_vector(i, next),
         }
         self.rip = next;
         Ok(())

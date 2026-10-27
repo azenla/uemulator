@@ -1,5 +1,7 @@
 #[cfg(freestanding)]
 use crate::prelude::*;
+mod avx;
+mod avx_special;
 mod bmi;
 pub(crate) mod decode;
 pub(crate) mod exception;
@@ -296,6 +298,12 @@ pub(crate) struct Cpu {
     /// the kernel's `rdmsr_safe` probing depends on. Seeded in `Cpu::new`.
     pub msr_misc: alloc::collections::BTreeMap<u32, u64>,
     pub xmm: [u128; 16],
+    /// Bits 255:128 of YMM0-15 (AVX). Legacy SSE instructions leave them alone; VEX.128 forms zero
+    /// them.
+    pub ymm_hi: [u128; 16],
+    /// True while a VEX instruction runs through the legacy SSE kernels (see `avx.rs`): they then
+    /// skip the CR4.OSFXSR gate and the 16-byte alignment rule.
+    pub vex_active: bool,
     pub mxcsr: u32,
     pub fcw: u16,
     /// TOP is in bits 11-13.
@@ -443,6 +451,8 @@ impl Cpu {
             .collect(),
             cpl: 0,
             xmm: [0; 16],
+            ymm_hi: [0; 16],
+            vex_active: false,
             mxcsr: MXCSR_RESET,
             fcw: FCW_RESET,
             fsw: 0,
@@ -758,6 +768,9 @@ impl Cpu {
             if ours != theirs {
                 differences.push(format!("{name}: {ours:#x} vs {theirs:#x}"));
             }
+        }
+        if self.ymm_hi != other.ymm_hi {
+            differences.push("ymm_hi".into());
         }
         if self.xmm != other.xmm {
             differences.push("xmm".into());

@@ -880,7 +880,7 @@ fn binary_operation(env: &mut FpEnv, format: Format, opcode: u8, dest: u64, sour
 /// scalar-double (or MMX vs. XMM integer) forms of an 0F opcode. `Np` = none, `P66` = operand-size
 /// prefix, `F3`/`F2` = rep/repne; if several are present F3/F2 win (see `Insn::rep`).
 #[derive(Clone, Copy, PartialEq)]
-enum Prefix {
+pub(super) enum Prefix {
     Np,
     P66,
     F3,
@@ -908,6 +908,10 @@ impl Cpu {
     /// SDM SSE exception rules: #UD if CR0.EM is set or the OS has not enabled SSE (CR4.OSFXSR),
     /// #NM if CR0.TS is set (lazy FPU switching). #UD takes priority over #NM.
     pub(super) fn sse_gate(&self) -> ExecResult<()> {
+        // A VEX instruction did its own checks (XCR0/OSXSAVE instead of OSFXSR) in `avx.rs`.
+        if self.vex_active {
+            return Ok(());
+        }
         if self.cr0 & CR0_EM != 0 || self.cr4 & CR4_OSFXSR == 0 {
             return Err(Exception::invalid_opcode());
         }
@@ -1234,7 +1238,10 @@ impl Cpu {
         let unaligned_ok = matches!(
             (opcode, prefix),
             (0x10, Prefix::Np | Prefix::P66) | (0x6f, Prefix::F3)
-        );
+        ) || (self.vex_active
+            // VEX drops the alignment rule for everything except the explicitly aligned
+            // vmovaps/vmovapd/vmovdqa loads (stores are checked by `aligned!`)
+            && !matches!((opcode, prefix), (0x28, _) | (0x6f, Prefix::P66)));
         macro_rules! src {
             ($size:expr) => {
                 match mem_addr {
@@ -2011,7 +2018,7 @@ fn put_u64<T: Lane>(r: &mut u128, k: usize, v: u64, width: u32) {
 }
 
 #[path = "sse_ext.rs"]
-mod ext;
+pub(in crate::cpu) mod ext;
 
 #[cfg(test)]
 mod tests {
