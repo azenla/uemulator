@@ -1217,3 +1217,12 @@ fn rdtscp_matches() {
     // rdtscp; hlt
     check_with(&[0x0f, 0x01, 0xf9, 0xf4], |h| h.cpu.tsc_aux = 0x77);
 }
+
+#[test]
+fn rdtscp_after_other_instructions_sees_the_same_time() {
+    // The JIT only updates icount at block exit; a clock read mid-block must pay for the
+    // instructions ahead of it. mov eax, 1; add eax, 2; nop; rdtscp; hlt
+    check(&[
+        0xb8, 1, 0, 0, 0, 0x83, 0xc0, 2, 0x90, 0x0f, 0x01, 0xf9, 0xf4,
+    ]);
+}

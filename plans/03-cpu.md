@@ -92,3 +92,14 @@ Anything else VEX-encoded (all vector forms, vzeroupper) is still #UD and logged
 ## RDTSCP
 
 `0F 01 F9`, advertised in 0x80000001 EDX bit 27: EDX:EAX = TSC (same CR4.TSD rule as rdtsc), ECX = IA32_TSC_AUX. Linux uses it for `rdpid`-less CPU/node lookup in the vDSO.
+
+## UMIP, SMEP/SMAP, PCID/INVPCID, MONITOR/MWAIT
+
+`cpu/protection.rs` plus the page walk in `mem.rs`.
+
+- UMIP (CR4 bit 11, CPUID.7.0:ECX bit 2): sgdt, sidt, sldt, str, smsw are #GP(0) at CPL > 0.
+- SMEP/SMAP (CR4 bits 20/21, CPUID.7.0:EBX bits 7/20): in `walk`, a supervisor-mode access (`!user`) to a page that is user-accessible at every level is #PF (P=1; the fetch bit is reported when NX *or* SMEP is on) for fetches under SMEP and for data accesses under SMAP while EFLAGS.AC is clear. `stac`/`clac` (0F 01 CB/CA) set/clear AC and are #UD outside CPL 0. **Such a translation is never put in the soft TLB** while SMEP or SMAP is on: AC changes (stac, clac, popf) without flushing, so a cached entry would let a later access skip the check. The kernel's user-copy paths are the only accesses affected, and they were slow-path walks anyway. Implicit supervisor accesses (descriptor tables) cannot be told from explicit ones inside `walk`, so they get the AC waiver too; no kernel relies on the difference.
+- PCID/INVPCID (CR4.PCIDE bit 17, CPUID.1:ECX bit 17, CPUID.7.0:EBX bit 10): CR3[11:0] holds the PCID and bit 63 is accepted and ignored. The TLB is untagged, so every CR3 write and every INVPCID type flushes everything (always a legal superset); operand validation follows the SDM. PCIDE can only be set while CR3[11:0] is zero.
+- MONITOR/MWAIT (CPUID.1:ECX bit 3, leaf 5 = 64-byte lines, extensions + interrupt-break): CPL 0, ECX/EDX checked. `mwait` after a `monitor` behaves like `hlt` with interrupts enabled (only interrupts wake it) and returns immediately with IF=0, which hardware may also do; the armed address is not tracked because nothing but DMA can write guest memory while the single CPU waits.
+- Linux 6.18 guest: "x86/cpu: User Mode Instruction Prevention (UMIP) activated"; `smep smap umip pcid invpcid monitor` appear in /proc/cpuinfo; lockstep boot is divergence-free.
+- Found by the lockstep verifier: `rdtscp` (group 7) reads guest time, so `jit::helpers::reads_guest_clock` now includes the whole group, otherwise the JIT read a stale `icount` mid-block.

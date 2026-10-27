@@ -33,4 +33,4 @@ Not a fit for the AMD identity (`GenuineIntel` would also change Linux's model-s
 ## Other items not done
 
 - ERMS/FSRM: measured slower, see the comment on `STRUCTURED_FEATURE_FSGSBASE` in `cpu/sys.rs`; needs a bulk `rep movsb`/`stosb` path first.
-- MONITOR/MWAIT, PCID/INVPCID, SMEP/SMAP/UMIP (MMU and CR4 changes), PKU, CET (shadow stacks; the kernel only needs `endbr64`, which is a NOP here), LA57, XSAVEC/XSAVES, x2APIC/APIC.
+- PKU, CET (shadow stacks; the kernel only needs `endbr64`, which is a NOP here), LA57, XSAVEC/XSAVES, x2APIC/APIC.

@@ -1740,6 +1740,8 @@ impl Cpu {
                 let v = combine_dwords(self.gpr[GPR_RAX], self.gpr[GPR_RDX]);
                 self.wrmsr(self.gpr[GPR_RCX] as u32, v)?;
             }
+            // invpcid
+            0x282 if i.p66 => return self.invpcid(i, next),
             // rdtsc
             0x131 => {
                 if self.cr4 & CR4_TSD != 0 && self.cpl != 0 {
@@ -13875,12 +13877,7 @@ mod exec_tests {
         }
         // The exact set of leaf 1 ECX bits is pinned in the tests in sys.rs; these must stay clear because
         // their instructions (or the OS support behind them) do not exist.
-        for (bit, name) in [
-            (1 << 3, "monitor/mwait"),
-            (1 << 5, "vmx"),
-            (1 << 28, "avx"),
-            (1 << 31, "hypervisor"),
-        ] {
+        for (bit, name) in [(1 << 5, "vmx"), (1 << 28, "avx"), (1 << 31, "hypervisor")] {
             assert_eq!(ecx & bit, 0, "{name} must not be advertised");
         }
         let [_, _, ecx, edx] = cpuid(0x8000_0001, 0);

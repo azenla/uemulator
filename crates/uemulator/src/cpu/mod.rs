@@ -7,6 +7,7 @@ mod exec;
 pub(crate) mod flags;
 mod fpu;
 pub(crate) mod mem;
+mod protection;
 mod sse;
 mod sys;
 #[cfg(test)]
@@ -281,6 +282,9 @@ pub(crate) struct Cpu {
     pub spec_ctrl: u64,
     /// XCR0, the enabled extended-state components (xgetbv/xsetbv). Bit 0 (x87) is always set.
     pub xcr0: u64,
+    /// MONITOR address and whether a monitor is armed for the next MWAIT.
+    pub monitor_address: u64,
+    pub monitor_armed: bool,
     /// State of the generator behind rdrand/rdseed (splitmix64). Seeded by the machine.
     pub rng_state: u64,
     pub pat: u64,
@@ -422,6 +426,8 @@ impl Cpu {
             tsc_aux: 0,
             spec_ctrl: 0,
             xcr0: xsave::XCR0_X87,
+            monitor_address: 0,
+            monitor_armed: false,
             rng_state: DEFAULT_RANDOM_SEED,
             pat: PAT_POWER_ON_DEFAULT,
             sysenter: [0; 3],

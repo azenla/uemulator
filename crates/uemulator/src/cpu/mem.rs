@@ -1,6 +1,7 @@
 use super::decode::{self, DecodeErr, Insn};
 use super::exception::{Exception, VECTOR_GENERAL_PROTECTION, VECTOR_PAGE_FAULT};
 use super::flags::*;
+use super::sys::{CR4_SMAP, CR4_SMEP};
 use super::*;
 use crate::dev::guestmem::GuestMem;
 
@@ -131,8 +132,8 @@ impl Cpu {
         if reserved_bit_violation {
             error_code |= PF_RESERVED;
         }
-        // The fetch bit is only reported when NX is enabled (SMEP is not advertised).
-        if access == AccessKind::Exec && self.efer & EFER_NXE != 0 {
+        // The fetch bit is only reported when NX or SMEP is enabled.
+        if access == AccessKind::Exec && (self.efer & EFER_NXE != 0 || self.cr4 & CR4_SMEP != 0) {
             error_code |= PF_INSTRUCTION_FETCH;
         }
         Exception::fault(VECTOR_PAGE_FAULT, Some(error_code))
@@ -191,7 +192,18 @@ impl Cpu {
             if leaf {
                 let write_protect = self.cr0 & CR0_WP != 0;
                 // Supervisor writes to read-only pages only fault when CR0.WP is set.
-                let denied = (user && !user_allowed)
+                // SMEP/SMAP: a supervisor-mode access to a page that is user-accessible at every
+                // level. SMAP is waived by EFLAGS.AC for explicit accesses; implicit ones
+                // (descriptor tables) are indistinguishable here and get the same waiver.
+                let supervisor_on_user_page = !user && user_allowed;
+                let smep_smap_denied = supervisor_on_user_page
+                    && if access == AccessKind::Exec {
+                        self.cr4 & CR4_SMEP != 0
+                    } else {
+                        self.cr4 & CR4_SMAP != 0 && self.eflags & AC == 0
+                    };
+                let denied = smep_smap_denied
+                    || (user && !user_allowed)
                     || (write && !writable && (user || write_protect))
                     || (access == AccessKind::Exec && no_execute && nxe);
                 if denied {
@@ -266,8 +278,13 @@ impl Cpu {
                 .wrapping_sub(self.ram_base));
         }
         let (page_pa, walk_flags) = self.walk(linear, access, user)?;
+        // A supervisor access to a user page is never cached while SMEP or SMAP is on: whether it
+        // is allowed depends on EFLAGS.AC (SMAP), which changes without any TLB flush (stac,
+        // clac, popf), and a cached entry would let a later access skip the check.
+        let uncacheable =
+            !user && walk_flags & TLB_FLAG_USER != 0 && self.cr4 & (CR4_SMEP | CR4_SMAP) != 0;
         // Only RAM-backed pages are cached; MMIO has no host pointer to put in `addend`.
-        if page_pa < self.ram.len() as u64 {
+        if page_pa < self.ram.len() as u64 && !uncacheable {
             let write_protect = self.cr0 & CR0_WP != 0;
             // Keep the other tags if the slot already maps this page, so a read refill does not
             // drop the page's exec tag and vice versa.

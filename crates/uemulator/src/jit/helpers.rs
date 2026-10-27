@@ -255,14 +255,17 @@ pub(crate) extern "C" fn helper_cond(cpu: &mut Cpu, cc: u64) -> u64 {
 /// `Insn::op` of `rdtsc` and `rdmsr` (`0f 31`, `0f 32`; `decode` puts the `0f` map in bits 8+).
 const OP_RDTSC: u16 = 0x131;
 const OP_RDMSR: u16 = 0x132;
+/// Group 7 (`0f 01`). It holds rdtscp (`0f 01 f9`), which reads the clock; `op` alone cannot tell
+/// the members apart here, and the group ends the block anyway, so every member pays the sync.
+const OP_GROUP7: u16 = 0x101;
 
 /// Instructions whose result depends on guest time, which `Cpu::now_ns` derives from `icount`:
-/// rdtsc, rdmsr (the TSC MSR), and in/out (which pass the time to the device). `icount` is only
+/// rdtsc, rdtscp, rdmsr (the TSC MSR), and in/out (which pass the time to the device). `icount` is only
 /// brought up to date when a block exits, so both emitters pay for the instructions ahead of
 /// one of these before calling the helper (see `Gen::helper`).
 pub(crate) fn reads_guest_clock(op: u16) -> bool {
     // e4..e7 in/out with an imm8 port; ec..ef in/out with the port in dx
-    matches!(op, OP_RDTSC | OP_RDMSR | 0xe4..=0xe7 | 0xec..=0xef)
+    matches!(op, OP_RDTSC | OP_RDMSR | OP_GROUP7 | 0xe4..=0xe7 | 0xec..=0xef)
 }
 
 /// The instructions an emitter may lower with its own exit sequence (`try_inline` returns true
@@ -451,8 +454,10 @@ mod tests {
     }
 
     #[test]
-    fn the_clock_reading_instructions_are_exactly_rdtsc_rdmsr_and_port_io() {
-        for op in [0x131, 0x132, 0xe4, 0xe5, 0xe6, 0xe7, 0xec, 0xed, 0xee, 0xef] {
+    fn the_clock_reading_instructions_are_exactly_rdtsc_rdtscp_rdmsr_and_port_io() {
+        for op in [
+            0x131, 0x132, 0x101, 0xe4, 0xe5, 0xe6, 0xe7, 0xec, 0xed, 0xee, 0xef,
+        ] {
             assert!(reads_guest_clock(op), "opcode {op:#x}");
         }
         for op in [

@@ -86,6 +86,14 @@ pub(crate) const CR4_OSXMMEXCPT: u64 = 1 << 10;
 pub(crate) const CR4_FSGSBASE: u64 = 1 << 16;
 /// Enables xgetbv/xsetbv/xsave/xrstor; also mirrored into CPUID.1:ECX bit 27.
 pub(crate) const CR4_OSXSAVE: u64 = 1 << 18;
+/// User-mode instruction prevention: sgdt/sidt/sldt/str/smsw are #GP outside CPL 0.
+pub(crate) const CR4_UMIP: u64 = 1 << 11;
+/// Process-context identifiers: CR3[11:0] is a PCID and bit 63 a no-flush hint.
+pub(crate) const CR4_PCIDE: u64 = 1 << 17;
+/// Supervisor-mode execution prevention: no instruction fetches from user pages at CPL < 3.
+pub(crate) const CR4_SMEP: u64 = 1 << 20;
+/// Supervisor-mode access prevention: no data accesses to user pages at CPL < 3 unless EFLAGS.AC.
+pub(crate) const CR4_SMAP: u64 = 1 << 21;
 /// CR4 bits a guest may set. Everything else (VME, PVI, MCE, UMIP, LA57, PCIDE, OSXSAVE, SMEP,
 /// SMAP...) is rejected with #GP because CPUID does not advertise it.
 const CR4_SUPPORTED: u64 = CR4_TSD
@@ -97,7 +105,11 @@ const CR4_SUPPORTED: u64 = CR4_TSD
     | CR4_OSFXSR
     | CR4_OSXMMEXCPT
     | CR4_FSGSBASE
-    | CR4_OSXSAVE;
+    | CR4_OSXSAVE
+    | CR4_UMIP
+    | CR4_PCIDE
+    | CR4_SMEP
+    | CR4_SMAP;
 
 /// Address widths reported by CPUID 0x8000_0008. CR3 and the canonical-address checks follow them.
 const PHYSICAL_ADDRESS_BITS: u32 = 40;
@@ -107,6 +119,10 @@ const VIRTUAL_ADDRESS_BITS: u32 = 48;
 /// Everything else (bits 2:0 and 11:5, the PCID field) is ignored without CR4.PCIDE.
 const CR3_MASK: u64 = 0x000f_ffff_ffff_f018;
 /// Bits at or above the physical address width are reserved in CR3: writing one is #GP(0).
+/// CR3 bit 63 with CR4.PCIDE: do not invalidate the new PCID's translations.
+const CR3_NO_FLUSH: u64 = 1 << 63;
+/// CR3 bits kept with CR4.PCIDE: the address plus the whole 12-bit PCID.
+const CR3_MASK_PCID: u64 = 0x000f_ffff_ffff_ffff;
 const CR3_RESERVED: u64 = !0u64 << PHYSICAL_ADDRESS_BITS;
 /// CR8 holds the 4-bit task priority; it is stored but no APIC consumes it. Higher bits are
 /// reserved.
@@ -187,6 +203,12 @@ const CPUID_LEAF_FEATURES: u32 = 1;
 const CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES: u32 = 7;
 /// Processor extended state enumeration (xsave component sizes).
 const CPUID_LEAF_XSTATE: u32 = 0xd;
+/// MONITOR/MWAIT parameters.
+const CPUID_LEAF_MONITOR: u32 = 5;
+/// Leaf 5 smallest/largest monitor-line size, and ECX bits: extensions enumerated, interrupts
+/// break MWAIT even when masked.
+const MONITOR_LINE_BYTES: u32 = 64;
+const MONITOR_ECX_EXTENSIONS_AND_BREAK: u32 = 0b11;
 const CPUID_LEAF_EXT_MAX: u32 = 0x8000_0000;
 const CPUID_LEAF_EXT_FEATURES: u32 = 0x8000_0001;
 const CPUID_LEAF_BRAND_FIRST: u32 = 0x8000_0002;
@@ -263,6 +285,10 @@ const FEATURE_SSSE3: u32 = 1 << 9;
 const FEATURE_SSE4_1: u32 = 1 << 19;
 /// SSE4.2: pcmpgtq, CRC32 and the pcmp[ei]str[im] string instructions.
 const FEATURE_SSE4_2: u32 = 1 << 20;
+/// MONITOR/MWAIT (leaf 5 describes them).
+const FEATURE_MONITOR: u32 = 1 << 3;
+/// CR4.PCIDE and the PCID field of CR3.
+const FEATURE_PCID: u32 = 1 << 17;
 /// MOVBE.
 const FEATURE_MOVBE: u32 = 1 << 22;
 const FEATURE_POPCNT: u32 = 1 << 23;
@@ -284,7 +310,9 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
     | FEATURE_POPCNT
     | FEATURE_AES
     | FEATURE_XSAVE
-    | FEATURE_RDRAND;
+    | FEATURE_RDRAND
+    | FEATURE_MONITOR
+    | FEATURE_PCID;
 
 /// Leaf 7 subleaf 0 EBX bit 0: rdfsbase, rdgsbase, wrfsbase, wrgsbase. ERMS/FSRM (bits 9 and 4)
 /// stay clear on purpose: they make the kernel's memcpy and clear_page use `rep movsb`/`rep stosb`,
@@ -299,7 +327,16 @@ const STRUCTURED_FEATURE_RDSEED: u32 = 1 << 18;
 const STRUCTURED_FEATURE_BMI1: u32 = 1 << 3;
 /// BMI2: bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx (VEX).
 const STRUCTURED_FEATURE_BMI2: u32 = 1 << 8;
+/// SMEP, INVPCID, SMAP.
+const STRUCTURED_FEATURE_SMEP: u32 = 1 << 7;
+const STRUCTURED_FEATURE_INVPCID: u32 = 1 << 10;
+const STRUCTURED_FEATURE_SMAP: u32 = 1 << 20;
+/// Leaf 7 ECX bit 2: UMIP.
+const STRUCTURED_ECX_UMIP: u32 = 1 << 2;
 const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE
+    | STRUCTURED_FEATURE_SMEP
+    | STRUCTURED_FEATURE_INVPCID
+    | STRUCTURED_FEATURE_SMAP
     | STRUCTURED_FEATURE_BMI1
     | STRUCTURED_FEATURE_BMI2
     | STRUCTURED_FEATURE_RDSEED;
@@ -374,7 +411,7 @@ const RBX: usize = 3;
 const R11: usize = 11;
 
 /// Whether bits 63:47 of `address` are all copies of bit 47.
-fn is_canonical(address: u64) -> bool {
+pub(super) fn is_canonical(address: u64) -> bool {
     let sign_extension = (address as i64) >> (VIRTUAL_ADDRESS_BITS - 1);
     sign_extension == 0 || sign_extension == -1
 }
@@ -397,7 +434,7 @@ impl Cpu {
             CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES => {
                 // Only subleaf 0 exists; EAX is the highest subleaf.
                 if self.gpr[RCX] as u32 == 0 {
-                    (0, STRUCTURED_EBX, 0, STRUCTURED_EDX)
+                    (0, STRUCTURED_EBX, STRUCTURED_ECX_UMIP, STRUCTURED_EDX)
                 } else {
                     (0, 0, 0, 0)
                 }
@@ -415,6 +452,12 @@ impl Cpu {
                     CPUID_LEAF1_EDX,
                 )
             }
+            CPUID_LEAF_MONITOR => (
+                MONITOR_LINE_BYTES,
+                MONITOR_LINE_BYTES,
+                MONITOR_ECX_EXTENSIONS_AND_BREAK,
+                0,
+            ),
             // Subleaf 0: supported XCR0 bits, size of the area for the currently enabled bits and
             // for all supported ones. Subleaf 1: EAX bit 0 = xsaveopt.
             CPUID_LEAF_XSTATE => match self.gpr[RCX] as u32 {
@@ -587,16 +630,29 @@ impl Cpu {
                     0 => self.write_cr0(v)?,
                     2 => self.cr2 = v,
                     3 => {
-                        if v & CR3_RESERVED != 0 {
+                        // With CR4.PCIDE, bits 11:0 are the PCID (not PWT/PCD) and bit 63 asks
+                        // not to flush; the TLB is untagged, so the hint is ignored (flushing
+                        // more than asked is always allowed).
+                        let pcide = self.cr4 & CR4_PCIDE != 0;
+                        let reserved = if pcide {
+                            CR3_RESERVED & !CR3_NO_FLUSH
+                        } else {
+                            CR3_RESERVED
+                        };
+                        if v & reserved != 0 {
                             return Err(Exception::general_protection(0));
                         }
-                        self.cr3 = v & CR3_MASK;
+                        self.cr3 = v & if pcide { CR3_MASK_PCID } else { CR3_MASK };
                         self.flush_tlb();
                     }
                     4 => {
                         // PAE cannot be turned off under IA-32e paging.
+                        // PCIDE may only be set while the PCID field of CR3 is zero.
                         if v & !CR4_SUPPORTED != 0
                             || (self.efer & EFER_LMA != 0 && v & CR4_PAE == 0)
+                            || (v & CR4_PCIDE != 0
+                                && self.cr4 & CR4_PCIDE == 0
+                                && self.cr3 & 0xfff != 0)
                         {
                             return Err(Exception::general_protection(0));
                         }
@@ -868,6 +924,10 @@ impl Cpu {
         const MODRM_XGETBV: u8 = 0xd0;
         const MODRM_XSETBV: u8 = 0xd1;
         const MODRM_RDTSCP: u8 = 0xf9;
+        const MODRM_MONITOR: u8 = 0xc8;
+        const MODRM_MWAIT: u8 = 0xc9;
+        const MODRM_CLAC: u8 = 0xca;
+        const MODRM_STAC: u8 = 0xcb;
         let reg = i.reg & 7;
         if i.op == OP_GROUP6 {
             let loc = self.modrm_location(i, next);
@@ -876,11 +936,13 @@ impl Cpu {
             match reg {
                 // sldt
                 0 => {
+                    self.umip_check()?;
                     let v = self.ldtr.sel as u64;
                     self.store_operand(loc, size, i, v)?;
                 }
                 // str
                 1 => {
+                    self.umip_check()?;
                     let v = self.tr.sel as u64;
                     self.store_operand(loc, size, i, v)?;
                 }
@@ -912,6 +974,19 @@ impl Cpu {
                     core::mem::swap(&mut self.seg[SEG_GS].base, &mut self.kgsbase);
                 }
                 MODRM_XGETBV => self.xgetbv()?,
+                MODRM_MONITOR => self.monitor()?,
+                MODRM_MWAIT => self.mwait()?,
+                // clac/stac: #UD outside CPL 0 (not #GP), unlike most privileged instructions
+                MODRM_CLAC | MODRM_STAC => {
+                    if self.cpl != 0 {
+                        return Err(Exception::invalid_opcode());
+                    }
+                    if i.modrm == MODRM_STAC {
+                        self.eflags |= AC;
+                    } else {
+                        self.eflags &= !AC;
+                    }
+                }
                 MODRM_XSETBV => self.xsetbv()?,
                 // Same CR4.TSD rule as rdtsc; ECX = IA32_TSC_AUX (zero-extended), EDX:EAX = TSC.
                 MODRM_RDTSCP => {
@@ -936,6 +1011,7 @@ impl Cpu {
                     Loc::Mem(addr) => addr,
                     _ => return Err(Exception::invalid_opcode()),
                 };
+                self.umip_check()?;
                 let table = if reg == 0 { self.gdtr } else { self.idtr };
                 self.write(addr, 2, table.limit as u64)?;
                 self.write(addr + 2, 8, table.base)?;
@@ -959,6 +1035,7 @@ impl Cpu {
             // smsw: the store truncates to the operand size, so a register destination of 32 or 64
             // bits receives CR0 itself
             4 => {
+                self.umip_check()?;
                 let size = if i.md == 3 { i.opsize } else { 2 };
                 let v = self.cr0;
                 self.store_operand(loc, size, i, v)?;
@@ -1476,6 +1553,8 @@ mod sys_tests {
             const XSAVE: u32 = 1 << 26;
             const OSXSAVE: u32 = 1 << 27;
             const RDRAND: u32 = 1 << 30;
+            const MONITOR: u32 = 1 << 3;
+            const PCID: u32 = 1 << 17;
             let mut h = blank();
             let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
             assert_eq!(
@@ -1489,8 +1568,10 @@ mod sys_tests {
                     | POPCNT
                     | AES
                     | XSAVE
-                    | RDRAND,
-                "no MONITOR, VMX, SMX, AVX or hypervisor bit, and OSXSAVE only follows CR4"
+                    | RDRAND
+                    | MONITOR
+                    | PCID,
+                "no VMX, SMX, AVX or hypervisor bit, and OSXSAVE only follows CR4"
             );
             h.cpu.cr4 |= CR4_OSXSAVE;
             let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
@@ -1512,12 +1593,21 @@ mod sys_tests {
             const RDSEED: u32 = 1 << 18;
             const BMI1: u32 = 1 << 3;
             const BMI2: u32 = 1 << 8;
+            const SMEP: u32 = 1 << 7;
+            const INVPCID: u32 = 1 << 10;
+            const SMAP: u32 = 1 << 20;
+            const UMIP: u32 = 1 << 2;
             let mut h = blank();
             // EAX is the highest subleaf. ERMS and FSRM stay clear (see sys.rs), as do SMEP, SMAP,
             // PCID, BMI, AVX2 and everything else.
             assert_eq!(
                 cpuid(&mut h, 7, 0),
-                [0, FSGSBASE | BMI1 | BMI2 | RDSEED, 0, STRUCTURED_EDX]
+                [
+                    0,
+                    FSGSBASE | BMI1 | BMI2 | RDSEED | SMEP | INVPCID | SMAP,
+                    UMIP,
+                    STRUCTURED_EDX
+                ]
             );
         }
 
@@ -1533,10 +1623,16 @@ mod sys_tests {
         fn other_standard_leaves_are_zero() {
             let mut h = blank();
             for leaf in [
-                2, 3, 4, 5, 6, 8, 0xa, 0xb, 0xc, 0xe, 0xf, 0x10, 0x14, 0x15, 0x1f,
+                2, 3, 4, 6, 8, 0xa, 0xb, 0xc, 0xe, 0xf, 0x10, 0x14, 0x15, 0x1f,
             ] {
                 assert_eq!(cpuid(&mut h, leaf, 0), [0, 0, 0, 0], "leaf {leaf:#x}");
             }
+        }
+
+        #[test]
+        fn leaf_5_describes_monitor_mwait() {
+            let mut h = blank();
+            assert_eq!(cpuid(&mut h, 5, 0), [64, 64, 0b11, 0]);
         }
 
         #[test]
@@ -2181,6 +2277,232 @@ mod sys_tests {
         }
     }
 
+    mod protection_features {
+        use super::*;
+
+        const SGDT: &[u8] = &[0x0f, 0x01, 0x06, 0xf4];
+        const SIDT: &[u8] = &[0x0f, 0x01, 0x0e, 0xf4];
+        const SMSW: &[u8] = &[0x0f, 0x01, 0xe0, 0xf4];
+        const SLDT: &[u8] = &[0x0f, 0x00, 0xc0, 0xf4];
+        const STR: &[u8] = &[0x0f, 0x00, 0xc8, 0xf4];
+        const MONITOR: &[u8] = &[0x0f, 0x01, 0xc8, 0xf4];
+        const MWAIT: &[u8] = &[0x0f, 0x01, 0xc9, 0xf4];
+        const MONITOR_MWAIT_MOV: &[u8] =
+            &[0x0f, 0x01, 0xc8, 0x0f, 0x01, 0xc9, 0xb8, 5, 0, 0, 0, 0xf4];
+        const CLAC: &[u8] = &[0x0f, 0x01, 0xca, 0xf4];
+        const STAC: &[u8] = &[0x0f, 0x01, 0xcb, 0xf4];
+        const LOAD_RSI: &[u8] = &[0x48, 0x8b, 0x06, 0xf4];
+        const STAC_LOAD_CLAC_LOAD: &[u8] = &[
+            0x0f, 0x01, 0xcb, 0x48, 0x8b, 0x06, 0x0f, 0x01, 0xca, 0x48, 0x8b, 0x06, 0xf4,
+        ];
+        const INVPCID: &[u8] = &[0x66, 0x0f, 0x38, 0x82, 0x06, 0xf4];
+        const INVPCID_REGISTER: &[u8] = &[0x66, 0x0f, 0x38, 0x82, 0xc6, 0xf4];
+        const WRITE_CR3: &[u8] = &[0x0f, 0x22, 0xd8, 0xf4];
+        const CR4_UMIP_BIT: u64 = 1 << 11;
+        const CR4_PCIDE_BIT: u64 = 1 << 17;
+        const CR4_SMEP_BIT: u64 = 1 << 20;
+        const CR4_SMAP_BIT: u64 = 1 << 21;
+        const AC_BIT: u64 = 1 << 18;
+        const IF_BIT: u64 = 1 << 9;
+
+        fn page_fault(code: u32) -> Stop {
+            Stop::Fault {
+                vector: 14,
+                error_code: Some(code),
+                software: false,
+            }
+        }
+
+        #[test]
+        fn umip_blocks_the_descriptor_table_reads_outside_cpl0() {
+            for code in [SGDT, SIDT, SMSW, SLDT, STR] {
+                // without UMIP they work at CPL 3: the only fault is the final hlt
+                let (h, stop) = run_with(code, |h| {
+                    user_mode(h);
+                    h.cpu.gpr[RSI] = DATA;
+                });
+                assert_eq!(stop, general_protection(0));
+                assert_eq!(
+                    h.cpu.rip,
+                    CODE_BASE + 3,
+                    "stopped at hlt, not the instruction"
+                );
+                assert_general_protection_zero(code, |h| {
+                    user_mode(h);
+                    h.cpu.cr4 |= CR4_UMIP_BIT;
+                    h.cpu.gpr[RSI] = DATA;
+                });
+                // CPL 0 is exempt
+                run_ok(code, |h| {
+                    h.cpu.cr4 |= CR4_UMIP_BIT;
+                    h.cpu.gpr[RSI] = DATA;
+                });
+            }
+        }
+
+        #[test]
+        fn smap_faults_supervisor_data_accesses_to_user_pages_unless_ac() {
+            let setup = |h: &mut Harness| {
+                user_mode(h);
+                h.cpu.set_cpl(0);
+                h.cpu.cr4 |= CR4_SMAP_BIT;
+                h.cpu.gpr[RSI] = DATA;
+            };
+            let h = assert_faults(LOAD_RSI, setup, page_fault(1));
+            assert_eq!(h.cpu.cr2, DATA);
+            // AC set: allowed
+            run_ok(LOAD_RSI, |h| {
+                setup(h);
+                h.cpu.eflags |= AC_BIT;
+            });
+            // without SMAP the same access is fine
+            run_ok(LOAD_RSI, |h| {
+                setup(h);
+                h.cpu.cr4 &= !CR4_SMAP_BIT;
+            });
+        }
+
+        #[test]
+        fn stac_and_clac_toggle_ac_and_a_cached_translation_cannot_outlive_clac() {
+            // stac; mov rax,[rsi]; clac; mov rax,[rsi]: the second load must fault even though the
+            // first one just walked the same page.
+            let (h, stop) = run_with(STAC_LOAD_CLAC_LOAD, |h| {
+                user_mode(h);
+                h.cpu.set_cpl(0);
+                h.cpu.cr4 |= CR4_SMAP_BIT;
+                h.cpu.gpr[RSI] = DATA;
+            });
+            assert_eq!(stop, page_fault(1));
+            assert_eq!(h.cpu.eflags & AC_BIT, 0);
+            let h = run_ok(STAC, |h| h.cpu.eflags &= !AC_BIT);
+            assert_ne!(h.cpu.eflags & AC_BIT, 0);
+            let h = run_ok(CLAC, |h| h.cpu.eflags |= AC_BIT);
+            assert_eq!(h.cpu.eflags & AC_BIT, 0);
+        }
+
+        #[test]
+        fn stac_and_clac_are_ud_outside_cpl0() {
+            for code in [STAC, CLAC] {
+                assert_invalid_opcode(code, user_mode);
+            }
+        }
+
+        #[test]
+        fn smep_faults_supervisor_fetches_from_user_pages() {
+            // the code page itself is user-accessible here
+            let h = assert_faults(
+                SGDT,
+                |h| {
+                    user_mode(h);
+                    h.cpu.set_cpl(0);
+                    h.cpu.cr4 |= CR4_SMEP_BIT;
+                },
+                page_fault(0x11),
+            );
+            assert_eq!(h.cpu.cr2, CODE_BASE);
+            // user fetches from user pages are unaffected
+            let (h, stop) = run_with(SGDT, |h| {
+                user_mode(h);
+                h.cpu.cr4 |= CR4_SMEP_BIT;
+                h.cpu.gpr[RSI] = DATA;
+            });
+            assert_eq!(stop, general_protection(0), "only the hlt faults");
+            assert_eq!(h.cpu.rip, CODE_BASE + 3);
+        }
+
+        #[test]
+        fn pcid_cr3_keeps_the_pcid_and_ignores_the_no_flush_bit() {
+            let cr3 = {
+                let h = Harness::new(&[0xf4]);
+                h.cpu.cr3
+            };
+            let h = run_ok(WRITE_CR3, |h| {
+                h.cpu.cr3 &= !0xfff;
+                h.cpu.cr4 |= CR4_PCIDE_BIT;
+                h.cpu.gpr[RAX] = (cr3 & !0xfff) | 5 | (1 << 63);
+            });
+            assert_eq!(h.cpu.cr3, (cr3 & !0xfff) | 5);
+            // without PCIDE bit 63 is reserved
+            assert_general_protection_zero(WRITE_CR3, |h| {
+                h.cpu.gpr[RAX] = h.cpu.cr3 | (1 << 63);
+            });
+        }
+
+        #[test]
+        fn pcide_cannot_be_set_while_cr3_holds_a_pcid() {
+            let mut h = blank();
+            h.cpu.cr3 |= 5;
+            assert_gp0(h.cpu.wrmsr(0xdead, 0));
+            let value = h.cpu.cr4 | CR4_PCIDE_BIT;
+            h.cpu.gpr[RAX] = value;
+            h.write(CODE_BASE, &[0x0f, 0x22, 0xe0, 0xf4]);
+            h.cpu.rip = CODE_BASE;
+            assert_eq!(h.run(10), general_protection(0));
+            assert_eq!(h.cpu.cr4 & CR4_PCIDE_BIT, 0);
+        }
+
+        fn invpcid_setup(kind: u64, low: u64, linear: u64) -> impl FnOnce(&mut Harness) {
+            move |h| {
+                h.cpu.gpr[RAX] = kind;
+                h.cpu.gpr[RSI] = DATA;
+                h.write_u64(DATA, low);
+                h.write_u64(DATA + 8, linear);
+            }
+        }
+
+        #[test]
+        fn invpcid_validates_its_operands_and_flushes_the_tlb() {
+            for kind in 0..=3 {
+                let h = run_ok(INVPCID, |h| {
+                    invpcid_setup(kind, 3, DATA)(h);
+                    // fill a TLB entry first
+                    h.cpu.read(DATA, 8).unwrap();
+                });
+                assert!(
+                    h.cpu.tlb.iter().all(|e| e.tag_r == !0 || e.tag_r != DATA),
+                    "type {kind}"
+                );
+            }
+            assert_general_protection_zero(INVPCID, invpcid_setup(4, 0, 0));
+            assert_general_protection_zero(INVPCID, invpcid_setup(0, 1 << 12, 0));
+            assert_general_protection_zero(INVPCID, invpcid_setup(0, 0, 1 << 47));
+            // a non-canonical address only matters for type 0
+            run_ok(INVPCID, invpcid_setup(1, 0, 1 << 47));
+            assert_general_protection_zero(INVPCID, |h| {
+                invpcid_setup(0, 0, DATA)(h);
+                user_mode(h);
+            });
+            assert_invalid_opcode(INVPCID_REGISTER, |h| h.cpu.gpr[RAX] = 0);
+        }
+
+        #[test]
+        fn monitor_and_mwait_are_privileged_and_check_ecx() {
+            for code in [MONITOR, MWAIT] {
+                assert_general_protection_zero(code, user_mode);
+            }
+            assert_general_protection_zero(MONITOR, |h| h.cpu.gpr[RCX] = 1);
+            assert_general_protection_zero(MONITOR, |h| h.cpu.gpr[RDX] = 1);
+            assert_general_protection_zero(MWAIT, |h| h.cpu.gpr[RCX] = 2);
+        }
+
+        #[test]
+        fn mwait_waits_like_hlt_only_with_interrupts_enabled_and_a_monitor_armed() {
+            let enabled = run_ok(MONITOR_MWAIT_MOV, |h| {
+                h.cpu.set_eflags_arith(0);
+                h.cpu.eflags |= IF_BIT;
+            });
+            assert!(enabled.cpu.halted);
+            assert_ne!(enabled.cpu.gpr[RAX], 5, "stopped at mwait");
+            let masked = run_ok(MONITOR_MWAIT_MOV, |h| h.cpu.eflags &= !IF_BIT);
+            assert_eq!(masked.cpu.gpr[RAX], 5, "returns at once with IF=0");
+            // no monitor armed: returns
+            let unarmed = run_ok(&[0x0f, 0x01, 0xc9, 0xb8, 5, 0, 0, 0, 0xf4], |h| {
+                h.cpu.eflags |= IF_BIT
+            });
+            assert_eq!(unarmed.cpu.gpr[RAX], 5);
+        }
+    }
+
     mod rdtsc {
         use super::*;
 
@@ -2656,14 +2978,10 @@ mod sys_tests {
                 (0, "VME"),
                 (1, "PVI"),
                 (6, "MCE"),
-                (11, "UMIP"),
                 (12, "LA57"),
                 (13, "VMXE"),
                 (14, "SMXE"),
-                (17, "PCIDE"),
                 (19, "reserved"),
-                (20, "SMEP"),
-                (21, "SMAP"),
                 (22, "PKE"),
                 (32, "upper half"),
                 (63, "upper half"),
@@ -3977,10 +4295,8 @@ mod sys_tests {
 
         #[test]
         fn register_forms_of_group_7_are_not_table_loads() {
-            // 0f 01 c8 is monitor, 0f 01 d0 xgetbv, 0f 01 d8 vmrun, 0f 01 c1 vmcall: none implemented.
+            // 0f 01 d0 is xgetbv, 0f 01 d8 vmrun, 0f 01 c1 vmcall: none implemented.
             for code in [
-                // .byte 0x0f, 0x01, 0xc8; hlt
-                &[0x0f, 0x01, 0xc8, 0xf4],
                 // xgetbv; hlt
                 &[0x0f, 0x01, 0xd0, 0xf4],
                 // .byte 0x0f, 0x01, 0xd8; hlt
