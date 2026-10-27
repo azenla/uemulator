@@ -28,6 +28,9 @@ pub(super) struct PlumbingCase {
     pub vex_mem: &'static [u8],
     pub vex256_reg: &'static [u8],
     pub vex256_mem: &'static [u8],
+    /// `vop xmm1, xmm3, xmm1` (destination = r/m operand), and its ymm twin.
+    pub collide: &'static [u8],
+    pub collide256: &'static [u8],
 }
 
 #[path = "avx_cases.rs"]
@@ -380,4 +383,62 @@ fn xsave_saves_and_restores_the_upper_halves() {
         "XSTATE_BV marks x87, SSE and AVX"
     );
     assert_eq!(v.read(DATA + 576, 16), high[0].to_le_bytes());
+}
+
+#[test]
+fn a_destination_that_is_also_the_r_m_source_still_reads_the_original_value() {
+    // vop xmm1, xmm3, xmm1: the kernel must see xmm3 as its first operand and the *old* xmm1 as
+    // the second. glibc's AVX2 string routines use this form constantly.
+    let mut rng = Rng(0xabcd_ef01_2345_6789);
+    for case in PLUMBING_CASES.iter().filter(|c| !c.collide.is_empty()) {
+        for _ in 0..ITERATIONS {
+            let data = inputs(&mut rng);
+            for (code, wide) in [(case.collide, false), (case.collide256, true)] {
+                if code.is_empty() {
+                    continue;
+                }
+                // reference: the ordinary non-colliding encoding with the same two operand values
+                let reference_code = if wide { case.vex256_reg } else { case.vex_reg };
+                let mut reference = vex(reference_code, &data);
+                let reference_stop = reference.run(100);
+                let mut colliding = harness(code, true);
+                colliding.cpu.xmm[1] = data.second;
+                colliding.cpu.ymm_hi[1] = data.second_hi;
+                colliding.cpu.xmm[3] = data.first;
+                colliding.cpu.ymm_hi[3] = data.first_hi;
+                let stop = colliding.run(100);
+                assert_eq!(stop, reference_stop, "{}", case.name);
+                if stop != Stop::Halted {
+                    continue;
+                }
+                assert_eq!(
+                    colliding.cpu.xmm[1], reference.cpu.xmm[1],
+                    "{} wide={wide}",
+                    case.name
+                );
+                assert_eq!(
+                    colliding.cpu.ymm_hi[1], reference.cpu.ymm_hi[1],
+                    "{} wide={wide}",
+                    case.name
+                );
+                assert_eq!(
+                    colliding.cpu.xmm[3], data.first,
+                    "{}: vvvv preserved",
+                    case.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_store_whose_destination_register_is_also_its_source_register() {
+    // vmovdqu ymm2, ymm2 (register store form 7f with both fields equal) and vmovss xmm1, xmm3, xmm1
+    // (reg-reg scalar move: destination = rm = xmm1, source = reg = xmm1, merge from xmm3)
+    let mut h = harness(&[0xc5, 0xe2, 0x10, 0xc9, 0xf4], true);
+    h.cpu.xmm[1] = 0x1111_1111_1111_1111_1111_1111_aaaa_aaaa;
+    h.cpu.xmm[3] = 0x3333_3333_3333_3333_3333_3333_3333_3333;
+    assert_eq!(h.run(10), Stop::Halted);
+    // vmovss xmm1, xmm3, xmm1: low dword from xmm1 (aaaa_aaaa), upper bits from xmm3
+    assert_eq!(h.cpu.xmm[1], 0x3333_3333_3333_3333_3333_3333_aaaa_aaaa);
 }

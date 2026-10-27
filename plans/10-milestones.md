@@ -13,7 +13,9 @@
 - `jit` feature (default on) gates `libc`/`windows-sys`; `--no-default-features` is dependency-free and interpreter-only.
 - x86_64 host JIT done (see 06): same inlined subset as aarch64, verified in lockstep. Exercised on macOS x86_64 under Rosetta; Linux and Windows x86_64 hosts compile but are untested.
 
-- Instruction extensions done (see 03, "Instruction extensions"): POPCNT/LZCNT, CMPXCHG16B, SSE3, SSSE3 (XMM forms), SSE4.1, SSE4.2 (incl. CRC32 and pcmp[ei]str[im]), PCLMULQDQ, AES-NI, MOVBE and FSGSBASE are implemented and advertised in CPUID (leaf 1 ECX, 0x80000001 ECX, leaf 7). The Alpine boot now executes cmpxchg16b, popcnt, pshufb and palignr in the kernel. Not advertised: ERMS/FSRM, AVX*, VMX/SVM.
+- Instruction extensions done (see 03, "Instruction extensions"): POPCNT/LZCNT, CMPXCHG16B, SSE3, SSSE3 (XMM forms), SSE4.1, SSE4.2 (incl. CRC32 and pcmp[ei]str[im]), PCLMULQDQ, AES-NI, MOVBE and FSGSBASE are implemented and advertised in CPUID (leaf 1 ECX, 0x80000001 ECX, leaf 7). The Alpine boot now executes cmpxchg16b, popcnt, pshufb and palignr in the kernel. Not advertised: ERMS/FSRM, VMX/SVM.
+
+- AVX, AVX2, FMA and F16C done (see 03): VEX.128/256 through the SSE kernels, YMM upper state in XSAVE, gathers, masked moves, a fused multiply-add on the soft-float engine, half-precision conversion. Found while booting Debian: a register-collision bug in the VEX staging that broke glibc's AVX2 `strcmp`, now covered by tests.
 
 - UMIP, SMEP/SMAP, PCID/INVPCID, MONITOR/MWAIT, RDTSCP done (see 03).
 

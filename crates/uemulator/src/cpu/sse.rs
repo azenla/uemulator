@@ -509,8 +509,20 @@ fn add(env: &mut FpEnv, format: Format, a: &Unpacked, b: &Unpacked, subtract: bo
         };
         (sign, exponent, widen(format, value))
     };
-    let mut x = term(a, a.sign);
-    let mut y = term(b, b_sign);
+    add_terms(env, format, term(a, a.sign), term(b, b_sign))
+}
+
+/// Sum of two finite, normalised terms `(sign, exponent, significand)` whose significands have
+/// their leading one at `WIDE_LEADING_BIT` (a zero term has significand 0 and exponent
+/// `i32::MIN`), rounded once. Also used by the fused multiply-add, whose exact product is one term.
+fn add_terms(
+    env: &mut FpEnv,
+    format: Format,
+    first: (bool, i32, u128),
+    second: (bool, i32, u128),
+) -> u64 {
+    let mut x = first;
+    let mut y = second;
     if (y.1, y.2) > (x.1, x.2) {
         core::mem::swap(&mut x, &mut y);
     }
@@ -708,8 +720,12 @@ fn compare_predicate(
     predicate: u8,
     dest: u64,
     source: u64,
+    extended: bool,
 ) -> bool {
     use core::cmp::Ordering::{Equal, Less};
+    if extended {
+        return fma::compare_predicate_avx(env, format, predicate & 0x1f, dest, source);
+    }
     let predicate = predicate & 7;
     let signaling = matches!(predicate, 1 | 2 | 5 | 6);
     let ordering = compare(env, format, dest, source, signaling);
@@ -1614,7 +1630,7 @@ impl Cpu {
                     let mut r = 0;
                     for k in 0..format.lanes() {
                         let (a, b) = (lane_get(dst, format, k), lane_get(s, format, k));
-                        if compare_predicate(&mut fp, format, predicate, a, b) {
+                        if compare_predicate(&mut fp, format, predicate, a, b, self.vex_active) {
                             lane_put(&mut r, format, k, format.lane_mask() as u64);
                         }
                     }
@@ -1622,7 +1638,8 @@ impl Cpu {
                 } else {
                     let s = lane_get(src!(format.bytes()), format, 0);
                     let a = lane_get(dst, format, 0);
-                    let matched = compare_predicate(&mut fp, format, predicate, a, s);
+                    let matched =
+                        compare_predicate(&mut fp, format, predicate, a, s, self.vex_active);
                     Some((dst & !format.lane_mask()) | if matched { format.lane_mask() } else { 0 })
                 }
             }
@@ -2019,6 +2036,8 @@ fn put_u64<T: Lane>(r: &mut u128, k: usize, v: u64, width: u32) {
 
 #[path = "sse_ext.rs"]
 pub(in crate::cpu) mod ext;
+#[path = "sse_fma.rs"]
+pub(in crate::cpu) mod fma;
 
 #[cfg(test)]
 mod tests {
@@ -5368,7 +5387,7 @@ mod tests {
             for (column, (a, b)) in operands.iter().enumerate() {
                 let mut env = default_env();
                 assert_eq!(
-                    compare_predicate(&mut env, SINGLE, predicate as u8, *a, *b),
+                    compare_predicate(&mut env, SINGLE, predicate as u8, *a, *b, false),
                     row[column],
                     "predicate {predicate} column {column}"
                 );
@@ -5384,14 +5403,16 @@ mod tests {
             SINGLE,
             8,
             ONE_SINGLE as u64,
-            ONE_SINGLE as u64
+            ONE_SINGLE as u64,
+            false
         ));
         assert!(!compare_predicate(
             &mut env,
             SINGLE,
             0xf9,
             ONE_SINGLE as u64,
-            ONE_SINGLE as u64
+            ONE_SINGLE as u64,
+            false
         ));
     }
 
@@ -5405,6 +5426,7 @@ mod tests {
                 predicate,
                 QNAN_SINGLE as u64,
                 ONE_SINGLE as u64,
+                false,
             );
             let expected = if matches!(predicate, 1 | 2 | 5 | 6) {
                 FLAG_INVALID
@@ -5419,6 +5441,7 @@ mod tests {
                 predicate,
                 ONE_SINGLE as u64,
                 SNAN_SINGLE as u64,
+                false,
             );
             assert_eq!(
                 env.flags, FLAG_INVALID,

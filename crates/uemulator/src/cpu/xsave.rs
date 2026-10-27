@@ -14,7 +14,7 @@ pub(super) const XCR0_SSE: u64 = 1 << 1;
 pub(super) const XCR0_AVX: u64 = 1 << 2;
 /// Components xsetbv accepts. Extending this also means extending CPUID leaf 0xD and the save
 /// area layout below, or the kernel will size its buffers for state the instructions skip.
-pub(super) const XCR0_SUPPORTED: u64 = XCR0_X87 | XCR0_SSE;
+pub(super) const XCR0_SUPPORTED: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX;
 
 /// The XSAVE area is the legacy image plus a 64-byte header: XSTATE_BV (8 bytes), XCOMP_BV (8)
 /// and 48 reserved bytes, all of which xrstor requires to be zero except XSTATE_BV.
@@ -258,8 +258,10 @@ mod tests {
         };
         let (h, stop) = write(XCR0_X87);
         assert_eq!((stop, h.cpu.xcr0), (Stop::Halted, XCR0_X87));
+        let (h, stop) = write(XCR0_X87 | XCR0_SSE | XCR0_AVX);
+        assert_eq!((stop, h.cpu.xcr0), (Stop::Halted, 7));
         // x87 cannot be disabled, unsupported components and high garbage are #GP
-        for bad in [XCR0_SSE, 0, 0b111, 1 << 63 | 1, 1 << 32 | 1] {
+        for bad in [XCR0_SSE, 0, 0b101, 0b1000 | 1, 1 << 63 | 1, 1 << 32 | 1] {
             let (h, stop) = write(bad);
             assert_eq!(stop, fault(13, Some(0)), "value {bad:#x}");
             assert_eq!(h.cpu.xcr0, 3);

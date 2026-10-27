@@ -13877,7 +13877,7 @@ mod exec_tests {
         }
         // The exact set of leaf 1 ECX bits is pinned in the tests in sys.rs; these must stay clear because
         // their instructions (or the OS support behind them) do not exist.
-        for (bit, name) in [(1 << 5, "vmx"), (1 << 28, "avx"), (1 << 31, "hypervisor")] {
+        for (bit, name) in [(1 << 5, "vmx"), (1 << 31, "hypervisor")] {
             assert_eq!(ecx & bit, 0, "{name} must not be advertised");
         }
         let [_, _, ecx, edx] = cpuid(0x8000_0001, 0);

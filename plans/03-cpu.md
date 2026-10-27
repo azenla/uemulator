@@ -46,7 +46,7 @@ Start from the fork's identity (read `target/i386/cpu.c` "XTCG CPU" model for th
 - Leaf 1 ECX: SSE3, PCLMULQDQ, SSSE3, CX16, SSE4.1, SSE4.2, MOVBE, POPCNT, AES; 0x80000001 ECX adds ABM (LZCNT). MONITOR/MWAIT, VMX/SVM, XSAVE/OSXSAVE, AVX, RDRAND and the hypervisor bit stay clear
 - Leaf 0x80000001: SYSCALL, NX, LM, (RDTSCP)
 - Leaf 0x80000007: invariant TSC set so the kernel trusts the TSC
-- XSAVE/OSXSAVE (x87+SSE components only) and RDRAND/RDSEED are advertised, see "XSAVE and RDRAND". No AVX
+- XSAVE/OSXSAVE (x87, SSE and AVX components), RDRAND/RDSEED, AVX, AVX2, FMA, F16C are advertised, see "XSAVE and RDRAND" and "AVX, AVX2, FMA, F16C"
 
 Advertising a bit is a promise; add bits only together with the test that proves the instructions.
 
@@ -87,7 +87,7 @@ The CPU is in-order and never speculates, so it says so, to keep the guest kerne
 
 `cpu/bmi.rs` (CPUID.7.0:EBX bits 3 and 8): andn, bextr, blsi, blsmsk, blsr, bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx plus tzcnt in `exec.rs`. They are LZ (VEX.L set is #UD); rorx also needs vvvv = 1111. Flag behavior: andn/blsr/blsmsk/blsi/bzhi set ZF, SF, PF from the result and clear OF; CF is "source is zero" (blsr, blsmsk), "source is non-zero" (blsi) and "index > width-1" (bzhi); bextr clears CF/OF and sets ZF only; mulx, pdep, pext, rorx and the shifts leave all flags alone. Shift counts are masked to width-1, and mulx writes the low half first so the high half wins when both destinations are the same register. AF/PF are architecturally undefined for the ones that set flags; ours are 0/computed as noted. Tests (`bmi.rs`) compare against independent reference models over a spread of edge values, and `jit/diff_alu.rs::bmi_instructions` pins JIT = interpreter.
 
-Anything else VEX-encoded (all vector forms, vzeroupper) is still #UD and logged once: AVX is not advertised.
+The vector VEX forms are in "AVX, AVX2, FMA, F16C" below.
 
 ## RDTSCP
 
@@ -103,3 +103,21 @@ Anything else VEX-encoded (all vector forms, vzeroupper) is still #UD and logged
 - MONITOR/MWAIT (CPUID.1:ECX bit 3, leaf 5 = 64-byte lines, extensions + interrupt-break): CPL 0, ECX/EDX checked. `mwait` after a `monitor` behaves like `hlt` with interrupts enabled (only interrupts wake it) and returns immediately with IF=0, which hardware may also do; the armed address is not tracked because nothing but DMA can write guest memory while the single CPU waits.
 - Linux 6.18 guest: "x86/cpu: User Mode Instruction Prevention (UMIP) activated"; `smep smap umip pcid invpcid monitor` appear in /proc/cpuinfo; lockstep boot is divergence-free.
 - Found by the lockstep verifier: `rdtscp` (group 7) reads guest time, so `jit::helpers::reads_guest_clock` now includes the whole group, otherwise the JIT read a stale `icount` mid-block.
+
+## AVX, AVX2, FMA, F16C
+
+Files: `avx.rs` (the wrapper and its table), `avx_special.rs` (everything else), `sse_fma.rs` (FMA, F16C and the 32 compare predicates, a child of `sse` because it needs the soft-float internals), tests in `avx_tests.rs`, `avx_special_tests.rs`, `avx_cases.rs` / `avx_special_encodings.rs` (encodings generated from the assembler; regenerate with the scripts' recipe: assemble each mnemonic with `hack/asm.sh`).
+
+State: `Cpu::ymm_hi: [u128; 16]` holds bits 255:128; legacy SSE leaves it alone, VEX.128 zeroes it. XCR0 bit 2 enables it (`XCR0_SUPPORTED` is now 7, AVX needs SSE); XSAVE component 2 is 256 bytes at offset 576 (area 832 bytes, CPUID.0xD.2 = {256, 576, 0, 0}), saved by xsave/xsaveopt and loaded or reset by xrstor. `fxsave` does not touch it, as on hardware. `Cpu::diff` compares it, so `--verify` covers it.
+
+Gate (`vex_gate`): #UD unless CR4.OSXSAVE and XCR0[2:1] = 11, then #NM under CR0.TS. CR4.OSFXSR does not matter for VEX.
+
+Wrapper (`exec_vex_vector`): most VEX instructions are an SSE instruction plus a non-destructive first source, so they run through the existing SSE kernels. `vex_form` classifies each (map, opcode, pp) as: `Merge` (is the destination seeded from vvvv: always, never, or only for the register form as in vmovss), `Dest` (reg, rm, or no vector destination) and `Width` (`Pair`: 128 bits, or two lane passes with VEX.L; `Scalar`: VEX.L ignored; `Xmm`: VEX.L is #UD). A pass seeds `xmm[dest]` from `xmm[vvvv]`, calls `sse()` with `vex_active` set (which drops the OSFXSR gate and the 16-byte alignment rule, except for the explicit vmovaps/vmovapd/vmovdqa/vmovntdqa loads), and for the upper lane swaps `xmm` with `ymm_hi` and adds 16 to the displacement. Both lanes run on a snapshot, so a fault in the second leaves nothing written. **Collisions**: seeding overwrites the destination, so if the kernel still has to read it as its other operand (`vpcmpeqb ymm1, ymm0, ymm1`, the destination is also the r/m source), that operand is redirected to a scratch register first. This was found by booting Debian: glibc's AVX2 string functions use that form constantly, and a wrong remap broke `strcmp` ("applet not found" in busybox). The plumbing tests now cover it. Explicitly aligned 256-bit moves need 32-byte alignment (checked once before the passes).
+
+`avx_special.rs`: movmskps/pd, pmovmskb (256-bit), cvtps2pd/cvtdq2pd (widening) and cvtpd2ps/cvt(t)pd2dq (narrowing, each half through the legacy kernel), shifts by xmm count (count is the low quadword of an xmm/m128, shared by both lanes) and by immediate (destination is vvvv), vptest/vtestps/vtestpd, vpermilps/pd (variable and immediate), vpermq/vpermpd/vpermps/vpermd, vperm2f128/i128, vinsert/vextract f128/i128, all the broadcasts, pmovsx/zx (the 256-bit forms widen twice as many elements, memory operands read exactly the bytes they use), vblendv* (mask register in imm8[7:4]), vpblendd, vpsllv/vpsrlv/vpsravd, vmaskmovps/pd and vpmaskmovd/q (masked-out elements are never read, written or faulted on), vldmxcsr/vstmxcsr, vzeroupper/vzeroall, vpcmpistrm/vpcmpestrm (also zero the upper half of xmm0), and the gathers.
+
+Gathers (VSIB): the decoder keeps SIB index 4 for the 0F38 90-93 opcodes (it is xmm4, not "no index"). The mask is normalised to all-ones/all-zeros per element, each completed element clears its mask element, and a fault writes the partial registers back before reporting (restartable, as on hardware); on completion the mask register is zero and everything above the gathered elements is zeroed. #UD when destination, mask and index registers are not all different.
+
+`sse_fma.rs`: FMA3 (132/213/231 of madd/msub/nmadd/nmsub, packed and scalar, and maddsub/msubadd) rounds once: the exact product of the two significands (at most 106 bits) is one term of `add_terms`, the same routine the legacy adder uses, so DAZ/FTZ/rounding mode/flags behave like the other soft-float instructions. NaN selection takes the first NaN in operand order (destination, vvvv, r/m), quieted; infinity times zero is invalid. Tested bit-for-bit against the host's `mul_add` for every form, with subnormals and forced cancellations. F16C: `vcvtph2ps` is exact (all 65536 inputs checked), `vcvtps2ph` rounds under imm8[1:0] or MXCSR.RC (imm8[2]) with overflow/underflow/precision flags (checked against an independent table-search reference in all four modes). The compare predicates beyond the legacy eight (imm8 8..31: the 32 SDM names, with the `_S` forms signalling on quiet NaNs) are all tested.
+
+Not implemented: AVX-512 (EVEX), VAES/VPCLMULQDQ (the 256-bit forms of AES/PCLMUL are #UD), VPOPCNT, GFNI, SHA, AVX-VNNI. The JIT runs every VEX instruction through its interpreter helper.

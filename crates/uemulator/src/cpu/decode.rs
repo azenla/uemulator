@@ -406,7 +406,9 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Insn, DecodeErr> {
                 let sib = r.u8()?;
                 i.scale = sib >> 6;
                 let index_field = ((sib >> 3) & 7) | ((i.rex & REX_X) << 2);
-                if index_field != SIB_INDEX_NONE {
+                // VSIB (the VEX gathers, 0F38 90-93) has no "no index" encoding: index 4 is xmm4/ymm4
+                let vsib = i.vex && map == MAP_0F38 && (0x90..=0x93).contains(&opb);
+                if index_field != SIB_INDEX_NONE || vsib {
                     i.index = index_field;
                 }
                 base_field = sib & 7;

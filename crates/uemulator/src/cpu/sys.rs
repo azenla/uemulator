@@ -296,6 +296,12 @@ const FEATURE_POPCNT: u32 = 1 << 23;
 const FEATURE_AES: u32 = 1 << 25;
 /// xsave, xrstor, xsaveopt, xgetbv, xsetbv (x87 and SSE state only; see `xsave.rs`).
 const FEATURE_XSAVE: u32 = 1 << 26;
+/// FMA3: the vfmadd/vfmsub/vfnmadd/vfnmsub families.
+const FEATURE_FMA: u32 = 1 << 12;
+/// AVX (VEX-encoded 128/256-bit floating point and the AVX forms of the SSE integer set).
+const FEATURE_AVX: u32 = 1 << 28;
+/// F16C: vcvtph2ps and vcvtps2ph.
+const FEATURE_F16C: u32 = 1 << 29;
 /// Mirrors CR4.OSXSAVE; computed in `cpuid`, never part of the static mask.
 const FEATURE_OSXSAVE: u32 = 1 << 27;
 /// rdrand (see `MachineConfig::random_seed`).
@@ -312,7 +318,10 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
     | FEATURE_XSAVE
     | FEATURE_RDRAND
     | FEATURE_MONITOR
-    | FEATURE_PCID;
+    | FEATURE_PCID
+    | FEATURE_FMA
+    | FEATURE_AVX
+    | FEATURE_F16C;
 
 /// Leaf 7 subleaf 0 EBX bit 0: rdfsbase, rdgsbase, wrfsbase, wrgsbase. ERMS/FSRM (bits 9 and 4)
 /// stay clear on purpose: they make the kernel's memcpy and clear_page use `rep movsb`/`rep stosb`,
@@ -323,6 +332,8 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
 const STRUCTURED_FEATURE_FSGSBASE: u32 = 1 << 0;
 /// rdseed.
 const STRUCTURED_FEATURE_RDSEED: u32 = 1 << 18;
+/// AVX2: the 256-bit integer set, vperm*, vpgather*, vpmaskmov*, variable shifts, broadcasts.
+const STRUCTURED_FEATURE_AVX2: u32 = 1 << 5;
 /// BMI1: andn, bextr, blsi, blsmsk, blsr (VEX) and tzcnt.
 const STRUCTURED_FEATURE_BMI1: u32 = 1 << 3;
 /// BMI2: bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx (VEX).
@@ -335,6 +346,7 @@ const STRUCTURED_FEATURE_SMAP: u32 = 1 << 20;
 const STRUCTURED_ECX_UMIP: u32 = 1 << 2;
 const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE
     | STRUCTURED_FEATURE_SMEP
+    | STRUCTURED_FEATURE_AVX2
     | STRUCTURED_FEATURE_INVPCID
     | STRUCTURED_FEATURE_SMAP
     | STRUCTURED_FEATURE_BMI1
@@ -464,10 +476,22 @@ impl Cpu {
                 0 => (
                     xsave::XCR0_SUPPORTED as u32,
                     xsave::enabled_area_size(self.xcr0),
-                    xsave::XSAVE_AREA_SIZE as u32,
+                    xsave::XSAVE_AREA_SIZE_WITH_AVX as u32,
                     0,
                 ),
-                1 => (XSTATE_FEATURE_XSAVEOPT, xsave::XSAVE_AREA_SIZE as u32, 0, 0),
+                1 => (
+                    XSTATE_FEATURE_XSAVEOPT,
+                    xsave::enabled_area_size(self.xcr0),
+                    0,
+                    0,
+                ),
+                // Component 2 (AVX): size and offset in the standard format
+                2 => (
+                    xsave::AVX_STATE_SIZE as u32,
+                    xsave::AVX_STATE_OFFSET as u32,
+                    0,
+                    0,
+                ),
                 _ => (0, 0, 0, 0),
             },
             CPUID_LEAF_EXT_MAX => (CPUID_MAX_EXTENDED_LEAF, VENDOR_EBX, VENDOR_ECX, VENDOR_EDX),
@@ -1555,6 +1579,9 @@ mod sys_tests {
             const RDRAND: u32 = 1 << 30;
             const MONITOR: u32 = 1 << 3;
             const PCID: u32 = 1 << 17;
+            const FMA: u32 = 1 << 12;
+            const AVX: u32 = 1 << 28;
+            const F16C: u32 = 1 << 29;
             let mut h = blank();
             let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
             assert_eq!(
@@ -1570,8 +1597,11 @@ mod sys_tests {
                     | XSAVE
                     | RDRAND
                     | MONITOR
-                    | PCID,
-                "no VMX, SMX, AVX or hypervisor bit, and OSXSAVE only follows CR4"
+                    | PCID
+                    | FMA
+                    | AVX
+                    | F16C,
+                "no VMX, SMX or hypervisor bit, and OSXSAVE only follows CR4"
             );
             h.cpu.cr4 |= CR4_OSXSAVE;
             let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
@@ -1594,6 +1624,7 @@ mod sys_tests {
             const BMI1: u32 = 1 << 3;
             const BMI2: u32 = 1 << 8;
             const SMEP: u32 = 1 << 7;
+            const AVX2: u32 = 1 << 5;
             const INVPCID: u32 = 1 << 10;
             const SMAP: u32 = 1 << 20;
             const UMIP: u32 = 1 << 2;
@@ -1604,7 +1635,7 @@ mod sys_tests {
                 cpuid(&mut h, 7, 0),
                 [
                     0,
-                    FSGSBASE | BMI1 | BMI2 | RDSEED | SMEP | INVPCID | SMAP,
+                    FSGSBASE | BMI1 | BMI2 | RDSEED | SMEP | AVX2 | INVPCID | SMAP,
                     UMIP,
                     STRUCTURED_EDX
                 ]
@@ -1638,11 +1669,15 @@ mod sys_tests {
         #[test]
         fn leaf_0xd_describes_the_xsave_area() {
             let mut h = blank();
-            // supported XCR0 bits, size for the enabled set, size for all supported
-            assert_eq!(cpuid(&mut h, 0xd, 0), [3, 576, 576, 0]);
+            // supported XCR0 bits (x87, SSE, AVX), size for the enabled set, size for all supported
+            assert_eq!(cpuid(&mut h, 0xd, 0), [7, 576, 832, 0]);
+            h.cpu.xcr0 = 7;
+            assert_eq!(cpuid(&mut h, 0xd, 0), [7, 832, 832, 0]);
             // xsaveopt only: no xsavec, xgetbv1 or xsaves
-            assert_eq!(cpuid(&mut h, 0xd, 1), [1, 576, 0, 0]);
-            assert_eq!(cpuid(&mut h, 0xd, 2), [0, 0, 0, 0]);
+            assert_eq!(cpuid(&mut h, 0xd, 1), [1, 832, 0, 0]);
+            // component 2 (AVX): 256 bytes at offset 576
+            assert_eq!(cpuid(&mut h, 0xd, 2), [256, 576, 0, 0]);
+            assert_eq!(cpuid(&mut h, 0xd, 3), [0, 0, 0, 0]);
         }
 
         #[test]

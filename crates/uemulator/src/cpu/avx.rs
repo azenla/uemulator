@@ -292,6 +292,22 @@ impl Cpu {
             Merge::Always => true,
             Merge::IfRegister => i.md == MODRM_MOD_REGISTER,
         };
+        // The explicitly aligned 256-bit moves need 32-byte alignment for the whole operand; the
+        // per-lane legacy kernels would only check 16.
+        let map = legacy.op >> 8;
+        let opcode = (legacy.op & 0xff) as u8;
+        let explicitly_aligned = matches!(
+            (map, opcode, i.p66),
+            (OPCODE_MAP_0F, 0x28 | 0x29 | 0x2b, _)
+                | (OPCODE_MAP_0F, 0x6f | 0x7f | 0xe7, true)
+                | (OPCODE_MAP_0F38, 0x2a, true)
+        );
+        if two_lanes && i.md != MODRM_MOD_REGISTER && explicitly_aligned {
+            let address = self.linear_address(i, self.effective_address(i, next));
+            if address & 31 != 0 {
+                return Err(Exception::general_protection(0));
+            }
+        }
         self.vex_active = true;
         for lane in 0..if two_lanes { 2 } else { 1 } {
             if lane == 1 {
@@ -300,7 +316,7 @@ impl Cpu {
                 core::mem::swap(&mut self.xmm, &mut self.ymm_hi);
                 legacy.disp = legacy.disp.wrapping_add(16);
             }
-            let outcome = self.run_vex_lane(&mut legacy, next, destination, merges, vvvv);
+            let outcome = self.run_vex_lane(&mut legacy, next, form, destination, merges, vvvv);
             if lane == 1 {
                 core::mem::swap(&mut self.xmm, &mut self.ymm_hi);
             }
@@ -313,6 +329,10 @@ impl Cpu {
         {
             self.ymm_hi[register] = 0;
         }
+        // vpcmpistrm/vpcmpestrm write xmm0 (not a ModRM operand), and zero its upper half too
+        if map == OPCODE_MAP_0F3A && matches!(opcode, 0x60 | 0x62) {
+            self.ymm_hi[0] = 0;
+        }
         Ok(())
     }
 
@@ -321,6 +341,7 @@ impl Cpu {
         &mut self,
         legacy: &mut Insn,
         next: u64,
+        form: Form,
         destination: Option<usize>,
         merges: bool,
         vvvv: usize,
@@ -330,24 +351,24 @@ impl Cpu {
         if let (true, Some(destination)) = (merges, destination)
             && vvvv != destination
         {
-            let is_reg_source = legacy.md == MODRM_MOD_REGISTER;
             // The legacy kernel reads the old destination as its first source, so seed it from
-            // vvvv. If the destination is also the register source it still has to be read:
-            // point the kernel at a scratch copy.
-            let source_field_is_destination = if destination == legacy.rm as usize {
-                // stores: the destination is rm and the kernel's source is reg
-                legacy.reg as usize == destination
-            } else {
-                is_reg_source && legacy.rm as usize == destination
+            // vvvv. That overwrites the destination register, so if the kernel still has to read
+            // it as its *other* operand, redirect that operand to a scratch copy first:
+            // - Dest::Reg: the kernel's source is ModRM.rm (register form);
+            // - Dest::Rm (stores): the kernel's source is ModRM.reg.
+            let collides = match form.dest {
+                Dest::Reg => legacy.md == MODRM_MOD_REGISTER && legacy.rm as usize == destination,
+                Dest::Rm => legacy.reg as usize == destination,
+                Dest::None => false,
             };
-            if source_field_is_destination {
+            if collides {
                 let k = Self::free_register([legacy.reg as usize, legacy.rm as usize, vvvv]);
                 scratch = Some((k, self.xmm[k]));
                 self.xmm[k] = self.xmm[destination];
-                if destination == legacy.rm as usize {
-                    legacy.reg = k as u8;
-                } else {
+                if form.dest == Dest::Reg {
                     legacy.rm = k as u8;
+                } else {
+                    legacy.reg = k as u8;
                 }
             }
             self.xmm[destination] = self.xmm[vvvv];
