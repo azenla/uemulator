@@ -56,7 +56,21 @@ pub(crate) struct Insn {
     pub imm: i64,
     /// Nesting level of `enter` (second immediate).
     pub imm2: u16,
+    /// Encoded with a VEX prefix (`c4`/`c5`). `op` then carries `VEX_OP_FLAG` on top of
+    /// `(map << 8) | opcode`, so no legacy opcode match (interpreter or JIT) can claim it. `p66`
+    /// and `rep` hold the implied-prefix field `pp`, `rex` the inverted-back R/X/B/W bits (with
+    /// `rex_present` still false: VEX never selects `spl/bpl/sil/dil`), and `opsize` is 8 with
+    /// VEX.W and 4 otherwise, because `pp = 66` is an opcode extension for VEX, not an operand
+    /// size.
+    pub vex: bool,
+    /// VEX.L: 256-bit vector length.
+    pub vex_l: bool,
+    /// VEX.vvvv, already un-inverted (0..=15): the extra register operand.
+    pub vex_v: u8,
 }
+
+/// Set in `Insn::op` for VEX-encoded instructions; see `Insn::vex`.
+pub(crate) const VEX_OP_FLAG: u16 = 0x1000;
 
 /// Marks an absent `base`/`index` register.
 pub(crate) const NO_REG: u8 = 0xff;
@@ -79,6 +93,22 @@ const PREFIX_SEG_SS: u8 = 0x36;
 const PREFIX_SEG_DS: u8 = 0x3e;
 const PREFIX_SEG_FS: u8 = 0x64;
 const PREFIX_SEG_GS: u8 = 0x65;
+
+const VEX_THREE_BYTE: u8 = 0xc4;
+const VEX_TWO_BYTE: u8 = 0xc5;
+/// VEX payload bits (stored inverted for R, X, B and vvvv).
+const VEX_R: u8 = 0x80;
+const VEX_X: u8 = 0x40;
+const VEX_B: u8 = 0x20;
+const VEX_MAP_MASK: u8 = 0x1f;
+const VEX_W: u8 = 0x80;
+const VEX_VVVV_SHIFT: u32 = 3;
+const VEX_VVVV_MASK: u8 = 0xf;
+const VEX_L: u8 = 0x04;
+const VEX_PP_MASK: u8 = 0x03;
+const VEX_PP_66: u8 = 1;
+const VEX_PP_F3: u8 = 2;
+const VEX_PP_F2: u8 = 3;
 
 const REX_FIRST: u8 = 0x40;
 const REX_LAST: u8 = 0x4f;
@@ -230,8 +260,9 @@ fn has_modrm(map: u16, opcode: u8) -> bool {
     }
 }
 
-/// One-byte opcodes that are invalid in 64-bit mode, plus VEX/EVEX (`c4`, `c5`, `62`), which are
-/// not supported because AVX is never advertised.
+/// One-byte opcodes that are invalid in 64-bit mode, plus EVEX (`62`), which is not supported.
+/// `c4`/`c5` are `les`/`lds` outside 64-bit mode and VEX prefixes here; `decode` consumes them
+/// before this check.
 fn invalid_in_long_mode(opcode: u8) -> bool {
     matches!(
         opcode,
@@ -241,10 +272,9 @@ fn invalid_in_long_mode(opcode: u8) -> bool {
             | 0x1e | 0x1f // push/pop ds
             | 0x27 | 0x2f | 0x37 | 0x3f // daa das aaa aas
             | 0x60 | 0x61 // pusha popa
-            | 0x62 // bound (EVEX)
+            | 0x62 // bound (EVEX, not supported)
             | 0x82 // group 1 alias
             | 0x9a // far call
-            | 0xc4 | 0xc5 // les/lds (VEX)
             | 0xce // into
             | 0xd4 | 0xd5 | 0xd6 // aam aad salc
             | 0xea // far jmp
@@ -284,31 +314,79 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Insn, DecodeErr> {
         }
         rex = 0;
     };
-    i.rex = rex;
-    i.rex_present = rex != 0;
-    let rexw = rex & REX_W != 0;
     let mut map = MAP_ONE_BYTE;
     let mut opb = op;
-    if op == OPCODE_ESCAPE_0F {
-        opb = r.u8()?;
-        map = MAP_0F;
-        if opb == OPCODE_ESCAPE_0F38 || opb == OPCODE_ESCAPE_0F3A {
-            map = if opb == OPCODE_ESCAPE_0F38 {
-                MAP_0F38
-            } else {
-                MAP_0F3A
-            };
-            opb = r.u8()?;
+    if op == VEX_THREE_BYTE || op == VEX_TWO_BYTE {
+        // A legacy operand-size, repeat, lock or REX prefix before VEX is #UD (SDM 2.3.2).
+        if i.p66 || i.rep != 0 || i.lock || rex != 0 {
+            return Err(DecodeErr::Invalid);
         }
-    }
-    i.op = (map << 8) | opb as u16;
-    i.opsize = if rexw {
-        8
-    } else if i.p66 {
-        2
+        let first = r.u8()?;
+        let (inverted_rxb, vex_map, payload) = if op == VEX_TWO_BYTE {
+            // R is the only extension bit; X, B and W are implied 0 and the map is 0F.
+            (first & VEX_R | VEX_X | VEX_B, MAP_0F, first)
+        } else {
+            let second = r.u8()?;
+            (
+                first & (VEX_R | VEX_X | VEX_B),
+                (first & VEX_MAP_MASK) as u16,
+                second,
+            )
+        };
+        if !(MAP_0F..=MAP_0F3A).contains(&vex_map) {
+            return Err(DecodeErr::Invalid);
+        }
+        let w = op == VEX_THREE_BYTE && payload & VEX_W != 0;
+        let mut synthesized = REX_FIRST;
+        // R, X and B are stored inverted: a clear bit means the extension is in use.
+        for (bit, rex_bit) in [(VEX_R, REX_R), (VEX_X, REX_X), (VEX_B, REX_B)] {
+            if inverted_rxb & bit == 0 {
+                synthesized |= rex_bit;
+            }
+        }
+        if w {
+            synthesized |= REX_W;
+        }
+        rex = synthesized;
+        i.vex = true;
+        i.vex_v = !(payload >> VEX_VVVV_SHIFT) & VEX_VVVV_MASK;
+        i.vex_l = payload & VEX_L != 0;
+        match payload & VEX_PP_MASK {
+            VEX_PP_66 => i.p66 = true,
+            VEX_PP_F3 => i.rep = 1,
+            VEX_PP_F2 => i.rep = 2,
+            _ => {}
+        }
+        map = vex_map;
+        opb = r.u8()?;
+        i.rex = rex;
+        i.opsize = if w { 8 } else { 4 };
+        i.op = VEX_OP_FLAG | (map << 8) | opb as u16;
     } else {
-        4
-    };
+        i.rex = rex;
+        i.rex_present = rex != 0;
+        let rexw = rex & REX_W != 0;
+        if op == OPCODE_ESCAPE_0F {
+            opb = r.u8()?;
+            map = MAP_0F;
+            if opb == OPCODE_ESCAPE_0F38 || opb == OPCODE_ESCAPE_0F3A {
+                map = if opb == OPCODE_ESCAPE_0F38 {
+                    MAP_0F38
+                } else {
+                    MAP_0F3A
+                };
+                opb = r.u8()?;
+            }
+        }
+        i.op = (map << 8) | opb as u16;
+        i.opsize = if rexw {
+            8
+        } else if i.p66 {
+            2
+        } else {
+            4
+        };
+    }
 
     if map == MAP_ONE_BYTE && invalid_in_long_mode(opb) {
         return Err(DecodeErr::Invalid);
@@ -451,6 +529,118 @@ mod decode_tests {
         (0x64, SEG_FS),
         (0x65, SEG_GS),
     ];
+
+    mod vex {
+        use super::*;
+
+        #[test]
+        fn three_byte_vex_fields_are_unpacked_and_un_inverted() {
+            // andn rax, rbx, rcx: c4 e2 e0 f2 c1 (R,X,B inverted = 1, map 2, W=1, vvvv=~1100)
+            let i = decoded(&[0xc4, 0xe2, 0xe0, 0xf2, 0xc1]);
+            assert!(i.vex && !i.vex_l);
+            assert_eq!(i.len, 5);
+            assert_eq!(i.op, VEX_OP_FLAG | 0x2f2);
+            assert_eq!((i.vex_v, i.opsize), (3, 8));
+            assert_eq!((i.reg, i.rm), (0, 1));
+            assert_eq!((i.rep, i.p66), (0, false));
+            // andn r9, r10, [rdi]: R and B extensions in use (inverted bits clear), vvvv = r10
+            let i = decoded(&[0xc4, 0x62, 0xa8, 0xf2, 0x0f]);
+            assert_eq!((i.vex_v, i.reg, i.base), (10, 9, 7));
+            assert_eq!(i.rex & 0xf, REX_W | REX_R);
+            assert!(
+                !i.rex_present,
+                "vex never selects the spl/bpl/sil/dil byte registers"
+            );
+        }
+
+        #[test]
+        fn x_and_b_extend_the_memory_operand() {
+            // c4 22 a8 f2 0c 47: andn r9, r10, [rdi + r8*2]
+            let i = decoded(&[0xc4, 0x22, 0xa8, 0xf2, 0x0c, 0x47]);
+            assert_eq!((i.base, i.index, i.scale), (7, 8, 1));
+        }
+
+        #[test]
+        fn two_byte_vex_implies_map_0f_and_no_x_b_w() {
+            // vzeroupper: c5 f8 77 (no ModRM), vmovups xmm0,[rax]: c5 f8 10 00
+            let i = decoded(&[0xc5, 0xf8, 0x77]);
+            assert_eq!((i.len, i.op, i.has_modrm), (3, VEX_OP_FLAG | 0x177, false));
+            let i = decoded(&[0xc5, 0xf8, 0x10, 0x00]);
+            assert_eq!(
+                (i.len, i.op, i.vex_v, i.vex_l),
+                (4, VEX_OP_FLAG | 0x110, 0, false)
+            );
+            // vex.R inverted clear: vmovups xmm8, xmm0 is c5 78 10 c0
+            let i = decoded(&[0xc5, 0x78, 0x10, 0xc0]);
+            assert_eq!(i.reg, 8);
+            // L bit and a non-trivial vvvv: c5 fc 58 c1 = vaddps ymm0, ymm0, ymm1
+            let i = decoded(&[0xc5, 0xfc, 0x58, 0xc1]);
+            assert!(i.vex_l);
+            assert_eq!(i.vex_v, 0);
+            let i = decoded(&[0xc5, 0xdc, 0x58, 0xc1]);
+            assert_eq!(i.vex_v, 4);
+        }
+
+        #[test]
+        fn pp_selects_the_implied_prefix_without_changing_operand_size() {
+            // shlx (66), sarx (F3), shrx (F2), all with W=0
+            let i = decoded(&[0xc4, 0xe2, 0x61, 0xf7, 0xc1]);
+            assert_eq!((i.p66, i.rep, i.opsize), (true, 0, 4));
+            let i = decoded(&[0xc4, 0xe2, 0x62, 0xf7, 0xc1]);
+            assert_eq!((i.p66, i.rep, i.opsize), (false, 1, 4));
+            let i = decoded(&[0xc4, 0xe2, 0x63, 0xf7, 0xc1]);
+            assert_eq!((i.p66, i.rep, i.opsize), (false, 2, 4));
+        }
+
+        #[test]
+        fn immediates_follow_the_map() {
+            // rorx rax, rcx, 5 (map 3 always has imm8)
+            assert_eq!(decoded(&[0xc4, 0xe3, 0xfb, 0xf0, 0xc1, 0x05]).imm, 5);
+            assert_length(&[0xc4, 0xe3, 0xfb, 0xf0, 0xc1, 0x05]);
+            assert_length(&[0xc5, 0xf9, 0x70, 0xc1, 0x1b]); // vpshufd xmm0, xmm1, 0x1b
+        }
+
+        #[test]
+        fn lengths_and_truncation() {
+            assert_length(&[0xc4, 0xe2, 0xe0, 0xf2, 0xc1]);
+            assert_length(&[0xc4, 0x62, 0xa8, 0xf2, 0x0f]);
+            assert_length(&[0xc5, 0xf8, 0x77]);
+            assert_length(&[0xc5, 0xf8, 0x10, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00]);
+        }
+
+        #[test]
+        fn reserved_encodings_are_invalid() {
+            // maps 0 and 4+ do not exist
+            for map in [0u8, 4, 5, 0x1f] {
+                assert_eq!(
+                    decode(&[0xc4, 0xe0 | map, 0xe0, 0xf2, 0xc1, 0, 0, 0]).err(),
+                    Some(DecodeErr::Invalid),
+                    "map {map}"
+                );
+            }
+            // legacy 66/F2/F3/F0/REX in front of VEX is #UD; segment and address-size prefixes are fine
+            for prefix in [0x66u8, 0xf2, 0xf3, 0xf0, 0x48, 0x40] {
+                assert_eq!(
+                    decode(&[prefix, 0xc4, 0xe2, 0xe0, 0xf2, 0xc1, 0, 0]).err(),
+                    Some(DecodeErr::Invalid),
+                    "{prefix:#x}"
+                );
+            }
+            assert_eq!(
+                decoded(&[0x64, 0x67, 0xc4, 0xe2, 0xe0, 0xf2, 0x07]).seg as usize,
+                SEG_FS
+            );
+        }
+
+        #[test]
+        fn vex_ops_cannot_collide_with_legacy_ops() {
+            // vex 0f38 f6 (mulx) vs legacy 0f 38 f6 (adcx): different `op`
+            let vex = decoded(&[0xc4, 0xe2, 0xe3, 0xf6, 0xc1]);
+            let legacy = decoded(&[0x66, 0x0f, 0x38, 0xf6, 0xc1]);
+            assert_ne!(vex.op, legacy.op);
+            assert!(!legacy.vex);
+        }
+    }
 
     mod prefixes {
         use super::*;
@@ -1497,9 +1687,9 @@ mod decode_tests {
     mod invalid_encodings {
         use super::*;
 
-        const INVALID_IN_64_BIT_MODE: [u8; 23] = [
+        const INVALID_IN_64_BIT_MODE: [u8; 21] = [
             0x06, 0x07, 0x0e, 0x16, 0x17, 0x1e, 0x1f, 0x27, 0x2f, 0x37, 0x3f, 0x60, 0x61, 0x62,
-            0x82, 0x9a, 0xc4, 0xc5, 0xce, 0xd4, 0xd5, 0xd6, 0xea,
+            0x82, 0x9a, 0xce, 0xd4, 0xd5, 0xd6, 0xea,
         ];
 
         #[test]
@@ -1541,17 +1731,9 @@ mod decode_tests {
         }
 
         #[test]
-        fn vex_and_evex_escapes_are_rejected_because_avx_is_not_advertised() {
-            let vex3 = [0xc4, 0xe2, 0x7d, 0x18, 0xc1];
-            let vex2 = [0xc5, 0xf8, 0x77];
+        fn evex_is_rejected() {
             let evex = [0x62, 0xf1, 0x7c, 0x48, 0x28, 0xc1];
-            for bytes in [&vex3[..], &vex2[..], &evex[..]] {
-                assert_eq!(
-                    decode(bytes).err(),
-                    Some(DecodeErr::Invalid),
-                    "{bytes:02x?}"
-                );
-            }
+            assert_eq!(decode(&evex).err(), Some(DecodeErr::Invalid));
         }
 
         #[test]
@@ -2267,14 +2449,16 @@ mod decode_tests {
                 opcode,
                 0x26 | 0x2e | 0x36 | 0x3e | 0x40
                     ..=0x4f | 0x64 | 0x65 | 0x66 | 0x67 | 0x0f | 0xf0 | 0xf2 | 0xf3
+                    // VEX escapes: their own tests are in `vex`
+                    | 0xc4 | 0xc5
             )
         }
 
         #[test]
         fn exactly_the_documented_one_byte_opcodes_are_invalid_in_long_mode() {
-            let invalid: [u8; 23] = [
+            let invalid: [u8; 21] = [
                 0x06, 0x07, 0x0e, 0x16, 0x17, 0x1e, 0x1f, 0x27, 0x2f, 0x37, 0x3f, 0x60, 0x61, 0x62,
-                0x82, 0x9a, 0xc4, 0xc5, 0xce, 0xd4, 0xd5, 0xd6, 0xea,
+                0x82, 0x9a, 0xce, 0xd4, 0xd5, 0xd6, 0xea,
             ];
             for opcode in (0..=0xffu8).filter(|&opcode| !is_prefix_or_escape(opcode)) {
                 let result = decode(&padded(&[], &[opcode]));

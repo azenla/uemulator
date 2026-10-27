@@ -1088,6 +1088,9 @@ impl Cpu {
         let osz = i.opsize;
         let op = i.op;
         let rex = i.rex_present;
+        if i.vex {
+            return self.exec_vex(i, next);
+        }
         match op {
             // The eight ALU ops (add/or/adc/sbb/and/sub/xor/cmp), forms 0..=5: r/m,r (byte, full),
             // r,r/m (byte, full), al,imm and eax,imm.
@@ -1951,6 +1954,27 @@ impl Cpu {
                 let v = self.load_operand(loc, osz, i)? & mask(osz);
                 let operand_bits = osz as u32 * 8;
                 let count = v.leading_zeros() - (u64::BITS - operand_bits);
+                self.write_gpr(i.reg, osz, true, count as u64);
+                let mut f = 0;
+                if v == 0 {
+                    f |= CF;
+                }
+                if count == 0 {
+                    f |= ZF;
+                }
+                self.set_eflags_arith(f);
+            }
+            // tzcnt (F3 0F BC): trailing zeros within the operand size, so a zero source gives the
+            // operand width and CF. Plain bsf without the prefix, hence BMI1 and this arm go
+            // together.
+            0x1bc if i.rep == REP_REPE => {
+                let loc = self.modrm_location(i, next);
+                let v = self.load_operand(loc, osz, i)? & mask(osz);
+                let count = if v == 0 {
+                    osz as u32 * 8
+                } else {
+                    v.trailing_zeros()
+                };
                 self.write_gpr(i.reg, osz, true, count as u64);
                 let mut f = 0;
                 if v == 0 {
@@ -6035,9 +6059,8 @@ mod exec_tests {
     }
 
     #[test]
-    fn rep_bsf_runs_as_bsf_like_tzcnt_on_a_cpu_without_bmi1() {
-        // BMI1 is not advertised, so F3 0F BC keeps its old meaning. (LZCNT and POPCNT are
-        // implemented: see the tests in sse_ext.rs.)
+    fn tzcnt_and_lzcnt_count_zeros_around_the_set_bit() {
+        // (More tzcnt cases are in bmi.rs; LZCNT and POPCNT are tested in sse_ext.rs too.)
         let pair = run_regs(code::TZCNT_64, &[(RBX, 0x100)]);
         assert_eq!(pair.reg(RAX), 8);
         let pair = run_regs(code::LZCNT_64, &[(RBX, 0x100)]);

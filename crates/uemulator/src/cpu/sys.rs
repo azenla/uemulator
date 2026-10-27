@@ -295,7 +295,14 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
 const STRUCTURED_FEATURE_FSGSBASE: u32 = 1 << 0;
 /// rdseed.
 const STRUCTURED_FEATURE_RDSEED: u32 = 1 << 18;
-const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE | STRUCTURED_FEATURE_RDSEED;
+/// BMI1: andn, bextr, blsi, blsmsk, blsr (VEX) and tzcnt.
+const STRUCTURED_FEATURE_BMI1: u32 = 1 << 3;
+/// BMI2: bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx (VEX).
+const STRUCTURED_FEATURE_BMI2: u32 = 1 << 8;
+const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE
+    | STRUCTURED_FEATURE_BMI1
+    | STRUCTURED_FEATURE_BMI2
+    | STRUCTURED_FEATURE_RDSEED;
 
 // Leaf 7 subleaf 0 EDX: the speculation-control interface. The MSRs behind these bits are
 // implemented as inert storage (see `ARCH_CAPABILITIES`).
@@ -1489,12 +1496,14 @@ mod sys_tests {
         fn leaf_7_subleaf_0_advertises_only_fsgsbase_and_speculation_control() {
             const FSGSBASE: u32 = 1 << 0;
             const RDSEED: u32 = 1 << 18;
+            const BMI1: u32 = 1 << 3;
+            const BMI2: u32 = 1 << 8;
             let mut h = blank();
             // EAX is the highest subleaf. ERMS and FSRM stay clear (see sys.rs), as do SMEP, SMAP,
             // PCID, BMI, AVX2 and everything else.
             assert_eq!(
                 cpuid(&mut h, 7, 0),
-                [0, FSGSBASE | RDSEED, 0, STRUCTURED_EDX]
+                [0, FSGSBASE | BMI1 | BMI2 | RDSEED, 0, STRUCTURED_EDX]
             );
         }
 

@@ -1,5 +1,6 @@
 #[cfg(freestanding)]
 use crate::prelude::*;
+mod bmi;
 pub(crate) mod decode;
 pub(crate) mod exception;
 mod exec;

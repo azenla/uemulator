@@ -1171,3 +1171,43 @@ fn xsave_xrstor_round_trip_matches() {
         },
     );
 }
+
+/// Every BMI1/BMI2 form in one block, with operands that exercise the edge cases (zero source,
+/// count beyond the operand width, all ones). The JIT runs them through the interpreter helper,
+/// so this pins that a VEX instruction is neither mis-decoded as its legacy-opcode neighbour nor
+/// treated as an inline-able op.
+#[test]
+fn bmi_instructions() {
+    #[rustfmt::skip]
+    let code: &[u8] = &[
+        0xc4, 0xe2, 0xe0, 0xf2, 0xc1,       // andn rax, rbx, rcx
+        0xc4, 0xe2, 0xf8, 0xf3, 0xc9,       // blsr rax, rcx
+        0xc4, 0xe2, 0xf8, 0xf3, 0xd1,       // blsmsk rax, rcx
+        0xc4, 0xe2, 0xf8, 0xf3, 0xd9,       // blsi rax, rcx
+        0xc4, 0xe2, 0xe0, 0xf7, 0xc1,       // bextr rax, rcx, rbx
+        0xc4, 0xe2, 0xe0, 0xf5, 0xc1,       // bzhi rax, rcx, rbx
+        0xc4, 0xe2, 0xe3, 0xf5, 0xc1,       // pdep rax, rbx, rcx
+        0xc4, 0xe2, 0xe2, 0xf5, 0xc1,       // pext rax, rbx, rcx
+        0xc4, 0xe2, 0xe3, 0xf6, 0xc1,       // mulx rax, rbx, rcx
+        0xc4, 0xe3, 0xfb, 0xf0, 0xc1, 0x05, // rorx rax, rcx, 5
+        0xc4, 0xe2, 0xe2, 0xf7, 0xc1,       // sarx rax, rcx, rbx
+        0xc4, 0xe2, 0xe1, 0xf7, 0xc1,       // shlx rax, rcx, rbx
+        0xc4, 0xe2, 0xe3, 0xf7, 0xc1,       // shrx rax, rcx, rbx
+        0xf3, 0x48, 0x0f, 0xbc, 0xc1,       // tzcnt rax, rcx
+        0xf3, 0x0f, 0xbc, 0xc1,             // tzcnt eax, ecx
+        0xf4,
+    ];
+    for (b, c) in [
+        (0u64, 0u64),
+        (3, 0x8000_0000_0000_0000),
+        (0x4008, 0xdead_beef_0bad_f00d),
+        (u64::MAX, u64::MAX),
+        (70, 0x0f0f_0f0f_0f0f_0f0f),
+    ] {
+        check_with(code, |h| {
+            h.cpu.gpr[3] = b;
+            h.cpu.gpr[1] = c;
+            h.cpu.gpr[2] = c.rotate_left(7);
+        });
+    }
+}
