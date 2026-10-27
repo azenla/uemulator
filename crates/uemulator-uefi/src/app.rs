@@ -19,20 +19,14 @@ use crate::unix_time::FirmwareTime;
 const INPUT_EVERY: u32 = 32;
 /// How long the guest being halted waits in the firmware per idle poll.
 const IDLE_STALL: Duration = Duration::from_micros(200);
-/// How long the last message stays up before shutdown (clean exit) or return to the firmware
-/// (error), so it can be read.
-const EXIT_MESSAGE_DELAY: Duration = Duration::from_secs(1);
+/// How long an error message stays up before returning to the firmware, so it can be read.
 const ERROR_MESSAGE_DELAY: Duration = Duration::from_secs(10);
 
 #[entry]
 fn efi_main() -> Status {
     uefi::helpers::init().expect("uefi helpers");
     match run() {
-        Ok(reason) => {
-            console::print(&format!("\nmachine exited: {reason:?}\n"));
-            uefi::boot::stall(EXIT_MESSAGE_DELAY);
-            uefi::runtime::reset(ResetType::SHUTDOWN, Status::SUCCESS, None)
-        }
+        Ok(_) => uefi::runtime::reset(ResetType::SHUTDOWN, Status::SUCCESS, None),
         Err(msg) => {
             console::print(&format!("uemulator: {msg}\n"));
             uefi::boot::stall(ERROR_MESSAGE_DELAY);
@@ -75,13 +69,9 @@ fn run() -> Result<ExitReason, String> {
     cfg.apply(&load_options())
         .map_err(|e| format!("load options: {e}"))?;
 
-    console::print(&format!("uemulator: loading {}\n", cfg.kernel));
     let kernel = read_file(&mut fs, &cfg.kernel)?;
     let initrd = match &cfg.initrd {
-        Some(p) => {
-            console::print(&format!("uemulator: loading {p}\n"));
-            Some(read_file(&mut fs, p)?)
-        }
+        Some(p) => Some(read_file(&mut fs, p)?),
         None => None,
     };
     drop(fs);
@@ -113,7 +103,7 @@ fn run() -> Result<ExitReason, String> {
                     "no usable hardware virtualization (VMX with EPT, or SVM with NPT)".into(),
                 );
             }
-            None => console::print("uemulator: no hardware virtualization, emulating\n"),
+            None => {}
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -128,7 +118,6 @@ fn run() -> Result<ExitReason, String> {
         .memory_mib(cfg.memory_mib)
         // The library's JIT needs executable memory, which the UEFI build does not provide.
         .jit(JitMode::Off)
-        .log(|s| console::print(&format!("{s}\n")))
         .poll(|con, idle| {
             // Idle polls (guest halted) always run; the others are thinned out to `INPUT_EVERY`.
             static TICKS: AtomicU32 = AtomicU32::new(0);

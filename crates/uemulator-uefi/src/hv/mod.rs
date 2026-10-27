@@ -45,8 +45,6 @@ const MS_PER_SEC: u64 = 1000;
 const CONSOLE_POLL_NS: u64 = 1_000_000;
 /// Polling interval while the guest is halted.
 const HLT_POLL_INTERVAL: Duration = Duration::from_micros(50);
-/// Reported unusual guest actions are capped so a guest that loops on one cannot flood the console.
-const MAX_NOTES: u32 = 20;
 /// The firmware tick that bounds how late the guest's timer interrupts arrive.
 const FIRMWARE_TICK: Duration = Duration::from_millis(1);
 /// Host TSC calibration runs for this long against the firmware's `Stall`.
@@ -347,9 +345,6 @@ pub fn run(
         Kind::Vmx => Box::new(vmx::Vmx::new(tables, &boot)?),
         Kind::Svm => Box::new(svm::Svm::new(tables, &boot)?),
     };
-    console::print(&format!(
-        "uemulator: hardware virtualization ({kind:?}), {memory_mib} MiB\n"
-    ));
     event_loop(&mut *vcpu, &mut ram, &mut platform, &console, &clock)
 }
 
@@ -363,7 +358,6 @@ fn event_loop(
 ) -> Result<ExitReason, String> {
     let mut fpu = FpuState::reset();
     let mut next_poll = 0u64;
-    let mut logged = 0u32;
     loop {
         // Devices only advance here, between entries. The firmware tick forces an exit at least
         // every millisecond or so (`speed_up_firmware_timer`), which bounds how late they run.
@@ -436,9 +430,6 @@ fn event_loop(
                 if msr::write(vcpu, n, v) {
                     vcpu.skip();
                 } else {
-                    note(&mut logged, || {
-                        format!("wrmsr {n:#x} = {v:#x} at {:#x}", vcpu.rip())
-                    });
                     vcpu.inject_gp();
                 }
             }
@@ -472,15 +463,6 @@ fn event_loop(
                 ));
             }
         }
-    }
-}
-
-/// Reports the first few unusual guest actions, so a failing boot says what it tripped on.
-#[cfg(target_os = "uefi")]
-fn note(count: &mut u32, msg: impl FnOnce() -> String) {
-    if *count < MAX_NOTES {
-        *count += 1;
-        console::print(&format!("uemulator: {}\n", msg()));
     }
 }
 

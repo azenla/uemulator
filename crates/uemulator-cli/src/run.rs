@@ -120,7 +120,6 @@ fn build_config(
 ) -> Result<MachineConfig, String> {
     let mut cfg = MachineConfig::new()
         .kernel(kernel)
-        .log(|m| eprintln!("[uemu] {m}"))
         .debug(args.debug)
         .verify_jit(args.verify);
     if let Some(initramfs) = initramfs {
@@ -207,9 +206,6 @@ pub fn run(
     });
     // `stty -g` output is the exact setting string to hand back to `stty` on exit.
     let saved_tty = if tty { enter_raw_mode(stty) } else { None };
-    if saved_tty.is_some() {
-        eprintln!("[uemu] raw terminal; Ctrl-] stops the machine\r");
-    }
     let input = console.clone();
     let stopper = machine.stop_handle();
     std::thread::spawn(move || {
@@ -240,7 +236,10 @@ pub fn run(
         stty(&[&saved]);
     }
     let reason = reason?;
-    eprintln!("{}", exit_message(&reason));
+    // Clean exits (power-off, reset, stop) stay silent; only failures are reported.
+    if matches!(reason, ExitReason::TripleFault | ExitReason::Internal(_)) {
+        eprintln!("{}", exit_message(&reason));
+    }
     Ok(reason)
 }
 
