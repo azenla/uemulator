@@ -359,13 +359,21 @@ impl MachineRun {
 
 /// Boots `kernel` on a full `EmulatedMachine` and returns when it exits, or after `limit`
 /// (a watchdog then stops it, giving `ExitReason::Stopped`). `configure` adjusts the config.
+/// Reboot is off unless `configure` turns it on: most guests end with a reset request, which
+/// would otherwise restart them forever.
 pub(crate) fn run_machine(
     kernel: Vec<u8>,
     jit: JitMode,
     limit: Duration,
     configure: impl FnOnce(MachineConfig) -> MachineConfig,
 ) -> MachineRun {
-    let config = configure(MachineConfig::new().kernel(kernel).memory_mib(64).jit(jit));
+    let config = configure(
+        MachineConfig::new()
+            .kernel(kernel)
+            .memory_mib(64)
+            .jit(jit)
+            .reboot(false),
+    );
     let mut machine = EmulatedMachine::new(config).expect("config must be valid");
     let output = Arc::new(Mutex::new(Vec::new()));
     let sink = output.clone();

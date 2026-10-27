@@ -32,7 +32,7 @@ Time registers (BCD, 24h) from host wall clock at boot (optional `fixed_time` co
 
 ## Misc ports
 
-- 0x92 fast A20 / reset bit; 0x64/0x60 i8042 stub: status 0, command 0xFE → reset exit; 0xCF9 reset control; 0x80 POST delay (ignore); 0xCF8/0xCFC PCI config: reads return 0xFFFFFFFF (no devices); 0x3F6.. IDE absent → 0xFF.
+- 0x92 fast A20 / reset bit; 0x64/0x60 i8042 stub: status 0, command 0xFE → reset request (`ExitReason::Reset`, or an in-library reboot, see 01-api); 0xCF9 reset control; 0x80 POST delay (ignore); 0xCF8/0xCFC PCI config: reads return 0xFFFFFFFF (no devices); 0x3F6.. IDE absent → 0xFF.
 - DMA controller 0x00–0x0F, 0x81–0x8F: accept writes, reads 0 (kernel may touch for `dma` reservation).
 - Kernel `x86_platform`/`legacy_pic`: with `acpi=off` and no APIC it expects PIC+PIT+RTC; no HPET.
 

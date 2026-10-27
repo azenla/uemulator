@@ -143,6 +143,7 @@ fn build_config(
     if args.disable_jit {
         cfg = cfg.jit(JitMode::Off);
     }
+    cfg = cfg.reboot(!args.no_reboot);
     Ok(cfg)
 }
 

@@ -256,6 +256,14 @@ impl PciFunction {
 }
 
 impl PciHost {
+    /// Tears the bus down and returns the disk behind its virtio-blk function, if any.
+    #[cfg(not(target_os = "uefi"))]
+    pub fn into_disk(self) -> Option<crate::disk::Disk> {
+        self.funcs
+            .into_iter()
+            .find_map(|function| function.transport.dev.into_disk())
+    }
+
     pub fn new(devs: Vec<Transport>) -> Self {
         let funcs = devs
             .into_iter()

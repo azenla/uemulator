@@ -15,6 +15,7 @@ impl MachineConfig {
     pub fn disk(self, d: Disk) -> Self;                 // raw image, virtio-blk (optional)
     pub fn net(self, mac: [u8; 6]) -> Self;             // virtio-net; frames via EmulatedMachine::net() (optional)
     pub fn console(self, k: ConsoleKind) -> Self;       // Serial (default) | Virtio (resizable hvc0)
+    pub fn reboot(self, on: bool) -> Self;              // true (default): guest reset restarts the machine in place; false: ExitReason::Reset
     pub fn log(self, f: impl Fn(&str) + Send + 'static) -> Self;
 }
 
@@ -44,6 +45,7 @@ impl ConsoleHandle {
 
 - `new` does all fallible setup (parse bzImage, allocate RAM, probe JIT) so `start` failing is rare.
 - Guest shutdown is a value (`ExitReason`), never a process exit. `hlt` with IF=0 (nothing can wake it; with `acpi=off` this is how Linux poweroff/halt ends, `cli; hlt` in `stop_this_cpu`) is `Shutdown`; a triple fault is `TripleFault`, so automated runs terminate. A reset request (0x64←0xFE, 0x92 bit 0, 0xCF9 RST_CPU) wins over a `hlt` right after it.
+- Reset restarts the machine in the library by default (`reboot(true)`): the vCPU thread rebuilds the CPU and every device (PIC, PIT, CMOS, UART, PCI, virtio) from power-on state, reloads kernel, initrd and command line into freshly zeroed RAM, and runs again, so a Linux `panic=-1` loops forever until `stop()`. Kept across the restart: the `ConsoleHandle`/`NetHandle` (devices are rebuilt around the same queues), the stop flag, the disk backend (handed back from the old virtio-blk), the poll hook and the log. The JIT starts with an empty code cache (a fresh `Jit` per boot, so translations of the old RAM can never run). The RTC is re-read from the host clock (or `unix_time`), virtual time restarts at 0. `reboot(false)` returns `ExitReason::Reset` instead (CLI `--no-reboot`). A triple fault always ends the run (`TripleFault`), and under `verify_jit` a reset always ends the run with `Reset` (the twin's devices cannot be rebuilt in step). The UEFI hardware-virtualization path has no in-process reboot and returns `Reset`.
 - Console is a plain byte stream backed by bounded queues; output with no reader drops oldest beyond a cap rather than blocking the guest.
 - Stdio bridging (raw tty, Ctrl-C) lives in `crates/uemulator-cli`, not the library.
 - No networking in the library. The CLI downloads with ureq.

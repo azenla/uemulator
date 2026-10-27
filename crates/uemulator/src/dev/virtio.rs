@@ -337,6 +337,12 @@ pub(crate) trait VirtioDev: Send {
         false
     }
     fn reset(&mut self) {}
+    /// Gives the backing disk back when the device is torn down for a machine reboot, so the
+    /// next incarnation of the device can serve the same image. Only virtio-blk has one.
+    #[cfg(not(target_os = "uefi"))]
+    fn into_disk(self: Box<Self>) -> Option<crate::disk::Disk> {
+        None
+    }
 }
 
 /// virtio-pci modern transport for one device: decodes accesses to BAR0 and owns the common

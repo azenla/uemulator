@@ -60,6 +60,7 @@ fn run_spinning(code: &[u8], jit: JitMode) -> crate::testkit::MachineRun {
 fn new_machine(code: &[u8]) -> EmulatedMachine {
     EmulatedMachine::new(
         MachineConfig::new()
+            .reboot(false)
             .kernel(fake_bzimage(code))
             .memory_mib(MIN_MEMORY_MIB),
     )
@@ -532,7 +533,7 @@ mod config {
 
     #[test]
     fn defaults_match_the_documented_ones() {
-        let config = MachineConfig::new();
+        let config = MachineConfig::new().reboot(false);
         assert!(config.kernel.is_empty());
         assert!(config.initrd.is_none());
         assert!(config.cmdline.is_none());
@@ -552,7 +553,7 @@ mod config {
 
     #[test]
     fn default_and_new_agree() {
-        let (a, b) = (MachineConfig::new(), MachineConfig::default());
+        let (a, b) = (MachineConfig::new().reboot(false), MachineConfig::default());
         assert_eq!(
             (a.memory_mib, a.jit, a.clock),
             (b.memory_mib, b.jit, b.clock)
@@ -562,6 +563,7 @@ mod config {
     #[test]
     fn every_builder_stores_its_value() {
         let config = MachineConfig::new()
+            .reboot(false)
             .kernel(&[1u8, 2, 3][..])
             .initrd(vec![4u8, 5])
             .cmdline("quiet")
@@ -598,6 +600,7 @@ mod config {
     #[test]
     fn a_later_builder_call_overrides_an_earlier_one() {
         let config = MachineConfig::new()
+            .reboot(false)
             .memory_mib(100)
             .memory_mib(200)
             .cmdline("a")
@@ -629,6 +632,7 @@ mod config {
     fn with_memory(mib: usize) -> Result<EmulatedMachine, Error> {
         EmulatedMachine::new(
             MachineConfig::new()
+                .reboot(false)
                 .kernel(fake_bzimage(&[0xf4]))
                 .memory_mib(mib),
         )
@@ -656,13 +660,18 @@ mod config {
 
     #[test]
     fn memory_is_checked_before_the_kernel_is_looked_at() {
-        let result = EmulatedMachine::new(MachineConfig::new().kernel(vec![0u8; 16]).memory_mib(1));
+        let result = EmulatedMachine::new(
+            MachineConfig::new()
+                .reboot(false)
+                .kernel(vec![0u8; 16])
+                .memory_mib(1),
+        );
         assert!(matches!(result, Err(Error::BadConfig(_))));
     }
 
     #[test]
     fn a_default_config_without_a_kernel_is_a_bad_kernel() {
-        match EmulatedMachine::new(MachineConfig::new()) {
+        match EmulatedMachine::new(MachineConfig::new().reboot(false)) {
             Err(Error::BadKernel(message)) => assert!(message.contains("HdrS"), "{message}"),
             other => panic!("expected BadKernel, got {:?}", other.err()),
         }
@@ -675,7 +684,12 @@ mod config {
             ..FakeKernel::new(&[0xf4])
         }
         .build();
-        let result = EmulatedMachine::new(MachineConfig::new().kernel(old).memory_mib(64));
+        let result = EmulatedMachine::new(
+            MachineConfig::new()
+                .reboot(false)
+                .kernel(old)
+                .memory_mib(64),
+        );
         assert!(matches!(result, Err(Error::BadKernel(_))));
     }
 
@@ -683,6 +697,7 @@ mod config {
     fn an_initrd_too_large_for_ram_is_a_config_error() {
         let result = EmulatedMachine::new(
             MachineConfig::new()
+                .reboot(false)
                 .kernel(fake_bzimage(&[0xf4]))
                 .initrd(vec![0u8; 65 * MIB])
                 .memory_mib(MIN_MEMORY_MIB),
@@ -699,6 +714,7 @@ mod config {
         .build();
         let result = EmulatedMachine::new(
             MachineConfig::new()
+                .reboot(false)
                 .kernel(kernel)
                 .cmdline("x".repeat(40))
                 .memory_mib(64),
@@ -715,6 +731,7 @@ mod config {
         .build();
         let fits = EmulatedMachine::new(
             MachineConfig::new()
+                .reboot(false)
                 .kernel(kernel.clone())
                 .cmdline("abcd")
                 .cmdline_append("efgh")
@@ -723,6 +740,7 @@ mod config {
         assert!(fits.is_ok());
         let too_long = EmulatedMachine::new(
             MachineConfig::new()
+                .reboot(false)
                 .kernel(kernel)
                 .cmdline("abcd")
                 .cmdline_append("efghijk")
@@ -735,6 +753,7 @@ mod config {
     fn jit_off_and_auto_never_fail_for_lack_of_a_jit() {
         for mode in auto_and_off() {
             let config = MachineConfig::new()
+                .reboot(false)
                 .kernel(fake_bzimage(&[0xf4]))
                 .memory_mib(64)
                 .jit(mode);
@@ -745,6 +764,7 @@ mod config {
     #[test]
     fn jit_on_succeeds_exactly_when_the_host_can_run_generated_code() {
         let config = MachineConfig::new()
+            .reboot(false)
             .kernel(fake_bzimage(&[0xf4]))
             .memory_mib(64)
             .jit(JitMode::On);
@@ -758,7 +778,7 @@ mod config {
     #[cfg(not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))))]
     #[test]
     fn without_a_jit_backend_jit_on_is_jit_unavailable_even_before_the_kernel_is_parsed() {
-        let result = EmulatedMachine::new(MachineConfig::new().jit(JitMode::On));
+        let result = EmulatedMachine::new(MachineConfig::new().reboot(false).jit(JitMode::On));
         assert!(matches!(result, Err(Error::JitUnavailable)));
     }
 
@@ -767,6 +787,7 @@ mod config {
     fn with_a_jit_backend_jit_on_is_accepted() {
         let result = EmulatedMachine::new(
             MachineConfig::new()
+                .reboot(false)
                 .kernel(fake_bzimage(&[0xf4]))
                 .memory_mib(64)
                 .jit(JitMode::On),
@@ -994,6 +1015,7 @@ mod lifecycle {
         for jit in auto_and_off() {
             let mut machine = EmulatedMachine::new(
                 MachineConfig::new()
+                    .reboot(false)
                     .kernel(fake_bzimage(&HELLO_RESET))
                     .memory_mib(64)
                     .jit(jit),
@@ -1045,6 +1067,7 @@ mod lifecycle {
         for jit in auto_and_off() {
             let mut machine = EmulatedMachine::new(
                 MachineConfig::new()
+                    .reboot(false)
                     .kernel(fake_bzimage(&SPIN))
                     .memory_mib(64)
                     .jit(jit),
@@ -1087,6 +1110,7 @@ mod lifecycle {
     fn console_and_net_handles_are_shared_with_the_devices() {
         let mut machine = EmulatedMachine::new(
             MachineConfig::new()
+                .reboot(false)
                 .kernel(fake_bzimage(&[0xf4]))
                 .memory_mib(64)
                 .net([2, 0, 0, 0, 0, 2]),
@@ -1112,6 +1136,7 @@ mod lifecycle {
         assert!(new_machine(&[0xf4]).net().is_none());
         let machine = EmulatedMachine::new(
             MachineConfig::new()
+                .reboot(false)
                 .kernel(fake_bzimage(&[0xf4]))
                 .memory_mib(64)
                 .net([0; 6]),
@@ -1381,6 +1406,7 @@ mod exits {
         // out of the callback there aborts the process instead of unwinding to the join.
         let mut machine = EmulatedMachine::new(
             MachineConfig::new()
+                .reboot(false)
                 .kernel(fake_bzimage(&HELLO_RESET))
                 .memory_mib(MIN_MEMORY_MIB)
                 .jit(JitMode::Off),
@@ -1458,7 +1484,7 @@ mod jit_modes {
 
     #[test]
     fn jit_on_is_refused_before_anything_is_loaded_when_the_host_cannot_jit() {
-        let config = MachineConfig::new().jit(JitMode::On);
+        let config = MachineConfig::new().reboot(false).jit(JitMode::On);
         match EmulatedMachine::new(config) {
             // Valid host: the empty kernel is what fails.
             Err(Error::BadKernel(_)) => assert!(host_has_jit()),
@@ -1646,6 +1672,7 @@ mod poll_hook {
     fn the_hook_receives_the_machines_own_console() {
         let mut machine = EmulatedMachine::new(
             MachineConfig::new()
+                .reboot(false)
                 .kernel(fake_bzimage(&SPIN))
                 .memory_mib(64)
                 .jit(JitMode::Off)
@@ -1686,5 +1713,161 @@ mod poll_hook {
         let mut buf = [0u8; 8];
         let count = console.read(&mut buf, Some(Duration::from_millis(1)));
         assert_eq!(&buf[..count], b"hi");
+    }
+}
+
+mod reboot {
+    use super::*;
+
+    /// A guest that counts its boots in RAM it cannot keep: the counter lives at 0x400000, which
+    /// only a cold boot (zeroed RAM) resets. It prints the counter as a digit, so a machine that
+    /// reboots without clearing RAM prints 1, 2, 3 instead of 1, 1, 1.
+    // mov ebx, 0x400000; inc byte [rbx]; mov al, [rbx]; add al, '0'; mov dx, 0x3f8; out dx, al;
+    // mov al, 0xfe; out 0x64, al; hlt
+    const COUNT_BOOTS_IN_RAM: [u8; 21] = [
+        0xbb, 0x00, 0x00, 0x40, 0x00, 0xfe, 0x03, 0x8a, 0x03, 0x04, 0x30, 0x66, 0xba, 0xf8, 0x03,
+        0xee, 0xb0, 0xfe, 0xe6, 0x64, 0xf4,
+    ];
+    /// Prints CMOS byte 0x40 as a digit, then stores 7 in it and resets through port 0xcf9. Only a
+    /// device reset makes every boot print 0.
+    // mov dx, 0x3f8; mov al, 0x40; out 0x70, al; in al, 0x71; add al, '0'; out dx, al;
+    // mov al, 0x40; out 0x70, al; mov al, 7; out 0x71, al; mov al, 0x0e; mov dx, 0xcf9; out dx, al;
+    // hlt
+    const COUNT_BOOTS_IN_CMOS: [u8; 29] = [
+        0x66, 0xba, 0xf8, 0x03, 0xb0, 0x40, 0xe6, 0x70, 0xe4, 0x71, 0x04, 0x30, 0xee, 0xb0, 0x40,
+        0xe6, 0x70, 0xb0, 0x07, 0xe6, 0x71, 0xb0, 0x0e, 0x66, 0xba, 0xf9, 0x0c, 0xee, 0xf4,
+    ];
+    const BOOTS_TO_OBSERVE: usize = 4;
+
+    /// Runs `kernel` with rebooting on until it has printed `bytes` bytes, then stops it.
+    fn run_until_output(kernel: Vec<u8>, jit: JitMode, bytes: usize) -> (Vec<u8>, ExitReason) {
+        let config = MachineConfig::new()
+            .kernel(kernel)
+            .memory_mib(MIN_MEMORY_MIB)
+            .jit(jit)
+            .reboot(true);
+        let mut machine = EmulatedMachine::new(config).unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink = output.clone();
+        let stop = machine.stop_handle();
+        machine.console().on_output(move |piece| {
+            let mut output = sink.lock().unwrap();
+            output.extend_from_slice(piece);
+            if output.len() >= bytes {
+                stop.stop();
+            }
+        });
+        // Backstop for a regression that stops printing.
+        let backstop = machine.stop_handle();
+        std::thread::spawn(move || {
+            std::thread::sleep(GENEROUS_LIMIT);
+            backstop.stop();
+        });
+        machine.start().unwrap();
+        let exit = machine.wait();
+        let output = output.lock().unwrap().clone();
+        (output, exit)
+    }
+
+    #[test]
+    fn a_reset_reboots_into_zeroed_ram_like_a_cold_boot() {
+        for jit in auto_and_off() {
+            let _turn = crate::jit::serialize_jit_tests();
+            let (output, exit) =
+                run_until_output(fake_bzimage(&COUNT_BOOTS_IN_RAM), jit, BOOTS_TO_OBSERVE);
+            assert_eq!(exit, ExitReason::Stopped, "{jit:?}");
+            assert_eq!(output, b"1".repeat(BOOTS_TO_OBSERVE), "{jit:?}");
+        }
+    }
+
+    #[test]
+    fn device_state_does_not_survive_a_reboot() {
+        for jit in auto_and_off() {
+            let _turn = crate::jit::serialize_jit_tests();
+            let (output, exit) =
+                run_until_output(fake_bzimage(&COUNT_BOOTS_IN_CMOS), jit, BOOTS_TO_OBSERVE);
+            assert_eq!(exit, ExitReason::Stopped, "{jit:?}");
+            assert_eq!(output, b"0".repeat(BOOTS_TO_OBSERVE), "{jit:?}");
+        }
+    }
+
+    #[test]
+    fn the_console_sink_and_stop_flag_outlive_the_reboots() {
+        // The sink is installed once and the stop handle taken before start; seeing every boot's
+        // output and a clean `Stopped` shows both stayed attached.
+        let (output, exit) = run_until_output(fake_bzimage(&HELLO_RESET), JitMode::Off, 2 * 2);
+        assert_eq!(exit, ExitReason::Stopped);
+        assert_eq!(output, b"hihi");
+    }
+
+    #[test]
+    fn reboot_off_ends_the_run_with_reset_after_one_boot() {
+        for jit in auto_and_off() {
+            let run = run_machine(
+                fake_bzimage(&COUNT_BOOTS_IN_RAM),
+                jit,
+                GENEROUS_LIMIT,
+                |config| config.reboot(false),
+            );
+            assert_eq!(run.exit, ExitReason::Reset, "{jit:?}");
+            assert_eq!(run.console_output, b"1", "{jit:?}");
+        }
+    }
+
+    #[test]
+    fn a_triple_fault_is_never_restarted() {
+        for reboot in [true, false] {
+            let run = run_machine(
+                fake_bzimage(&NULL_IDT_THEN_INT3),
+                JitMode::Off,
+                GENEROUS_LIMIT,
+                |config| config.reboot(reboot),
+            );
+            assert_eq!(run.exit, ExitReason::TripleFault, "reboot {reboot}");
+        }
+    }
+
+    #[test]
+    fn verification_never_restarts_the_machine() {
+        for jit in auto_and_off() {
+            let _turn = crate::jit::serialize_jit_tests();
+            let run = run_machine(fake_bzimage(&HELLO_RESET), jit, GENEROUS_LIMIT, |config| {
+                config.verify_jit(true).reboot(true)
+            });
+            assert_eq!(run.exit, ExitReason::Reset, "{jit:?}");
+            assert_eq!(run.console_output, b"hi", "{jit:?}");
+        }
+    }
+
+    #[test]
+    fn the_reboot_image_shares_the_embedders_net_queues() {
+        let machine = EmulatedMachine::new(
+            MachineConfig::new()
+                .kernel(fake_bzimage(&HELLO_RESET))
+                .memory_mib(MIN_MEMORY_MIB)
+                .net([2, 0, 0, 0, 0, 1]),
+        )
+        .unwrap();
+        let held_by_embedder = machine.net().unwrap();
+        let image = machine.vcpu.as_ref().unwrap().reboot.as_ref().unwrap();
+        let (mac, rebuilt) = image.net.as_ref().unwrap();
+        assert_eq!(*mac, [2, 0, 0, 0, 0, 1]);
+        assert!(held_by_embedder.send_frame(b"frame"));
+        assert!(
+            rebuilt.has_pending(),
+            "the rebuilt device sees the same queue"
+        );
+    }
+
+    #[test]
+    fn reboot_is_the_default_and_off_or_verify_keeps_no_image() {
+        let image_kept = |config: MachineConfig| {
+            let machine = EmulatedMachine::new(config.kernel(fake_bzimage(&SPIN))).unwrap();
+            machine.vcpu.as_ref().unwrap().reboot.is_some()
+        };
+        let base = || MachineConfig::new().memory_mib(MIN_MEMORY_MIB);
+        assert!(image_kept(base()));
+        assert!(!image_kept(base().reboot(false)));
+        assert!(!image_kept(base().verify_jit(true)));
     }
 }

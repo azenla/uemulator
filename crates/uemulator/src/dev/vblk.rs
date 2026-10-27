@@ -149,6 +149,10 @@ impl VirtioDev for VirtioBlk {
         DEVICE_TYPE_BLOCK
     }
 
+    fn into_disk(self: Box<Self>) -> Option<Disk> {
+        Some(self.disk)
+    }
+
     fn features(&self) -> u64 {
         let mut features = VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_FLUSH;
         if self.disk.backend.read_only() {

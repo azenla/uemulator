@@ -116,6 +116,9 @@ pub struct MachineArgs {
     /// Guest console device
     #[arg(long, value_enum, default_value = "serial")]
     console: ConsoleArg,
+    /// End the run with "machine reset" when the guest resets instead of rebooting it in place
+    #[arg(long)]
+    no_reboot: bool,
     /// Run the interpreter only
     #[arg(long)]
     disable_jit: bool,
@@ -389,9 +392,17 @@ mod tests {
             machine.verify,
             machine.debug,
             machine.realtime,
+            machine.no_reboot,
         ] {
             assert!(!flag);
         }
+    }
+
+    #[test]
+    fn no_reboot_is_a_machine_flag_of_boot_and_quick() {
+        assert!(machine_args(&["--no-reboot"]).no_reboot);
+        let quick = parse(&["quick", "alpine", "--no-reboot"]).unwrap();
+        assert!(matches!(quick.cmd, Cmd::Quick { machine, .. } if machine.no_reboot));
     }
 
     #[test]

@@ -71,8 +71,9 @@ pub enum ExitReason {
     /// before the `hlt` wins and is reported as `Reset`.
     Shutdown,
     /// The guest asked for a reset through the keyboard controller (port 0x64), fast A20 (0x92)
-    /// or reset control (0xcf9) port; see `dev/mod.rs`. Kernels reboot on panic with `panic=-1`,
-    /// so a panic ends a run this way.
+    /// or reset control (0xcf9) port; see `dev/mod.rs`. Only produced with
+    /// `MachineConfig::reboot(false)` or under `verify_jit`: by default the machine restarts
+    /// itself instead.
     Reset,
     TripleFault,
     /// `stop()` / `StopHandle::stop()`, or `wait()` with nothing running.
@@ -120,6 +121,7 @@ pub struct MachineConfig {
     debug: bool,
     verify: bool,
     unix_time: Option<u64>,
+    reboot: bool,
 }
 
 impl Default for MachineConfig {
@@ -141,6 +143,7 @@ impl Default for MachineConfig {
             debug: false,
             verify: false,
             unix_time: None,
+            reboot: true,
         }
     }
 }
@@ -209,7 +212,8 @@ impl MachineConfig {
     }
 
     /// Runs the JIT in lockstep with a second, interpreter-only CPU and stops at the first block
-    /// where their state diverges. Very slow; for JIT development. The second CPU has the same RTC
+    /// where their state diverges. Very slow; for JIT development. A guest reset ends the run
+    /// with `ExitReason::Reset` whatever `reboot` says. The second CPU has the same RTC
     /// boot time and the same virtio functions in the same slots, but not their data: disk
     /// contents and host console or network input are seen by the main CPU only, so a guest that
     /// reads them will report a divergence. Verification always runs on virtual time, whatever
@@ -218,6 +222,25 @@ impl MachineConfig {
     #[doc(hidden)]
     pub fn verify_jit(mut self, on: bool) -> Self {
         self.verify = on;
+        self
+    }
+
+    /// Whether a guest reset request (keyboard controller, port 0x92, port 0xCF9) restarts the
+    /// machine in place (the default) or ends the run with `ExitReason::Reset`.
+    ///
+    /// A restart looks like a cold boot to the guest: the kernel, initrd and command line are
+    /// loaded again into freshly zeroed RAM, the CPU and every device start from power-on state,
+    /// virtual time starts at 0 and the JIT starts with an empty code cache. What survives is
+    /// what the embedder holds or what a real machine keeps: the `ConsoleHandle` and `NetHandle`
+    /// (with whatever is queued in them), the stop flag, the disk image and its contents, and the
+    /// RTC (re-read from the host clock, or re-applied from `unix_time`). A guest that panics
+    /// with `panic=-1` therefore reboots forever; end such a run with `stop()`.
+    ///
+    /// A triple fault is never restarted: it ends the run with `ExitReason::TripleFault` so
+    /// diagnostics and exit codes keep working. Under `verify_jit` a reset always ends the run
+    /// with `Reset`, because the twin interpreter's devices cannot be rebuilt in step.
+    pub fn reboot(mut self, on: bool) -> Self {
+        self.reboot = on;
         self
     }
 
@@ -270,6 +293,21 @@ struct Vcpu {
     /// Pristine copy of RAM for the lockstep interpreter CPU; only set when `verify` is on.
     boot_ram: Option<Vec<u8>>,
     devcfg: DevConfig,
+    /// What a restart needs; `None` when a reset should end the run.
+    reboot: Option<RebootImage>,
+}
+
+/// Everything `boot::load` needs to lay the guest out again, plus the parts of the device set
+/// that cannot be rebuilt from the old `Devices` (the disk is recovered from them instead).
+struct RebootImage {
+    kernel: Vec<u8>,
+    initrd: Option<Vec<u8>>,
+    /// The final command line, defaults and `cmdline_append` already applied.
+    cmdline: String,
+    /// The embedder's handle shares its queues with the device, so the new device must be built
+    /// around this very handle.
+    net: Option<([u8; 6], NetHandle)>,
+    virtio_console: bool,
 }
 
 /// Wall-clock seconds, or 0 where there is no clock (UEFI keeps its own, see `unix_time`).
@@ -354,8 +392,51 @@ fn interpreter_twin(
     twin
 }
 
+/// What a finished run hands to the next one.
+struct Finished {
+    ram_bytes: usize,
+    #[cfg(not(target_os = "uefi"))]
+    disk: Option<Disk>,
+}
+
 impl Vcpu {
+    /// Boots, and boots again after every guest reset while `reboot` is set.
     fn run(mut self) -> ExitReason {
+        loop {
+            let (reason, finished) = self.run_once();
+            let (ExitReason::Reset, Some(image)) = (&reason, &self.reboot) else {
+                return reason;
+            };
+            if let Some(log) = &self.log {
+                log("guest reset: rebooting");
+            }
+            // Fresh zeroed RAM, not a `fill(0)` of the old one: `boot::load` relies on zeroes,
+            // and filling would commit every page the host had lazily left untouched.
+            let mut ram = vec![0u8; finished.ram_bytes];
+            match boot::load(
+                &mut ram,
+                &image.kernel,
+                image.initrd.as_deref(),
+                &image.cmdline,
+            ) {
+                Ok(boot) => self.boot = boot,
+                Err(e) => return ExitReason::Internal(format!("reboot: {e}")),
+            }
+            self.ram = ram;
+            self.devcfg = DevConfig {
+                #[cfg(not(target_os = "uefi"))]
+                disk: finished.disk,
+                net: image.net.clone(),
+                virtio_console: image.virtio_console,
+            };
+        }
+    }
+
+    /// One power-on to the next exit. Everything the CPU owns is built here, so a reboot starts
+    /// from a CPU with no leftover state and from a JIT with an empty code cache: a reused cache
+    /// would never see stores to the new CPU's empty `page_has_code` map and could run
+    /// translations of the previous run's RAM.
+    fn run_once(&mut self) -> (ExitReason, Finished) {
         let console = self.console.clone();
         // Under verify both CPUs must start from one boot time even when the caller gave none;
         // two separate wall-clock reads could straddle a second boundary.
@@ -365,11 +446,13 @@ impl Vcpu {
                 self.unix_time.unwrap_or_else(host_unix_time),
             )
         });
+        let ram = core::mem::take(&mut self.ram);
+        let ram_bytes = ram.len();
         let mut cpu = Cpu::new(
-            self.ram,
+            ram,
             self.boot,
-            self.console,
-            self.stop,
+            self.console.clone(),
+            self.stop.clone(),
             self.log.clone(),
             core::mem::take(&mut self.devcfg),
         );
@@ -380,7 +463,8 @@ impl Vcpu {
         if let Some(boot_unix) = boot_unix {
             cpu.dev.set_boot_time(boot_unix);
         }
-        cpu.poll = self.poll.take().map(|host_poll| {
+        // Cloned, not taken: a reboot builds a new CPU that needs the hook again.
+        cpu.poll = self.poll.clone().map(|host_poll| {
             let poll: PollFn = Arc::new(move |idle| host_poll(&console, idle));
             poll
         });
@@ -416,7 +500,12 @@ impl Vcpu {
         ) {
             l(&cpu.dump());
         }
-        reason
+        let finished = Finished {
+            ram_bytes,
+            #[cfg(not(target_os = "uefi"))]
+            disk: cpu.dev.into_disk(),
+        };
+        (reason, finished)
     }
 }
 
@@ -464,13 +553,23 @@ impl EmulatedMachine {
         let boot = boot::load(&mut ram, &cfg.kernel, cfg.initrd.as_deref(), &cmdline)?;
         let net = cfg.net_mac.map(|mac| (mac, NetHandle::default()));
         let net_handle = net.as_ref().map(|(_, handle)| handle.clone());
+        let virtio_console = cfg.console_kind == ConsoleKind::Virtio;
         let devcfg = DevConfig {
             #[cfg(not(target_os = "uefi"))]
             disk: cfg.disk,
             net,
-            virtio_console: cfg.console_kind == ConsoleKind::Virtio,
+            virtio_console,
         };
         let boot_ram = cfg.verify.then(|| ram.clone());
+        // Verification cannot restart (the twin's devices cannot be rebuilt in step), so it keeps
+        // no image and a reset ends the run.
+        let reboot = (cfg.reboot && !cfg.verify).then(|| RebootImage {
+            kernel: cfg.kernel,
+            initrd: cfg.initrd,
+            cmdline,
+            net: devcfg.net.clone(),
+            virtio_console,
+        });
         let console = ConsoleHandle::default();
         let stop = Arc::new(AtomicBool::new(false));
         Ok(Self {
@@ -488,6 +587,7 @@ impl EmulatedMachine {
                 unix_time: cfg.unix_time,
                 boot_ram,
                 devcfg,
+                reboot,
             }),
             #[cfg(not(target_os = "uefi"))]
             thread: None,
