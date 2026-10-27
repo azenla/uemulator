@@ -191,8 +191,10 @@ const FEATURE_SSE3: u32 = 1 << 0;
 const FEATURE_CX16: u32 = 1 << 13;
 /// SSSE3, XMM forms only (the MMX forms are #UD, see `sse_ext.rs`).
 const FEATURE_SSSE3: u32 = 1 << 9;
+const FEATURE_SSE4_1: u32 = 1 << 19;
 const FEATURE_POPCNT: u32 = 1 << 23;
-const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3 | FEATURE_SSSE3 | FEATURE_CX16 | FEATURE_POPCNT;
+const CPUID_LEAF1_ECX: u32 =
+    FEATURE_SSE3 | FEATURE_SSSE3 | FEATURE_CX16 | FEATURE_SSE4_1 | FEATURE_POPCNT;
 
 /// Leaf 0x8000_0001 EDX repeats this subset of the leaf 1 bits (the AMD aliases); DE and PSE
 /// are not mirrored.

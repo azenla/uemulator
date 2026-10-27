@@ -95,7 +95,10 @@ impl Rig {
 
     /// Like `run` but keeps CR0, CR4 and MXCSR as the test left them.
     fn exec(&mut self, asm: &str) -> Stop {
-        let bytes = code(asm);
+        self.exec_bytes(code(asm))
+    }
+
+    fn exec_bytes(&mut self, bytes: &[u8]) -> Stop {
         self.h.write(CODE_BASE, bytes);
         self.h.cpu.rip = CODE_BASE;
         self.h.cpu.halted = false;
@@ -589,6 +592,9 @@ fn words_of(v: u128) -> [u16; 8] {
 fn dwords_of(v: u128) -> [u32; 4] {
     std::array::from_fn(|k| (v >> (32 * k)) as u32)
 }
+fn qwords_of(v: u128) -> [u64; 2] {
+    [v as u64, (v >> 64) as u64]
+}
 fn lanes16(v: [u16; 8]) -> u128 {
     v.iter().rev().fold(0, |acc, &x| (acc << 16) | x as u128)
 }
@@ -962,6 +968,980 @@ fn unassigned_extension_opcodes_are_invalid() {
     }
 }
 
+mod sse41 {
+    use super::*;
+
+    /// Runs a snippet whose last byte before the `hlt` is imm8, with that byte replaced.
+    fn exec_imm(rig: &mut Rig, asm: &str, imm: u8) -> Stop {
+        let mut bytes = code(asm).to_vec();
+        let last = bytes.len() - 2;
+        bytes[last] = imm;
+        rig.exec_bytes(&bytes)
+    }
+
+    /// xmm0 = `dst`, xmm1 = `src`; returns xmm0 after `asm` with immediate `imm`.
+    fn op_imm(rig: &mut Rig, asm: &str, imm: u8, dst: u128, src: u128) -> u128 {
+        rig.h.cpu.xmm[0] = dst;
+        rig.h.cpu.xmm[1] = src;
+        rig.reset();
+        let stop = exec_imm(rig, asm, imm);
+        assert_eq!(
+            stop,
+            Stop::Halted,
+            "{asm} {imm:#x}: {}",
+            rig.h.cpu.dump_regs()
+        );
+        rig.h.cpu.xmm[0]
+    }
+
+    /// Like `op_imm` with the source in memory at `DATA`.
+    fn op_mem_imm(rig: &mut Rig, asm: &str, imm: u8, dst: u128, src: u128) -> u128 {
+        rig.h.cpu.xmm[0] = dst;
+        rig.h.write(DATA, &src.to_le_bytes());
+        rig.reset();
+        let stop = exec_imm(rig, asm, imm);
+        assert_eq!(
+            stop,
+            Stop::Halted,
+            "{asm} {imm:#x}: {}",
+            rig.h.cpu.dump_regs()
+        );
+        rig.h.cpu.xmm[0]
+    }
+
+    fn lane_values<const N: usize>(v: u128, lane_bits: usize) -> [u128; N] {
+        std::array::from_fn(|k| (v >> (k * lane_bits)) & ((1u128 << lane_bits) - 1))
+    }
+
+    fn from_lane_values(values: &[u128], lane_bits: usize) -> u128 {
+        values
+            .iter()
+            .enumerate()
+            .fold(0, |acc, (k, &x)| acc | (x << (k * lane_bits)))
+    }
+
+    #[test]
+    fn variable_blends_select_by_the_mask_lane_sign_bit() {
+        let mut rig = Rig::new();
+        for (name, lane_bits) in [("pblendvb", 8), ("blendvps", 32), ("blendvpd", 64)] {
+            let register = format!("{name} xmm1, xmm2, xmm0");
+            let memory = format!("{name} xmm1, [rsi], xmm0");
+            let all = vectors();
+            for (index, &mask) in all.iter().enumerate() {
+                let dst = all[(index + 5) % all.len()];
+                let src = all[(index + 11) % all.len()];
+                let lanes = 128 / lane_bits;
+                let want = from_lane_values(
+                    &(0..lanes)
+                        .map(|k| {
+                            let pick =
+                                |v: u128| (v >> (k * lane_bits)) & ((1u128 << lane_bits) - 1);
+                            if pick(mask) >> (lane_bits - 1) & 1 == 1 {
+                                pick(src)
+                            } else {
+                                pick(dst)
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    lane_bits,
+                );
+                rig.h.cpu.xmm[0] = mask;
+                rig.h.cpu.xmm[1] = dst;
+                rig.h.cpu.xmm[2] = src;
+                rig.run_ok(&register);
+                assert_eq!(rig.h.cpu.xmm[1], want, "{register} {mask:#x}");
+                assert_eq!(rig.h.cpu.xmm[0], mask, "the mask register is not written");
+                rig.h.cpu.xmm[0] = mask;
+                rig.h.cpu.xmm[1] = dst;
+                rig.h.write(DATA, &src.to_le_bytes());
+                rig.run_ok(&memory);
+                assert_eq!(rig.h.cpu.xmm[1], want, "{memory} {mask:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn immediate_blends_pick_lanes_by_the_selector_bits() {
+        let mut rig = Rig::new();
+        let dst = lanes8(std::array::from_fn(|k| k as u8));
+        let src = lanes8(std::array::from_fn(|k| 0x80 + k as u8));
+        for (name, lane_bits) in [("pblendw", 16), ("blendps", 32), ("blendpd", 64)] {
+            let register = format!("{name} xmm0, xmm1, 0");
+            let memory = format!("{name} xmm0, [rsi], 0");
+            let lanes = 128 / lane_bits;
+            for imm in [0u8, 1, 2, 0x55, 0xaa, 0x0f, 0xf0, 0xff, 0xfe] {
+                let d = lane_values::<8>(dst, lane_bits);
+                let s = lane_values::<8>(src, lane_bits);
+                let want = from_lane_values(
+                    &(0..lanes)
+                        .map(|k| if imm >> k & 1 == 1 { s[k] } else { d[k] })
+                        .collect::<Vec<_>>(),
+                    lane_bits,
+                );
+                assert_eq!(
+                    op_imm(&mut rig, &register, imm, dst, src),
+                    want,
+                    "{name} {imm:#x}"
+                );
+                assert_eq!(
+                    op_mem_imm(&mut rig, &memory, imm, dst, src),
+                    want,
+                    "{name} memory {imm:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ptest_reports_and_and_andn_zero_and_clears_the_other_flags() {
+        let mut rig = Rig::new();
+        let cases = [
+            (0u128, 0u128, ZF | CF),
+            (0xff00, 0x00ff, ZF),
+            (0xf0f0, 0xf0f0, CF),
+            (0x00f0, 0xf0f0, 0),
+            (0xf0f0, 0x00f0, CF),
+            (u128::MAX, 1 << 127, CF),
+            (1 << 127, 1 << 127, CF),
+            (0, 1, ZF),
+        ];
+        for (dst, src, want) in cases {
+            for asm in ["ptest xmm0, xmm1", "ptest xmm0, [rsi]"] {
+                rig.h.cpu.xmm[0] = dst;
+                rig.h.cpu.xmm[1] = src;
+                rig.h.write(DATA, &src.to_le_bytes());
+                rig.reset();
+                rig.h.cpu.set_eflags_arith(ARITH_FLAGS & !(ZF | CF));
+                assert_eq!(rig.exec(asm), Stop::Halted);
+                assert_eq!(rig.flags(), want, "{asm} {dst:#x} {src:#x}");
+                assert_eq!(rig.h.cpu.xmm[0], dst, "ptest writes no register");
+            }
+        }
+        // Every status flag is preset: OF, SF, AF and PF must be cleared, ZF and CF rewritten.
+        rig.h.cpu.xmm[0] = 0x00f0;
+        rig.h.cpu.xmm[1] = 0xf0f0;
+        rig.reset();
+        rig.h.cpu.set_eflags_arith(ARITH_FLAGS);
+        rig.exec("ptest xmm0, xmm1");
+        assert_eq!(rig.flags(), 0);
+    }
+
+    #[test]
+    fn pmovsx_and_pmovzx_extend_the_low_lanes() {
+        let mut rig = Rig::new();
+        let source = lanes8([
+            0x80, 0x7f, 0xff, 0x01, 0xfe, 0x02, 0x00, 0x81, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 1,
+            2,
+        ]);
+        let forms: [(&str, u32, u32); 6] = [
+            ("bw", 8, 16),
+            ("bd", 8, 32),
+            ("bq", 8, 64),
+            ("wd", 16, 32),
+            ("wq", 16, 64),
+            ("dq", 32, 64),
+        ];
+        for (suffix, from_bits, to_bits) in forms {
+            for (kind, signed) in [("sx", true), ("zx", false)] {
+                let lanes = 128 / to_bits as usize;
+                let from = from_bits as usize;
+                let want = from_lane_values(
+                    &(0..lanes)
+                        .map(|k| {
+                            let raw = lane_values::<16>(source, from)[k];
+                            let extended = if signed && raw >> (from - 1) & 1 == 1 {
+                                raw | (u128::MAX << from)
+                            } else {
+                                raw
+                            };
+                            extended & ((1u128 << to_bits) - 1)
+                        })
+                        .collect::<Vec<_>>(),
+                    to_bits as usize,
+                );
+                let register = format!("pmov{kind}{suffix} xmm0, xmm1");
+                let memory = format!("pmov{kind}{suffix} xmm0, [rsi]");
+                assert_eq!(rig.op(&register, !0, source), want, "{register}");
+                assert_eq!(rig.op_mem(&memory, !0, source), want, "{memory}");
+            }
+        }
+    }
+
+    #[test]
+    fn pmovx_memory_forms_need_no_alignment() {
+        let mut rig = Rig::new();
+        rig.h
+            .write(DATA + 1, &[0x80, 0x7f, 1, 0, 2, 0, 3, 0, 0xff, 0xff]);
+        for (asm, want) in [
+            ("pmovsxbq xmm0, [rsi]", lanes64([u64::MAX - 0x7f, 0x7f])),
+            ("pmovzxbd xmm0, [rsi]", lanes32([0x80, 0x7f, 1, 0])),
+            ("pmovsxwd xmm0, [rsi]", lanes32([0x7f80, 1, 2, 3])),
+        ] {
+            rig.reset();
+            rig.h.cpu.gpr[RSI] = DATA + 1;
+            assert_eq!(rig.exec(asm), Stop::Halted, "{asm}");
+            assert_eq!(rig.h.cpu.xmm[0], want, "{asm}");
+        }
+    }
+
+    #[test]
+    fn dword_and_word_arithmetic_matches_per_lane_references() {
+        let mut rig = Rig::new();
+        check_binary(&mut rig, "pmuldq", |a, b| {
+            let (x, y) = (dwords_of(a), dwords_of(b));
+            lanes64(std::array::from_fn(|k| {
+                ((x[2 * k] as i32 as i64) * (y[2 * k] as i32 as i64)) as u64
+            }))
+        });
+        check_binary(&mut rig, "pmulld", |a, b| {
+            let (x, y) = (dwords_of(a), dwords_of(b));
+            lanes32(std::array::from_fn(|k| x[k].wrapping_mul(y[k])))
+        });
+        check_binary(&mut rig, "pminsb", |a, b| {
+            let (x, y) = (bytes_of(a), bytes_of(b));
+            lanes8(std::array::from_fn(|k| (x[k] as i8).min(y[k] as i8) as u8))
+        });
+        check_binary(&mut rig, "pmaxsb", |a, b| {
+            let (x, y) = (bytes_of(a), bytes_of(b));
+            lanes8(std::array::from_fn(|k| (x[k] as i8).max(y[k] as i8) as u8))
+        });
+        check_binary(&mut rig, "pminsd", |a, b| {
+            let (x, y) = (dwords_of(a), dwords_of(b));
+            lanes32(std::array::from_fn(|k| {
+                (x[k] as i32).min(y[k] as i32) as u32
+            }))
+        });
+        check_binary(&mut rig, "pmaxsd", |a, b| {
+            let (x, y) = (dwords_of(a), dwords_of(b));
+            lanes32(std::array::from_fn(|k| {
+                (x[k] as i32).max(y[k] as i32) as u32
+            }))
+        });
+        check_binary(&mut rig, "pminuw", |a, b| {
+            let (x, y) = (words_of(a), words_of(b));
+            lanes16(std::array::from_fn(|k| x[k].min(y[k])))
+        });
+        check_binary(&mut rig, "pmaxuw", |a, b| {
+            let (x, y) = (words_of(a), words_of(b));
+            lanes16(std::array::from_fn(|k| x[k].max(y[k])))
+        });
+        check_binary(&mut rig, "pminud", |a, b| {
+            let (x, y) = (dwords_of(a), dwords_of(b));
+            lanes32(std::array::from_fn(|k| x[k].min(y[k])))
+        });
+        check_binary(&mut rig, "pmaxud", |a, b| {
+            let (x, y) = (dwords_of(a), dwords_of(b));
+            lanes32(std::array::from_fn(|k| x[k].max(y[k])))
+        });
+        check_binary(&mut rig, "pcmpeqq", |a, b| {
+            let (x, y) = (qwords_of(a), qwords_of(b));
+            lanes64(std::array::from_fn(
+                |k| if x[k] == y[k] { u64::MAX } else { 0 },
+            ))
+        });
+        check_binary(&mut rig, "packusdw", |a, b| {
+            let lanes: Vec<i32> = dwords_of(a)
+                .into_iter()
+                .chain(dwords_of(b))
+                .map(|x| x as i32)
+                .collect();
+            lanes16(std::array::from_fn(|k| lanes[k].clamp(0, 0xffff) as u16))
+        });
+    }
+
+    #[test]
+    fn pmuldq_uses_the_even_dwords_signed() {
+        let mut rig = Rig::new();
+        let a = lanes32([0xffff_ffff, 99, 3, 99]);
+        let b = lanes32([2, 99, 0x8000_0000, 99]);
+        assert_eq!(
+            rig.op("pmuldq xmm0, xmm1", a, b),
+            lanes64([(-2i64) as u64, (3i64 * i32::MIN as i64) as u64])
+        );
+    }
+
+    #[test]
+    fn phminposuw_finds_the_first_minimum_word() {
+        let mut rig = Rig::new();
+        for &src in &vectors() {
+            let words = words_of(src);
+            let (index, minimum) = words
+                .iter()
+                .enumerate()
+                .fold(
+                    (0, words[0]),
+                    |best, (k, &w)| if w < best.1 { (k, w) } else { best },
+                );
+            let want = minimum as u128 | ((index as u128) << 16);
+            assert_eq!(rig.op("phminposuw xmm0, xmm1", !0, src), want, "{src:#x}");
+            assert_eq!(rig.op_mem("phminposuw xmm0, [rsi]", !0, src), want);
+        }
+        // ties pick the lowest index
+        assert_eq!(
+            rig.op(
+                "phminposuw xmm0, xmm1",
+                0,
+                lanes16([5, 3, 9, 3, 3, 8, 7, 6])
+            ),
+            3 | (1 << 16)
+        );
+    }
+
+    #[test]
+    fn mpsadbw_sums_absolute_differences_of_sliding_windows() {
+        let mut rig = Rig::new();
+        let all = vectors();
+        for imm in 0..8u8 {
+            for (index, &dst) in all.iter().enumerate() {
+                let src = all[(index * 5 + 2) % all.len()];
+                let (d, s) = (bytes_of(dst), bytes_of(src));
+                let dst_start = ((imm >> 2) & 1) as usize * 4;
+                let src_start = (imm & 3) as usize * 4;
+                let want = lanes16(std::array::from_fn(|window| {
+                    (0..4)
+                        .map(|k| {
+                            (d[dst_start + window + k] as i32 - s[src_start + k] as i32)
+                                .unsigned_abs()
+                        })
+                        .sum::<u32>() as u16
+                }));
+                assert_eq!(
+                    op_imm(&mut rig, "mpsadbw xmm0, xmm1, 0", imm, dst, src),
+                    want,
+                    "imm {imm} {dst:#x} {src:#x}"
+                );
+            }
+        }
+        // The memory form and the ignored upper immediate bits.
+        let (dst, src) = (all[3], all[7]);
+        assert_eq!(
+            op_mem_imm(&mut rig, "mpsadbw xmm0, [rsi], 0", 0xfd, dst, src),
+            op_imm(&mut rig, "mpsadbw xmm0, xmm1, 0", 0x05, dst, src)
+        );
+    }
+
+    const EXTRACT_SOURCE: u128 = 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100;
+
+    #[test]
+    fn pextr_stores_the_selected_lane_zero_extended() {
+        let mut rig = Rig::new();
+        let source = lanes8([
+            0x80, 0x91, 0xa2, 0xb3, 0xc4, 0xd5, 0xe6, 0xf7, 0x08, 0x19, 0x2a, 0x3b, 0x4c, 0x5d,
+            0x6e, 0x7f,
+        ]);
+        let bytes = bytes_of(source);
+        for imm in 0..=0x1fu8 {
+            rig.h.cpu.xmm[1] = source;
+            rig.h.cpu.gpr[RAX] = u64::MAX;
+            rig.reset();
+            assert_eq!(exec_imm(&mut rig, "pextrb eax, xmm1, 0", imm), Stop::Halted);
+            assert_eq!(
+                rig.gpr(RAX),
+                bytes[(imm & 15) as usize] as u64,
+                "pextrb {imm}"
+            );
+            rig.h.cpu.gpr[RAX] = u64::MAX;
+            rig.reset();
+            assert_eq!(
+                exec_imm(&mut rig, ".byte 0x66, 0x0f, 0x3a, 0x15, 0xc8, 0x00", imm),
+                Stop::Halted
+            );
+            let word = u16::from_le_bytes([
+                bytes[2 * (imm & 7) as usize],
+                bytes[2 * (imm & 7) as usize + 1],
+            ]);
+            assert_eq!(rig.gpr(RAX), word as u64, "pextrw {imm}");
+            rig.h.cpu.gpr[RAX] = u64::MAX;
+            rig.reset();
+            assert_eq!(exec_imm(&mut rig, "pextrd eax, xmm1, 0", imm), Stop::Halted);
+            assert_eq!(
+                rig.gpr(RAX),
+                dwords_of(source)[(imm & 3) as usize] as u64,
+                "pextrd {imm}"
+            );
+            rig.h.cpu.gpr[RAX] = 0;
+            rig.reset();
+            assert_eq!(exec_imm(&mut rig, "pextrq rax, xmm1, 0", imm), Stop::Halted);
+            assert_eq!(
+                rig.gpr(RAX),
+                qwords_of(source)[(imm & 1) as usize],
+                "pextrq {imm}"
+            );
+            rig.h.cpu.gpr[RAX] = u64::MAX;
+            rig.reset();
+            assert_eq!(
+                exec_imm(&mut rig, "extractps eax, xmm1, 0", imm),
+                Stop::Halted
+            );
+            assert_eq!(
+                rig.gpr(RAX),
+                dwords_of(source)[(imm & 3) as usize] as u64,
+                "extractps {imm}"
+            );
+        }
+        // Extended registers on both sides.
+        rig.h.cpu.xmm[9] = EXTRACT_SOURCE;
+        rig.reset();
+        assert_eq!(exec_imm(&mut rig, "pextrq r9, xmm9, 0", 1), Stop::Halted);
+        assert_eq!(rig.gpr(R9), 0x0f0e_0d0c_0b0a_0908);
+        rig.reset();
+        assert_eq!(exec_imm(&mut rig, "pextrb r9d, xmm9, 0", 5), Stop::Halted);
+        assert_eq!(rig.gpr(R9), 5);
+    }
+
+    #[test]
+    fn pextr_memory_forms_write_only_their_lane_size() {
+        let mut rig = Rig::new();
+        for (asm, size, imm) in [
+            ("pextrb [rsi], xmm1, 0", 1usize, 3u8),
+            ("pextrw [rsi], xmm1, 0", 2, 5),
+            ("pextrd [rsi], xmm1, 0", 4, 2),
+            ("pextrq [rsi], xmm1, 0", 8, 1),
+            ("extractps [rsi], xmm1, 0", 4, 3),
+        ] {
+            rig.h.cpu.xmm[1] = EXTRACT_SOURCE;
+            rig.h.write(DATA, &[0xaa; 16]);
+            rig.reset();
+            // Misaligned on purpose: pextr stores need no alignment.
+            rig.h.cpu.gpr[RSI] = DATA + 1;
+            assert_eq!(exec_imm(&mut rig, asm, imm), Stop::Halted, "{asm}");
+            let written = rig.h.read(DATA + 1, 16);
+            let lane_start = size * imm as usize;
+            let want = &EXTRACT_SOURCE.to_le_bytes()[lane_start..lane_start + size];
+            assert_eq!(&written[..size], want, "{asm}");
+            assert!(
+                written[size..15].iter().all(|&b| b == 0xaa),
+                "{asm} wrote too much"
+            );
+            assert_eq!(rig.h.read(DATA, 1), [0xaa]);
+        }
+    }
+
+    #[test]
+    fn pinsr_replaces_the_selected_lane() {
+        let mut rig = Rig::new();
+        let dst = EXTRACT_SOURCE;
+        for imm in 0..=0x1fu8 {
+            rig.h.cpu.xmm[0] = dst;
+            rig.h.cpu.gpr[RAX] = 0xffff_ffff_ffff_ffa5;
+            rig.reset();
+            assert_eq!(exec_imm(&mut rig, "pinsrb xmm0, eax, 0", imm), Stop::Halted);
+            let mut want = bytes_of(dst);
+            want[(imm & 15) as usize] = 0xa5;
+            assert_eq!(rig.h.cpu.xmm[0], lanes8(want), "pinsrb {imm}");
+            rig.h.cpu.xmm[0] = dst;
+            rig.h.cpu.gpr[RAX] = 0xdead_beef_1234_5678;
+            rig.reset();
+            assert_eq!(exec_imm(&mut rig, "pinsrd xmm0, eax, 0", imm), Stop::Halted);
+            let mut want = dwords_of(dst);
+            want[(imm & 3) as usize] = 0x1234_5678;
+            assert_eq!(rig.h.cpu.xmm[0], lanes32(want), "pinsrd {imm}");
+            rig.h.cpu.xmm[0] = dst;
+            rig.reset();
+            assert_eq!(exec_imm(&mut rig, "pinsrq xmm0, rax, 0", imm), Stop::Halted);
+            let mut want = qwords_of(dst);
+            want[(imm & 1) as usize] = 0xdead_beef_1234_5678;
+            assert_eq!(rig.h.cpu.xmm[0], lanes64(want), "pinsrq {imm}");
+        }
+    }
+
+    #[test]
+    fn pinsr_memory_forms_read_their_lane_size_unaligned() {
+        let mut rig = Rig::new();
+        let end = SCRATCH + SCRATCH_BYTES;
+        rig.h
+            .write(end - 8, &0x1122_3344_5566_7788u64.to_le_bytes());
+        for (asm, size, imm, expected) in [
+            ("pinsrb xmm0, [rsi], 0", 1usize, 4u8, {
+                let mut b = bytes_of(EXTRACT_SOURCE);
+                b[4] = 0x88;
+                lanes8(b)
+            }),
+            ("pinsrd xmm0, [rsi], 0", 4, 1, {
+                let mut d = dwords_of(EXTRACT_SOURCE);
+                d[1] = 0x5566_7788;
+                lanes32(d)
+            }),
+            ("pinsrq xmm0, [rsi], 0", 8, 0, {
+                let mut q = qwords_of(EXTRACT_SOURCE);
+                q[0] = 0x1122_3344_5566_7788;
+                lanes64(q)
+            }),
+        ] {
+            rig.h.cpu.xmm[0] = EXTRACT_SOURCE;
+            rig.reset();
+            rig.h.cpu.gpr[RSI] = end - size as u64;
+            // The little-endian operand is the low `size` bytes of the qword written above.
+            rig.h.write(
+                end - size as u64,
+                &0x1122_3344_5566_7788u64.to_le_bytes()[..size],
+            );
+            assert_eq!(exec_imm(&mut rig, asm, imm), Stop::Halted, "{asm}");
+            assert_eq!(rig.h.cpu.xmm[0], expected, "{asm}");
+        }
+        // Extended registers.
+        rig.h.cpu.xmm[9] = 0;
+        rig.h.cpu.gpr[R8] = 0x77;
+        rig.reset();
+        assert_eq!(exec_imm(&mut rig, "pinsrq xmm9, r8, 0", 1), Stop::Halted);
+        assert_eq!(rig.h.cpu.xmm[9], (0x77u128) << 64);
+    }
+
+    #[test]
+    fn insertps_selects_source_and_destination_dwords_and_zeroes_by_mask() {
+        let mut rig = Rig::new();
+        let dst = lanes32([0xd0, 0xd1, 0xd2, 0xd3]);
+        let src = lanes32([0x50, 0x51, 0x52, 0x53]);
+        for imm in 0..=0xffu8 {
+            let source_lane = (imm >> 6) as usize;
+            let destination_lane = ((imm >> 4) & 3) as usize;
+            let mut want = dwords_of(dst);
+            want[destination_lane] = dwords_of(src)[source_lane];
+            for (k, lane) in want.iter_mut().enumerate() {
+                if imm >> k & 1 == 1 {
+                    *lane = 0;
+                }
+            }
+            assert_eq!(
+                op_imm(&mut rig, "insertps xmm0, xmm1, 0", imm, dst, src),
+                lanes32(want),
+                "imm {imm:#x}"
+            );
+            // The m32 form always reads its one dword: count_s is ignored.
+            let mut want_memory = dwords_of(dst);
+            want_memory[destination_lane] = 0x50;
+            for (k, lane) in want_memory.iter_mut().enumerate() {
+                if imm >> k & 1 == 1 {
+                    *lane = 0;
+                }
+            }
+            assert_eq!(
+                op_mem_imm(&mut rig, "insertps xmm0, [rsi], 0", imm, dst, src),
+                lanes32(want_memory),
+                "memory imm {imm:#x}"
+            );
+        }
+    }
+
+    const MODE_NAMES: [&str; 4] = ["nearest even", "down", "up", "toward zero"];
+
+    fn round_single(x: f32, mode: u8) -> f32 {
+        match mode {
+            0 => x.round_ties_even(),
+            1 => x.floor(),
+            2 => x.ceil(),
+            _ => x.trunc(),
+        }
+    }
+
+    fn round_double(x: f64, mode: u8) -> f64 {
+        match mode {
+            0 => x.round_ties_even(),
+            1 => x.floor(),
+            2 => x.ceil(),
+            _ => x.trunc(),
+        }
+    }
+
+    const SINGLE_VALUES: [f32; 20] = [
+        0.0,
+        -0.0,
+        0.3,
+        -0.3,
+        0.5,
+        -0.5,
+        1.5,
+        -1.5,
+        2.5,
+        -2.5,
+        3.5,
+        8_388_607.5,
+        -8_388_607.5,
+        8_388_608.0,
+        1e10,
+        -1e10,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        123_456.75,
+        1.0,
+    ];
+
+    const DOUBLE_VALUES: [f64; 18] = [
+        0.0,
+        -0.0,
+        0.3,
+        -0.3,
+        0.5,
+        -0.5,
+        1.5,
+        -1.5,
+        2.5,
+        -2.5,
+        4_503_599_627_370_495.5,
+        -4_503_599_627_370_495.5,
+        4_503_599_627_370_496.0,
+        1e300,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        123_456.75,
+        1.0,
+    ];
+
+    #[test]
+    fn roundps_and_roundss_round_every_mode_and_flag_inexact_results() {
+        let mut rig = Rig::new();
+        for mode in 0..4u8 {
+            for &x in &SINGLE_VALUES {
+                let want_bits = round_single(x, mode).to_bits();
+                let inexact = round_single(x, mode) != x;
+                let src = singles([x, x, x, x]);
+                let packed = op_imm(&mut rig, "roundps xmm0, xmm1, 0", mode, 0, src);
+                assert_eq!(
+                    dwords_of(packed),
+                    [want_bits; 4],
+                    "roundps {x} {}",
+                    MODE_NAMES[mode as usize]
+                );
+                let flags = rig.h.cpu.mxcsr & MXCSR_EXCEPTION_FLAGS;
+                assert_eq!(
+                    flags,
+                    if inexact { FLAG_PRECISION } else { 0 },
+                    "flags for {x}"
+                );
+                // The scalar form leaves the upper lanes of the destination alone.
+                let marker = lanes32([0, 0x1111_1111, 0x2222_2222, 0x3333_3333]);
+                let scalar = op_imm(&mut rig, "roundss xmm0, xmm1, 0", mode, marker, src);
+                assert_eq!(
+                    dwords_of(scalar),
+                    [want_bits, 0x1111_1111, 0x2222_2222, 0x3333_3333],
+                    "roundss {x}"
+                );
+                // Suppressing the precision exception hides the flag but not the rounding.
+                let quiet = op_imm(&mut rig, "roundps xmm0, xmm1, 0", mode | 8, 0, src);
+                assert_eq!(dwords_of(quiet), [want_bits; 4]);
+                assert_eq!(rig.h.cpu.mxcsr & MXCSR_EXCEPTION_FLAGS, 0, "suppressed {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn roundpd_and_roundsd_round_every_mode_and_flag_inexact_results() {
+        let mut rig = Rig::new();
+        for mode in 0..4u8 {
+            for &x in &DOUBLE_VALUES {
+                let want_bits = round_double(x, mode).to_bits();
+                let inexact = round_double(x, mode) != x;
+                let src = doubles([x, x]);
+                let packed = op_imm(&mut rig, "roundpd xmm0, xmm1, 0", mode, 0, src);
+                assert_eq!(
+                    qwords_of(packed),
+                    [want_bits; 2],
+                    "roundpd {x} {}",
+                    MODE_NAMES[mode as usize]
+                );
+                let flags = rig.h.cpu.mxcsr & MXCSR_EXCEPTION_FLAGS;
+                assert_eq!(
+                    flags,
+                    if inexact { FLAG_PRECISION } else { 0 },
+                    "flags for {x}"
+                );
+                let scalar = op_imm(
+                    &mut rig,
+                    "roundsd xmm0, xmm1, 0",
+                    mode,
+                    lanes64([0, 0x1234]),
+                    src,
+                );
+                assert_eq!(qwords_of(scalar), [want_bits, 0x1234], "roundsd {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn round_with_the_mxcsr_bit_uses_mxcsr_rc_and_ignores_immediate_mode_bits() {
+        let mut rig = Rig::new();
+        let src = singles([2.5, -2.5, 0.3, -0.3]);
+        for mode in 0..4u8 {
+            rig.h.cpu.xmm[1] = src;
+            rig.reset();
+            rig.h.cpu.mxcsr |= (mode as u32) << MXCSR_RC_SHIFT;
+            // imm bit 2 set; the low mode bits (here 3) must be ignored.
+            assert_eq!(
+                exec_imm(&mut rig, "roundps xmm0, xmm1, 0", 0b111),
+                Stop::Halted
+            );
+            let want = singles([2.5f32, -2.5, 0.3, -0.3].map(|x| round_single(x, mode)));
+            assert_eq!(
+                rig.h.cpu.xmm[0], want,
+                "mxcsr rc {}",
+                MODE_NAMES[mode as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn round_nan_inputs_and_denormals() {
+        let mut rig = Rig::new();
+        let qnan = f32::from_bits(0x7fc0_0123);
+        let snan = f32::from_bits(0x7f80_0001);
+        let result = op_imm(
+            &mut rig,
+            "roundps xmm0, xmm1, 0",
+            1,
+            0,
+            singles([qnan, snan, 1.0, 0.0]),
+        );
+        assert_eq!(
+            dwords_of(result)[0],
+            0x7fc0_0123,
+            "a quiet NaN passes through"
+        );
+        assert_eq!(
+            dwords_of(result)[1],
+            0x7fc0_0001,
+            "a signaling NaN is quieted"
+        );
+        assert_eq!(rig.h.cpu.mxcsr & MXCSR_EXCEPTION_FLAGS, FLAG_INVALID);
+        // A subnormal rounds to 0 (nearest) or to 1.0 (up) and raises only precision, never the
+        // denormal flag.
+        let subnormal = f32::from_bits(1);
+        let result = op_imm(
+            &mut rig,
+            "roundss xmm0, xmm1, 0",
+            2,
+            0,
+            singles([subnormal, 0.0, 0.0, 0.0]),
+        );
+        assert_eq!(dwords_of(result)[0], 1.0f32.to_bits());
+        assert_eq!(rig.h.cpu.mxcsr & MXCSR_EXCEPTION_FLAGS, FLAG_PRECISION);
+        // With DAZ the subnormal is a zero: nothing to round up, nothing inexact.
+        rig.h.cpu.xmm[1] = singles([subnormal, 0.0, 0.0, 0.0]);
+        rig.reset();
+        rig.h.cpu.mxcsr |= MXCSR_DAZ;
+        assert_eq!(exec_imm(&mut rig, "roundss xmm0, xmm1, 0", 2), Stop::Halted);
+        assert_eq!(dwords_of(rig.h.cpu.xmm[0])[0], 0);
+        assert_eq!(rig.h.cpu.mxcsr & MXCSR_EXCEPTION_FLAGS, 0);
+    }
+
+    #[test]
+    fn an_unmasked_precision_exception_faults_unless_suppressed() {
+        let mut rig = Rig::new();
+        rig.h.cpu.xmm[0] = 0x5555;
+        rig.h.cpu.xmm[1] = singles([2.5, 0.0, 0.0, 0.0]);
+        rig.reset();
+        rig.h.cpu.cr4 |= CR4_OSXMMEXCPT;
+        rig.h.cpu.mxcsr &= !(FLAG_PRECISION << MXCSR_MASK_SHIFT);
+        assert_eq!(exec_imm(&mut rig, "roundss xmm0, xmm1, 0", 0), xm());
+        assert_eq!(
+            rig.h.cpu.xmm[0], 0x5555,
+            "the destination is untouched by a fault"
+        );
+        assert_eq!(rig.h.cpu.mxcsr & FLAG_PRECISION, FLAG_PRECISION);
+        rig.h.cpu.mxcsr &= !FLAG_PRECISION;
+        assert_eq!(exec_imm(&mut rig, "roundss xmm0, xmm1, 0", 8), Stop::Halted);
+        assert_eq!(dwords_of(rig.h.cpu.xmm[0])[0], 2.0f32.to_bits());
+    }
+
+    #[test]
+    fn round_memory_forms_follow_the_operand_size_and_alignment_rules() {
+        let mut rig = Rig::new();
+        // roundss reads 4 bytes, roundsd 8: any alignment.
+        rig.h.write(DATA + 1, &2.5f32.to_le_bytes());
+        rig.reset();
+        rig.h.cpu.gpr[RSI] = DATA + 1;
+        assert_eq!(
+            exec_imm(&mut rig, "roundss xmm0, [rsi], 0", 0),
+            Stop::Halted
+        );
+        assert_eq!(dwords_of(rig.h.cpu.xmm[0])[0], 2.0f32.to_bits());
+        // roundps needs an aligned m128.
+        rig.reset();
+        rig.h.cpu.gpr[RSI] = DATA + 4;
+        assert_eq!(exec_imm(&mut rig, "roundps xmm0, [rsi], 0", 0), gp0());
+        rig.reset();
+        rig.h.cpu.gpr[RSI] = DATA + 8;
+        assert_eq!(exec_imm(&mut rig, "roundpd xmm0, [rsi], 0", 0), gp0());
+    }
+
+    #[test]
+    fn dpps_multiplies_selected_lanes_and_broadcasts_the_sum_to_selected_outputs() {
+        let mut rig = Rig::new();
+        let dst = singles([1.0, 2.0, 3.0, 4.0]);
+        let src = singles([5.0, 6.0, 7.0, 8.0]);
+        for imm in 0..=0xffu8 {
+            let products = [5.0f32, 12.0, 21.0, 32.0];
+            let selected = |k: usize| {
+                if imm >> (4 + k) & 1 == 1 {
+                    products[k]
+                } else {
+                    0.0
+                }
+            };
+            let sum = (selected(0) + selected(1)) + (selected(2) + selected(3));
+            let want = singles(std::array::from_fn(|k| {
+                if imm >> k & 1 == 1 { sum } else { 0.0 }
+            }));
+            assert_eq!(
+                op_imm(&mut rig, "dpps xmm0, xmm1, 0", imm, dst, src),
+                want,
+                "dpps {imm:#x}"
+            );
+            assert_eq!(
+                op_mem_imm(&mut rig, "dpps xmm0, [rsi], 0", imm, dst, src),
+                want,
+                "dpps memory {imm:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn dppd_multiplies_selected_lanes_and_broadcasts_the_sum_to_selected_outputs() {
+        let mut rig = Rig::new();
+        let dst = doubles([1.5, 2.0]);
+        let src = doubles([4.0, -3.0]);
+        for imm in 0..=0xffu8 {
+            let products = [6.0f64, -6.0];
+            let selected = |k: usize| {
+                if imm >> (4 + k) & 1 == 1 {
+                    products[k]
+                } else {
+                    0.0
+                }
+            };
+            let sum = selected(0) + selected(1);
+            let want = doubles(std::array::from_fn(|k| {
+                if imm >> k & 1 == 1 { sum } else { 0.0 }
+            }));
+            assert_eq!(
+                op_imm(&mut rig, "dppd xmm0, xmm1, 0", imm, dst, src),
+                want,
+                "dppd {imm:#x}"
+            );
+        }
+        assert_eq!(
+            op_mem_imm(&mut rig, "dppd xmm0, [rsi], 0", 0x11, dst, src),
+            doubles([6.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn dpps_propagates_nans_and_raises_exceptions_like_the_arithmetic_ops() {
+        let mut rig = Rig::new();
+        let nan = f32::from_bits(0x7fc0_0042);
+        let result = op_imm(
+            &mut rig,
+            "dpps xmm0, xmm1, 0",
+            0xff,
+            singles([1.0, nan, 1.0, 1.0]),
+            singles([1.0, 1.0, 1.0, 1.0]),
+        );
+        assert_eq!(dwords_of(result), [0x7fc0_0042; 4]);
+        // inf * 0 is invalid: the default NaN, with the flag.
+        let result = op_imm(
+            &mut rig,
+            "dpps xmm0, xmm1, 0",
+            0x11,
+            singles([f32::INFINITY, 0.0, 0.0, 0.0]),
+            singles([0.0, 0.0, 0.0, 0.0]),
+        );
+        assert_eq!(dwords_of(result)[0], DEFAULT_NAN_SINGLE);
+        assert_eq!(rig.h.cpu.mxcsr & MXCSR_EXCEPTION_FLAGS, FLAG_INVALID);
+    }
+
+    #[test]
+    fn movntdqa_loads_aligned_memory_only() {
+        let mut rig = Rig::new();
+        let value = vectors()[10];
+        assert_eq!(rig.op_mem("movntdqa xmm0, [rsi]", 0, value), value);
+        rig.reset();
+        rig.h.cpu.gpr[RSI] = DATA + 8;
+        assert_eq!(rig.exec("movntdqa xmm0, [rsi]"), gp0());
+        rig.h.cpu.cr0 |= CR0_TS;
+        assert_eq!(
+            rig.exec(".byte 0x66, 0x0f, 0x38, 0x2a, 0xc1"),
+            ud(),
+            "no register form, even with CR0.TS set"
+        );
+    }
+
+    #[test]
+    fn sse41_memory_operands_must_be_aligned() {
+        let mut rig = Rig::new();
+        for asm in [
+            "pblendvb xmm1, [rsi], xmm0",
+            "pblendw xmm0, [rsi], 0",
+            "ptest xmm0, [rsi]",
+            "pmulld xmm0, [rsi]",
+            "pminsb xmm0, [rsi]",
+            "pcmpeqq xmm0, [rsi]",
+            "packusdw xmm0, [rsi]",
+            "phminposuw xmm0, [rsi]",
+            "dpps xmm0, [rsi], 0",
+            "mpsadbw xmm0, [rsi], 0",
+            "blendpd xmm0, [rsi], 0",
+        ] {
+            rig.reset();
+            rig.h.cpu.gpr[RSI] = DATA + 1;
+            assert_eq!(rig.exec(asm), gp0(), "{asm}");
+        }
+    }
+
+    #[test]
+    fn enable_rules_apply() {
+        let mut rig = Rig::new();
+        for asm in [
+            "pblendvb xmm1, xmm2, xmm0",
+            "ptest xmm0, xmm1",
+            "pmovsxbw xmm0, xmm1",
+            "roundss xmm0, xmm1, 0",
+            "pextrd eax, xmm1, 0",
+            "pinsrb xmm0, eax, 0",
+            "insertps xmm0, xmm1, 0",
+        ] {
+            rig.reset();
+            rig.h.cpu.cr4 &= !CR4_OSFXSR;
+            assert_eq!(rig.exec(asm), ud(), "{asm} without OSFXSR");
+            rig.reset();
+            rig.h.cpu.cr0 |= CR0_EM;
+            assert_eq!(rig.exec(asm), ud(), "{asm} with CR0.EM");
+            rig.reset();
+            rig.h.cpu.cr0 |= CR0_TS;
+            assert_eq!(rig.exec(asm), nm(), "{asm} with CR0.TS");
+        }
+    }
+
+    #[test]
+    fn jit_matches_the_interpreter() {
+        for asm in [
+            "pblendvb xmm1, xmm2, xmm0",
+            "blendvps xmm1, [rsi], xmm0",
+            "ptest xmm0, xmm1",
+            "pmovsxbd xmm0, xmm1",
+            "pmuldq xmm0, xmm1",
+            "pminud xmm0, [rsi]",
+            "phminposuw xmm0, xmm1",
+            "mpsadbw xmm0, xmm1, 0",
+            "pextrq rax, xmm1, 0",
+            "pinsrb xmm0, eax, 0",
+            "insertps xmm0, xmm1, 0",
+            "roundps xmm0, xmm1, 0",
+            "roundsd xmm0, [rsi], 0",
+            "dpps xmm0, xmm1, 0",
+            "packusdw xmm0, xmm1",
+        ] {
+            assert_jit_matches_interpreter(code(asm), |h| {
+                h.cpu.cr4 |= CR4_OSFXSR;
+                h.cpu.gpr[RSI] = DATA;
+                h.cpu.gpr[RAX] = 0x1234_5678_9abc_def0;
+                h.cpu.xmm[0] = singles([1.5, -2.25, 1e30, 7.0]);
+                h.cpu.xmm[1] = singles([2.5, 3.5, -1e30, -7.5]);
+                h.cpu.xmm[2] = 0x8070_6050_4030_2010_00ff_7f80_0102_0304;
+                h.write(DATA, &h.cpu.xmm[1].to_le_bytes());
+            });
+        }
+    }
+}
+
 const SNIPPETS: &[(&str, &[u8])] = &[
     ("movddup xmm0, xmm1", &[0xf2, 0x0f, 0x12, 0xc1, 0xf4]),
     ("movddup xmm0, [rsi]", &[0xf2, 0x0f, 0x12, 0x06, 0xf4]),
@@ -1146,6 +2126,303 @@ const SNIPPETS: &[(&str, &[u8])] = &[
     (
         ".byte 0x66, 0x0f, 0x3a, 0xff, 0xc1, 0x00",
         &[0x66, 0x0f, 0x3a, 0xff, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "pblendvb xmm1, xmm2, xmm0",
+        &[0x66, 0x0f, 0x38, 0x10, 0xca, 0xf4],
+    ),
+    (
+        "pblendvb xmm1, [rsi], xmm0",
+        &[0x66, 0x0f, 0x38, 0x10, 0x0e, 0xf4],
+    ),
+    (
+        "blendvps xmm1, xmm2, xmm0",
+        &[0x66, 0x0f, 0x38, 0x14, 0xca, 0xf4],
+    ),
+    (
+        "blendvps xmm1, [rsi], xmm0",
+        &[0x66, 0x0f, 0x38, 0x14, 0x0e, 0xf4],
+    ),
+    (
+        "blendvpd xmm1, xmm2, xmm0",
+        &[0x66, 0x0f, 0x38, 0x15, 0xca, 0xf4],
+    ),
+    (
+        "blendvpd xmm1, [rsi], xmm0",
+        &[0x66, 0x0f, 0x38, 0x15, 0x0e, 0xf4],
+    ),
+    (
+        "pblendw xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x0e, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "pblendw xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x0e, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "blendps xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x0c, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "blendps xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x0c, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "blendpd xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x0d, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "blendpd xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x0d, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "mpsadbw xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x42, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "mpsadbw xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x42, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "dpps xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x40, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "dpps xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x40, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "dppd xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x41, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "dppd xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x41, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "roundps xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x08, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "roundps xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x08, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "roundpd xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x09, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "roundpd xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x09, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "roundss xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x0a, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "roundss xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x0a, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "roundsd xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x0b, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "roundsd xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x0b, 0x06, 0x00, 0xf4],
+    ),
+    ("ptest xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x17, 0xc1, 0xf4]),
+    ("ptest xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x17, 0x06, 0xf4]),
+    ("pmovsxbw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x20, 0xc1, 0xf4]),
+    (
+        "pmovsxbw xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x20, 0x06, 0xf4],
+    ),
+    ("pmovzxbw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x30, 0xc1, 0xf4]),
+    (
+        "pmovzxbw xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x30, 0x06, 0xf4],
+    ),
+    ("pmovsxbd xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x21, 0xc1, 0xf4]),
+    (
+        "pmovsxbd xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x21, 0x06, 0xf4],
+    ),
+    ("pmovzxbd xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x31, 0xc1, 0xf4]),
+    (
+        "pmovzxbd xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x31, 0x06, 0xf4],
+    ),
+    ("pmovsxbq xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x22, 0xc1, 0xf4]),
+    (
+        "pmovsxbq xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x22, 0x06, 0xf4],
+    ),
+    ("pmovzxbq xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x32, 0xc1, 0xf4]),
+    (
+        "pmovzxbq xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x32, 0x06, 0xf4],
+    ),
+    ("pmovsxwd xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x23, 0xc1, 0xf4]),
+    (
+        "pmovsxwd xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x23, 0x06, 0xf4],
+    ),
+    ("pmovzxwd xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x33, 0xc1, 0xf4]),
+    (
+        "pmovzxwd xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x33, 0x06, 0xf4],
+    ),
+    ("pmovsxwq xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x24, 0xc1, 0xf4]),
+    (
+        "pmovsxwq xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x24, 0x06, 0xf4],
+    ),
+    ("pmovzxwq xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x34, 0xc1, 0xf4]),
+    (
+        "pmovzxwq xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x34, 0x06, 0xf4],
+    ),
+    ("pmovsxdq xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x25, 0xc1, 0xf4]),
+    (
+        "pmovsxdq xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x25, 0x06, 0xf4],
+    ),
+    ("pmovzxdq xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x35, 0xc1, 0xf4]),
+    (
+        "pmovzxdq xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x35, 0x06, 0xf4],
+    ),
+    ("pmuldq xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x28, 0xc1, 0xf4]),
+    ("pmuldq xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x28, 0x06, 0xf4]),
+    ("pmulld xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x40, 0xc1, 0xf4]),
+    ("pmulld xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x40, 0x06, 0xf4]),
+    ("pminsb xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x38, 0xc1, 0xf4]),
+    ("pminsb xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x38, 0x06, 0xf4]),
+    ("pminsd xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x39, 0xc1, 0xf4]),
+    ("pminsd xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x39, 0x06, 0xf4]),
+    ("pminuw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x3a, 0xc1, 0xf4]),
+    ("pminuw xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x3a, 0x06, 0xf4]),
+    ("pminud xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x3b, 0xc1, 0xf4]),
+    ("pminud xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x3b, 0x06, 0xf4]),
+    ("pmaxsb xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x3c, 0xc1, 0xf4]),
+    ("pmaxsb xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x3c, 0x06, 0xf4]),
+    ("pmaxsd xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x3d, 0xc1, 0xf4]),
+    ("pmaxsd xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x3d, 0x06, 0xf4]),
+    ("pmaxuw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x3e, 0xc1, 0xf4]),
+    ("pmaxuw xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x3e, 0x06, 0xf4]),
+    ("pmaxud xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x3f, 0xc1, 0xf4]),
+    ("pmaxud xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x3f, 0x06, 0xf4]),
+    ("pcmpeqq xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x29, 0xc1, 0xf4]),
+    ("pcmpeqq xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x29, 0x06, 0xf4]),
+    ("packusdw xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x2b, 0xc1, 0xf4]),
+    (
+        "packusdw xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x2b, 0x06, 0xf4],
+    ),
+    (
+        "phminposuw xmm0, xmm1",
+        &[0x66, 0x0f, 0x38, 0x41, 0xc1, 0xf4],
+    ),
+    (
+        "phminposuw xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x41, 0x06, 0xf4],
+    ),
+    (
+        "movntdqa xmm0, [rsi]",
+        &[0x66, 0x0f, 0x38, 0x2a, 0x06, 0xf4],
+    ),
+    (
+        ".byte 0x66, 0x0f, 0x38, 0x2a, 0xc1",
+        &[0x66, 0x0f, 0x38, 0x2a, 0xc1, 0xf4],
+    ),
+    (
+        "pextrb eax, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x14, 0xc8, 0x00, 0xf4],
+    ),
+    (
+        "pextrb [rsi], xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x14, 0x0e, 0x00, 0xf4],
+    ),
+    (
+        "pextrb r9d, xmm9, 0",
+        &[0x66, 0x45, 0x0f, 0x3a, 0x14, 0xc9, 0x00, 0xf4],
+    ),
+    (
+        ".byte 0x66, 0x0f, 0x3a, 0x15, 0xc8, 0x00",
+        &[0x66, 0x0f, 0x3a, 0x15, 0xc8, 0x00, 0xf4],
+    ),
+    (
+        "pextrw [rsi], xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x15, 0x0e, 0x00, 0xf4],
+    ),
+    (
+        "pextrd eax, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x16, 0xc8, 0x00, 0xf4],
+    ),
+    (
+        "pextrd [rsi], xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x16, 0x0e, 0x00, 0xf4],
+    ),
+    (
+        "pextrq rax, xmm1, 0",
+        &[0x66, 0x48, 0x0f, 0x3a, 0x16, 0xc8, 0x00, 0xf4],
+    ),
+    (
+        "pextrq [rsi], xmm1, 0",
+        &[0x66, 0x48, 0x0f, 0x3a, 0x16, 0x0e, 0x00, 0xf4],
+    ),
+    (
+        "pextrq r9, xmm9, 0",
+        &[0x66, 0x4d, 0x0f, 0x3a, 0x16, 0xc9, 0x00, 0xf4],
+    ),
+    (
+        "extractps eax, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x17, 0xc8, 0x00, 0xf4],
+    ),
+    (
+        "extractps [rsi], xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x17, 0x0e, 0x00, 0xf4],
+    ),
+    (
+        "pinsrb xmm0, eax, 0",
+        &[0x66, 0x0f, 0x3a, 0x20, 0xc0, 0x00, 0xf4],
+    ),
+    (
+        "pinsrb xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x20, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "pinsrd xmm0, eax, 0",
+        &[0x66, 0x0f, 0x3a, 0x22, 0xc0, 0x00, 0xf4],
+    ),
+    (
+        "pinsrd xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x22, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "pinsrq xmm0, rax, 0",
+        &[0x66, 0x48, 0x0f, 0x3a, 0x22, 0xc0, 0x00, 0xf4],
+    ),
+    (
+        "pinsrq xmm0, [rsi], 0",
+        &[0x66, 0x48, 0x0f, 0x3a, 0x22, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "pinsrq xmm9, r8, 0",
+        &[0x66, 0x4d, 0x0f, 0x3a, 0x22, 0xc8, 0x00, 0xf4],
+    ),
+    (
+        "insertps xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x21, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "insertps xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x21, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "movaps xmm0, xmm1; roundps xmm0, [rsi], 0",
+        &[0x0f, 0x28, 0xc1, 0x66, 0x0f, 0x3a, 0x08, 0x06, 0x00, 0xf4],
     ),
     // SNIPPETS-END
 ];

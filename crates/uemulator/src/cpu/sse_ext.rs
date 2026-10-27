@@ -40,6 +40,44 @@ enum Op {
     Unary(fn(u128) -> u128),
     /// Binary with the imm8 that follows the ModRM bytes.
     WithImm(fn(u128, u128, u8) -> u128),
+    /// `dst = f(dst, src, xmm0)`: the implicit xmm0 operand of the variable blends.
+    WithMask(fn(u128, u128, u128) -> u128),
+    /// movntdqa: an aligned 128-bit load that exists only with a memory operand.
+    LoadAligned,
+    /// pmovsx*/pmovzx*: widen the low lanes of the source from `from_bits` to `to_bits`.
+    Widen {
+        signed: bool,
+        from_bits: u32,
+        to_bits: u32,
+    },
+    /// ptest: ZF and CF from `dst & src` and `!dst & src`.
+    Ptest,
+    /// roundps/roundpd/roundss/roundsd.
+    Round {
+        double: bool,
+        scalar: bool,
+    },
+    /// dpps/dppd.
+    DotProduct {
+        double: bool,
+    },
+    Extract(LaneKind),
+    Insert(LaneKind),
+    /// insertps: one dword of the source (register form) or the m32 into one dword of the
+    /// destination, then zeroing by mask.
+    Insertps,
+}
+
+/// The element a pextr*/pinsr*/extractps instruction moves between a vector register and a
+/// general register or memory.
+#[derive(Clone, Copy)]
+enum LaneKind {
+    Byte,
+    Word,
+    /// pextrd/pinsrd, or the 64-bit pextrq/pinsrq under REX.W.
+    DwordOrQword,
+    /// extractps: the dword is moved as raw bits.
+    Single,
 }
 
 /// How an operation reads its second operand.
@@ -51,6 +89,11 @@ enum Source {
     Unaligned,
     /// The low `n` bytes of the register, or `n` bytes of memory (no alignment requirement).
     Low(u8),
+    /// The whole register, but only `n` bytes of memory (insertps picks a dword out of the
+    /// register form and takes an m32).
+    WholeOrMemory(u8),
+    /// No vector source: the instruction handles its ModRM operand itself.
+    None,
 }
 
 impl Op {
@@ -58,13 +101,23 @@ impl Op {
         match self {
             Op::Movddup => Source::Low(8),
             Op::Lddqu => Source::Unaligned,
+            Op::Widen {
+                from_bits, to_bits, ..
+            } => Source::Low((from_bits * (VECTOR_BITS / to_bits) / 8) as u8),
+            Op::Round { double, scalar } if scalar => Source::Low(if double {
+                DOUBLE.bytes()
+            } else {
+                SINGLE.bytes()
+            }),
+            Op::Insertps => Source::WholeOrMemory(SINGLE.bytes()),
+            Op::Extract(_) | Op::Insert(_) => Source::None,
             _ => Source::Aligned,
         }
     }
 
     /// Instructions that exist only with a memory operand: the register form is #UD.
     fn memory_only(self) -> bool {
-        matches!(self, Op::Lddqu)
+        matches!(self, Op::Lddqu | Op::LoadAligned)
     }
 }
 
@@ -153,6 +206,88 @@ fn decode_integer_op(map: u16, opcode: u8, prefix: Prefix) -> Option<Op> {
             Op::Unary(|b| zip_lanes::<u32>(b, 0, |x, _| (x as i32).unsigned_abs()))
         }
         (OPCODE_MAP_0F3A, 0x0f) => Op::WithImm(palignr),
+        _ => return decode_sse41_op(map, opcode),
+    })
+}
+
+/// SSE4.1 (all 66-prefixed). The 0F38 widening moves are numbered 0x20-0x25 (sign) and 0x30-0x35
+/// (zero) in the order bw, bd, bq, wd, wq, dq.
+fn decode_sse41_op(map: u16, opcode: u8) -> Option<Op> {
+    const WIDENINGS: [(u32, u32); 6] = [(8, 16), (8, 32), (8, 64), (16, 32), (16, 64), (32, 64)];
+    Some(match (map, opcode) {
+        (OPCODE_MAP_0F38, 0x10) => Op::WithMask(blend_variable::<u8>),
+        (OPCODE_MAP_0F38, 0x14) => Op::WithMask(blend_variable::<u32>),
+        (OPCODE_MAP_0F38, 0x15) => Op::WithMask(blend_variable::<u64>),
+        (OPCODE_MAP_0F38, 0x17) => Op::Ptest,
+        (OPCODE_MAP_0F38, 0x20..=0x25) => {
+            let (from_bits, to_bits) = WIDENINGS[(opcode - 0x20) as usize];
+            Op::Widen {
+                signed: true,
+                from_bits,
+                to_bits,
+            }
+        }
+        (OPCODE_MAP_0F38, 0x30..=0x35) => {
+            let (from_bits, to_bits) = WIDENINGS[(opcode - 0x30) as usize];
+            Op::Widen {
+                signed: false,
+                from_bits,
+                to_bits,
+            }
+        }
+        (OPCODE_MAP_0F38, 0x28) => Op::Binary(pmuldq),
+        (OPCODE_MAP_0F38, 0x29) => {
+            Op::Binary(|a, b| zip_lanes::<u64>(a, b, |x, y| if x == y { u64::MAX } else { 0 }))
+        }
+        (OPCODE_MAP_0F38, 0x2a) => Op::LoadAligned,
+        (OPCODE_MAP_0F38, 0x2b) => Op::Binary(|a, b| pack_sat(a, b, 32, false)),
+        (OPCODE_MAP_0F38, 0x38) => {
+            Op::Binary(|a, b| zip_lanes::<u8>(a, b, |x, y| (x as i8).min(y as i8) as u8))
+        }
+        (OPCODE_MAP_0F38, 0x39) => {
+            Op::Binary(|a, b| zip_lanes::<u32>(a, b, |x, y| (x as i32).min(y as i32) as u32))
+        }
+        (OPCODE_MAP_0F38, 0x3a) => Op::Binary(|a, b| zip_lanes::<u16>(a, b, u16::min)),
+        (OPCODE_MAP_0F38, 0x3b) => Op::Binary(|a, b| zip_lanes::<u32>(a, b, u32::min)),
+        (OPCODE_MAP_0F38, 0x3c) => {
+            Op::Binary(|a, b| zip_lanes::<u8>(a, b, |x, y| (x as i8).max(y as i8) as u8))
+        }
+        (OPCODE_MAP_0F38, 0x3d) => {
+            Op::Binary(|a, b| zip_lanes::<u32>(a, b, |x, y| (x as i32).max(y as i32) as u32))
+        }
+        (OPCODE_MAP_0F38, 0x3e) => Op::Binary(|a, b| zip_lanes::<u16>(a, b, u16::max)),
+        (OPCODE_MAP_0F38, 0x3f) => Op::Binary(|a, b| zip_lanes::<u32>(a, b, u32::max)),
+        (OPCODE_MAP_0F38, 0x40) => Op::Binary(|a, b| zip_lanes::<u32>(a, b, u32::wrapping_mul)),
+        (OPCODE_MAP_0F38, 0x41) => Op::Unary(phminposuw),
+        (OPCODE_MAP_0F3A, 0x08) => Op::Round {
+            double: false,
+            scalar: false,
+        },
+        (OPCODE_MAP_0F3A, 0x09) => Op::Round {
+            double: true,
+            scalar: false,
+        },
+        (OPCODE_MAP_0F3A, 0x0a) => Op::Round {
+            double: false,
+            scalar: true,
+        },
+        (OPCODE_MAP_0F3A, 0x0b) => Op::Round {
+            double: true,
+            scalar: true,
+        },
+        (OPCODE_MAP_0F3A, 0x0c) => Op::WithImm(blend_immediate::<u32>),
+        (OPCODE_MAP_0F3A, 0x0d) => Op::WithImm(blend_immediate::<u64>),
+        (OPCODE_MAP_0F3A, 0x0e) => Op::WithImm(blend_immediate::<u16>),
+        (OPCODE_MAP_0F3A, 0x14) => Op::Extract(LaneKind::Byte),
+        (OPCODE_MAP_0F3A, 0x15) => Op::Extract(LaneKind::Word),
+        (OPCODE_MAP_0F3A, 0x16) => Op::Extract(LaneKind::DwordOrQword),
+        (OPCODE_MAP_0F3A, 0x17) => Op::Extract(LaneKind::Single),
+        (OPCODE_MAP_0F3A, 0x20) => Op::Insert(LaneKind::Byte),
+        (OPCODE_MAP_0F3A, 0x21) => Op::Insertps,
+        (OPCODE_MAP_0F3A, 0x22) => Op::Insert(LaneKind::DwordOrQword),
+        (OPCODE_MAP_0F3A, 0x40) => Op::DotProduct { double: false },
+        (OPCODE_MAP_0F3A, 0x41) => Op::DotProduct { double: true },
+        (OPCODE_MAP_0F3A, 0x42) => Op::WithImm(mpsadbw),
         _ => return None,
     })
 }
@@ -277,7 +412,312 @@ fn horizontal(fp: &mut FpEnv, format: Format, subtract: bool, dst: u128, src: u1
     result
 }
 
+/// pmuldq: signed product of dwords 0 and 2 of each operand, as two qwords.
+fn pmuldq(dst: u128, src: u128) -> u128 {
+    let mut result = 0;
+    for quad in 0..2 {
+        let product =
+            (u32::get(dst, 2 * quad) as i32 as i64) * (u32::get(src, 2 * quad) as i32 as i64);
+        u64::put(&mut result, quad, product as u64);
+    }
+    result
+}
+
+/// pblendvb/blendvps/blendvpd: each lane comes from `src` when the top bit of the matching lane
+/// of the implicit xmm0 mask is set, else it stays.
+fn blend_variable<T: Lane>(dst: u128, src: u128, mask: u128) -> u128 {
+    let lane_bits = VECTOR_BITS as usize / T::N;
+    let mut result = 0;
+    for lane in 0..T::N {
+        let take_source = (mask >> (lane * lane_bits + lane_bits - 1)) & 1 != 0;
+        T::put(
+            &mut result,
+            lane,
+            T::get(if take_source { src } else { dst }, lane),
+        );
+    }
+    result
+}
+
+/// pblendw/blendps/blendpd: bit `k` of the immediate selects lane `k` of `src`; immediate bits
+/// beyond the lane count are ignored.
+fn blend_immediate<T: Lane>(dst: u128, src: u128, selector: u8) -> u128 {
+    let mut result = 0;
+    for lane in 0..T::N {
+        let take_source = (selector >> lane) & 1 != 0;
+        T::put(
+            &mut result,
+            lane,
+            T::get(if take_source { src } else { dst }, lane),
+        );
+    }
+    result
+}
+
+/// pmovsx*/pmovzx*: the low `128 / to_bits` lanes of `from_bits` bits, extended.
+fn widen(src: u128, signed: bool, from_bits: u32, to_bits: u32) -> u128 {
+    let from_mask = (1u128 << from_bits) - 1;
+    let to_mask = (1u128 << to_bits) - 1;
+    let mut result = 0;
+    for lane in 0..VECTOR_BITS / to_bits {
+        let raw = (src >> (lane * from_bits)) & from_mask;
+        let negative = (raw >> (from_bits - 1)) & 1 != 0;
+        let value = if signed && negative {
+            raw | !from_mask
+        } else {
+            raw
+        };
+        result |= (value & to_mask) << (lane * to_bits);
+    }
+    result
+}
+
+/// phminposuw: the smallest unsigned word (first one on a tie) in bits 15:0 and its index in
+/// bits 18:16; everything above is zero.
+fn phminposuw(src: u128) -> u128 {
+    let mut minimum = u16::get(src, 0);
+    let mut index = 0;
+    for lane in 1..u16::N {
+        let value = u16::get(src, lane);
+        if value < minimum {
+            minimum = value;
+            index = lane;
+        }
+    }
+    minimum as u128 | ((index as u128) << 16)
+}
+
+/// mpsadbw: eight sums of absolute differences between a sliding 4-byte window of the
+/// destination and one fixed 4-byte block of the source. imm8 bits 1:0 pick the source block and
+/// bit 2 the destination's first window start, both in units of four bytes.
+fn mpsadbw(dst: u128, src: u128, selector: u8) -> u128 {
+    const BLOCK_BYTES: usize = 4;
+    let source_start = (selector & 3) as usize * BLOCK_BYTES;
+    let destination_start = ((selector >> 2) & 1) as usize * BLOCK_BYTES;
+    let mut result = 0;
+    for window in 0..u16::N {
+        let sum: u16 = (0..BLOCK_BYTES)
+            .map(|k| {
+                let a = u8::get(dst, destination_start + window + k) as i16;
+                let b = u8::get(src, source_start + k) as i16;
+                (a - b).unsigned_abs()
+            })
+            .sum();
+        u16::put(&mut result, window, sum);
+    }
+    result
+}
+
+/// roundps/pd/ss/sd immediate: bit 2 selects MXCSR.RC instead of bits 1:0, bit 3 suppresses the
+/// precision exception.
+const ROUND_USE_MXCSR: u8 = 1 << 2;
+const ROUND_SUPPRESS_PRECISION: u8 = 1 << 3;
+const ROUND_MODE_MASK: u8 = 3;
+
+/// Rounds one value to an integral value in the same format. A signaling NaN is quieted and
+/// raises invalid; zeros, infinities and quiet NaNs pass through; a subnormal input is not
+/// reported as a denormal operand (the SDM lists only invalid and precision for these
+/// instructions) but DAZ still turns it into a zero. `quiet_precision` hides the inexact flag.
+fn round_integral(
+    fp: &mut FpEnv,
+    format: Format,
+    bits: u64,
+    rounding: u32,
+    quiet_precision: bool,
+) -> u64 {
+    let denormal_before = fp.flags & FLAG_DENORMAL;
+    let value = unpack(fp, format, bits);
+    fp.flags = (fp.flags & !FLAG_DENORMAL) | denormal_before;
+    match value.kind {
+        Kind::SignalingNan => {
+            fp.flags |= FLAG_INVALID;
+            return value.bits | format.quiet_bit();
+        }
+        Kind::QuietNan | Kind::Infinity | Kind::Zero => return value.bits,
+        Kind::Finite => {}
+    }
+    // Magnitudes of 2^fraction_bits and up have no fractional bits.
+    if value.exponent >= format.fraction_bits as i32 {
+        return value.bits;
+    }
+    let shift = (format.fraction_bits as i32 - value.exponent) as u32;
+    // Beyond this shift the whole significand is below half of the last kept place, so only the
+    // sticky remainder matters.
+    const NEGLIGIBLE_SHIFT: u32 = 100;
+    let significand = value.significand as u128;
+    let (mut kept, remainder, half) = if shift > NEGLIGIBLE_SHIFT {
+        (0, 1, 2)
+    } else {
+        (
+            significand >> shift,
+            significand & ((1u128 << shift) - 1),
+            1u128 << (shift - 1),
+        )
+    };
+    if rounds_up(rounding, value.sign, kept, remainder, half) {
+        kept += 1;
+    }
+    if remainder != 0 && !quiet_precision {
+        fp.flags |= FLAG_PRECISION;
+    }
+    if kept == 0 {
+        return format.zero(value.sign);
+    }
+    let leading = leading_bit(kept);
+    let sign_bits = if value.sign { format.sign_bit() } else { 0 };
+    let exponent_field = (leading as i32 + format.bias()) as u64;
+    let fraction = ((kept << (format.fraction_bits - leading)) as u64) & format.fraction_mask();
+    sign_bits | (exponent_field << format.fraction_bits) | fraction
+}
+
+fn round_lanes(
+    fp: &mut FpEnv,
+    format: Format,
+    scalar: bool,
+    dst: u128,
+    src: u128,
+    selector: u8,
+) -> u128 {
+    let rounding = if selector & ROUND_USE_MXCSR != 0 {
+        fp.rounding
+    } else {
+        (selector & ROUND_MODE_MASK) as u32
+    };
+    let quiet_precision = selector & ROUND_SUPPRESS_PRECISION != 0;
+    // The scalar forms keep the rest of the destination.
+    let (lanes, mut result) = if scalar {
+        (1, dst & !format.lane_mask())
+    } else {
+        (format.lanes(), 0)
+    };
+    for lane in 0..lanes {
+        let bits = round_integral(
+            fp,
+            format,
+            lane_get(src, format, lane),
+            rounding,
+            quiet_precision,
+        );
+        lane_put(&mut result, format, lane, bits);
+    }
+    result
+}
+
+/// dpps/dppd: imm8 bits 7:4 pick which products take part, bits 3:0 which result lanes receive the
+/// sum (the others are zeroed). The sum is `(p0 + p1) + (p2 + p3)` with unselected products as
+/// +0.0, the order the SDM pseudocode gives.
+fn dot_product(fp: &mut FpEnv, double: bool, dst: u128, src: u128, selector: u8) -> u128 {
+    let format = if double { DOUBLE } else { SINGLE };
+    let product_mask = selector >> 4;
+    let output_mask = selector & 0xf;
+    let mut products = [format.zero(false); 4];
+    for (lane, product) in products.iter_mut().enumerate().take(format.lanes()) {
+        if (product_mask >> lane) & 1 != 0 {
+            *product = arithmetic(
+                fp,
+                format,
+                Arithmetic::Multiply,
+                lane_get(dst, format, lane),
+                lane_get(src, format, lane),
+            );
+        }
+    }
+    let sum = if double {
+        arithmetic(fp, format, Arithmetic::Add, products[0], products[1])
+    } else {
+        let low = arithmetic(fp, format, Arithmetic::Add, products[0], products[1]);
+        let high = arithmetic(fp, format, Arithmetic::Add, products[2], products[3]);
+        arithmetic(fp, format, Arithmetic::Add, low, high)
+    };
+    let mut result = 0;
+    for lane in 0..format.lanes() {
+        if (output_mask >> lane) & 1 != 0 {
+            lane_put(&mut result, format, lane, sum);
+        }
+    }
+    result
+}
+
+/// pinsrb/pinsrd/pinsrq: replaces one lane of `dst`; imm8 is taken modulo the lane count.
+fn insert_lane(dst: u128, kind: LaneKind, selector: u8, value: u64, wide: bool) -> u128 {
+    let selector = selector as usize;
+    let (lane_bits, lane_count) = match kind {
+        LaneKind::Byte => (8, u8::N),
+        _ if wide => (64, u64::N),
+        _ => (32, u32::N),
+    };
+    let shift = (selector % lane_count) as u32 * lane_bits;
+    let lane_mask = ((1u128 << lane_bits) - 1) << shift;
+    (dst & !lane_mask) | (((value as u128) << shift) & lane_mask)
+}
+
+/// insertps: imm8 bits 7:6 pick the source dword (register form only, the m32 form always uses
+/// its one dword), bits 5:4 the destination dword it replaces, bits 3:0 zero result dwords.
+fn insertps(dst: u128, src: u128, selector: u8, from_memory: bool) -> u128 {
+    let source_lane = if from_memory {
+        0
+    } else {
+        (selector >> 6) as usize
+    };
+    let destination_lane = ((selector >> 4) & 3) as u32;
+    let zero_mask = selector & 0xf;
+    let mut result = dst & !(LOW_32 << (destination_lane * 32));
+    result |= (u32::get(src, source_lane) as u128) << (destination_lane * 32);
+    for lane in 0..u32::N {
+        if (zero_mask >> lane) & 1 != 0 {
+            result &= !(LOW_32 << (lane * 32));
+        }
+    }
+    result
+}
+
 impl Cpu {
+    /// pextrb/pextrw/pextrd/pextrq/extractps: the lane of `source` that imm8 selects goes to the
+    /// ModRM.rm general register (zero-extended) or memory. imm8 is taken modulo the lane count.
+    fn extract_lane(
+        &mut self,
+        i: &Insn,
+        mem_addr: Option<u64>,
+        kind: LaneKind,
+        source: u128,
+    ) -> ExecResult<()> {
+        let selector = i.imm as usize;
+        let (value, size) = match kind {
+            LaneKind::Byte => (u8::get(source, selector % u8::N) as u64, 1),
+            LaneKind::Word => (u16::get(source, selector % u16::N) as u64, 2),
+            LaneKind::DwordOrQword if i.opsize == 8 => (u64::get(source, selector % u64::N), 8),
+            LaneKind::DwordOrQword | LaneKind::Single => {
+                (u32::get(source, selector % u32::N) as u64, 4)
+            }
+        };
+        match mem_addr {
+            Some(addr) => self.write(addr, size, value),
+            None => {
+                self.write_gpr(i.rm, size.max(4), true, value);
+                Ok(())
+            }
+        }
+    }
+
+    /// The value pinsrb/pinsrd/pinsrq insert: from memory, or from the low bits of the ModRM.rm
+    /// general register.
+    fn insert_source(
+        &mut self,
+        i: &Insn,
+        mem_addr: Option<u64>,
+        kind: LaneKind,
+    ) -> ExecResult<u64> {
+        let size = match kind {
+            LaneKind::Byte => 1,
+            _ if i.opsize == 8 => 8,
+            _ => 4,
+        };
+        match mem_addr {
+            Some(addr) => self.read(addr, size),
+            None => Ok(self.read_gpr(i.rm, size.max(4), true) & mask(size)),
+        }
+    }
+
     /// Executes an instruction of the extension sets above. `Ok(false)` means "not mine": the
     /// caller raises the logged #UD for an unimplemented opcode. On `Ok(true)` the caller sets
     /// rip to `next`.
@@ -306,9 +746,10 @@ impl Cpu {
             Some(self.linear_address(i, self.effective_address(i, next)))
         };
         let src = match (op.source(), mem_addr) {
-            (_, None) => {
+            (Source::None, None) => 0,
+            (source, None) => {
                 let v = self.xmm[i.rm as usize];
-                match op.source() {
+                match source {
                     Source::Low(bytes) => v & mask_bytes(bytes),
                     _ => v,
                 }
@@ -320,9 +761,13 @@ impl Cpu {
                 self.read128(addr)?
             }
             (Source::Unaligned, Some(addr)) => self.read128(addr)?,
-            (Source::Low(bytes), Some(addr)) => self.read(addr, bytes)? as u128,
+            (Source::Low(bytes) | Source::WholeOrMemory(bytes), Some(addr)) => {
+                self.read(addr, bytes)? as u128
+            }
+            (Source::None, Some(_)) => 0,
         };
         let dst = self.xmm[reg];
+        let selector = i.imm as u8;
         let mut fp = FpEnv::new(self.mxcsr);
         let result = match op {
             Op::Movddup => (src & LOW_64) | (src << 64),
@@ -352,7 +797,39 @@ impl Cpu {
             }
             Op::Binary(f) => f(dst, src),
             Op::Unary(f) => f(src),
-            Op::WithImm(f) => f(dst, src, i.imm as u8),
+            Op::WithImm(f) => f(dst, src, selector),
+            Op::WithMask(f) => f(dst, src, self.xmm[0]),
+            Op::LoadAligned => src,
+            Op::Widen {
+                signed,
+                from_bits,
+                to_bits,
+            } => widen(src, signed, from_bits, to_bits),
+            Op::Ptest => {
+                let mut flags = 0;
+                if dst & src == 0 {
+                    flags |= ZF;
+                }
+                if !dst & src == 0 {
+                    flags |= CF;
+                }
+                self.set_eflags_arith(flags);
+                return Ok(true);
+            }
+            Op::Round { double, scalar } => {
+                let format = if double { DOUBLE } else { SINGLE };
+                round_lanes(&mut fp, format, scalar, dst, src, selector)
+            }
+            Op::DotProduct { double } => dot_product(&mut fp, double, dst, src, selector),
+            Op::Extract(kind) => {
+                self.extract_lane(i, mem_addr, kind, dst)?;
+                return Ok(true);
+            }
+            Op::Insert(kind) => {
+                let value = self.insert_source(i, mem_addr, kind)?;
+                insert_lane(dst, kind, selector, value, i.opsize == 8)
+            }
+            Op::Insertps => insertps(dst, src, selector, mem_addr.is_some()),
         };
         self.fp_commit(&fp)?;
         self.xmm[reg] = result;

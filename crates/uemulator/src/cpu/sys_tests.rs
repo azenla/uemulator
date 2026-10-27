@@ -395,12 +395,13 @@ mod cpuid_leaves {
         const SSE3: u32 = 1 << 0;
         const SSSE3: u32 = 1 << 9;
         const CX16: u32 = 1 << 13;
+        const SSE4_1: u32 = 1 << 19;
         const POPCNT: u32 = 1 << 23;
         let mut h = blank();
         let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
         assert_eq!(
             ecx,
-            SSE3 | SSSE3 | CX16 | POPCNT,
+            SSE3 | SSSE3 | CX16 | SSE4_1 | POPCNT,
             "no MONITOR, VMX, SMX, XSAVE, OSXSAVE, AVX, RDRAND or hypervisor bit"
         );
     }
