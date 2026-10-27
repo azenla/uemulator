@@ -26,11 +26,13 @@ const EXIT_MACHINE_FAILURE: i32 = 2;
 
 const EXIT_CODES_HELP: &str = "\
 Exit codes:
-  0  the machine ended by itself (guest reset or shutdown), or was stopped with Ctrl-] or --timeout
+  0  the machine ended by itself (guest power-off, or reset with --no-reboot), or was stopped
+     with Ctrl-] or --timeout
   1  setup failed (bad arguments, unreadable file, download failure, rejected configuration)
   2  the machine failed: guest triple fault or emulator-internal error (e.g. --verify divergence)";
 
-/// Maps how the machine ended to the process exit status. A reset counts as success because Linux
+/// Maps how the machine ended to the process exit status. A power-off is how a guest finishes
+/// cleanly; a reset only reaches here with `--no-reboot` and counts as success because Linux
 /// guests reboot on panic with `panic=-1` and a clean reboot is how an installer finishes.
 /// Stopping the machine (Ctrl-] or `--timeout`) is a deliberate host action, so it is success too;
 /// callers that need to tell a timeout from a normal end can run without `--timeout`.
@@ -82,6 +84,7 @@ enum Cmd {
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum ConsoleArg {
+    /// ttyS0 on the 16550; for kernels without a built-in virtio_console driver
     Serial,
     /// hvc0; the host terminal size is forwarded and follows resizes
     Virtio,
@@ -112,8 +115,11 @@ pub struct MachineArgs {
     #[arg(long, value_name = "LOCAL,REMOTE")]
     net_udp: Option<String>,
     /// Guest console device
-    #[arg(long, value_enum, default_value = "serial")]
+    #[arg(long, value_enum, default_value = "virtio")]
     console: ConsoleArg,
+    /// End the run with "machine reset" when the guest resets instead of rebooting it in place
+    #[arg(long)]
+    no_reboot: bool,
     /// Run the interpreter only
     #[arg(long)]
     disable_jit: bool,
@@ -379,7 +385,7 @@ mod tests {
         assert_eq!(machine.net_udp, None);
         assert_eq!(machine.time, None);
         assert_eq!(machine.timeout, None);
-        assert!(matches!(machine.console, ConsoleArg::Serial));
+        assert!(matches!(machine.console, ConsoleArg::Virtio));
         for flag in [
             machine.net_user,
             machine.net_loop,
@@ -387,9 +393,17 @@ mod tests {
             machine.verify,
             machine.debug,
             machine.realtime,
+            machine.no_reboot,
         ] {
             assert!(!flag);
         }
+    }
+
+    #[test]
+    fn no_reboot_is_a_machine_flag_of_boot_and_quick() {
+        assert!(machine_args(&["--no-reboot"]).no_reboot);
+        let quick = parse(&["quick", "alpine", "--no-reboot"]).unwrap();
+        assert!(matches!(quick.cmd, Cmd::Quick { machine, .. } if machine.no_reboot));
     }
 
     #[test]

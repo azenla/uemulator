@@ -91,7 +91,10 @@ fn run() -> Result<ExitReason, String> {
         match crate::hv::detect() {
             // The hardware path runs the whole guest itself and returns its exit reason.
             Some(kind) => {
-                let mut cmdline = String::from(uemulator::DEFAULT_CMDLINE);
+                // The serial command line, not `DEFAULT_CMDLINE`: the hardware path only forwards
+                // legacy port I/O to `Platform`, which has no virtio devices and no MMIO exits,
+                // so an `hvc0` console would never appear.
+                let mut cmdline = String::from(uemulator::DEFAULT_SERIAL_CMDLINE);
                 for extra in &cfg.cmdline_extra {
                     cmdline.push(' ');
                     cmdline.push_str(extra);
@@ -118,6 +121,8 @@ fn run() -> Result<ExitReason, String> {
         return Err("hardware virtualization is only available on x86_64".into());
     }
 
+    // The emulator path uses the library's default virtio console (`hvc0`); its device is plain
+    // PCI MMIO and DMA, which the no_std build supports like the hosted one.
     let mut mc = MachineConfig::new()
         .kernel(kernel)
         .memory_mib(cfg.memory_mib)

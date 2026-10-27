@@ -1224,3 +1224,36 @@ fn edge_triggered_uart_line_is_unaffected_by_lowering() {
     assert_eq!(inp(&mut dev, UART_DATA_PORT, 1), b'x' as u32);
     assert_eq!(dev.pic.ack(), Some(PIC_VECTOR_BASE_MASTER as u8 + IRQ_UART));
 }
+
+#[test]
+fn into_disk_hands_back_the_attached_disk_with_its_contents() {
+    const MARKER: &[u8] = b"survives a reboot";
+    let dev = Devices::new(
+        ConsoleHandle::default(),
+        DevConfig {
+            disk: Some(Disk::memory(vec![0; 4096])),
+            net: Some(([2, 0, 0, 0, 0, 1], NetHandle::default())),
+            virtio_console: true,
+        },
+    );
+    let mut disk = dev.into_disk().expect("a disk was attached");
+    disk.backend.write_at(512, MARKER).unwrap();
+    // The next boot's devices are built around the returned disk and give it back again.
+    let rebuilt = Devices::new(
+        ConsoleHandle::default(),
+        DevConfig {
+            disk: Some(disk),
+            ..Default::default()
+        },
+    );
+    let mut disk = rebuilt.into_disk().unwrap();
+    let mut read_back = [0u8; MARKER.len()];
+    disk.backend.read_at(512, &mut read_back).unwrap();
+    assert_eq!(read_back, MARKER);
+}
+
+#[test]
+fn into_disk_without_a_disk_is_none() {
+    assert!(bus().into_disk().is_none());
+    assert!(bus_with_pci().into_disk().is_none());
+}

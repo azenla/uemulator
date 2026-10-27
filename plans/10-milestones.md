@@ -7,6 +7,8 @@
 - M6 done (see 11-storage-net-console.md): configurable RAM (`--mem`), virtio-pci disk, network and console (with resize), guest-verified: ping through the gateway responder, `stty size` follows `resize()`, disk read/write through `virtio_blk`.
 - M5 partly done: realtime idle (`ClockMode::Realtime`), raw tty in the example, fixed RTC time option. Not done: block chaining, guest register caching, LAPIC/IOAPIC, SMP.
 
+- Machine lifecycle done: a guest reset reboots the machine in place by default (`MachineConfig::reboot`, CLI `--no-reboot` to end with `ExitReason::Reset`; checked on the real Alpine kernel with `busybox reboot -f`, interpreter and JIT), `hlt` with IF=0 is `ExitReason::Shutdown` (checked with `busybox poweroff -f`; the UEFI hardware-virtualization loop applies the same rule, but has no in-process reboot). `ConsoleKind::Virtio` (hvc0) is the default everywhere except the UEFI hardware-virtualization path (no virtio in `Platform`). The M2 criterion "VFS panic then clean Reset" now needs `--no-reboot`; by default `panic=-1` reboots forever.
+
 - Workspace split done: `crates/uemulator` (library) + `crates/uemulator-cli` (`uemulator boot|quick`, clap). 
 - `jit` feature (default on) gates `libc`/`windows-sys`; `--no-default-features` is dependency-free and interpreter-only.
 - x86_64 host JIT done (see 06): same inlined subset as aarch64, verified in lockstep. Exercised on macOS x86_64 under Rosetta; Linux and Windows x86_64 hosts compile but are untested.

@@ -22,7 +22,7 @@ The switch is `target_os = "uefi"`, not a feature, so `--no-default-features` on
 
 ## Application
 
-Reads `\uemulator.cfg` from the filesystem it was loaded from, then the load options. Both use whitespace-separated words: `kernel=\vmlinuz`, `initrd=\initramfs` (or `initrd=none`), `mem=1024` (MiB), and everything after `--` is appended to the kernel command line. Lines starting with `#` are comments. Console output goes to the firmware text console, which QEMU `-nographic` attaches to the serial port, and input comes from the firmware text input. Guest shutdown or reset shuts the machine down.
+Reads `\uemulator.cfg` from the filesystem it was loaded from, then the load options. Both use whitespace-separated words: `kernel=\vmlinuz`, `initrd=\initramfs` (or `initrd=none`), `mem=1024` (MiB), and everything after `--` is appended to the kernel command line. Lines starting with `#` are comments. Console output goes to the firmware text console, which QEMU `-nographic` attaches to the serial port, and input comes from the firmware text input. The emulator path uses the library's default virtio console and restarts the guest in place on a reset; guest power-off (`hlt` with interrupts off) shuts the machine down. The hardware-virtualization path keeps the serial console (it forwards only port I/O to `Platform`) and has no in-process reboot: a guest reset or power-off shuts the machine down.
 
 `hack/uefi/boot.sh [x86_64|aarch64] [-- kernel words]` builds, assembles an ESP directory (`EFI/BOOT/BOOT*.EFI`, `vmlinuz`, `initramfs`, `uemulator.cfg`), and starts QEMU with KVM or HVF when the host architecture matches the target, TCG otherwise. See the script header for its environment variables.
 

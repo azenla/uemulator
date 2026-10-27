@@ -47,6 +47,15 @@ fn parse_disk_spec(spec: &str) -> (&str, bool) {
     }
 }
 
+/// Always set on the config, never skipped for the "default": the library's own default is
+/// virtio, so leaving `--console serial` unapplied would silently give hvc0.
+fn console_kind(arg: ConsoleArg) -> ConsoleKind {
+    match arg {
+        ConsoleArg::Serial => ConsoleKind::Serial,
+        ConsoleArg::Virtio => ConsoleKind::Virtio,
+    }
+}
+
 fn network_requested(args: &MachineArgs) -> bool {
     args.net_loop || args.net_user || args.net_udp.is_some()
 }
@@ -131,9 +140,7 @@ fn build_config(
     if network_requested(args) {
         cfg = cfg.net(GUEST_MAC);
     }
-    if matches!(args.console, ConsoleArg::Virtio) {
-        cfg = cfg.console(ConsoleKind::Virtio);
-    }
+    cfg = cfg.console(console_kind(args.console));
     if let Some(t) = args.time {
         cfg = cfg.unix_time(t);
     }
@@ -143,7 +150,20 @@ fn build_config(
     if args.disable_jit {
         cfg = cfg.jit(JitMode::Off);
     }
+    cfg = cfg.reboot(!args.no_reboot);
     Ok(cfg)
+}
+
+/// The line printed when the machine ends: a guest power-off and a guest reset (only seen with
+/// `--no-reboot`) read differently from a host stop or a failure.
+pub(crate) fn exit_message(reason: &ExitReason) -> String {
+    match reason {
+        ExitReason::Shutdown => "machine powered off".to_string(),
+        ExitReason::Reset => "machine reset".to_string(),
+        ExitReason::Stopped => "machine stopped".to_string(),
+        ExitReason::TripleFault => "machine failed: guest triple fault".to_string(),
+        ExitReason::Internal(message) => format!("machine failed: {message}"),
+    }
 }
 
 /// Runs the machine to its end and reports why it ended. `Err` is a setup failure; the machine's
@@ -220,7 +240,7 @@ pub fn run(
         stty(&[&saved]);
     }
     let reason = reason?;
-    eprintln!("machine exited: {reason:?}");
+    eprintln!("{}", exit_message(&reason));
     Ok(reason)
 }
 
@@ -294,6 +314,27 @@ mod tests {
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.borrow().clone()
         }
+    }
+
+    #[test]
+    fn each_console_argument_maps_to_its_own_kind() {
+        assert_eq!(console_kind(ConsoleArg::Serial), ConsoleKind::Serial);
+        assert_eq!(console_kind(ConsoleArg::Virtio), ConsoleKind::Virtio);
+    }
+
+    #[test]
+    fn every_exit_reason_prints_a_distinct_message() {
+        assert_eq!(exit_message(&ExitReason::Shutdown), "machine powered off");
+        assert_eq!(exit_message(&ExitReason::Reset), "machine reset");
+        assert_eq!(exit_message(&ExitReason::Stopped), "machine stopped");
+        assert_eq!(
+            exit_message(&ExitReason::TripleFault),
+            "machine failed: guest triple fault"
+        );
+        assert_eq!(
+            exit_message(&ExitReason::Internal("jit divergence".into())),
+            "machine failed: jit divergence"
+        );
     }
 
     #[test]

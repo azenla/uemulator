@@ -898,8 +898,12 @@ impl Vcpu for Vmx {
         vmread(VMCS_GUEST_RIP)
     }
 
-    fn irq_ok(&self) -> bool {
+    fn interrupts_enabled(&self) -> bool {
         vmread(VMCS_GUEST_RFLAGS) & arch::RFLAGS_IF != 0
+    }
+
+    fn irq_ok(&self) -> bool {
+        self.interrupts_enabled()
             && vmread(VMCS_GUEST_INTERRUPTIBILITY_STATE)
                 & INTERRUPTIBILITY_BLOCKING_BY_STI_AND_MOV_SS
                 == 0

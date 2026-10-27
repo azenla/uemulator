@@ -216,6 +216,14 @@ impl Devices {
         }
     }
 
+    /// Consumes the devices and returns the disk, for the machine to attach to the devices it
+    /// builds for the next boot. Everything else (PCI config, virtqueues, UART, PIC, PIT) is
+    /// dropped on purpose: a reboot must not leak state from the previous run.
+    #[cfg(not(target_os = "uefi"))]
+    pub fn into_disk(self) -> Option<Disk> {
+        self.pci.into_disk()
+    }
+
     pub fn state(&self, now: u64) -> String {
         format!("{} | {}", self.pic.state(), self.pit.state(now))
     }

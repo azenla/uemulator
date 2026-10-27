@@ -750,10 +750,23 @@ impl Cpu {
     }
 
     /// Handles a halted CPU: skips (or sleeps) to the next device deadline so timers can raise
-    /// the interrupt that wakes it. Returns `Some` only for stop/reset.
+    /// the interrupt that wakes it. Returns `Some` for stop, reset and power-off.
     fn idle(&mut self) -> Option<ExitReason> {
         if self.stop.load(Ordering::Relaxed) {
             return Some(ExitReason::Stopped);
+        }
+        // A reset written just before the `hlt` (`out 0x64, 0xfe; hlt`, with IF=0 as in every
+        // kernel's reboot path) must win over the shutdown check below.
+        if self.dev.reset_requested {
+            return Some(ExitReason::Reset);
+        }
+        // `hlt` with IF=0 can only be woken by NMI, SMI, INIT or RESET (SDM vol. 3 sec. 6.8,
+        // HLT), and nothing here raises the first three: the guest is dead, which is how Linux's
+        // poweroff and halt end without ACPI (`stop_this_cpu`: `cli; hlt` in a loop). Only IF is
+        // tested, not `interrupt_shadow` or a queued event: `sti; hlt` has IF=1 by the time
+        // `hlt` runs, and a PIC line pending behind IF=0 never wakes the CPU either.
+        if self.eflags & flags::IF == 0 {
+            return Some(ExitReason::Shutdown);
         }
         let now = self.now_ns();
         match self.dev.next_deadline(now) {

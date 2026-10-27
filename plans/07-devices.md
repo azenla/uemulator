@@ -7,7 +7,8 @@ Port I/O only (no MMIO in v1). Unknown ports read all ones, writes ignored. Devi
 - `now_ns()` = single virtual time. `ClockMode::Virtual`: `ns = icount * NS_PER_INSN (default 2)`, plus warps. `Realtime`: `max(virtual, wall)`; HLT sleeps on a condvar until the next deadline or console input.
 - TSC = `now_ns * tsc_hz / 1e9` (advertised 1 GHz-ish; kernel calibrates via PIT, so PIT and TSC must share this clock).
 - Timer queue: sorted deadlines from PIT, RTC periodic, (LAPIC timer later). The run loop checks `now >= next_deadline` at TB boundaries and on the icount budget (05).
-- HLT with interrupts enabled in Virtual mode: advance the clock to `next_deadline` immediately (skip idle). With no deadline and no input in Realtime mode: block on the condvar. With no deadline at all in Virtual mode: guest is dead → `ExitReason::Shutdown`? (decide: report `Internal("halted forever")`).
+- HLT with interrupts enabled in Virtual mode: advance the clock to `next_deadline` immediately (skip idle). With no deadline and no input in Realtime mode: block on the condvar. With no deadline at all in Virtual mode and IF=1 the host naps and polls (host input can still wake the guest).
+- HLT with IF=0 is `ExitReason::Shutdown`: only NMI/SMI/INIT/RESET wake it (SDM vol. 3 6.8) and none exists, so the guest is dead. This is how Linux ends poweroff/halt with `acpi=off` (`stop_this_cpu`: `cli; hlt` loop). Decided in `Cpu::idle` (after stop and reset checks), so interpreter and JIT agree; only IF counts, not the STI/MOV SS shadow (`sti; hlt` waits). A PIC line pending behind IF=0 does not save it. The UEFI hardware-virtualization loop applies the same rule (`hlt_outcome`).
 
 ## 16550 UART at 0x3F8, IRQ4
 
@@ -31,7 +32,7 @@ Time registers (BCD, 24h) from host wall clock at boot (optional `fixed_time` co
 
 ## Misc ports
 
-- 0x92 fast A20 / reset bit; 0x64/0x60 i8042 stub: status 0, command 0xFE → reset exit; 0xCF9 reset control; 0x80 POST delay (ignore); 0xCF8/0xCFC PCI config: reads return 0xFFFFFFFF (no devices); 0x3F6.. IDE absent → 0xFF.
+- 0x92 fast A20 / reset bit; 0x64/0x60 i8042 stub: status 0, command 0xFE → reset request (`ExitReason::Reset`, or an in-library reboot, see 01-api); 0xCF9 reset control; 0x80 POST delay (ignore); 0xCF8/0xCFC PCI config: reads return 0xFFFFFFFF (no devices); 0x3F6.. IDE absent → 0xFF.
 - DMA controller 0x00–0x0F, 0x81–0x8F: accept writes, reads 0 (kernel may touch for `dma` reservation).
 - Kernel `x86_platform`/`legacy_pic`: with `acpi=off` and no APIC it expects PIC+PIT+RTC; no HPET.
 

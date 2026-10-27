@@ -52,6 +52,10 @@ impl Vcpu for FakeVcpu {
         self.rip
     }
 
+    fn interrupts_enabled(&self) -> bool {
+        self.rflags & RFLAGS_IF != 0
+    }
+
     fn irq_ok(&self) -> bool {
         self.rflags & RFLAGS_IF != 0 && !self.interrupt_shadow && self.injected.is_empty()
     }
