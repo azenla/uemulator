@@ -5336,6 +5336,9 @@ mod register_range_checks {
     }
 }
 
+#[path = "x64_sized_tests.rs"]
+mod sized_forms;
+
 fn run(build: impl FnOnce(&mut Asm), arg0: u64, arg1: u64) -> u64 {
     let _guard = crate::jit::serialize_jit_tests();
     let memory = ExecMem::new(16384).unwrap();

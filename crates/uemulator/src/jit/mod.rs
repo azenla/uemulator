@@ -92,6 +92,8 @@ mod diff_flags;
 #[cfg(test)]
 mod diff_flow;
 #[cfg(test)]
+mod diff_hazards;
+#[cfg(test)]
 mod diff_memory;
 #[cfg(test)]
 mod diff_misc;
