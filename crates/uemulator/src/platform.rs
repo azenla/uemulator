@@ -7,13 +7,15 @@ use crate::dev::guestmem::GuestMem;
 use crate::dev::{DevConfig, Devices};
 use crate::machine::Error;
 
-/// The Linux boot protocol default, as `EmulatedMachine` uses for a serial console.
+/// The default `EmulatedMachine` builds for a serial console. `machine.rs` formats its own copy
+/// of this string (with `hvc0` for a virtio console); keep the two in sync.
 pub const DEFAULT_CMDLINE: &str =
     "console=ttyS0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1";
 
 /// Lays out a bzImage, an optional initramfs, the command line, boot parameters, a GDT and
 /// identity-mapped page tables in `ram` (guest physical address 0 is `ram[0]`), and returns the
-/// 64-bit entry state.
+/// 64-bit entry state. For hosts that start the guest themselves; `EmulatedMachine` calls the
+/// same loader.
 pub fn load_linux(
     ram: &mut [u8],
     kernel: &[u8],
@@ -28,6 +30,8 @@ pub fn load_linux(
 /// nanoseconds on any monotonic clock, as long as it is the same clock for every call.
 pub struct Platform {
     dev: Devices,
+    /// Empty `page_has_code` map for `GuestMem`: there is no translated code here to invalidate
+    /// when a device writes guest RAM by DMA.
     no_code_pages: Vec<u8>,
 }
 
@@ -51,6 +55,8 @@ impl Platform {
         self.dev.io_out(port, size, value, now_ns);
     }
 
+    /// Runs due device work. `Devices::tick` takes guest memory for DMA, though nothing in a
+    /// `Platform` (no disk, net or virtio console) writes it.
     pub fn tick(&mut self, now_ns: u64, ram: &mut [u8]) {
         let mut mem = GuestMem::new(ram, &self.no_code_pages);
         self.dev.tick(now_ns, &mut mem);
@@ -65,10 +71,12 @@ impl Platform {
         self.dev.pic.ack()
     }
 
+    /// Earliest time a device needs `tick`, e.g. the next PIT edge; `None` if nothing is scheduled.
     pub fn next_deadline(&self, now_ns: u64) -> Option<u64> {
         self.dev.next_deadline(now_ns)
     }
 
+    /// Set once the guest wrote a reset command (ports 0x64, 0x92 or 0xcf9); stays set.
     pub fn reset_requested(&self) -> bool {
         self.dev.reset_requested
     }

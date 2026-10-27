@@ -1,9 +1,23 @@
 #[cfg(target_os = "uefi")]
 use crate::prelude::*;
+
+/// Guest page size in bytes is 1 << PAGE_SHIFT; must match `Cpu::page_has_code` indexing.
+const PAGE_SHIFT: u32 = 12;
+
+/// Device-side view of guest RAM for DMA (virtqueues, request buffers).
+///
+/// Device code cannot take `&mut Cpu`, so this borrows RAM and the `page_has_code`
+/// flags separately. DMA writes bypass the CPU store path (`Cpu::phys_write`), which is
+/// what normally invalidates translated code, so every write that lands on a flagged
+/// page is recorded in `code_pages_written`. The caller must drain `code_pages_written` into `Cpu::code_written`
+/// once the borrow ends (see `tick_devices` and `phys_write` in cpu); skipping that
+/// leaves stale decoded blocks or JIT code for memory the device just overwrote.
 pub(crate) struct GuestMem<'a> {
     ram: &'a mut [u8],
+    /// `Cpu::page_has_code`: one byte per guest page, nonzero if a translated block covers it.
     code: &'a [u8],
-    pub hits: Vec<usize>,
+    /// Page numbers written while flagged in `code`, each listed once.
+    pub code_pages_written: Vec<usize>,
 }
 
 impl<'a> GuestMem<'a> {
@@ -11,14 +25,15 @@ impl<'a> GuestMem<'a> {
         GuestMem {
             ram,
             code,
-            hits: Vec::new(),
+            code_pages_written: Vec::new(),
         }
     }
 
-    pub fn read(&self, pa: u64, buf: &mut [u8]) -> bool {
-        match usize::try_from(pa)
+    /// Out-of-range reads fail instead of faulting: a bad guest descriptor must not panic the host.
+    pub fn read(&self, phys_addr: u64, buf: &mut [u8]) -> bool {
+        match usize::try_from(phys_addr)
             .ok()
-            .and_then(|a| self.ram.get(a..a.checked_add(buf.len())?))
+            .and_then(|start| self.ram.get(start..start.checked_add(buf.len())?))
         {
             Some(src) => {
                 buf.copy_from_slice(src);
@@ -28,49 +43,54 @@ impl<'a> GuestMem<'a> {
         }
     }
 
-    pub fn write(&mut self, pa: u64, data: &[u8]) -> bool {
-        let Ok(a) = usize::try_from(pa) else {
+    /// Returns false, writing nothing, if any byte of the range is outside RAM.
+    pub fn write(&mut self, phys_addr: u64, data: &[u8]) -> bool {
+        let Ok(start) = usize::try_from(phys_addr) else {
             return false;
         };
-        let Some(end) = a.checked_add(data.len()) else {
+        let Some(end) = start.checked_add(data.len()) else {
             return false;
         };
         if end > self.ram.len() || data.is_empty() {
             return end <= self.ram.len();
         }
-        for p in (a >> 12)..=((end - 1) >> 12) {
-            if self.code.get(p).is_some_and(|&c| c != 0) && !self.hits.contains(&p) {
-                self.hits.push(p);
+        // A write can span pages; `end - 1` is the last byte written, not one past it.
+        for page in (start >> PAGE_SHIFT)..=((end - 1) >> PAGE_SHIFT) {
+            if self.code.get(page).is_some_and(|&flag| flag != 0)
+                && !self.code_pages_written.contains(&page)
+            {
+                self.code_pages_written.push(page);
             }
         }
-        self.ram[a..end].copy_from_slice(data);
+        self.ram[start..end].copy_from_slice(data);
         true
     }
 
-    pub fn u16(&self, pa: u64) -> u16 {
-        let mut b = [0u8; 2];
-        self.read(pa, &mut b);
-        u16::from_le_bytes(b)
+    /// The `read_u*` accessors return 0 for unmapped addresses.
+    pub fn read_u16(&self, phys_addr: u64) -> u16 {
+        let mut bytes = [0u8; 2];
+        self.read(phys_addr, &mut bytes);
+        u16::from_le_bytes(bytes)
     }
 
-    pub fn u32(&self, pa: u64) -> u32 {
-        let mut b = [0u8; 4];
-        self.read(pa, &mut b);
-        u32::from_le_bytes(b)
+    pub fn read_u32(&self, phys_addr: u64) -> u32 {
+        let mut bytes = [0u8; 4];
+        self.read(phys_addr, &mut bytes);
+        u32::from_le_bytes(bytes)
     }
 
-    pub fn u64(&self, pa: u64) -> u64 {
-        let mut b = [0u8; 8];
-        self.read(pa, &mut b);
-        u64::from_le_bytes(b)
+    pub fn read_u64(&self, phys_addr: u64) -> u64 {
+        let mut bytes = [0u8; 8];
+        self.read(phys_addr, &mut bytes);
+        u64::from_le_bytes(bytes)
     }
 
-    pub fn put_u16(&mut self, pa: u64, v: u16) {
-        self.write(pa, &v.to_le_bytes());
+    pub fn write_u16(&mut self, phys_addr: u64, value: u16) {
+        self.write(phys_addr, &value.to_le_bytes());
     }
 
-    pub fn put_u32(&mut self, pa: u64, v: u32) {
-        self.write(pa, &v.to_le_bytes());
+    pub fn write_u32(&mut self, phys_addr: u64, value: u32) {
+        self.write(phys_addr, &value.to_le_bytes());
     }
 }
 

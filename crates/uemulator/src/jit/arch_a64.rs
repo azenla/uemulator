@@ -1,11 +1,16 @@
+//! aarch64 glue for `native.rs`: the entry/exit trampoline, helper addresses and the block
+//! compiler entry point. The x86_64 host has the same three functions in `arch_x64.rs`.
+
 use super::a64::{self, Asm};
-use super::emit::Gen;
-use super::helpers;
+use super::emit::{CPU, Gen, TLB_BASE};
+use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
 use crate::cpu::Cpu;
 use crate::cpu::decode::Insn;
 
 pub(crate) use super::emit::Addrs;
 
+/// The trampoline placed at the start of the code buffer, and the addresses of its two exit
+/// stubs. See the module docs of `emit.rs` for how blocks use them.
 pub(crate) struct Prologue {
     pub code: Vec<u8>,
     pub exit_ok: u64,
@@ -13,32 +18,52 @@ pub(crate) struct Prologue {
 }
 
 fn bytes(words: &[u32]) -> Vec<u8> {
-    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
+const FRAME_POINTER: u32 = 29;
+const LINK_REGISTER: u32 = 30;
+/// 16-byte aligned frame: fp/lr, then x19..x24 in pairs, then 16 bytes of padding.
+const FRAME_SIZE: i32 = 80;
+const SAVE_X19_X20: i32 = 16;
+const SAVE_X21_X22: i32 = 32;
+const SAVE_X23_X24: i32 = 48;
+
+/// Builds `extern "C" fn(cpu: *mut Cpu, block: u64) -> u64` (the call in `Cpu::step_block`).
+/// It saves the callee-saved registers the blocks use, latches `CPU` and `TLB_BASE`, and jumps
+/// into the block. Blocks call helpers with `blr`, which overwrites x30, so the return address
+/// is saved in the frame and the stubs return through the restored x30.
 pub(crate) fn prologue(base: u64) -> Prologue {
-    let mut a = Asm::new(base);
-    a.stp_pre(29, 30, a64::SP, -80);
-    a.stp_off(19, 20, a64::SP, 16);
-    a.stp_off(21, 22, a64::SP, 32);
-    a.stp_off(23, 24, a64::SP, 48);
-    a.mov(19, 0);
-    a.ldr(20, 19, std::mem::offset_of!(Cpu, tlb_cur) as u32);
-    a.br(1);
-    let exit_fail = a.here();
-    a.cmp_imm(0, 2, true);
-    a.cinc_eq(1, 1);
-    a.lsl_imm(1, 1, 8);
-    a.orr(0, 0, 1, true);
-    let exit_ok = a.here();
-    a.ldp_off(23, 24, a64::SP, 48);
-    a.ldp_off(21, 22, a64::SP, 32);
-    a.ldp_off(19, 20, a64::SP, 16);
-    a.ldp_post(29, 30, a64::SP, 80);
-    a.ret();
-    a.finish();
+    let mut asm = Asm::new(base);
+    asm.stp_pre(FRAME_POINTER, LINK_REGISTER, a64::SP, -FRAME_SIZE);
+    asm.stp_off(19, 20, a64::SP, SAVE_X19_X20);
+    asm.stp_off(21, 22, a64::SP, SAVE_X21_X22);
+    asm.stp_off(23, 24, a64::SP, SAVE_X23_X24);
+    asm.mov(CPU, 0);
+    asm.ldr(
+        TLB_BASE,
+        CPU,
+        std::mem::offset_of!(Cpu, tlb_active_base) as u32,
+    );
+    asm.br(1);
+    // Block exit with a helper status in x0 and the stopping instruction's index in x1: the
+    // exit code is `status | retired << EXIT_COUNT_SHIFT`, where an instruction that
+    // completed (`STATUS_EXIT_REQUESTED`) counts as retired and one that faulted does not.
+    let exit_fail = asm.here();
+    asm.cmp_imm(0, STATUS_EXIT_REQUESTED as u32, true);
+    asm.cinc_eq(1, 1);
+    asm.lsl_imm(1, 1, EXIT_COUNT_SHIFT);
+    asm.orr(0, 0, 1, true);
+    // Normal block exit: x0 already holds the finished exit code.
+    let exit_ok = asm.here();
+    asm.ldp_off(23, 24, a64::SP, SAVE_X23_X24);
+    asm.ldp_off(21, 22, a64::SP, SAVE_X21_X22);
+    asm.ldp_off(19, 20, a64::SP, SAVE_X19_X20);
+    asm.ldp_post(FRAME_POINTER, LINK_REGISTER, a64::SP, FRAME_SIZE);
+    asm.ret();
+    asm.finish();
     Prologue {
-        code: bytes(&a.code),
+        code: bytes(&asm.code),
         exit_ok,
         exit_fail,
     }
@@ -46,23 +71,25 @@ pub(crate) fn prologue(base: u64) -> Prologue {
 
 pub(crate) fn addrs(exit_ok: u64, exit_fail: u64) -> Addrs {
     Addrs {
-        exec: helpers::h_exec as *const () as usize as u64,
-        ld: helpers::h_ld as *const () as usize as u64,
-        st: helpers::h_st as *const () as usize as u64,
-        cond: helpers::h_cond as *const () as usize as u64,
+        exec: helpers::helper_exec as *const () as usize as u64,
+        ld: helpers::helper_load as *const () as usize as u64,
+        st: helpers::helper_store as *const () as usize as u64,
+        cond: helpers::helper_cond as *const () as usize as u64,
         exit_ok,
         exit_fail,
     }
 }
 
+/// Compiles one block to machine code meant to run at `addr` (the encoder bakes in pc-relative
+/// branches to the exit stubs). Returns the code and the number of inlined instructions.
 pub(crate) fn compile_block(
     addr: u64,
-    ad: &Addrs,
+    addrs: &Addrs,
     insns: &[Insn],
     rips: &[u64],
     end_rip: u64,
 ) -> (Vec<u8>, u32) {
-    let mut g = Gen::new(addr, ad, insns);
-    g.compile(rips, end_rip);
-    (bytes(&g.a.code), g.inlined)
+    let mut generator = Gen::new(addr, addrs, insns);
+    generator.compile(rips, end_rip);
+    (bytes(&generator.asm.code), generator.inlined)
 }

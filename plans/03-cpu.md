@@ -4,7 +4,7 @@
 
 - 16 GPRs (u64), `rip`, `rflags` (without lazy bits), segment regs (selector, base, limit, attrs) incl. hidden parts, GDTR/IDTR/LDTR/TR
 - CR0, CR2, CR3, CR4, CR8 (stored only), EFER, STAR/LSTAR/CSTAR/SFMASK, KERNEL_GS_BASE, FS/GS base, TSC_AUX, PAT, APIC base (stub), MTRR msrs (stored)
-- lazy flags: `cc_op`, `cc_dst`, `cc_src`, `cc_src2`
+- lazy flags: `lazy_op`, `lazy_size`, `lazy_dst`, `lazy_src`, `lazy_src2` (QEMU calls these `cc_*`)
 - x87: 8×80-bit regs (stored as raw 10 bytes + software softfloat ops), FCW/FSW/FTW, MXCSR, XMM0–15 (u128)
 - pending interrupt state, `halted`, `exit_request`, icount, soft TLB arrays (see 04)
 - hflags cache: CPL, code size (16/32/64), addseg, SS32, protected/real, used in TB key
@@ -23,7 +23,7 @@ Coverage priority (what Linux + Debian userspace uses):
 
 ## Lazy flags
 
-CC_OP-style: ALU ops store `(op, dst, src[, src2])`; flags are materialized when consumed (jcc/setcc/cmov/pushf/adc/sbb/rcl/...) or when the op class changes. Reuse the QEMU scheme conceptually (`cc_helper*`): ops per width (B/W/L/Q) for ADD, ADC, SUB, SBB, LOGIC, INC, DEC, SHL, SHR, SAR, MUL, ADCX/OX (later), plus EFLAGS (materialized) and CLR. Fork note: INC/DEC keep carry via `cc_src`, a cheap win.
+CC_OP-style: ALU ops store `(op, dst, src[, src2])`; flags are materialized when consumed (jcc/setcc/cmov/pushf/adc/sbb/rcl/...) or when the op class changes. Reuse the QEMU scheme conceptually (`cc_helper*`): ops per width (B/W/L/Q) for ADD, ADC, SUB, SBB, LOGIC, INC, DEC, SHL, SHR, SAR, MUL, ADCX/OX (later), plus EFLAGS (materialized) and CLR. Fork note: INC/DEC keep carry via `lazy_src`, a cheap win.
 
 Interpreter and JIT both call the same `flags::compute_all(cc_op, dst, src, src2)`; the JIT inlines the hot cases (ZF/SF/CF from SUB/CMP/TEST/AND followed by jcc).
 
@@ -31,7 +31,7 @@ Interpreter and JIT both call the same `flags::compute_all(cc_op, dst, src, src2
 
 - An instruction commits GPR/flag writes only after all its faulting loads/stores; pushes and pops compute RSP in a temp and write it last; string ops commit per iteration (rep is interruptible, RIP stays on the instruction until RCX hits 0).
 - Every faulting uop sequence is preceded by an `insn_start(rip)` that stores guest RIP to `Env` (JIT: one `str`; coalesced when there are no faulting ops in between). No unwind tables in v1.
-- Exception delivery (`exc.rs`): long mode IDT gate lookup, IST, TSS rsp0, error code push, privilege change stack switch, #DF escalation, triple fault → exit. Also real-address and protected-mode 32-bit delivery only as far as the decompressor needs.
+- Exception delivery (`exception.rs`): long mode IDT gate lookup, IST, TSS rsp0, error code push, privilege change stack switch, #DF escalation, triple fault → exit. Also real-address and protected-mode 32-bit delivery only as far as the decompressor needs.
 - `iretq`, `sysretq`, far calls/jumps through call gates (not needed) — implement iret and far jmp/ret with descriptor loads in long mode.
 - Segment loads in 64-bit mode: validate and cache base/limit/attrs for CS/SS/DS/ES; FS/GS use MSR bases (`wrfsbase` not advertised).
 - Page faults: CR2 + error code (P/W/U/RSVD/I), fixups via kernel `ex_table` work because RIP is exact.

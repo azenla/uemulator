@@ -1,8 +1,17 @@
+//! Minimal aarch64 assembler: just the instruction forms `emit.rs` and the prologue in
+//! `arch_a64.rs` use. Each opcode literal is the fixed bits of the instruction with every
+//! register and immediate field zero; the fields are or-ed in at the `*_SHIFT` positions below.
+//! `is64 = false` selects the W-register (32-bit) form by leaving `SF` clear.
+//!
+//! Register arguments are plain numbers 0..=31. Number 31 is `xzr` or `sp` depending on the
+//! instruction, which is why `mov_sp` exists next to `mov`.
+
 #![allow(dead_code)]
 
 pub(crate) const XZR: u32 = 31;
 pub(crate) const SP: u32 = 31;
 
+/// A64 condition field values. Flipping bit 0 inverts a condition (`cset` relies on this).
 pub(crate) const EQ: u32 = 0;
 pub(crate) const NE: u32 = 1;
 pub(crate) const CS: u32 = 2;
@@ -18,68 +27,120 @@ pub(crate) const LT: u32 = 11;
 pub(crate) const GT: u32 = 12;
 pub(crate) const LE: u32 = 13;
 
+/// Instruction-word field positions.
+const RN_SHIFT: u32 = 5;
+const RM_SHIFT: u32 = 16;
+/// Bit 31: 64-bit (X register) form.
+const SF: u32 = 1 << 31;
+const COND_SHIFT: u32 = 12;
+const IMM12_SHIFT: u32 = 10;
+/// Shift amount of the shifted-register add.
+const IMM6_SHIFT: u32 = 10;
+/// MOVZ/MOVK/MOVN: 16-bit immediate, and which halfword it replaces (`hw` * 16 bits).
+const IMM16_SHIFT: u32 = 5;
+const HW_SHIFT: u32 = 21;
+/// Bitfield moves: rotate amount and index of the last bit of the field.
+const IMMR_SHIFT: u32 = 16;
+const IMMS_SHIFT: u32 = 10;
+/// N:immr:imms of a logical (bitmask) immediate sits here as one 13-bit field.
+const BITMASK_IMM_SHIFT: u32 = 10;
+/// Load/store pair: second register and the signed 7-bit offset, scaled by 8.
+const RT2_SHIFT: u32 = 10;
+const IMM7_SHIFT: u32 = 15;
+const IMM7_MASK: u32 = 0x7f;
+const PAIR_OFFSET_SCALE: i32 = 8;
+
+/// PC-relative branch immediates count instructions, not bytes.
+const IMM26_MASK: u32 = 0x03ff_ffff;
+const IMM19_MASK: u32 = 0x7_ffff;
+const IMM19_SHIFT: u32 = 5;
+const IMM26_SIGNED_LIMIT: i64 = 1 << 25;
+
+/// Unsigned 12-bit immediates of add/sub and of the scaled load/store offset.
+pub(crate) const IMM12_LIMIT: u32 = 1 << 12;
+const XREG_BITS: u32 = 64;
+const WREG_BITS: u32 = 32;
+
+/// Index into `Asm::labels`.
 pub(crate) type Label = usize;
 
+/// Which immediate field of a branch `Asm::finish` patches once the label's position is known.
 #[derive(Clone, Copy)]
-enum Fix {
-    B26,
-    B19,
+enum Fixup {
+    /// `b`: 26-bit offset from bit 0.
+    Imm26,
+    /// `b.cond`, `cbz`, `cbnz`: 19-bit offset from bit 5.
+    Imm19,
 }
 
 pub(crate) struct Asm {
     pub code: Vec<u32>,
+    /// Address the code will run at. Must be where the words are finally written, because
+    /// `here` and `b_abs` compute pc-relative offsets against it.
     base: u64,
+    /// Position (in words) each label was bound to.
     labels: Vec<Option<usize>>,
-    fixes: Vec<(usize, Label, Fix)>,
+    /// Branches emitted before their target was bound: (word index, label, field to patch).
+    fixes: Vec<(usize, Label, Fixup)>,
 }
 
+/// Encodes `val` as a logical immediate (the 13-bit N:immr:imms field) for `and`/`orr`/`eor`/
+/// `ands`, or `None` if it is not representable. Representable values are a run of ones,
+/// rotated, replicated across the register in 2, 4, ..., 64-bit elements. Zero and all-ones
+/// are never encodable. For `!is64` only the low 32 bits count.
 pub(crate) fn encode_bitmask(val: u64, is64: bool) -> Option<u32> {
-    let reg: u32 = if is64 { 64 } else { 32 };
-    let mut imm = if is64 { val } else { val & 0xffff_ffff };
-    if imm == 0 || imm == if is64 { u64::MAX } else { 0xffff_ffff } {
+    let register_bits: u32 = if is64 { XREG_BITS } else { WREG_BITS };
+    let mut pattern = if is64 { val } else { val & 0xffff_ffff };
+    if pattern == 0 || pattern == if is64 { u64::MAX } else { 0xffff_ffff } {
         return None;
     }
     if !is64 {
-        imm |= imm << 32;
+        pattern |= pattern << 32;
     }
-    let mut size = reg;
+    // Smallest element size whose halves are equal all the way down.
+    let mut element_size = register_bits;
     loop {
-        size /= 2;
-        let mask = (1u64 << size) - 1;
-        if (imm & mask) != ((imm >> size) & mask) {
-            size *= 2;
+        element_size /= 2;
+        let half_mask = (1u64 << element_size) - 1;
+        if (pattern & half_mask) != ((pattern >> element_size) & half_mask) {
+            element_size *= 2;
             break;
         }
-        if size <= 2 {
+        if element_size <= 2 {
             break;
         }
     }
-    let mask = u64::MAX >> (64 - size);
-    imm &= mask;
-    let shifted = |v: u64| {
+    let element_mask = u64::MAX >> (XREG_BITS - element_size);
+    pattern &= element_mask;
+    // True if `v` is one contiguous run of ones (possibly shifted up from bit 0).
+    let is_run_of_ones = |v: u64| {
         v != 0 && {
-            let x = (v - 1) | v;
-            x & x.wrapping_add(1) == 0
+            let filled = (v - 1) | v;
+            filled & filled.wrapping_add(1) == 0
         }
     };
-    let (i, cto);
-    if shifted(imm) {
-        i = imm.trailing_zeros();
-        cto = (imm >> i).trailing_ones();
+    let (rotation_source, run_length);
+    if is_run_of_ones(pattern) {
+        rotation_source = pattern.trailing_zeros();
+        run_length = (pattern >> rotation_source).trailing_ones();
     } else {
-        imm |= !mask;
-        if !shifted(!imm) {
+        // The run wraps around the element: extend with ones above it and look at the zeros.
+        pattern |= !element_mask;
+        if !is_run_of_ones(!pattern) {
             return None;
         }
-        let clo = imm.leading_ones();
-        i = 64 - clo;
-        cto = clo + imm.trailing_ones() - (64 - size);
+        let leading_ones = pattern.leading_ones();
+        rotation_source = XREG_BITS - leading_ones;
+        run_length = leading_ones + pattern.trailing_ones() - (XREG_BITS - element_size);
     }
-    let immr = (size - i) & (size - 1);
-    let mut nimms = !(size - 1) << 1;
-    nimms |= cto - 1;
-    let n = ((nimms >> 6) & 1) ^ 1;
-    Some((n << 12) | (immr << 6) | (nimms & 0x3f))
+    let immr = (element_size - rotation_source) & (element_size - 1);
+    // imms holds run_length - 1 in its low bits; the bits above encode the element size
+    // (0xxxxx for 32-bit elements, 10xxxx for 16, ...). N is set only for 64-bit elements,
+    // which is the inverse of bit 6 of this value.
+    let mut size_prefixed_imms = !(element_size - 1) << 1;
+    size_prefixed_imms |= run_length - 1;
+    let n = ((size_prefixed_imms >> 6) & 1) ^ 1;
+    Some((n << 12) | (immr << 6) | (size_prefixed_imms & 0x3f))
 }
 
 impl Asm {
@@ -92,12 +153,13 @@ impl Asm {
         }
     }
 
+    /// Address of the next instruction to be emitted.
     pub fn here(&self) -> u64 {
         self.base + self.code.len() as u64 * 4
     }
 
-    pub fn emit(&mut self, w: u32) {
-        self.code.push(w);
+    pub fn emit(&mut self, word: u32) {
+        self.code.push(word);
     }
 
     pub fn label(&mut self) -> Label {
@@ -105,45 +167,51 @@ impl Asm {
         self.labels.len() - 1
     }
 
-    pub fn bind(&mut self, l: Label) {
-        self.labels[l] = Some(self.code.len());
+    pub fn bind(&mut self, label: Label) {
+        self.labels[label] = Some(self.code.len());
     }
 
+    /// Patches every branch to a label. The offsets are not range-checked: `b.cond`/`cbz` reach
+    /// only +-1 MiB and `b` +-128 MiB, far more than one block (at most `MAX_INSNS` instructions
+    /// plus their out-of-line slow paths) ever spans. Panics on a label that was never bound.
     pub fn finish(&mut self) {
-        for &(at, l, k) in &self.fixes {
-            let off = self.labels[l].expect("unbound label") as i64 - at as i64;
-            match k {
-                Fix::B26 => self.code[at] |= (off as u32) & 0x03ff_ffff,
-                Fix::B19 => self.code[at] |= ((off as u32) & 0x7_ffff) << 5,
+        for &(at, label, fixup) in &self.fixes {
+            let offset = self.labels[label].expect("unbound label") as i64 - at as i64;
+            match fixup {
+                Fixup::Imm26 => self.code[at] |= (offset as u32) & IMM26_MASK,
+                Fixup::Imm19 => self.code[at] |= ((offset as u32) & IMM19_MASK) << IMM19_SHIFT,
             }
         }
         self.fixes.clear();
     }
 
-    pub fn b(&mut self, l: Label) {
-        self.fixes.push((self.code.len(), l, Fix::B26));
+    pub fn b(&mut self, label: Label) {
+        self.fixes.push((self.code.len(), label, Fixup::Imm26));
         self.emit(0x1400_0000);
     }
 
-    pub fn b_cond(&mut self, cond: u32, l: Label) {
-        self.fixes.push((self.code.len(), l, Fix::B19));
+    pub fn b_cond(&mut self, cond: u32, label: Label) {
+        self.fixes.push((self.code.len(), label, Fixup::Imm19));
         self.emit(0x5400_0000 | cond);
     }
 
-    pub fn cbz(&mut self, rt: u32, l: Label, is64: bool) {
-        self.fixes.push((self.code.len(), l, Fix::B19));
+    pub fn cbz(&mut self, rt: u32, label: Label, is64: bool) {
+        self.fixes.push((self.code.len(), label, Fixup::Imm19));
         self.emit(if is64 { 0xb400_0000 } else { 0x3400_0000 } | rt);
     }
 
-    pub fn cbnz(&mut self, rt: u32, l: Label, is64: bool) {
-        self.fixes.push((self.code.len(), l, Fix::B19));
+    pub fn cbnz(&mut self, rt: u32, label: Label, is64: bool) {
+        self.fixes.push((self.code.len(), label, Fixup::Imm19));
         self.emit(if is64 { 0xb500_0000 } else { 0x3500_0000 } | rt);
     }
 
+    /// Direct branch to an absolute address outside this `Asm` (the exit stubs in the prologue).
+    /// Reach is +-128 MiB; the JIT code buffer (`CODE_SIZE` in `native.rs`) is exactly that big,
+    /// so a block can always reach the stubs at its start.
     pub fn b_abs(&mut self, target: u64) {
-        let off = (target as i64 - self.here() as i64) / 4;
-        assert!(off.abs() < (1 << 25), "branch out of range");
-        self.emit(0x1400_0000 | (off as u32 & 0x03ff_ffff));
+        let offset = (target as i64 - self.here() as i64) / 4;
+        assert!(offset.abs() < IMM26_SIGNED_LIMIT, "branch out of range");
+        self.emit(0x1400_0000 | (offset as u32 & IMM26_MASK));
     }
 
     pub fn ret(&mut self) {
@@ -151,25 +219,29 @@ impl Asm {
     }
 
     pub fn blr(&mut self, rn: u32) {
-        self.emit(0xd63f_0000 | rn << 5);
+        self.emit(0xd63f_0000 | rn << RN_SHIFT);
     }
 
     pub fn br(&mut self, rn: u32) {
-        self.emit(0xd61f_0000 | rn << 5);
+        self.emit(0xd61f_0000 | rn << RN_SHIFT);
     }
 
+    /// `hw` is the halfword index 0..=3 the 16 bits land in.
     pub fn movz(&mut self, rd: u32, imm: u32, hw: u32) {
-        self.emit(0xd280_0000 | hw << 21 | (imm & 0xffff) << 5 | rd);
+        self.emit(0xd280_0000 | hw << HW_SHIFT | (imm & 0xffff) << IMM16_SHIFT | rd);
     }
 
     pub fn movk(&mut self, rd: u32, imm: u32, hw: u32) {
-        self.emit(0xf280_0000 | hw << 21 | (imm & 0xffff) << 5 | rd);
+        self.emit(0xf280_0000 | hw << HW_SHIFT | (imm & 0xffff) << IMM16_SHIFT | rd);
     }
 
+    /// Writes the bitwise NOT of the shifted immediate.
     pub fn movn(&mut self, rd: u32, imm: u32, hw: u32) {
-        self.emit(0x9280_0000 | hw << 21 | (imm & 0xffff) << 5 | rd);
+        self.emit(0x9280_0000 | hw << HW_SHIFT | (imm & 0xffff) << IMM16_SHIFT | rd);
     }
 
+    /// Loads any 64-bit constant: one `movn` when the top 48 bits are all ones, otherwise a
+    /// `movz` for the first non-zero halfword and a `movk` for each further one.
     pub fn mov_imm(&mut self, rd: u32, v: u64) {
         if v == 0 {
             self.movz(rd, 0, 0);
@@ -193,18 +265,21 @@ impl Asm {
         }
     }
 
+    /// `orr rd, xzr, rm`. Register 31 here is `xzr`, so this cannot move from or to `sp`.
     pub fn mov(&mut self, rd: u32, rm: u32) {
-        self.emit(0xaa00_03e0 | rm << 16 | rd);
+        self.emit(0xaa00_03e0 | rm << RM_SHIFT | rd);
     }
 
+    /// `add rd, rn, #0`, the form that treats register 31 as `sp`.
     pub fn mov_sp(&mut self, rd: u32, rn: u32) {
-        self.emit(0x9100_0000 | rn << 5 | rd);
+        self.emit(0x9100_0000 | rn << RN_SHIFT | rd);
     }
 
+    /// Unshifted 12-bit immediate only; callers must range-check (see `Gen::effective_address`).
     fn addsub_imm(&mut self, op: u32, rd: u32, rn: u32, imm: u32, is64: bool) {
-        let sf = if is64 { 0x8000_0000 } else { 0 };
-        assert!(imm < 4096);
-        self.emit(sf | op | imm << 10 | rn << 5 | rd);
+        let sf = if is64 { SF } else { 0 };
+        assert!(imm < IMM12_LIMIT);
+        self.emit(sf | op | imm << IMM12_SHIFT | rn << RN_SHIFT | rd);
     }
 
     pub fn add_imm(&mut self, rd: u32, rn: u32, imm: u32, is64: bool) {
@@ -221,8 +296,8 @@ impl Asm {
     }
 
     fn reg3(&mut self, op: u32, rd: u32, rn: u32, rm: u32, is64: bool) {
-        let sf = if is64 { 0x8000_0000 } else { 0 };
-        self.emit(sf | op | rm << 16 | rn << 5 | rd);
+        let sf = if is64 { SF } else { 0 };
+        self.emit(sf | op | rm << RM_SHIFT | rn << RN_SHIFT | rd);
     }
 
     pub fn add(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
@@ -262,8 +337,9 @@ impl Asm {
         self.reg3(0x1ac0_2800, rd, rn, rm, is64);
     }
 
-    pub fn add_lsl(&mut self, rd: u32, rn: u32, rm: u32, sh: u32) {
-        self.emit(0x8b00_0000 | rm << 16 | sh << 10 | rn << 5 | rd);
+    /// 64-bit `add rd, rn, rm, lsl #shift`.
+    pub fn add_lsl(&mut self, rd: u32, rn: u32, rm: u32, shift: u32) {
+        self.emit(0x8b00_0000 | rm << RM_SHIFT | shift << IMM6_SHIFT | rn << RN_SHIFT | rd);
     }
 
     pub fn cmp(&mut self, rn: u32, rm: u32, is64: bool) {
@@ -276,42 +352,54 @@ impl Asm {
         self.ands(XZR, rn, rm, is64);
     }
 
+    /// Returns false, emitting nothing, when `imm` is not a valid bitmask immediate; the
+    /// caller must then materialise the constant in a register itself.
     fn logic_imm(&mut self, op: u32, rd: u32, rn: u32, imm: u64, is64: bool) -> bool {
         match encode_bitmask(imm, is64) {
-            Some(e) => {
-                let sf = if is64 { 0x8000_0000 } else { 0 };
-                self.emit(sf | op | e << 10 | rn << 5 | rd);
+            Some(bitmask) => {
+                let sf = if is64 { SF } else { 0 };
+                self.emit(sf | op | bitmask << BITMASK_IMM_SHIFT | rn << RN_SHIFT | rd);
                 true
             }
             None => false,
         }
     }
 
+    /// See `logic_imm` for the meaning of the result.
     pub fn and_imm(&mut self, rd: u32, rn: u32, imm: u64, is64: bool) -> bool {
         self.logic_imm(0x1200_0000, rd, rn, imm, is64)
     }
 
+    // The shifts and extensions below are all aliases of these three bitfield moves, with
+    // `immr` the rotate amount and `imms` the index of the field's last bit.
     pub fn ubfm(&mut self, rd: u32, rn: u32, immr: u32, imms: u32, is64: bool) {
-        let w = if is64 { 0xd340_0000 } else { 0x5300_0000 };
-        self.emit(w | immr << 16 | imms << 10 | rn << 5 | rd);
+        let opcode = if is64 { 0xd340_0000 } else { 0x5300_0000 };
+        self.emit(opcode | immr << IMMR_SHIFT | imms << IMMS_SHIFT | rn << RN_SHIFT | rd);
     }
     pub fn sbfm(&mut self, rd: u32, rn: u32, immr: u32, imms: u32, is64: bool) {
-        let w = if is64 { 0x9340_0000 } else { 0x1300_0000 };
-        self.emit(w | immr << 16 | imms << 10 | rn << 5 | rd);
+        let opcode = if is64 { 0x9340_0000 } else { 0x1300_0000 };
+        self.emit(opcode | immr << IMMR_SHIFT | imms << IMMS_SHIFT | rn << RN_SHIFT | rd);
     }
     pub fn bfm(&mut self, rd: u32, rn: u32, immr: u32, imms: u32, is64: bool) {
-        let w = if is64 { 0xb340_0000 } else { 0x3300_0000 };
-        self.emit(w | immr << 16 | imms << 10 | rn << 5 | rd);
+        let opcode = if is64 { 0xb340_0000 } else { 0x3300_0000 };
+        self.emit(opcode | immr << IMMR_SHIFT | imms << IMMS_SHIFT | rn << RN_SHIFT | rd);
     }
 
-    pub fn lsl_imm(&mut self, rd: u32, rn: u32, s: u32) {
-        self.ubfm(rd, rn, (64 - s) & 63, 63 - s, true);
+    /// 64-bit immediate shifts.
+    pub fn lsl_imm(&mut self, rd: u32, rn: u32, shift: u32) {
+        self.ubfm(
+            rd,
+            rn,
+            (XREG_BITS - shift) & (XREG_BITS - 1),
+            XREG_BITS - 1 - shift,
+            true,
+        );
     }
-    pub fn lsr_imm(&mut self, rd: u32, rn: u32, s: u32) {
-        self.ubfm(rd, rn, s, 63, true);
+    pub fn lsr_imm(&mut self, rd: u32, rn: u32, shift: u32) {
+        self.ubfm(rd, rn, shift, XREG_BITS - 1, true);
     }
-    pub fn asr_imm(&mut self, rd: u32, rn: u32, s: u32) {
-        self.sbfm(rd, rn, s, 63, true);
+    pub fn asr_imm(&mut self, rd: u32, rn: u32, shift: u32) {
+        self.sbfm(rd, rn, shift, XREG_BITS - 1, true);
     }
     pub fn uxtb(&mut self, rd: u32, rn: u32) {
         self.ubfm(rd, rn, 0, 7, false);
@@ -319,8 +407,9 @@ impl Asm {
     pub fn uxth(&mut self, rd: u32, rn: u32) {
         self.ubfm(rd, rn, 0, 15, false);
     }
+    /// 32-bit `mov`, which zeroes the upper half of the destination.
     pub fn uxtw(&mut self, rd: u32, rn: u32) {
-        self.emit(0x2a00_03e0 | rn << 16 | rd);
+        self.emit(0x2a00_03e0 | rn << RM_SHIFT | rd);
     }
     pub fn sxtb(&mut self, rd: u32, rn: u32, is64: bool) {
         self.sbfm(rd, rn, 0, 7, is64);
@@ -332,25 +421,29 @@ impl Asm {
         self.sbfm(rd, rn, 0, 31, true);
     }
 
+    /// Inserts the low `width` bits of `rn` into `rd` at bit `lsb`, keeping the other bits.
     pub fn bfi(&mut self, rd: u32, rn: u32, lsb: u32, width: u32, is64: bool) {
-        let m = if is64 { 63 } else { 31 };
-        self.bfm(rd, rn, (m + 1 - lsb) & m, width - 1, is64);
+        let last_bit = if is64 { XREG_BITS - 1 } else { WREG_BITS - 1 };
+        self.bfm(rd, rn, (last_bit + 1 - lsb) & last_bit, width - 1, is64);
     }
 
+    /// `csinc rd, xzr, xzr, !cond`: rd = cond ? 1 : 0.
     pub fn cset(&mut self, rd: u32, cond: u32) {
-        self.emit(0x9a9f_07e0 | ((cond ^ 1) << 12) | rd);
+        self.emit(0x9a9f_07e0 | ((cond ^ 1) << COND_SHIFT) | rd);
     }
 
     pub fn csel(&mut self, rd: u32, rn: u32, rm: u32, cond: u32) {
-        self.emit(0x9a80_0000 | rm << 16 | cond << 12 | rn << 5 | rd);
+        self.emit(0x9a80_0000 | rm << RM_SHIFT | cond << COND_SHIFT | rn << RN_SHIFT | rd);
     }
 
+    /// Unsigned-offset load/store: the encoded immediate is `off >> scale`, so `off` must be a
+    /// multiple of the access size (`1 << scale`) and below `4096 << scale`.
     fn ldst_imm(&mut self, base: u32, scale: u32, rt: u32, rn: u32, off: u32) {
         assert!(
-            off.is_multiple_of(1 << scale) && (off >> scale) < 4096,
+            off.is_multiple_of(1 << scale) && (off >> scale) < IMM12_LIMIT,
             "bad ldst offset {off}"
         );
-        self.emit(base | (off >> scale) << 10 | rn << 5 | rt);
+        self.emit(base | (off >> scale) << IMM12_SHIFT | rn << RN_SHIFT | rt);
     }
 
     pub fn ldr(&mut self, rt: u32, rn: u32, off: u32) {
@@ -378,10 +471,14 @@ impl Asm {
         self.ldst_imm(0x3900_0000, 0, rt, rn, off);
     }
 
+    /// Register-offset form `[rn, rm]`: no shift, no extend.
     fn ldst_reg(&mut self, base: u32, rt: u32, rn: u32, rm: u32) {
-        self.emit(base | rm << 16 | rn << 5 | rt);
+        self.emit(base | rm << RM_SHIFT | rn << RN_SHIFT | rt);
     }
 
+    /// Loads `size` bytes from `[rn + rm]`. Unsigned loads zero-extend; signed ones sign-extend
+    /// to 64 bits (`ldrsb`/`ldrsh`/`ldrsw` into an X register). A signed 8-byte load is a plain
+    /// `ldr`, and a signed size other than 1 or 2 is treated as 4.
     pub fn ldr_r(&mut self, rt: u32, rn: u32, rm: u32, size: u8, signed: bool) {
         let base = match (size, signed) {
             (1, false) => 0x3860_6800,
@@ -395,6 +492,8 @@ impl Asm {
         self.ldst_reg(base, rt, rn, rm);
     }
 
+    /// Stores the low `size` bytes of `rt` to `[rn + rm]`; any size other than 1, 2 or 4
+    /// stores 8.
     pub fn str_r(&mut self, rt: u32, rn: u32, rm: u32, size: u8) {
         let base = match size {
             1 => 0x3820_6800,
@@ -405,26 +504,35 @@ impl Asm {
         self.ldst_reg(base, rt, rn, rm);
     }
 
+    /// 64-bit `stp`/`ldp`. `imm` is a byte offset, a multiple of 8 in -512..=504.
+    fn pair_imm7(imm: i32) -> u32 {
+        ((imm / PAIR_OFFSET_SCALE) as u32 & IMM7_MASK) << IMM7_SHIFT
+    }
+
+    /// Pre-indexed: the base register is updated before the store.
     pub fn stp_pre(&mut self, rt: u32, rt2: u32, rn: u32, imm: i32) {
-        self.emit(0xa980_0000 | (((imm / 8) as u32) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt);
+        self.emit(0xa980_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt);
     }
     pub fn stp_off(&mut self, rt: u32, rt2: u32, rn: u32, imm: i32) {
-        self.emit(0xa900_0000 | (((imm / 8) as u32) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt);
+        self.emit(0xa900_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt);
     }
     pub fn ldp_off(&mut self, rt: u32, rt2: u32, rn: u32, imm: i32) {
-        self.emit(0xa940_0000 | (((imm / 8) as u32) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt);
+        self.emit(0xa940_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt);
     }
+    /// `csinc rd, rn, rn, ne`: rd = eq ? rn + 1 : rn.
     pub fn cinc_eq(&mut self, rd: u32, rn: u32) {
-        self.emit(0x9a80_0400 | rn << 16 | (NE << 12) | rn << 5 | rd);
+        self.emit(0x9a80_0400 | rn << RM_SHIFT | (NE << COND_SHIFT) | rn << RN_SHIFT | rd);
     }
+    /// Read/write the NZCV condition flags (system register S3_3_C4_C2_0).
     pub fn mrs_nzcv(&mut self, rt: u32) {
         self.emit(0xd53b_4200 | rt);
     }
     pub fn msr_nzcv(&mut self, rt: u32) {
         self.emit(0xd51b_4200 | rt);
     }
+    /// Post-indexed: the base register is updated after the load.
     pub fn ldp_post(&mut self, rt: u32, rt2: u32, rn: u32, imm: i32) {
-        self.emit(0xa8c0_0000 | (((imm / 8) as u32) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt);
+        self.emit(0xa8c0_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt);
     }
 }
 

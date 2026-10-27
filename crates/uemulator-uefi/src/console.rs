@@ -7,12 +7,21 @@ use uefi::proto::console::text::{Key, ScanCode};
 /// Guest output waits here until the next poll, so the firmware is called once per burst
 /// rather than once per byte.
 static PENDING: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Bytes of a UTF-8 sequence cut off at the end of the last write, completed by the next one.
 static UTF8_TAIL: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
+/// UTF-16 code units are collected in a buffer of this capacity and handed to the firmware as soon
+/// as `OUTPUT_FLUSH_THRESHOLD` is reached. The gap leaves room for the largest step (CR plus a
+/// surrogate pair) and the terminating NUL, so the buffer never grows.
+const OUTPUT_BUFFER_UNITS: usize = 512;
+const OUTPUT_FLUSH_THRESHOLD: usize = 500;
+
+/// Output callback for the guest console; never calls the firmware.
 pub fn queue(bytes: &[u8]) {
     PENDING.lock().extend_from_slice(bytes);
 }
 
+/// Writes everything queued to the firmware console.
 pub fn flush() {
     let bytes = core::mem::take(&mut *PENDING.lock());
     if !bytes.is_empty() {
@@ -20,16 +29,19 @@ pub fn flush() {
     }
 }
 
+/// Host messages; queued guest output goes first so the two stay in order.
 pub fn print(text: &str) {
     flush();
     write_now(text.as_bytes());
 }
 
+/// Converts UTF-8 to the firmware's UTF-16 with LF turned into CR LF, as its console needs.
 fn write_now(bytes: &[u8]) {
     let mut tail = UTF8_TAIL.lock();
     tail.extend_from_slice(bytes);
     let valid = match core::str::from_utf8(&tail) {
         Ok(s) => s.len(),
+        // `error_len() == None` means the input ends inside a sequence: keep it for the next write.
         Err(e) if e.error_len().is_none() => e.valid_up_to(),
         // Not UTF-8 at all: pass the bytes through as Latin-1 rather than stall.
         Err(_) => tail.len(),
@@ -40,14 +52,14 @@ fn write_now(bytes: &[u8]) {
     };
     tail.drain(..valid);
     drop(tail);
-    let mut units: Vec<u16> = Vec::with_capacity(512);
+    let mut units: Vec<u16> = Vec::with_capacity(OUTPUT_BUFFER_UNITS);
     for c in text.chars() {
         if c == '\n' {
             units.push(b'\r' as u16);
         }
         let mut buf = [0u16; 2];
         units.extend_from_slice(c.encode_utf16(&mut buf));
-        if units.len() >= 500 {
+        if units.len() >= OUTPUT_FLUSH_THRESHOLD {
             emit(&mut units);
         }
     }
@@ -66,7 +78,8 @@ fn emit(units: &mut Vec<u16>) {
     units.clear();
 }
 
-/// Reads every pending key and returns it as the bytes a terminal would send.
+/// Reads every pending key and returns it as the bytes a terminal would send (xterm escape
+/// sequences for the special keys, which the guest's tty expects).
 pub fn read_input() -> Vec<u8> {
     let mut out = Vec::new();
     uefi::system::with_stdin(|input| {

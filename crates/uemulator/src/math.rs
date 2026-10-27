@@ -1,13 +1,17 @@
-//! The float methods `core` lacks, under their `std` names.
+//! The float methods `core` lacks, under their `std` names. `core` omits float math that needs a
+//! C math library, so on UEFI (`no_std`) call sites `use` these traits and keep writing
+//! `x.sqrt()`. Hosted builds use `std`'s inherent methods and never compile this module.
 
 pub(crate) trait FloatExt: Sized {
     fn sqrt(self) -> Self;
     fn floor(self) -> Self;
     fn ceil(self) -> Self;
     fn trunc(self) -> Self;
+    /// `rint` rounds half to even, as `round_ties_even` does.
     fn round_ties_even(self) -> Self;
 }
 
+/// `f64`-only methods, used by the x87 transcendental instructions.
 pub(crate) trait Float64Ext {
     fn powi(self, n: i32) -> f64;
     fn exp_m1(self) -> f64;

@@ -16,7 +16,10 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 - Cargo workspace: `crates/uemulator-uefi` (`no_std` UEFI app, empty on hosted targets), `crates/uemulator` (library; `no_std` + `alloc` on `target_os = "uefi"`; the default `jit` feature pulls in `libc` on unix and `windows-sys` on Windows, `--no-default-features` has zero dependencies and is interpreter-only) and `crates/uemulator-cli` (clap, ureq; may use crates freely). Tests live in the library crate.
 - `lib.rs` is the entire public API: `EmulatedMachine::new(cfg)` then `start()`. Everything else is `pub(crate)`.
 - The library never touches stdio, never calls `process::exit`, holds no global mutable state, never panics on guest behavior. Guest faults are guest exceptions.
-- Comments minimal; only for non-obvious why.
+- Comment what is surprising, looks obscure, or is named something non-obvious: hardware quirks, ordering constraints, invariants the JIT relies on, why a value is what it is. Cite the SDM section or the QEMU behavior when that is the real source. Don't restate what the code says.
+- Write comments for the next Claude who has to change this without having seen the history. Say what breaks if the code is changed carelessly. Plain, terse prose like a human maintainer would write: no "This function...", no filler, no banner or section-divider comments.
+- Prefer descriptive names. Don't shorten to 3-5 letters when a real word reads better; rename when you touch something badly named. Architectural names from the Intel/AMD manuals (`cr0`, `efer`, `rip`, `gdtr`, `cpl`, `mxcsr`) stay as-is.
+- No magic constants. Name register bits, MSR numbers, descriptor flags, vector numbers, sizes and timeouts as `const`s at the narrowest scope that makes sense, and let comments refer to the name.
 - `../ext/qemu-uplink` is read-only reference (see `plans/09-qemu-map.md`). Study behavior; write Rust from scratch, don't transliterate.
 - The interpreter is the oracle for the JIT. Any new uop gets an interpreter implementation and a test first.
 - Advertise a CPUID bit only together with the tests for the instructions behind it.

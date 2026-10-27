@@ -19,10 +19,22 @@ use uemulator::{ConsoleHandle, ExitReason, Platform};
 use crate::console;
 use arch::{FpuState, Gprs};
 
-const PAGE: usize = 4096;
-const HUGE: usize = 2 << 20;
-/// How often the firmware console is polled for input, in guest-visible microseconds.
+const PAGE_SIZE: usize = 4096;
+const HUGE_PAGE_SIZE: usize = 2 << 20;
+const GIB: usize = 1 << 30;
+const MIB_SHIFT: u32 = 20;
+const NANOS_PER_SEC: u128 = 1_000_000_000;
+/// How often the firmware console is polled for input, in nanoseconds of host time.
 const CONSOLE_POLL_NS: u64 = 1_000_000;
+/// Polling interval while the guest is halted.
+const HLT_POLL_INTERVAL: Duration = Duration::from_micros(50);
+/// Reported unusual guest actions are capped so a guest that loops on one cannot flood the console.
+const MAX_NOTES: u32 = 20;
+/// The firmware tick that bounds how late the guest's timer interrupts arrive.
+const FIRMWARE_TICK: Duration = Duration::from_millis(1);
+/// Host TSC calibration runs for this long against the firmware's `Stall`.
+const CALIBRATION_MS: u64 = 50;
+const HZ_PER_KHZ: u64 = 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -32,21 +44,28 @@ pub enum Kind {
 
 /// Which extension this CPU offers, if any (and whether the firmware left it usable).
 pub fn detect() -> Option<Kind> {
-    let leaf1 = arch::cpuid(1, 0);
-    if leaf1[2] & (1 << 5) != 0 && vmx::usable() {
+    let features = arch::cpuid(arch::CPUID_LEAF_FEATURES, 0);
+    if features[2] & arch::CPUID_1_ECX_VMX != 0 && vmx::usable() {
         return Some(Kind::Vmx);
     }
-    let max_ext = arch::cpuid(0x8000_0000, 0)[0];
-    if max_ext >= 0x8000_000a && arch::cpuid(0x8000_0001, 0)[2] & (1 << 2) != 0 && svm::usable() {
+    let max_ext_leaf = arch::cpuid(arch::CPUID_LEAF_EXT_MAX, 0)[0];
+    if max_ext_leaf >= arch::CPUID_LEAF_SVM
+        && arch::cpuid(arch::CPUID_LEAF_EXT_FEATURES, 0)[2] & arch::CPUID_EXT1_ECX_SVM != 0
+        && svm::usable()
+    {
         return Some(Kind::Svm);
     }
     None
 }
 
+/// Why `Vcpu::run` returned. The instruction-specific ones leave rip at the instruction; the
+/// handler calls `Vcpu::skip` when it has emulated it.
 pub enum Exit {
     Io {
         port: u16,
+        /// Bytes: 1, 2 or 4.
         size: u8,
+        /// The guest executed OUT.
         write: bool,
     },
     Cpuid,
@@ -62,24 +81,35 @@ pub enum Exit {
     TripleFault,
     /// Guest instruction that is not virtualized and raises `#UD`.
     Undefined,
+    /// Guest access to a physical address with no RAM behind it.
     Fault {
         gpa: u64,
         write: bool,
     },
+    /// Exit code or basic reason nothing handles.
     Other(u64),
 }
 
+/// One virtual CPU. Interrupt and exception injection is queued by the `inject_*` calls and takes
+/// effect on the next `run`.
 pub trait Vcpu {
+    /// Guest registers as of the last exit; edits are loaded by the next `run`.
     fn gprs(&mut self) -> &mut Gprs;
+    /// Enters the guest and returns at the next exit. `Err` is a fatal condition (rejected guest
+    /// state, unsupported string I/O).
     fn run(&mut self) -> Result<Exit, String>;
     /// Moves the guest past the instruction behind the last exit.
     fn skip(&mut self);
     fn rip(&self) -> u64;
+    /// The guest can take an external interrupt now: IF set, no STI or MOV SS shadow, and no other
+    /// event already queued.
     fn irq_ok(&self) -> bool;
     fn inject_irq(&mut self, vector: u8);
+    /// Requests (or cancels) an exit as soon as `irq_ok` would become true.
     fn window(&mut self, on: bool);
     fn inject_gp(&mut self);
     fn inject_ud(&mut self);
+    /// The guest's EFER as the guest should see it (SVM hides its own SVME bit).
     fn efer(&self) -> u64;
     fn set_efer(&mut self, efer: u64);
 }
@@ -88,25 +118,28 @@ pub trait Vcpu {
 pub fn alloc_pages(n: usize) -> Result<*mut u8, String> {
     let p = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, n)
         .map_err(|e| format!("out of memory: {e}"))?;
-    unsafe { core::ptr::write_bytes(p.as_ptr(), 0, n * PAGE) };
+    unsafe { core::ptr::write_bytes(p.as_ptr(), 0, n * PAGE_SIZE) };
     Ok(p.as_ptr())
 }
 
 /// Guest RAM: contiguous host memory, mapped 1:1 into the guest physical address space.
 pub struct GuestRam {
     ptr: *mut u8,
+    /// Size the guest was configured with.
     len: usize,
+    /// `len` rounded up to whole 2 MiB pages, the extent `build_tables` maps.
     mapped: usize,
 }
 
 impl GuestRam {
     fn new(mib: usize) -> Result<Self, String> {
-        let len = mib << 20;
-        let mapped = len.next_multiple_of(HUGE);
-        let pages = (mapped + HUGE) / PAGE;
+        let len = mib << MIB_SHIFT;
+        let mapped = len.next_multiple_of(HUGE_PAGE_SIZE);
+        // One extra huge page, so the start can be rounded up to a 2 MiB boundary.
+        let pages = (mapped + HUGE_PAGE_SIZE) / PAGE_SIZE;
         let raw = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
             .map_err(|e| format!("cannot allocate {mib} MiB of guest memory: {e}"))?;
-        let ptr = (raw.as_ptr() as usize).next_multiple_of(HUGE) as *mut u8;
+        let ptr = (raw.as_ptr() as usize).next_multiple_of(HUGE_PAGE_SIZE) as *mut u8;
         unsafe { core::ptr::write_bytes(ptr, 0, mapped) };
         Ok(Self { ptr, len, mapped })
     }
@@ -120,25 +153,37 @@ impl GuestRam {
     }
 
     /// Builds a 4-level table that maps guest physical `0..mapped` onto the RAM with 2 MiB pages.
-    /// `ept` selects Intel's entry format over AMD's (which is the ordinary x86 format).
+    /// `ept` selects Intel's entry format over AMD's (which is the ordinary x86 format). Returns
+    /// the physical address of the top level, for the EPT pointer or the nested CR3.
     pub fn build_tables(&self, ept: bool) -> Result<u64, String> {
+        // Bits 2:0 are read, write, execute in an EPT entry and present, writable, user in an
+        // ordinary one, so one value serves as "allowed" in both.
+        const ENTRY_ACCESS: u64 = 0b111;
+        // EPT leaf: memory type in bits 5:3 (6 = write-back). Bit 7 makes a PD entry a 2 MiB
+        // leaf in both formats.
+        const EPT_MEMORY_TYPE_WRITE_BACK: u64 = 6 << 3;
+        const LARGE_PAGE: u64 = 1 << 7;
+        const ENTRIES_PER_TABLE: usize = PAGE_SIZE / size_of::<u64>();
+
         let page = || alloc_pages(1).map(|p| p as *mut u64);
-        let table = 0x7;
+        let table = ENTRY_ACCESS;
         let leaf = if ept {
-            0x7 | (6 << 3) | (1 << 7)
+            ENTRY_ACCESS | EPT_MEMORY_TYPE_WRITE_BACK | LARGE_PAGE
         } else {
-            0x7 | (1 << 7)
+            ENTRY_ACCESS | LARGE_PAGE
         };
         let pml4 = page()?;
         let pdpt = page()?;
         unsafe {
             *pml4 = pdpt as u64 | table;
-            for (g, gb) in (0..self.mapped).step_by(1 << 30).enumerate() {
+            // One page directory (512 x 2 MiB) per GiB.
+            for (pdpt_index, gib_start) in (0..self.mapped).step_by(GIB).enumerate() {
                 let pd = page()?;
-                *pdpt.add(g) = pd as u64 | table;
-                let n = ((self.mapped - gb) / HUGE).min(512);
-                for i in 0..n {
-                    *pd.add(i) = (self.host_addr() + (gb + i * HUGE) as u64) | leaf;
+                *pdpt.add(pdpt_index) = pd as u64 | table;
+                let entries = ((self.mapped - gib_start) / HUGE_PAGE_SIZE).min(ENTRIES_PER_TABLE);
+                for i in 0..entries {
+                    *pd.add(i) =
+                        (self.host_addr() + (gib_start + i * HUGE_PAGE_SIZE) as u64) | leaf;
                 }
             }
         }
@@ -146,25 +191,26 @@ impl GuestRam {
     }
 }
 
-/// Host time in guest nanoseconds, from the TSC.
+/// Host time in guest nanoseconds, from the TSC. Zero is the end of calibration.
 struct Clock {
     tsc0: u64,
+    /// TSC frequency measured against the firmware's `Stall`; never zero.
     hz: u64,
 }
 
 impl Clock {
     fn calibrate() -> Self {
         let t0 = arch::rdtsc();
-        boot::stall(Duration::from_millis(50));
+        boot::stall(Duration::from_millis(CALIBRATION_MS));
         let t1 = arch::rdtsc();
         Self {
             tsc0: t1,
-            hz: ((t1 - t0) * 20).max(1),
+            hz: ((t1 - t0) * (1000 / CALIBRATION_MS)).max(1),
         }
     }
 
     fn now_ns(&self) -> u64 {
-        ((arch::rdtsc() - self.tsc0) as u128 * 1_000_000_000 / self.hz as u128) as u64
+        ((arch::rdtsc() - self.tsc0) as u128 * NANOS_PER_SEC / self.hz as u128) as u64
     }
 }
 
@@ -181,7 +227,10 @@ pub fn run(
     let clock = Clock::calibrate();
     // The guest cannot calibrate the TSC against the emulated PIT, as exits make its readings
     // too noisy, so it is told.
-    let cmdline = format!("{cmdline} tsc_early_khz={} tsc=reliable", clock.hz / 1000);
+    let cmdline = format!(
+        "{cmdline} tsc_early_khz={} tsc=reliable",
+        clock.hz / HZ_PER_KHZ
+    );
     let boot =
         uemulator::load_linux(ram.bytes(), kernel, initrd, &cmdline).map_err(|e| format!("{e}"))?;
     let console = ConsoleHandle::default();
@@ -212,6 +261,8 @@ fn event_loop(
     let mut next_poll = 0u64;
     let mut logged = 0u32;
     loop {
+        // Devices only advance here, between entries. The firmware tick forces an exit at least
+        // every millisecond or so (`speed_up_firmware_timer`), which bounds how late they run.
         let now = clock.now_ns();
         platform.tick(now, ram.bytes());
         if now >= next_poll {
@@ -241,6 +292,7 @@ fn event_loop(
 
         match exit {
             Exit::HostInterrupt => arch::host_interrupt_window(),
+            // Nothing to do: the exit itself was the point, the next iteration injects.
             Exit::IntWindow => {}
             Exit::Io { port, size, write } => {
                 let now = clock.now_ns();
@@ -251,6 +303,7 @@ fn event_loop(
                 } else {
                     let v = platform.io_in(port, size, now) as u64;
                     let mask = u64::MAX >> (64 - 8 * size as u32);
+                    // A 32-bit IN zero-extends into rax; 8- and 16-bit ones leave the rest alone.
                     g.rax = if size == 4 {
                         v
                     } else {
@@ -273,7 +326,7 @@ fn event_loop(
                 match msr::read(vcpu, n) {
                     Some(v) => {
                         let g = vcpu.gprs();
-                        g.rax = v & 0xffff_ffff;
+                        g.rax = v & u32::MAX as u64;
                         g.rdx = v >> 32;
                         vcpu.skip();
                     }
@@ -283,7 +336,7 @@ fn event_loop(
             }
             Exit::Wrmsr => {
                 let g = vcpu.gprs();
-                let (n, v) = (g.rcx as u32, (g.rdx << 32) | (g.rax & 0xffff_ffff));
+                let (n, v) = (g.rcx as u32, (g.rdx << 32) | (g.rax & u32::MAX as u64));
                 if msr::write(vcpu, n, v) {
                     vcpu.skip();
                 } else {
@@ -302,7 +355,7 @@ fn event_loop(
                     if platform.irq_pending() || platform.reset_requested() {
                         break;
                     }
-                    boot::stall(Duration::from_micros(50));
+                    boot::stall(HLT_POLL_INTERVAL);
                 }
             }
             Exit::TripleFault => return Ok(ExitReason::TripleFault),
@@ -327,7 +380,7 @@ fn event_loop(
 
 /// Reports the first few unusual guest actions, so a failing boot says what it tripped on.
 fn note(count: &mut u32, msg: impl FnOnce() -> String) {
-    if *count < 20 {
+    if *count < MAX_NOTES {
         *count += 1;
         console::print(&format!("uemulator: {}\n", msg()));
     }
@@ -344,5 +397,5 @@ fn poll_console(console: &ConsoleHandle) {
 /// The guest only runs between physical interrupts, so the firmware's tick (10 ms by default)
 /// bounds how late its timer interrupts arrive. Ask for 1 ms where the firmware allows it.
 fn speed_up_firmware_timer() {
-    crate::timer::set_period(Duration::from_millis(1));
+    crate::timer::set_period(FIRMWARE_TICK);
 }

@@ -1,4 +1,7 @@
 //! Minimal x86-64 assembler for the JIT backend.
+//!
+//! Only the instruction forms `emit_x64.rs` needs are encoded. Register operands are the
+//! architectural 0..=15 numbers; the low three bits go into ModRM/SIB and bit 3 into a REX prefix.
 
 pub const RAX: u8 = 0;
 pub const RCX: u8 = 1;
@@ -17,11 +20,17 @@ pub const R13: u8 = 13;
 pub const R14: u8 = 14;
 pub const R15: u8 = 15;
 
+/// Integer argument registers in order. Windows x64 and System V differ only here (and in the
+/// shadow space the caller must reserve on Windows, see `emit_x64::FRAME`); the generated code
+/// never passes more than four arguments, so the stack-passed tail never comes up.
 #[cfg(windows)]
 pub const ARGS: [u8; 4] = [RCX, RDX, R8, R9];
 #[cfg(not(windows))]
 pub const ARGS: [u8; 4] = [RDI, RSI, RDX, RCX];
 
+/// Group-1 ALU operation numbers. They are both the ModRM.reg opcode extension of the immediate
+/// forms (`0x81`/`0x83`) and bits 5:3 of the `op r/m, r` opcodes (`0x01`, `0x09`, ...). ADC (2)
+/// and SBB (3) fill the gaps and are not used.
 pub const ADD: u8 = 0;
 pub const OR: u8 = 1;
 pub const AND: u8 = 4;
@@ -29,14 +38,46 @@ pub const SUB: u8 = 5;
 pub const XOR: u8 = 6;
 pub const CMP: u8 = 7;
 
+/// Shift operation numbers: ModRM.reg opcode extension of `0xc1`.
 pub const SHL: u8 = 4;
 pub const SHR: u8 = 5;
 
+/// Condition codes as encoded in `0f 8x` (Jcc rel32). The same numbers are the low nibble of the
+/// guest `70..7f` / `0f 80..8f` opcodes, so the JIT passes guest condition codes straight through.
+pub const E: u8 = 4;
 pub const NE: u8 = 5;
 
+const REX_BASE: u8 = 0x40;
+const REX_W: u8 = 1 << 3;
+const REX_R: u8 = 1 << 2;
+const REX_X: u8 = 1 << 1;
+const REX_B: u8 = 1;
+
+const OPERAND_SIZE_PREFIX: u8 = 0x66;
+
+/// ModRM.mod values.
+const MOD_NO_DISPLACEMENT: u8 = 0;
+const MOD_DISP8: u8 = 1;
+const MOD_DISP32: u8 = 2;
+const MOD_REGISTER: u8 = 3;
+
+/// ModRM.rm (or SIB.base, low three bits) value 4 means "a SIB byte follows", so rsp and r12
+/// as base always need one.
+const RM_NEEDS_SIB: u8 = 4;
+/// With mod=00, base/rm value 5 means disp32 with no base (RIP-relative as rm), so rbp and r13
+/// as base cannot use mod=00 and get a zero disp8 instead.
+const BASE_DISP32_ONLY: u8 = 5;
+/// SIB.index value 4 (without REX.X) means "no index".
+const SIB_NO_INDEX: u8 = 4;
+
+/// Low bits of the `op r/m, r` ALU opcodes: the 64/32-bit "r/m is the destination" form.
+const ALU_RM_REG: u8 = 1;
+
+/// A memory operand `[base + index << scale + disp]`.
 #[derive(Clone, Copy)]
 pub struct Mem {
     base: u8,
+    /// `(register, log2 scale)`.
     index: Option<(u8, u8)>,
     disp: i32,
 }
@@ -49,7 +90,8 @@ pub fn mem(base: u8, disp: i32) -> Mem {
     }
 }
 
-/// `[base + index << scale + disp]`; `index` must not be RSP.
+/// `[base + index << scale + disp]`; `scale` is log2 (0..=3) and `index` must not be RSP, whose
+/// SIB encoding means "no index" (R12 is fine, REX.X distinguishes it).
 pub fn mem_idx(base: u8, index: u8, scale: u8, disp: i32) -> Mem {
     Mem {
         base,
@@ -62,9 +104,13 @@ pub fn mem_idx(base: u8, index: u8, scale: u8, disp: i32) -> Mem {
 pub struct Label(usize);
 
 pub struct Asm {
+    /// Address the finished code will execute at: `jmp_abs` and `here` are relative to it, so it
+    /// must be the final location, not a staging buffer.
     base: u64,
     pub code: Vec<u8>,
+    /// Bound offset into `code` per label.
     labels: Vec<Option<usize>>,
+    /// `(offset of a rel32 field, label)`; resolved by `finish`.
     fixups: Vec<(usize, usize)>,
 }
 
@@ -87,92 +133,135 @@ impl Asm {
         Label(self.labels.len() - 1)
     }
 
-    pub fn bind(&mut self, l: Label) {
-        self.labels[l.0] = Some(self.code.len());
+    pub fn bind(&mut self, label: Label) {
+        self.labels[label.0] = Some(self.code.len());
     }
 
+    /// Patches every label reference. All labels that were jumped to must be bound by now.
     pub fn finish(&mut self) {
-        for &(pos, l) in &self.fixups {
-            let target = self.labels[l].expect("unbound label");
+        for &(pos, label) in &self.fixups {
+            let target = self.labels[label].expect("unbound label");
+            // rel32 is relative to the end of the instruction, and the field is always last.
             let rel = target as i64 - (pos as i64 + 4);
             self.code[pos..pos + 4].copy_from_slice(&(rel as i32).to_le_bytes());
         }
         self.fixups.clear();
     }
 
-    fn rex(&mut self, w: bool, reg: u8, index: u8, base: u8, force: bool) {
-        let r =
-            0x40 | (w as u8) << 3 | (reg >> 3 & 1) << 2 | (index >> 3 & 1) << 1 | (base >> 3 & 1);
-        if r != 0x40 || force {
-            self.code.push(r);
+    /// Emits a REX prefix only when it carries a bit. `force_rex` is for byte operations on a
+    /// register numbered 4..=7: without any REX they address ah/ch/dh/bh instead of spl/bpl/sil/dil.
+    fn rex(&mut self, w: bool, reg: u8, index: u8, base: u8, force_rex: bool) {
+        let mut rex = REX_BASE;
+        if w {
+            rex |= REX_W;
+        }
+        if reg & 8 != 0 {
+            rex |= REX_R;
+        }
+        if index & 8 != 0 {
+            rex |= REX_X;
+        }
+        if base & 8 != 0 {
+            rex |= REX_B;
+        }
+        if rex != REX_BASE || force_rex {
+            self.code.push(rex);
         }
     }
 
     fn modrm_mem(&mut self, reg: u8, m: Mem) {
         let base = m.base & 7;
-        let sib = m.index.is_some() || base == 4;
-        let md = if m.disp == 0 && base != 5 {
-            0
+        let sib = m.index.is_some() || base == RM_NEEDS_SIB;
+        let mode = if m.disp == 0 && base != BASE_DISP32_ONLY {
+            MOD_NO_DISPLACEMENT
         } else if i8::try_from(m.disp).is_ok() {
-            1
+            MOD_DISP8
         } else {
-            2
+            MOD_DISP32
         };
         self.code
-            .push(md << 6 | (reg & 7) << 3 | if sib { 4 } else { base });
+            .push(mode << 6 | (reg & 7) << 3 | if sib { RM_NEEDS_SIB } else { base });
         if sib {
-            let (ix, sc) = m.index.map_or((4, 0), |(i, s)| (i & 7, s));
-            self.code.push(sc << 6 | ix << 3 | base);
+            let (index, scale) = m.index.map_or((SIB_NO_INDEX, 0), |(i, s)| (i & 7, s));
+            self.code.push(scale << 6 | index << 3 | base);
         }
-        match md {
-            1 => self.code.push(m.disp as i8 as u8),
-            2 => self.code.extend_from_slice(&m.disp.to_le_bytes()),
+        match mode {
+            MOD_DISP8 => self.code.push(m.disp as i8 as u8),
+            MOD_DISP32 => self.code.extend_from_slice(&m.disp.to_le_bytes()),
             _ => {}
         }
     }
 
-    fn op_rm(&mut self, pfx: bool, w: bool, force: bool, opc: &[u8], reg: u8, m: Mem) {
-        if pfx {
-            self.code.push(0x66);
+    /// `w` is REX.W (64-bit operand size). `reg` is the ModRM.reg field: a register or an
+    /// opcode extension digit.
+    fn op_rm(
+        &mut self,
+        operand_size_prefix: bool,
+        w: bool,
+        force_rex: bool,
+        opcode: &[u8],
+        reg: u8,
+        m: Mem,
+    ) {
+        if operand_size_prefix {
+            self.code.push(OPERAND_SIZE_PREFIX);
         }
-        self.rex(w, reg, m.index.map_or(0, |i| i.0), m.base, force);
-        self.code.extend_from_slice(opc);
+        self.rex(w, reg, m.index.map_or(0, |i| i.0), m.base, force_rex);
+        self.code.extend_from_slice(opcode);
         self.modrm_mem(reg, m);
     }
 
-    fn op_rr(&mut self, pfx: bool, w: bool, force: bool, opc: &[u8], reg: u8, rm: u8) {
-        if pfx {
-            self.code.push(0x66);
+    fn op_rr(
+        &mut self,
+        operand_size_prefix: bool,
+        w: bool,
+        force_rex: bool,
+        opcode: &[u8],
+        reg: u8,
+        rm: u8,
+    ) {
+        if operand_size_prefix {
+            self.code.push(OPERAND_SIZE_PREFIX);
         }
-        self.rex(w, reg, 0, rm, force);
-        self.code.extend_from_slice(opc);
-        self.code.push(0xc0 | (reg & 7) << 3 | (rm & 7));
+        self.rex(w, reg, 0, rm, force_rex);
+        self.code.extend_from_slice(opcode);
+        self.code
+            .push(MOD_REGISTER << 6 | (reg & 7) << 3 | (rm & 7));
     }
 
+    /// With `w == false` this is a 32-bit move that zero-extends into the upper half, which is
+    /// how the JIT truncates a value to 32 bits (also with `d == s`).
     pub fn mov_rr(&mut self, d: u8, s: u8, w: bool) {
         self.op_rr(false, w, false, &[0x89], s, d);
     }
 
+    /// Picks the shortest encoding. Deliberately a `mov` even for zero (never `xor`): emitted
+    /// blocks load constants while host flags are still live for a following `jcc`.
     pub fn mov_imm(&mut self, r: u8, v: u64) {
         if v <= u32::MAX as u64 {
+            // mov r32, imm32 zero-extends.
             self.rex(false, 0, 0, r, false);
             self.code.push(0xb8 | (r & 7));
             self.code.extend_from_slice(&(v as u32).to_le_bytes());
         } else if i32::try_from(v as i64).is_ok() {
+            // mov r/m64, imm32 sign-extends: covers the negative values 32-bit mov cannot.
             self.op_rr(false, true, false, &[0xc7], 0, r);
             self.code.extend_from_slice(&(v as u32).to_le_bytes());
         } else {
+            // movabs r64, imm64
             self.rex(true, 0, 0, r, false);
             self.code.push(0xb8 | (r & 7));
             self.code.extend_from_slice(&v.to_le_bytes());
         }
     }
 
+    /// 64-bit load.
     pub fn ld(&mut self, d: u8, m: Mem) {
         self.op_rm(false, true, false, &[0x8b], d, m);
     }
 
-    /// Load `size` bytes, zero- or sign-extended to 64 bits.
+    /// Load `size` bytes, zero- or sign-extended to 64 bits. The 32-bit zero-extending form
+    /// relies on the CPU clearing the upper half; `size` outside 1/2/4 means 8.
     pub fn ld_ext(&mut self, d: u8, m: Mem, size: u8, signed: bool) {
         match (size, signed) {
             (1, false) => self.op_rm(false, false, false, &[0x0f, 0xb6], d, m),
@@ -180,11 +269,14 @@ impl Asm {
             (2, false) => self.op_rm(false, false, false, &[0x0f, 0xb7], d, m),
             (2, true) => self.op_rm(false, true, false, &[0x0f, 0xbf], d, m),
             (4, false) => self.op_rm(false, false, false, &[0x8b], d, m),
+            // movsxd
             (4, true) => self.op_rm(false, true, false, &[0x63], d, m),
             _ => self.op_rm(false, true, false, &[0x8b], d, m),
         }
     }
 
+    /// Register-to-register counterpart of `ld_ext`. For `size == 1` the source is a byte
+    /// register, so REX is forced to reach sil/dil.
     pub fn ext_rr(&mut self, d: u8, s: u8, size: u8, signed: bool) {
         match (size, signed) {
             (1, false) => self.op_rr(false, false, true, &[0x0f, 0xb6], d, s),
@@ -197,6 +289,8 @@ impl Asm {
         }
     }
 
+    /// Store the low `size` bytes of `s`; `size` outside 1/2/4 means 8. The byte form forces REX
+    /// so that `s` = rsi/rdi means sil/dil rather than dh/bh.
     pub fn st(&mut self, m: Mem, s: u8, size: u8) {
         match size {
             1 => self.op_rm(false, false, true, &[0x88], s, m),
@@ -211,59 +305,67 @@ impl Asm {
         self.code.extend_from_slice(&v.to_le_bytes());
     }
 
+    /// Does not touch host flags, which is why the block generator computes effective addresses
+    /// with it.
     pub fn lea(&mut self, d: u8, m: Mem) {
         self.op_rm(false, true, false, &[0x8d], d, m);
     }
 
     /// `op d, s` for ADD/OR/AND/SUB/XOR/CMP (the `op r/m, r` forms).
     pub fn alu_rr(&mut self, op: u8, d: u8, s: u8, w: bool) {
-        self.op_rr(false, w, false, &[op << 3 | 1], s, d);
+        self.op_rr(false, w, false, &[op << 3 | ALU_RM_REG], s, d);
     }
 
     pub fn test_rr(&mut self, a: u8, b: u8, w: bool) {
         self.op_rr(false, w, false, &[0x85], b, a);
     }
 
+    /// Uses the sign-extended imm8 form when the value fits. With `w` the imm32 is
+    /// sign-extended to 64 bits.
     pub fn alu_ri(&mut self, op: u8, r: u8, imm: i32, w: bool) {
-        if let Ok(b) = i8::try_from(imm) {
+        if let Ok(imm8) = i8::try_from(imm) {
             self.op_rr(false, w, false, &[0x83], op, r);
-            self.code.push(b as u8);
+            self.code.push(imm8 as u8);
         } else {
             self.op_rr(false, w, false, &[0x81], op, r);
             self.code.extend_from_slice(&imm.to_le_bytes());
         }
     }
 
-    pub fn shift_ri(&mut self, op: u8, r: u8, n: u8, w: bool) {
+    pub fn shift_ri(&mut self, op: u8, r: u8, count: u8, w: bool) {
         self.op_rr(false, w, false, &[0xc1], op, r);
-        self.code.push(n);
+        self.code.push(count);
     }
 
+    /// 64-bit `cmp [m], r`.
     pub fn cmp_mr(&mut self, m: Mem, r: u8) {
         self.op_rm(false, true, false, &[0x39], r, m);
     }
 
     pub fn cmp_m8_imm(&mut self, m: Mem, v: u8) {
-        self.op_rm(false, false, false, &[0x80], 7, m);
+        self.op_rm(false, false, false, &[0x80], CMP, m);
         self.code.push(v);
     }
 
+    /// Byte register `r` is set to the E condition; REX is forced for sil/dil.
     pub fn sete(&mut self, r: u8) {
         self.op_rr(false, false, true, &[0x0f, 0x94], 0, r);
     }
 
-    pub fn jcc(&mut self, cc: u8, l: Label) {
+    /// Always the rel32 form so label distances never need relaxation.
+    pub fn jcc(&mut self, cc: u8, label: Label) {
         self.code.extend_from_slice(&[0x0f, 0x80 | cc]);
-        self.fixups.push((self.code.len(), l.0));
+        self.fixups.push((self.code.len(), label.0));
         self.code.extend_from_slice(&[0; 4]);
     }
 
-    pub fn jmp(&mut self, l: Label) {
+    pub fn jmp(&mut self, label: Label) {
         self.code.push(0xe9);
-        self.fixups.push((self.code.len(), l.0));
+        self.fixups.push((self.code.len(), label.0));
         self.code.extend_from_slice(&[0; 4]);
     }
 
+    /// Jump to an absolute address within rel32 range (the code buffer is far smaller than 2 GiB).
     pub fn jmp_abs(&mut self, target: u64) {
         let rel = target as i64 - (self.here() as i64 + 5);
         self.code.push(0xe9);
@@ -271,6 +373,7 @@ impl Asm {
             .extend_from_slice(&i32::try_from(rel).expect("jump out of range").to_le_bytes());
     }
 
+    /// REX.B (if `r >= 8`) is the only prefix needed: indirect call/jump default to 64-bit.
     pub fn call_reg(&mut self, r: u8) {
         self.op_rr(false, false, false, &[0xff], 2, r);
     }
@@ -479,12 +582,13 @@ mod tests {
 
     #[test]
     fn branches_and_flags() {
+        const COND_L: u8 = 0xc;
         let r = run(
             |a| {
                 let l = a.label();
                 a.alu_rr(CMP, RAX, RCX, true);
                 a.mov_imm(RAX, 1);
-                a.jcc(0xc, l);
+                a.jcc(COND_L, l);
                 a.mov_imm(RAX, 2);
                 a.bind(l);
             },

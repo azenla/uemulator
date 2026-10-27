@@ -11,6 +11,9 @@ use clap::{Args, Parser, Subcommand};
 
 use quick::Distro;
 
+const DEFAULT_DISK_GIB: u64 = 8;
+const EXIT_ERROR: i32 = 1;
+
 #[derive(Parser)]
 #[command(name = "uemulator", about = "Minimal x86_64 system emulator")]
 struct Cli {
@@ -37,8 +40,9 @@ enum Cmd {
         /// Re-download the cached artifacts
         #[arg(long)]
         update: bool,
-        /// Size in GiB of the disk created at ~/.uemulator/quick/<distro>/disk.img
-        #[arg(long, default_value_t = 8, value_name = "GIB")]
+        /// Size in GiB of the sparse disk created at ~/.uemulator/quick/<distro>/disk.img; ignored
+        /// if the file exists or `--disk` is given
+        #[arg(long, default_value_t = DEFAULT_DISK_GIB, value_name = "GIB")]
         disk_size: u64,
         #[command(flatten)]
         machine: MachineArgs,
@@ -54,7 +58,7 @@ pub enum ConsoleArg {
 
 #[derive(Args)]
 pub struct MachineArgs {
-    /// Guest memory in MiB [default: 2048, 3072 for `quick fedora`]
+    /// Guest memory in MiB, 64 to 3072 [default: 2048, 3072 for `quick fedora`]
     #[arg(long, short = 'm')]
     memory: Option<usize>,
     /// Kernel command line
@@ -104,44 +108,46 @@ fn read(path: &PathBuf) -> Result<Vec<u8>, String> {
 
 fn main() {
     let cli = Cli::parse();
-    let res = match cli.cmd {
+    let result = match cli.cmd {
         Cmd::Boot {
             kernel,
             initramfs,
             machine,
-        } => read(&kernel).and_then(|k| {
-            let i = initramfs.as_ref().map(read).transpose()?;
-            run::run(k, i, machine)
+        } => read(&kernel).and_then(|kernel_image| {
+            let initramfs_image = initramfs.as_ref().map(read).transpose()?;
+            run::run(kernel_image, initramfs_image, machine)
         }),
         Cmd::Quick {
             distro,
             update,
             disk_size,
             mut machine,
-        } => quick::ensure(distro, update).and_then(|a| {
-            let k = read(&a.kernel)?;
-            let i = read(&a.initramfs)?;
+        } => quick::ensure(distro, update).and_then(|artifacts| {
+            let kernel_image = read(&artifacts.kernel)?;
+            let initramfs_image = read(&artifacts.initramfs)?;
+            // The installers fetch packages over the network, so default to NAT unless the user
+            // picked another backend.
             if !machine.net_loop && machine.net_udp.is_none() {
                 machine.net_user = true;
             }
-            let extra = distro.cmdline();
-            if !extra.is_empty() {
-                let mut a = extra.to_string();
+            let distro_args = distro.cmdline();
+            if !distro_args.is_empty() {
+                let mut append = distro_args.to_string();
                 if let Some(user) = machine.append.take() {
-                    a = format!("{a} {user}");
+                    append = format!("{append} {user}");
                 }
-                machine.append = Some(a);
+                machine.append = Some(append);
             }
             machine.memory.get_or_insert(distro.default_memory_mib());
             if machine.disk.is_none() {
                 let disk = quick::ensure_disk(distro, disk_size)?;
                 machine.disk = Some(disk.to_string_lossy().into_owned());
             }
-            run::run(k, Some(i), machine)
+            run::run(kernel_image, Some(initramfs_image), machine)
         }),
     };
-    if let Err(e) = res {
+    if let Err(e) = result {
         eprintln!("error: {e}");
-        exit(1);
+        exit(EXIT_ERROR);
     }
 }

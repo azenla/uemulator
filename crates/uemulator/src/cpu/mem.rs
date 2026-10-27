@@ -1,262 +1,346 @@
 use super::decode::{self, DecodeErr, Insn};
-use super::exc::Exc;
+use super::exception::{Exception, VECTOR_PAGE_FAULT};
 use super::flags::*;
 use super::*;
 use crate::dev::guestmem::GuestMem;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Acc {
+pub(crate) enum AccessKind {
     Read,
     Write,
     Exec,
 }
 
-const PTE_P: u64 = 1;
-const PTE_W: u64 = 2;
-const PTE_U: u64 = 4;
-const PTE_A: u64 = 0x20;
-const PTE_D: u64 = 0x40;
-const PTE_PS: u64 = 0x80;
-const PTE_NX: u64 = 1 << 63;
-const PTE_RSVD: u64 = 0x000f_ff00_0000_0000;
+const PTE_PRESENT: u64 = 1 << 0;
+const PTE_WRITABLE: u64 = 1 << 1;
+const PTE_USER: u64 = 1 << 2;
+const PTE_ACCESSED: u64 = 1 << 5;
+const PTE_DIRTY: u64 = 1 << 6;
+/// Makes a PDPT entry a 1 GiB leaf or a PD entry a 2 MiB leaf.
+const PTE_PAGE_SIZE: u64 = 1 << 7;
+const PTE_NO_EXECUTE: u64 = 1 << 63;
+/// Physical address bits 40-51, reserved because CPUID 0x80000008 advertises 40 address bits.
+const PTE_RESERVED_MASK: u64 = 0x000f_ff00_0000_0000;
+const PTE_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+const PTE_BYTES: u64 = 8;
+const LEVEL_INDEX_BITS: u32 = 9;
+const LEVEL_INDEX_MASK: u64 = (1 << LEVEL_INDEX_BITS) - 1;
+/// The PML4 is level 3 and the PT is level 0; only 4-level long-mode paging is walked.
+const TOP_LEVEL: u32 = 3;
+/// Bit 47 and everything above must be equal (48-bit linear addresses, no LA57).
+const CANONICAL_SIGN_BIT: u32 = 47;
+const MAX_INSN_LEN: usize = 15;
+
+/// Bits of the #PF error code.
+const PF_PRESENT: u32 = 1 << 0;
+const PF_WRITE: u32 = 1 << 1;
+const PF_USER: u32 = 1 << 2;
+const PF_RESERVED: u32 = 1 << 3;
+const PF_INSTRUCTION_FETCH: u32 = 1 << 4;
+
+/// `log_once` key bases for unmapped physical accesses; the page number is added to them.
+const LOG_KEY_UNMAPPED_READ: u64 = 0x1000;
+const LOG_KEY_UNMAPPED_WRITE: u64 = 0x2000;
+
+/// Slot of `linear` in `Cpu::tlb`: direct-mapped by page number, in the user half if `user`.
+/// The JIT's inline probe computes the same index.
+#[inline]
+fn tlb_slot(linear: u64, user: bool) -> usize {
+    ((user as usize) << TLB_INDEX_BITS)
+        | ((linear >> PAGE_SHIFT) as usize & (TLB_ENTRIES_PER_MODE - 1))
+}
 
 impl Cpu {
+    /// EFLAGS with the deferred arithmetic flags resolved.
     pub fn eflags_full(&self) -> u64 {
         let arith = flags::compute(
-            self.cc,
-            self.cc_size,
-            self.cc_dst,
-            self.cc_src,
-            self.cc_src2,
+            self.lazy_op,
+            self.lazy_size,
+            self.lazy_dst,
+            self.lazy_src,
+            self.lazy_src2,
             self.eflags,
         );
-        (self.eflags & !ARITH) | arith | 2
+        (self.eflags & !ARITH) | arith | RESERVED_ONE
     }
 
-    pub fn set_arith_flags_from_cc(&mut self) {
+    /// Resolves the deferred flags into `eflags`. Needed before anything edits or snapshots
+    /// non-arithmetic bits, since those writes would otherwise be mixed with stale lazy state.
+    pub fn materialize_lazy_flags(&mut self) {
         self.eflags = self.eflags_full();
-        self.cc = Cc::Eflags;
+        self.lazy_op = LazyFlagsOp::Eflags;
     }
 
+    /// Sets the `ARITH` flags eagerly from `arith`, dropping any deferred state.
     pub fn set_eflags_arith(&mut self, arith: u64) {
-        self.eflags = (self.eflags & !ARITH) | (arith & ARITH) | 2;
-        self.cc = Cc::Eflags;
+        self.eflags = (self.eflags & !ARITH) | (arith & ARITH) | RESERVED_ONE;
+        self.lazy_op = LazyFlagsOp::Eflags;
     }
 
-    pub fn set_cc(&mut self, cc: Cc, size: u8, dst: u64, src: u64, src2: u64) {
-        self.cc = cc;
-        self.cc_size = size;
-        self.cc_dst = dst;
-        self.cc_src = src;
-        self.cc_src2 = src2;
+    pub fn set_lazy_flags(&mut self, op: LazyFlagsOp, size: u8, dst: u64, src: u64, src2: u64) {
+        self.lazy_op = op;
+        self.lazy_size = size;
+        self.lazy_dst = dst;
+        self.lazy_src = src;
+        self.lazy_src2 = src2;
     }
 
     pub fn cf(&self) -> bool {
         self.eflags_full() & CF != 0
     }
 
-    pub fn page_fault(&mut self, la: u64, acc: Acc, user: bool, present: bool, rsvd: bool) -> Exc {
-        self.cr2 = la;
-        let mut e = 0u32;
+    /// Builds the #PF exception and sets CR2 right here, when the fault is raised, rather than
+    /// at delivery.
+    pub fn page_fault(
+        &mut self,
+        linear: u64,
+        access: AccessKind,
+        user: bool,
+        present: bool,
+        reserved_bit_violation: bool,
+    ) -> Exception {
+        self.cr2 = linear;
+        let mut error_code = 0u32;
         if present {
-            e |= 1;
+            error_code |= PF_PRESENT;
         }
-        if acc == Acc::Write {
-            e |= 2;
+        if access == AccessKind::Write {
+            error_code |= PF_WRITE;
         }
         if user {
-            e |= 4;
+            error_code |= PF_USER;
         }
-        if rsvd {
-            e |= 8;
+        if reserved_bit_violation {
+            error_code |= PF_RESERVED;
         }
-        if acc == Acc::Exec && self.efer & (1 << 11) != 0 {
-            e |= 16;
+        // The fetch bit is only reported when NX is enabled (SMEP is not advertised).
+        if access == AccessKind::Exec && self.efer & EFER_NXE != 0 {
+            error_code |= PF_INSTRUCTION_FETCH;
         }
-        Exc::fault(14, Some(e))
+        Exception::fault(VECTOR_PAGE_FAULT, Some(error_code))
     }
 
-    fn rd64_phys(&self, pa: u64) -> Option<u64> {
-        let a = pa as usize;
+    fn read_ram_u64(&self, pa: u64) -> Option<u64> {
+        let start = pa as usize;
         self.ram
-            .get(a..a + 8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .get(start..start + PTE_BYTES as usize)
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    fn walk(&mut self, la: u64, acc: Acc, user: bool) -> R<(u64, u8)> {
-        let write = acc == Acc::Write;
-        let nxe = self.efer & (1 << 11) != 0;
-        let mut table = self.cr3 & 0x000f_ffff_ffff_f000;
-        let mut rw = true;
-        let mut us = true;
-        let mut nx = false;
-        let mut level = 3i32;
+    /// 4-level page walk. Returns the physical address of the 4 KiB page containing `linear`
+    /// (inside a 2 MiB/1 GiB leaf too) and the `TLB_FLAG_*` permissions, or the #PF. Page
+    /// tables are read straight from RAM, never through the TLB; a table outside RAM counts
+    /// as not present. Sets Accessed on every level touched, and Dirty on a write, but only
+    /// after the permission check passed.
+    fn walk(&mut self, linear: u64, access: AccessKind, user: bool) -> ExecResult<(u64, u8)> {
+        let write = access == AccessKind::Write;
+        let nxe = self.efer & EFER_NXE != 0;
+        let mut table = self.cr3 & PTE_ADDRESS_MASK;
+        // Effective permissions are the AND (user, write) or OR (no-execute) over all levels.
+        let mut writable = true;
+        let mut user_allowed = true;
+        let mut no_execute = false;
+        let mut level = TOP_LEVEL;
         loop {
-            let idx = (la >> (12 + 9 * level)) & 0x1ff;
-            let pa = table + idx * 8;
-            let Some(mut e) = self.rd64_phys(pa) else {
-                return Err(self.page_fault(la, acc, user, false, false));
+            let index = (linear >> (PAGE_SHIFT + LEVEL_INDEX_BITS * level)) & LEVEL_INDEX_MASK;
+            let pte_address = table + index * PTE_BYTES;
+            let Some(mut pte) = self.read_ram_u64(pte_address) else {
+                return Err(self.page_fault(linear, access, user, false, false));
             };
-            if e & PTE_P == 0 {
-                return Err(self.page_fault(la, acc, user, false, false));
+            if pte & PTE_PRESENT == 0 {
+                return Err(self.page_fault(linear, access, user, false, false));
             }
-            if e & PTE_RSVD != 0 || (!nxe && e & PTE_NX != 0) {
-                return Err(self.page_fault(la, acc, user, true, true));
+            if pte & PTE_RESERVED_MASK != 0 || (!nxe && pte & PTE_NO_EXECUTE != 0) {
+                return Err(self.page_fault(linear, access, user, true, true));
             }
-            let leaf = level == 0 || (e & PTE_PS != 0 && level <= 2);
-            rw &= e & PTE_W != 0;
-            us &= e & PTE_U != 0;
-            nx |= e & PTE_NX != 0;
+            let leaf = level == 0 || (pte & PTE_PAGE_SIZE != 0 && level <= 2);
+            writable &= pte & PTE_WRITABLE != 0;
+            user_allowed &= pte & PTE_USER != 0;
+            no_execute |= pte & PTE_NO_EXECUTE != 0;
             if leaf {
-                let wp = self.cr0 & (1 << 16) != 0;
-                let denied = (user && !us)
-                    || (write && !rw && (user || wp))
-                    || (acc == Acc::Exec && nx && nxe);
+                let write_protect = self.cr0 & CR0_WP != 0;
+                // Supervisor writes to read-only pages only fault when CR0.WP is set.
+                let denied = (user && !user_allowed)
+                    || (write && !writable && (user || write_protect))
+                    || (access == AccessKind::Exec && no_execute && nxe);
                 if denied {
-                    return Err(self.page_fault(la, acc, user, true, false));
+                    return Err(self.page_fault(linear, access, user, true, false));
                 }
-                let mut upd = e | PTE_A;
+                let mut updated = pte | PTE_ACCESSED;
                 if write {
-                    upd |= PTE_D;
+                    updated |= PTE_DIRTY;
                 }
-                if upd != e {
-                    e = upd;
-                    self.ram[pa as usize..pa as usize + 8].copy_from_slice(&e.to_le_bytes());
+                if updated != pte {
+                    pte = updated;
+                    self.ram[pte_address as usize..][..PTE_BYTES as usize]
+                        .copy_from_slice(&pte.to_le_bytes());
                 }
-                let size_bits = 12 + 9 * level as u32;
-                let base = e & 0x000f_ffff_ffff_f000 & !((1u64 << size_bits) - 1);
-                let pa_page = base | (la & ((1u64 << size_bits) - 1) & !0xfff);
-                let mut f = 0;
-                if rw {
-                    f |= TLB_W;
+                let leaf_shift = PAGE_SHIFT + LEVEL_INDEX_BITS * level;
+                let leaf_offset_mask = (1u64 << leaf_shift) - 1;
+                let leaf_base = pte & PTE_ADDRESS_MASK & !leaf_offset_mask;
+                let page_pa = leaf_base | (linear & leaf_offset_mask & !PAGE_OFFSET_MASK);
+                let mut tlb_flags = 0;
+                if writable {
+                    tlb_flags |= TLB_FLAG_WRITABLE;
                 }
-                if us {
-                    f |= TLB_U;
+                if user_allowed {
+                    tlb_flags |= TLB_FLAG_USER;
                 }
-                if nx && nxe {
-                    f |= TLB_NX;
+                if no_execute && nxe {
+                    tlb_flags |= TLB_FLAG_NO_EXECUTE;
                 }
-                if e & PTE_D != 0 {
-                    f |= TLB_D;
+                if pte & PTE_DIRTY != 0 {
+                    tlb_flags |= TLB_FLAG_DIRTY;
                 }
-                return Ok((pa_page, f));
+                return Ok((page_pa, tlb_flags));
             }
-            if e & PTE_A == 0 {
-                e |= PTE_A;
-                self.ram[pa as usize..pa as usize + 8].copy_from_slice(&e.to_le_bytes());
+            if pte & PTE_ACCESSED == 0 {
+                pte |= PTE_ACCESSED;
+                self.ram[pte_address as usize..][..PTE_BYTES as usize]
+                    .copy_from_slice(&pte.to_le_bytes());
             }
-            table = e & 0x000f_ffff_ffff_f000;
+            table = pte & PTE_ADDRESS_MASK;
             level -= 1;
         }
     }
 
-    pub fn translate(&mut self, la: u64, acc: Acc, sys: bool) -> R<u64> {
-        if (la as i64) >> 47 != 0 && (la as i64) >> 47 != -1 {
-            return Err(Exc::gp(0));
+    /// Linear to physical address for one access, refilling the TLB on a miss.
+    ///
+    /// `supervisor` marks implicit accesses by the CPU itself (descriptor tables, TSS,
+    /// interrupt delivery): they ignore CPL and use the supervisor TLB half even at CPL 3.
+    /// Only the 48-bit canonical check is done, and it raises #GP(0) even for stack accesses
+    /// where hardware raises #SS.
+    pub fn translate(
+        &mut self,
+        linear: u64,
+        access: AccessKind,
+        supervisor: bool,
+    ) -> ExecResult<u64> {
+        let sign_extension = (linear as i64) >> CANONICAL_SIGN_BIT;
+        if sign_extension != 0 && sign_extension != -1 {
+            return Err(Exception::general_protection(0));
         }
-        let user = self.cpl == 3 && !sys;
-        let page = la & !0xfff;
-        let slot = ((user as usize) << TLB_BITS) | ((la >> 12) as usize & (TLB_N - 1));
-        let e = self.tlb[slot];
-        let tag = match acc {
-            Acc::Read => e.tag_r,
-            Acc::Write => e.tag_w,
-            Acc::Exec => e.tag_x,
+        let user = self.cpl == USER_CPL && !supervisor;
+        let page = linear & !PAGE_OFFSET_MASK;
+        let slot = tlb_slot(linear, user);
+        let entry = self.tlb[slot];
+        let tag = match access {
+            AccessKind::Read => entry.tag_r,
+            AccessKind::Write => entry.tag_w,
+            AccessKind::Exec => entry.tag_x,
         };
         if tag == page {
-            return Ok(la.wrapping_add(e.addend).wrapping_sub(self.ram_base));
+            return Ok(linear
+                .wrapping_add(entry.addend)
+                .wrapping_sub(self.ram_base));
         }
-        let (pbase, flags) = self.walk(la, acc, user)?;
-        if pbase < self.ram.len() as u64 {
-            let wp = self.cr0 & (1 << 16) != 0;
-            let mut ent = if e.tag_r == page || e.tag_w == page || e.tag_x == page {
-                e
+        let (page_pa, walk_flags) = self.walk(linear, access, user)?;
+        // Only RAM-backed pages are cached; MMIO has no host pointer to put in `addend`.
+        if page_pa < self.ram.len() as u64 {
+            let write_protect = self.cr0 & CR0_WP != 0;
+            // Keep the other tags if the slot already maps this page, so a read refill does not
+            // drop the page's exec tag and vice versa.
+            let mut refilled = if entry.tag_r == page || entry.tag_w == page || entry.tag_x == page
+            {
+                entry
             } else {
                 TLB_EMPTY
             };
-            ent.addend = (self.ram_base + pbase).wrapping_sub(page);
-            if !user || flags & TLB_U != 0 {
-                ent.tag_r = page;
-                if flags & TLB_NX == 0 {
-                    ent.tag_x = page;
+            refilled.addend = (self.ram_base + page_pa).wrapping_sub(page);
+            if !user || walk_flags & TLB_FLAG_USER != 0 {
+                refilled.tag_r = page;
+                if walk_flags & TLB_FLAG_NO_EXECUTE == 0 {
+                    refilled.tag_x = page;
                 }
             }
-            let w_ok = flags & TLB_D != 0
+            // The write tag is withheld unless the store can skip both the walk (that sets
+            // Dirty) and the code-page check, so the first store to such a page goes slow.
+            let write_permitted = walk_flags & TLB_FLAG_DIRTY != 0
                 && if user {
-                    flags & (TLB_U | TLB_W) == (TLB_U | TLB_W)
+                    walk_flags & (TLB_FLAG_USER | TLB_FLAG_WRITABLE)
+                        == (TLB_FLAG_USER | TLB_FLAG_WRITABLE)
                 } else {
-                    flags & TLB_W != 0 || !wp
+                    walk_flags & TLB_FLAG_WRITABLE != 0 || !write_protect
                 };
-            if w_ok && self.code_page[(pbase >> 12) as usize] == 0 {
-                ent.tag_w = page;
+            if write_permitted && self.page_has_code[(page_pa >> PAGE_SHIFT) as usize] == 0 {
+                refilled.tag_w = page;
             }
-            self.tlb[slot] = ent;
+            self.tlb[slot] = refilled;
         }
-        Ok(pbase | (la & 0xfff))
+        Ok(page_pa | (linear & PAGE_OFFSET_MASK))
     }
 
     pub fn flush_tlb(&mut self) {
-        for e in self.tlb.iter_mut() {
-            *e = TLB_EMPTY;
+        for entry in self.tlb.iter_mut() {
+            *entry = TLB_EMPTY;
         }
     }
 
-    pub fn invlpg(&mut self, la: u64) {
-        let i = (la >> 12) as usize & (TLB_N - 1);
-        self.tlb[i] = TLB_EMPTY;
-        self.tlb[TLB_N + i] = TLB_EMPTY;
+    /// Empties the page's slot in both halves; whatever other page shares the slot goes too.
+    pub fn invlpg(&mut self, linear: u64) {
+        let slot = tlb_slot(linear, false);
+        self.tlb[slot] = TLB_EMPTY;
+        self.tlb[TLB_ENTRIES_PER_MODE + slot] = TLB_EMPTY;
     }
 
+    /// Reads `size` bytes (at most 8, all inside one page) at a physical address: RAM, else
+    /// MMIO, else all ones for unmapped space.
     fn phys_read(&mut self, pa: u64, size: u8) -> u64 {
-        let a = pa as usize;
-        let n = size as usize;
-        if let Some(b) = self.ram.get(a..a + n) {
-            let mut v = [0u8; 8];
-            v[..n].copy_from_slice(b);
-            u64::from_le_bytes(v)
-        } else if let Some(v) = self.dev.mmio_read(pa, size) {
-            v
+        let start = pa as usize;
+        let len = size as usize;
+        if let Some(src) = self.ram.get(start..start + len) {
+            let mut bytes = [0u8; 8];
+            bytes[..len].copy_from_slice(src);
+            u64::from_le_bytes(bytes)
+        } else if let Some(value) = self.dev.mmio_read(pa, size) {
+            value
         } else {
-            self.log_once(0x1000 + (pa >> 12), || {
+            self.log_once(LOG_KEY_UNMAPPED_READ + (pa >> PAGE_SHIFT), || {
                 format!("read of unmapped physical address {pa:#x}")
             });
             u64::MAX >> (64 - 8 * size as u32)
         }
     }
 
+    /// Counterpart of `phys_read`; writes to unmapped space are dropped.
     fn phys_write(&mut self, pa: u64, size: u8, val: u64) {
-        let a = pa as usize;
-        let n = size as usize;
-        if a + n <= self.ram.len() {
-            if self.code_page[a >> 12] != 0 {
-                self.code_written(a >> 12);
+        let start = pa as usize;
+        let len = size as usize;
+        if start + len <= self.ram.len() {
+            if self.page_has_code[start >> PAGE_SHIFT] != 0 {
+                self.code_written(start >> PAGE_SHIFT);
             }
-            self.ram[a..a + n].copy_from_slice(&val.to_le_bytes()[..n]);
+            self.ram[start..start + len].copy_from_slice(&val.to_le_bytes()[..len]);
         } else {
-            let hits = {
-                let mut mem = GuestMem::new(&mut self.ram, &self.code_page);
+            let written_code_pages = {
+                let mut mem = GuestMem::new(&mut self.ram, &self.page_has_code);
                 if self.dev.mmio_write(pa, size, val, &mut mem) {
-                    mem.hits
+                    mem.code_pages_written
                 } else {
-                    self.log_once(0x2000 + (pa >> 12), || {
+                    self.log_once(LOG_KEY_UNMAPPED_WRITE + (pa >> PAGE_SHIFT), || {
                         format!("write to unmapped physical address {pa:#x}")
                     });
                     Vec::new()
                 }
             };
-            for p in hits {
-                self.code_written(p);
+            for page in written_code_pages {
+                self.code_written(page);
             }
         }
     }
 
+    /// A store or device DMA hit a page that translated code came from.
+    ///
+    /// With the JIT only that page's blocks are dropped; `block_exit_requested` makes the
+    /// block that is currently running stop after this store instead of executing bytes it
+    /// may just have overwritten. Without it the whole decode cache is flushed.
     pub fn code_written(&mut self, ppn: usize) {
-        if let Some(mut j) = self.jit.take() {
-            j.invalidate_page(ppn as u64);
-            self.jit = Some(j);
-            self.code_page[ppn] = 0;
-            self.dc_gen = self.dc_gen.wrapping_add(1);
-            self.exit_block = true;
+        if let Some(mut jit) = self.jit.take() {
+            jit.invalidate_page(ppn as u64);
+            self.jit = Some(jit);
+            self.page_has_code[ppn] = 0;
+            self.decode_cache_generation = self.decode_cache_generation.wrapping_add(1);
+            self.block_exit_requested = true;
         } else {
             self.flush_decode();
         }
@@ -264,156 +348,192 @@ impl Cpu {
 
     pub fn flush_decode(&mut self) {
         self.flushes += 1;
-        self.dc_gen = self.dc_gen.wrapping_add(1);
-        for p in self.code_list.drain(..) {
-            self.code_page[p as usize] = 0;
+        self.decode_cache_generation = self.decode_cache_generation.wrapping_add(1);
+        for page in self.pages_with_code.drain(..) {
+            self.page_has_code[page as usize] = 0;
         }
     }
 
+    /// Flags the physical page as holding translated code and revokes write tags pointing at
+    /// it, so the next store to it goes through `phys_write` and `code_written`.
     pub fn mark_code(&mut self, pa: u64) {
-        let p = (pa >> 12) as usize;
-        if p < self.code_page.len() && self.code_page[p] == 0 {
-            self.code_page[p] = 1;
-            self.code_list.push(p as u32);
-            let base = self.ram_base;
-            for e in self.tlb.iter_mut() {
-                if e.tag_w != TLB_INV
-                    && (e.tag_w.wrapping_add(e.addend).wrapping_sub(base) >> 12) as usize == p
+        let page = (pa >> PAGE_SHIFT) as usize;
+        if page < self.page_has_code.len() && self.page_has_code[page] == 0 {
+            self.page_has_code[page] = 1;
+            self.pages_with_code.push(page as u32);
+            let ram_base = self.ram_base;
+            for entry in self.tlb.iter_mut() {
+                // tag + addend is the page's host address, minus ram_base its physical address.
+                if entry.tag_w != TLB_TAG_INVALID
+                    && (entry
+                        .tag_w
+                        .wrapping_add(entry.addend)
+                        .wrapping_sub(ram_base)
+                        >> PAGE_SHIFT) as usize
+                        == page
                 {
-                    e.tag_w = TLB_INV;
+                    entry.tag_w = TLB_TAG_INVALID;
                 }
             }
         }
     }
 
-    fn mem_read(&mut self, la: u64, size: u8, sys: bool) -> R<u64> {
-        let user = self.cpl == 3 && !sys;
-        let e = &self.tlb[((user as usize) << TLB_BITS) | ((la >> 12) as usize & (TLB_N - 1))];
-        if e.tag_r == la & !0xfff && (la & 0xfff) + size as u64 <= 4096 {
-            let p = la.wrapping_add(e.addend);
+    /// Guest load of `size` bytes (1, 2, 4 or 8). The fast path needs the whole access inside
+    /// the page the tag covers: the tag only describes one page, and the next page may map
+    /// anywhere, so a straddling access translates and reads each page separately.
+    fn mem_read(&mut self, linear: u64, size: u8, supervisor: bool) -> ExecResult<u64> {
+        let user = self.cpl == USER_CPL && !supervisor;
+        let entry = &self.tlb[tlb_slot(linear, user)];
+        if entry.tag_r == linear & !PAGE_OFFSET_MASK
+            && (linear & PAGE_OFFSET_MASK) + size as u64 <= PAGE_SIZE
+        {
+            let host = linear.wrapping_add(entry.addend);
             unsafe {
                 return Ok(match size {
-                    1 => *(p as *const u8) as u64,
-                    2 => (p as *const u16).read_unaligned() as u64,
-                    4 => (p as *const u32).read_unaligned() as u64,
-                    _ => (p as *const u64).read_unaligned(),
+                    1 => *(host as *const u8) as u64,
+                    2 => (host as *const u16).read_unaligned() as u64,
+                    4 => (host as *const u32).read_unaligned() as u64,
+                    _ => (host as *const u64).read_unaligned(),
                 });
             }
         }
-        let off = (la & 0xfff) as usize;
-        if off + size as usize <= 4096 {
-            let pa = self.translate(la, Acc::Read, sys)?;
+        let offset = (linear & PAGE_OFFSET_MASK) as usize;
+        if offset + size as usize <= PAGE_SIZE as usize {
+            let pa = self.translate(linear, AccessKind::Read, supervisor)?;
             return Ok(self.phys_read(pa, size));
         }
-        let first = 4096 - off;
-        let pa1 = self.translate(la, Acc::Read, sys)?;
-        let pa2 = self.translate((la & !0xfff).wrapping_add(4096), Acc::Read, sys)?;
-        let lo = self.phys_read(pa1, first as u8);
-        let hi = self.phys_read(pa2, size - first as u8);
-        Ok(lo | (hi << (8 * first)))
+        let first_len = PAGE_SIZE as usize - offset;
+        let first_pa = self.translate(linear, AccessKind::Read, supervisor)?;
+        let second_pa = self.translate(
+            (linear & !PAGE_OFFSET_MASK).wrapping_add(PAGE_SIZE),
+            AccessKind::Read,
+            supervisor,
+        )?;
+        let low = self.phys_read(first_pa, first_len as u8);
+        let high = self.phys_read(second_pa, size - first_len as u8);
+        Ok(low | (high << (8 * first_len)))
     }
 
-    fn mem_write(&mut self, la: u64, size: u8, val: u64, sys: bool) -> R<()> {
-        let user = self.cpl == 3 && !sys;
-        let e = &self.tlb[((user as usize) << TLB_BITS) | ((la >> 12) as usize & (TLB_N - 1))];
-        if e.tag_w == la & !0xfff && (la & 0xfff) + size as u64 <= 4096 {
-            let p = la.wrapping_add(e.addend);
+    /// Store counterpart of `mem_read`. A straddling store translates both pages before
+    /// writing either, so a fault on the second page leaves memory untouched.
+    fn mem_write(&mut self, linear: u64, size: u8, val: u64, supervisor: bool) -> ExecResult<()> {
+        let user = self.cpl == USER_CPL && !supervisor;
+        let entry = &self.tlb[tlb_slot(linear, user)];
+        if entry.tag_w == linear & !PAGE_OFFSET_MASK
+            && (linear & PAGE_OFFSET_MASK) + size as u64 <= PAGE_SIZE
+        {
+            let host = linear.wrapping_add(entry.addend);
             unsafe {
                 match size {
-                    1 => *(p as *mut u8) = val as u8,
-                    2 => (p as *mut u16).write_unaligned(val as u16),
-                    4 => (p as *mut u32).write_unaligned(val as u32),
-                    _ => (p as *mut u64).write_unaligned(val),
+                    1 => *(host as *mut u8) = val as u8,
+                    2 => (host as *mut u16).write_unaligned(val as u16),
+                    4 => (host as *mut u32).write_unaligned(val as u32),
+                    _ => (host as *mut u64).write_unaligned(val),
                 }
             }
             return Ok(());
         }
-        let off = (la & 0xfff) as usize;
-        if off + size as usize <= 4096 {
-            let pa = self.translate(la, Acc::Write, sys)?;
+        let offset = (linear & PAGE_OFFSET_MASK) as usize;
+        if offset + size as usize <= PAGE_SIZE as usize {
+            let pa = self.translate(linear, AccessKind::Write, supervisor)?;
             self.phys_write(pa, size, val);
             return Ok(());
         }
-        let first = 4096 - off;
-        let pa1 = self.translate(la, Acc::Write, sys)?;
-        let pa2 = self.translate((la & !0xfff).wrapping_add(4096), Acc::Write, sys)?;
-        self.phys_write(pa1, first as u8, val);
-        self.phys_write(pa2, size - first as u8, val >> (8 * first));
+        let first_len = PAGE_SIZE as usize - offset;
+        let first_pa = self.translate(linear, AccessKind::Write, supervisor)?;
+        let second_pa = self.translate(
+            (linear & !PAGE_OFFSET_MASK).wrapping_add(PAGE_SIZE),
+            AccessKind::Write,
+            supervisor,
+        )?;
+        self.phys_write(first_pa, first_len as u8, val);
+        self.phys_write(second_pa, size - first_len as u8, val >> (8 * first_len));
         Ok(())
     }
 
-    pub fn read(&mut self, la: u64, size: u8) -> R<u64> {
-        self.mem_read(la, size, false)
+    pub fn read(&mut self, linear: u64, size: u8) -> ExecResult<u64> {
+        self.mem_read(linear, size, false)
     }
 
-    pub fn write(&mut self, la: u64, size: u8, val: u64) -> R<()> {
-        self.mem_write(la, size, val, false)
+    pub fn write(&mut self, linear: u64, size: u8, val: u64) -> ExecResult<()> {
+        self.mem_write(linear, size, val, false)
     }
 
-    pub fn read_sys(&mut self, la: u64, size: u8) -> R<u64> {
-        self.mem_read(la, size, true)
+    /// Access by the CPU itself (see `translate`), independent of CPL.
+    pub fn read_sys(&mut self, linear: u64, size: u8) -> ExecResult<u64> {
+        self.mem_read(linear, size, true)
     }
 
-    pub fn write_sys(&mut self, la: u64, size: u8, val: u64) -> R<()> {
-        self.mem_write(la, size, val, true)
+    pub fn write_sys(&mut self, linear: u64, size: u8, val: u64) -> ExecResult<()> {
+        self.mem_write(linear, size, val, true)
     }
 
-    pub fn read128(&mut self, la: u64) -> R<u128> {
-        let lo = self.read(la, 8)?;
-        let hi = self.read(la.wrapping_add(8), 8)?;
-        Ok(lo as u128 | ((hi as u128) << 64))
+    pub fn read128(&mut self, linear: u64) -> ExecResult<u128> {
+        let low = self.read(linear, 8)?;
+        let high = self.read(linear.wrapping_add(8), 8)?;
+        Ok(low as u128 | ((high as u128) << 64))
     }
 
-    pub fn write128(&mut self, la: u64, v: u128) -> R<()> {
-        self.translate(la, Acc::Write, false)?;
-        self.translate(la.wrapping_add(15), Acc::Write, false)?;
-        self.write(la, 8, v as u64)?;
-        self.write(la.wrapping_add(8), 8, (v >> 64) as u64)
+    pub fn write128(&mut self, linear: u64, v: u128) -> ExecResult<()> {
+        // Probe both ends first: the stores below must not start if the second half faults.
+        self.translate(linear, AccessKind::Write, false)?;
+        self.translate(linear.wrapping_add(15), AccessKind::Write, false)?;
+        self.write(linear, 8, v as u64)?;
+        self.write(linear.wrapping_add(8), 8, (v >> 64) as u64)
     }
 
-    pub fn fetch_decode(&mut self) -> R<Insn> {
+    /// Decodes the instruction at `rip`, through the decode cache. Marks the page(s) it was
+    /// read from as holding code so later stores invalidate the cache.
+    pub fn fetch_decode(&mut self) -> ExecResult<Insn> {
         let rip = self.rip;
-        let pa = self.translate(rip, Acc::Exec, false)?;
-        let h = (pa ^ (pa >> 16)) as usize & (DC_SIZE - 1);
-        let e = &self.dcache[h];
-        if e.gpa == pa && e.gen_ == self.dc_gen {
-            return Ok(e.insn);
+        let pa = self.translate(rip, AccessKind::Exec, false)?;
+        let slot = (pa ^ (pa >> 16)) as usize & (DECODE_CACHE_ENTRIES - 1);
+        let cached = &self.decode_cache[slot];
+        if cached.gpa == pa && cached.generation == self.decode_cache_generation {
+            return Ok(cached.insn);
         }
-        let page_left = 4096 - (pa & 0xfff) as usize;
-        let n = page_left.min(15);
-        let a = pa as usize;
-        let mut buf = [0u8; 16];
-        let Some(src) = self.ram.get(a..a + n) else {
-            return Err(self.page_fault(rip, Acc::Exec, self.cpl == 3, false, false));
+        let bytes_left_in_page = PAGE_SIZE as usize - (pa & PAGE_OFFSET_MASK) as usize;
+        let len = bytes_left_in_page.min(MAX_INSN_LEN);
+        let start = pa as usize;
+        let mut buf = [0u8; MAX_INSN_LEN];
+        // Executing from MMIO or unmapped space is reported as a not-present fetch fault.
+        let Some(src) = self.ram.get(start..start + len) else {
+            return Err(self.page_fault(rip, AccessKind::Exec, self.cpl == USER_CPL, false, false));
         };
-        buf[..n].copy_from_slice(src);
-        match decode::decode(&buf[..n]) {
-            Ok(i) => {
-                self.dcache[h] = DEntry {
+        buf[..len].copy_from_slice(src);
+        match decode::decode(&buf[..len]) {
+            Ok(insn) => {
+                self.decode_cache[slot] = DecodeCacheEntry {
                     gpa: pa,
-                    gen_: self.dc_gen,
-                    insn: i,
+                    generation: self.decode_cache_generation,
+                    insn,
                 };
                 self.mark_code(pa);
-                Ok(i)
+                Ok(insn)
             }
-            Err(DecodeErr::Invalid) => Err(Exc::ud()),
-            Err(DecodeErr::Truncated) if n == 15 => Err(Exc::ud()),
+            Err(DecodeErr::Invalid) => Err(Exception::invalid_opcode()),
+            Err(DecodeErr::Truncated) if len == MAX_INSN_LEN => Err(Exception::invalid_opcode()),
+            // The instruction runs into the next page. It is not cached, because its validity
+            // depends on two pages; both get marked as code instead.
             Err(DecodeErr::Truncated) => {
-                let pa2 = self.translate((rip & !0xfff).wrapping_add(4096), Acc::Exec, false)?;
-                let m = 15 - n;
-                let b = pa2 as usize;
-                let Some(src2) = self.ram.get(b..b + m) else {
-                    return Err(Exc::ud());
+                let next_page_pa = self.translate(
+                    (rip & !PAGE_OFFSET_MASK).wrapping_add(PAGE_SIZE),
+                    AccessKind::Exec,
+                    false,
+                )?;
+                let missing = MAX_INSN_LEN - len;
+                let next_start = next_page_pa as usize;
+                let Some(next_src) = self.ram.get(next_start..next_start + missing) else {
+                    return Err(Exception::invalid_opcode());
                 };
-                buf[n..15].copy_from_slice(src2);
-                match decode::decode(&buf[..15]) {
-                    Ok(i) => {
+                buf[len..MAX_INSN_LEN].copy_from_slice(next_src);
+                match decode::decode(&buf[..MAX_INSN_LEN]) {
+                    Ok(insn) => {
                         self.mark_code(pa);
-                        self.mark_code(pa2);
-                        Ok(i)
+                        self.mark_code(next_page_pa);
+                        Ok(insn)
                     }
-                    Err(_) => Err(Exc::ud()),
+                    Err(_) => Err(Exception::invalid_opcode()),
                 }
             }
         }

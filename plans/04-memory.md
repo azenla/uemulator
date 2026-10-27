@@ -18,7 +18,7 @@
 
 4-level long-mode walk (4 KiB/2 MiB/1 GiB), PAE (3-level, needed by the decompressor transitions if any), 32-bit non-PAE low priority. Honors U/S, R/W, NX (EFER.NXE), CR0.WP, reserved bits (raise `#PF` with RSVD), sets A and D bits in guest memory atomically (single-threaded: plain RMW). No SMEP/SMAP (not advertised). Canonical-address checks (#GP/#SS) in the translator.
 
-Page fault error code and CR2 are set in `exc.rs`. Walk reads page-table entries through the physical RAM map directly (never the soft TLB).
+Page fault error code and CR2 are set in `Cpu::page_fault` (`mem.rs`). Walk reads page-table entries through the physical RAM map directly (never the soft TLB).
 
 ## Code-page tracking (self-modifying code)
 

@@ -1,52 +1,222 @@
 use super::decode::*;
-use super::exc::Exc;
+use super::exception::{Exception, VECTOR_SEGMENT_NOT_PRESENT, VECTOR_STACK_FAULT};
 use super::flags::*;
+use super::sys::{CR0_TS, CR4_TSD};
 use super::*;
 
+// Indices into `Cpu::gpr` (architectural register numbers); GPR_RSP and GPR_RSI come from mod.rs.
+const GPR_RAX: usize = 0;
+const GPR_RCX: usize = 1;
+const GPR_RDX: usize = 2;
+const GPR_RBX: usize = 3;
+const GPR_RBP: usize = 5;
+const GPR_RDI: usize = 7;
+
+/// Register numbers are 4 bits wide once REX extends the ModRM/opcode field.
+const GPR_INDEX_MASK: usize = 15;
+
+/// Without a REX prefix, byte-register numbers 4..=7 mean AH, CH, DH, BH (bits 15:8 of
+/// registers 0..=3) instead of SPL, BPL, SIL, DIL.
+const BYTE_REG_AH: u8 = 4;
+const BYTE_REG_BH: u8 = 7;
+
+const BYTE_MASK: u64 = 0xff;
+const WORD_MASK: u64 = 0xffff;
+const DWORD_MASK: u64 = 0xffff_ffff;
+
+const REX_B: u8 = 1;
+
+/// `Insn::rep` values: F3 is rep/repe, F2 is repne.
+const REP_REPE: u8 = 1;
+const REP_REPNE: u8 = 2;
+
+/// A rep string instruction returns to the run loop after this many iterations (RIP unchanged,
+/// so it resumes where it left off) so pending interrupts and device events are still serviced.
+const REP_ITERATIONS_PER_SLICE: u64 = 4096;
+
+const VECTOR_BREAKPOINT: u8 = 3;
+
+/// The low two bits of a selector are the RPL; the rest (index and TI) identify the descriptor.
+const SELECTOR_RPL_MASK: u16 = 3;
+
+const EFLAGS_ID: u64 = 1 << 21;
+const IOPL_SHIFT: u32 = 12;
+
+/// EFLAGS bits popf/iretq load at any CPL. IF is added when CPL <= IOPL and IOPL when CPL is 0
+/// (see `Cpu::loadable_eflags`). RF and VM are never loaded by either.
+const EFLAGS_ALWAYS_LOADABLE: u64 = CF | PF | AF | ZF | SF | TF | DF | OF | NT | AC | EFLAGS_ID;
+
+/// sahf/lahf transfer these flags (SF, ZF, AF, PF, CF) to and from AH.
+const LAHF_SAHF_FLAGS: u64 = SF | ZF | AF | PF | CF;
+
+/// Shift/rotate counts are masked to 5 bits, or 6 bits for 64-bit operands.
+const SHIFT_COUNT_MASK: u64 = 0x1f;
+const SHIFT_COUNT_MASK_64BIT: u64 = 0x3f;
+
+/// `log_once` key space for unimplemented opcodes; other callers (mem.rs, sys.rs) use other bases.
+const UNIMPLEMENTED_OPCODE_LOG_BASE: u64 = 0x4000_0000;
+
+// ALU operation numbers: bits 5:3 of opcodes 0x00..=0x3f and ModRM.reg of group 1 (0x80/81/83).
+// 6 is xor and is the fallthrough arm of `alu`.
+const ALU_ADD: u8 = 0;
+const ALU_OR: u8 = 1;
+const ALU_ADC: u8 = 2;
+const ALU_SBB: u8 = 3;
+const ALU_AND: u8 = 4;
+const ALU_SUB: u8 = 5;
+const ALU_CMP: u8 = 7;
+
+// ModRM.reg of the shift/rotate group (0xc0/c1/d0..d3). /6 is an undocumented alias of SHL and
+// /7 (sar) is the fallthrough arm of `shift_rotate`.
+const SHIFT_ROL: u8 = 0;
+const SHIFT_ROR: u8 = 1;
+const SHIFT_RCL: u8 = 2;
+const SHIFT_RCR: u8 = 3;
+const SHIFT_SHL: u8 = 4;
+const SHIFT_SHR: u8 = 5;
+const SHIFT_SAL_ALIAS: u8 = 6;
+
+// ModRM.reg of group 3 (0xf6/f7); /1 is an alias of /0 (test), /7 is idiv.
+const GROUP3_TEST: u8 = 0;
+const GROUP3_TEST_ALIAS: u8 = 1;
+const GROUP3_NOT: u8 = 2;
+const GROUP3_NEG: u8 = 3;
+const GROUP3_MUL: u8 = 4;
+const GROUP3_IMUL: u8 = 5;
+const GROUP3_DIV: u8 = 6;
+
+// ModRM.reg of groups 4/5 (0xfe/0xff).
+const GROUP5_INC: u8 = 0;
+const GROUP5_DEC: u8 = 1;
+const GROUP5_CALL_NEAR: u8 = 2;
+const GROUP5_JMP_NEAR: u8 = 4;
+const GROUP5_PUSH: u8 = 6;
+
+// Bit-test family: bt, bts, btr, btc.
+const BIT_TEST: u8 = 0;
+const BIT_SET: u8 = 1;
+const BIT_RESET: u8 = 2;
+const BIT_COMPLEMENT: u8 = 3;
+/// Group 8 (0f ba): ModRM.reg 4..=7 are bt/bts/btr/btc with an imm8 bit offset.
+const GROUP8_FIRST_BIT_OP: u8 = 4;
+
+/// Operand location after ModRM decoding. Memory addresses are linear (segment base applied).
 #[derive(Clone, Copy)]
 pub(crate) enum Loc {
     Reg(u8),
     Mem(u64),
 }
 
+fn sign_extend(value: u64, bits: u32) -> i64 {
+    let shift = 64 - bits;
+    ((value << shift) as i64) >> shift
+}
+
+/// A null selector has index 0 and TI 0 whatever its RPL. A selector with TI set and index 0
+/// refers to LDT entry 0 and is not null, so TI stays part of the comparison.
+fn selector_is_null(sel: u16) -> bool {
+    sel & !SELECTOR_RPL_MASK == 0
+}
+
+/// Error code for a selector-related fault: the selector with RPL cleared (EXT bit 0).
+fn selector_error_code(sel: u16) -> u32 {
+    (sel & !SELECTOR_RPL_MASK) as u32
+}
+
+/// Operand size of push/pop/pushf/popf in 64-bit mode: 8 bytes, or 2 with a 66 prefix. REX.W
+/// is irrelevant and 4 is not encodable, so `Insn::opsize` must not be used for these.
+fn stack_operand_size(i: &Insn) -> u8 {
+    if i.p66 { 2 } else { 8 }
+}
+
+/// Register number embedded in the low opcode bits (push/pop/mov imm/xchg/bswap), extended by REX.B.
+fn opcode_register(i: &Insn) -> u8 {
+    (i.op as u8 & 7) | ((i.rex & REX_B) << 3)
+}
+
+fn address_mask(i: &Insn) -> u64 {
+    if i.addr32 { DWORD_MASK } else { u64::MAX }
+}
+
+fn shift_count_mask(size: u8) -> u64 {
+    if size == 8 {
+        SHIFT_COUNT_MASK_64BIT
+    } else {
+        SHIFT_COUNT_MASK
+    }
+}
+
+/// Joins EDX:EAX style halves (wrmsr, cmpxchg8b); the upper 32 bits of both inputs are ignored.
+fn combine_dwords(low: u64, high: u64) -> u64 {
+    (low & DWORD_MASK) | (high << 32)
+}
+
 impl Cpu {
-    pub fn rd_reg(&self, r: u8, size: u8, rex: bool) -> u64 {
-        let g = self.gpr[r as usize & 15];
+    /// Reads a general register at the given operand size. With `rex` false, byte registers 4..=7
+    /// are AH/CH/DH/BH.
+    pub fn read_gpr(&self, r: u8, size: u8, rex: bool) -> u64 {
+        let g = self.gpr[r as usize & GPR_INDEX_MASK];
         match size {
             1 => {
-                if !rex && (4..8).contains(&r) {
-                    (self.gpr[r as usize - 4] >> 8) & 0xff
+                if !rex && (BYTE_REG_AH..=BYTE_REG_BH).contains(&r) {
+                    (self.gpr[(r - BYTE_REG_AH) as usize] >> 8) & BYTE_MASK
                 } else {
-                    g & 0xff
+                    g & BYTE_MASK
                 }
             }
-            2 => g & 0xffff,
-            4 => g & 0xffff_ffff,
+            2 => g & WORD_MASK,
+            4 => g & DWORD_MASK,
             _ => g,
         }
     }
 
-    pub fn wr_reg(&mut self, r: u8, size: u8, rex: bool, v: u64) {
+    /// Writes a general register. 8- and 16-bit writes merge into the old value; a 32-bit write
+    /// zero-extends into the full register (64-bit mode rule). `rex` as in `read_gpr`.
+    pub fn write_gpr(&mut self, r: u8, size: u8, rex: bool, v: u64) {
         match size {
             1 => {
-                if !rex && (4..8).contains(&r) {
-                    let g = &mut self.gpr[r as usize - 4];
-                    *g = (*g & !0xff00) | ((v & 0xff) << 8);
+                if !rex && (BYTE_REG_AH..=BYTE_REG_BH).contains(&r) {
+                    let g = &mut self.gpr[(r - BYTE_REG_AH) as usize];
+                    *g = (*g & !(BYTE_MASK << 8)) | ((v & BYTE_MASK) << 8);
                 } else {
                     let g = &mut self.gpr[r as usize];
-                    *g = (*g & !0xff) | (v & 0xff);
+                    *g = (*g & !BYTE_MASK) | (v & BYTE_MASK);
                 }
             }
             2 => {
                 let g = &mut self.gpr[r as usize];
-                *g = (*g & !0xffff) | (v & 0xffff);
+                *g = (*g & !WORD_MASK) | (v & WORD_MASK);
             }
-            4 => self.gpr[r as usize] = v & 0xffff_ffff,
+            4 => self.gpr[r as usize] = v & DWORD_MASK,
             _ => self.gpr[r as usize] = v,
         }
     }
 
-    pub fn ea(&self, i: &Insn, next: u64) -> u64 {
+    fn set_edx_eax(&mut self, v: u64) {
+        self.gpr[GPR_RAX] = v & DWORD_MASK;
+        self.gpr[GPR_RDX] = v >> 32;
+    }
+
+    fn iopl(&self) -> u8 {
+        ((self.eflags & IOPL) >> IOPL_SHIFT) as u8
+    }
+
+    /// EFLAGS bits that popf/iretq may change when executed at `cpl`.
+    fn loadable_eflags(&self, cpl: u8) -> u64 {
+        let mut loadable = EFLAGS_ALWAYS_LOADABLE;
+        if cpl <= self.iopl() {
+            loadable |= IF;
+        }
+        if cpl == 0 {
+            loadable |= IOPL;
+        }
+        loadable
+    }
+
+    /// Effective address (offset within the segment), truncated for the 67 prefix. RIP-relative
+    /// displacements are relative to the end of the whole instruction, immediate included, which
+    /// is what `next` is.
+    pub fn effective_address(&self, i: &Insn, next: u64) -> u64 {
         let mut a = i.disp as u64;
         if i.rip_rel {
             a = a.wrapping_add(next);
@@ -59,183 +229,203 @@ impl Cpu {
             }
         }
         if i.addr32 {
-            a &= 0xffff_ffff;
+            a &= DWORD_MASK;
         }
         a
     }
 
-    pub fn lin(&self, i: &Insn, a: u64) -> u64 {
-        match i.seg {
-            4 => a.wrapping_add(self.seg[4].base),
-            5 => a.wrapping_add(self.seg[5].base),
+    /// Applies the segment base. In 64-bit mode only FS and GS have a base; ES/CS/SS/DS
+    /// overrides are ignored.
+    pub fn linear_address(&self, i: &Insn, a: u64) -> u64 {
+        let seg = i.seg as usize;
+        match seg {
+            SEG_FS | SEG_GS => a.wrapping_add(self.seg[seg].base),
             _ => a,
         }
     }
 
-    pub fn rm_loc(&self, i: &Insn, next: u64) -> Loc {
+    pub fn modrm_location(&self, i: &Insn, next: u64) -> Loc {
         if i.md == 3 {
             Loc::Reg(i.rm)
         } else {
-            Loc::Mem(self.lin(i, self.ea(i, next)))
+            Loc::Mem(self.linear_address(i, self.effective_address(i, next)))
         }
     }
 
-    pub fn ld(&mut self, loc: Loc, size: u8, i: &Insn) -> R<u64> {
+    pub fn load_operand(&mut self, loc: Loc, size: u8, i: &Insn) -> ExecResult<u64> {
         match loc {
-            Loc::Reg(r) => Ok(self.rd_reg(r, size, i.rex_present)),
+            Loc::Reg(r) => Ok(self.read_gpr(r, size, i.rex_present)),
             Loc::Mem(a) => self.read(a, size),
         }
     }
 
-    pub fn st(&mut self, loc: Loc, size: u8, i: &Insn, v: u64) -> R<()> {
+    pub fn store_operand(&mut self, loc: Loc, size: u8, i: &Insn, v: u64) -> ExecResult<()> {
         match loc {
             Loc::Reg(r) => {
-                self.wr_reg(r, size, i.rex_present, v);
+                self.write_gpr(r, size, i.rex_present, v);
                 Ok(())
             }
             Loc::Mem(a) => self.write(a, size, v),
         }
     }
 
-    pub fn push(&mut self, size: u8, v: u64) -> R<()> {
-        let sp = self.gpr[4].wrapping_sub(size as u64);
+    /// GPR_RSP is only updated after the store succeeds so a fault leaves it unchanged.
+    pub fn push(&mut self, size: u8, v: u64) -> ExecResult<()> {
+        let sp = self.gpr[GPR_RSP].wrapping_sub(size as u64);
         self.write(sp, size, v)?;
-        self.gpr[4] = sp;
+        self.gpr[GPR_RSP] = sp;
         Ok(())
     }
 
-    pub fn pop(&mut self, size: u8) -> R<u64> {
-        let v = self.read(self.gpr[4], size)?;
-        self.gpr[4] = self.gpr[4].wrapping_add(size as u64);
+    pub fn pop(&mut self, size: u8) -> ExecResult<u64> {
+        let v = self.read(self.gpr[GPR_RSP], size)?;
+        self.gpr[GPR_RSP] = self.gpr[GPR_RSP].wrapping_add(size as u64);
         Ok(v)
     }
 
-    pub fn cond(&self, cc: u8) -> bool {
+    /// Evaluates a 4-bit condition code (jcc/setcc/cmovcc low opcode nibble). Bits 3:1 pick the
+    /// condition and bit 0 negates it.
+    pub fn condition_holds(&self, cc: u8) -> bool {
         let f = self.eflags_full();
         let sf = f & SF != 0;
         let of = f & OF != 0;
         let r = match cc >> 1 {
-            0 => of,
-            1 => f & CF != 0,
-            2 => f & ZF != 0,
-            3 => f & (CF | ZF) != 0,
-            4 => sf,
-            5 => f & PF != 0,
-            6 => sf != of,
-            _ => f & ZF != 0 || sf != of,
+            0 => of,                      // o
+            1 => f & CF != 0,             // b
+            2 => f & ZF != 0,             // e
+            3 => f & (CF | ZF) != 0,      // be
+            4 => sf,                      // s
+            5 => f & PF != 0,             // p
+            6 => sf != of,                // l
+            _ => f & ZF != 0 || sf != of, // le
         };
         r ^ (cc & 1 == 1)
     }
 
-    fn alu(&mut self, k: u8, a: u64, b: u64, size: u8) -> u64 {
+    /// Two-operand ALU op. CMP computes flags like SUB; the caller decides not to store it.
+    fn alu(&mut self, operation: u8, a: u64, b: u64, size: u8) -> u64 {
         let m = mask(size);
         let (a, b) = (a & m, b & m);
-        match k {
-            0 => {
+        match operation {
+            ALU_ADD => {
                 let r = a.wrapping_add(b) & m;
-                self.set_cc(Cc::Add, size, r, b, 0);
+                self.set_lazy_flags(LazyFlagsOp::Add, size, r, b, 0);
                 r
             }
-            1 => {
+            ALU_OR => {
                 let r = a | b;
-                self.set_cc(Cc::Logic, size, r, 0, 0);
+                self.set_lazy_flags(LazyFlagsOp::Logic, size, r, 0, 0);
                 r
             }
-            2 => {
-                let c = self.cf() as u64;
-                let r = a.wrapping_add(b).wrapping_add(c) & m;
-                self.set_cc(Cc::Adc, size, r, b, c);
+            ALU_ADC => {
+                let carry = self.cf() as u64;
+                let r = a.wrapping_add(b).wrapping_add(carry) & m;
+                self.set_lazy_flags(LazyFlagsOp::Adc, size, r, b, carry);
                 r
             }
-            3 => {
-                let c = self.cf() as u64;
-                let r = a.wrapping_sub(b).wrapping_sub(c) & m;
-                self.set_cc(Cc::Sbb, size, r, b, c);
+            ALU_SBB => {
+                let carry = self.cf() as u64;
+                let r = a.wrapping_sub(b).wrapping_sub(carry) & m;
+                self.set_lazy_flags(LazyFlagsOp::Sbb, size, r, b, carry);
                 r
             }
-            4 => {
+            ALU_AND => {
                 let r = a & b;
-                self.set_cc(Cc::Logic, size, r, 0, 0);
+                self.set_lazy_flags(LazyFlagsOp::Logic, size, r, 0, 0);
                 r
             }
-            5 | 7 => {
+            ALU_SUB | ALU_CMP => {
                 let r = a.wrapping_sub(b) & m;
-                self.set_cc(Cc::Sub, size, r, b, 0);
+                self.set_lazy_flags(LazyFlagsOp::Sub, size, r, b, 0);
                 r
             }
             _ => {
                 let r = a ^ b;
-                self.set_cc(Cc::Logic, size, r, 0, 0);
+                self.set_lazy_flags(LazyFlagsOp::Logic, size, r, 0, 0);
                 r
             }
         }
     }
 
-    fn shift(&mut self, k: u8, a: u64, cnt: u64, size: u8) -> u64 {
+    /// Shifts and rotates. A count that is zero after masking changes neither the value nor any
+    /// flag. OF is computed for every count, not only count 1 where the SDM defines it.
+    fn shift_rotate(&mut self, operation: u8, value: u64, count: u64, size: u8) -> u64 {
         let bits = size as u32 * 8;
         let m = mask(size);
-        let c = (cnt & if size == 8 { 0x3f } else { 0x1f }) as u32;
-        if c == 0 {
-            return a & m;
+        let count = (count & shift_count_mask(size)) as u32;
+        if count == 0 {
+            return value & m;
         }
-        let a = a & m;
+        let a = value & m;
         let fl = self.eflags_full();
         let msb = |v: u64| (v >> (bits - 1)) & 1;
-        let (r, cf, of, szp) = match k {
-            0 => {
-                let c2 = c % bits;
-                let r = if c2 == 0 {
+        let second_msb = |v: u64| (v >> (bits - 2)) & 1;
+        // (result, CF, OF, whether SF/ZF/PF come from the result)
+        let (r, cf, of, szp) = match operation {
+            SHIFT_ROL => {
+                // Counts above the width wrap, but CF/OF are still updated when count % bits == 0.
+                let rotate = count % bits;
+                let r = if rotate == 0 {
                     a
                 } else {
-                    ((a << c2) | (a >> (bits - c2))) & m
+                    ((a << rotate) | (a >> (bits - rotate))) & m
                 };
                 let cf = r & 1;
                 (r, cf, msb(r) ^ cf, false)
             }
-            1 => {
-                let c2 = c % bits;
-                let r = if c2 == 0 {
+            SHIFT_ROR => {
+                let rotate = count % bits;
+                let r = if rotate == 0 {
                     a
                 } else {
-                    ((a >> c2) | (a << (bits - c2))) & m
+                    ((a >> rotate) | (a << (bits - rotate))) & m
                 };
-                (r, msb(r), msb(r) ^ ((r >> (bits - 2)) & 1), false)
+                (r, msb(r), msb(r) ^ second_msb(r), false)
             }
-            2 => {
+            SHIFT_RCL => {
+                // Rotating through CF is a cycle of bits + 1 positions.
                 let mut r = a;
                 let mut cf = fl & CF;
-                for _ in 0..c % (bits + 1) {
+                for _ in 0..count % (bits + 1) {
                     let out = msb(r);
                     r = ((r << 1) | cf) & m;
                     cf = out;
                 }
                 (r, cf, msb(r) ^ cf, false)
             }
-            3 => {
+            SHIFT_RCR => {
                 let mut r = a;
                 let mut cf = fl & CF;
-                for _ in 0..c % (bits + 1) {
+                for _ in 0..count % (bits + 1) {
                     let out = r & 1;
                     r = (r >> 1) | (cf << (bits - 1));
                     cf = out;
                 }
-                (r, cf, msb(r) ^ ((r >> (bits - 2)) & 1), false)
+                (r, cf, msb(r) ^ second_msb(r), false)
             }
-            4 | 6 => {
-                let r = if c >= bits { 0 } else { (a << c) & m };
-                let cf = if c <= bits { (a >> (bits - c)) & 1 } else { 0 };
+            SHIFT_SHL | SHIFT_SAL_ALIAS => {
+                let r = if count >= bits { 0 } else { (a << count) & m };
+                let cf = if count <= bits {
+                    (a >> (bits - count)) & 1
+                } else {
+                    0
+                };
                 (r, cf, msb(r) ^ cf, true)
             }
-            5 => {
-                let r = if c >= bits { 0 } else { a >> c };
-                let cf = if c <= bits { (a >> (c - 1)) & 1 } else { 0 };
+            SHIFT_SHR => {
+                let r = if count >= bits { 0 } else { a >> count };
+                let cf = if count <= bits {
+                    (a >> (count - 1)) & 1
+                } else {
+                    0
+                };
                 (r, cf, msb(a), true)
             }
             _ => {
-                let sh = 64 - bits;
-                let sa = ((a << sh) as i64) >> sh;
-                let r = (sa >> c.min(63)) as u64 & m;
-                let cf = ((sa >> (c - 1).min(63)) & 1) as u64;
+                // SAR: shift the sign-extended value so counts above the width fill with the sign.
+                let signed = sign_extend(a, bits);
+                let r = (signed >> count.min(63)) as u64 & m;
+                let cf = ((signed >> (count - 1).min(63)) & 1) as u64;
                 (r, cf, 0, true)
             }
         };
@@ -254,221 +444,248 @@ impl Cpu {
         r
     }
 
-    fn mul_div(&mut self, i: &Insn, next: u64, size: u8) -> R<()> {
-        let loc = self.rm_loc(i, next);
+    /// Group 3 mul/imul/div/idiv (one-operand forms). Byte forms use AX as the wide register;
+    /// the others use rDX:rAX. Division raises #DE for a zero divisor and for a quotient that does
+    /// not fit the destination.
+    fn mul_div(&mut self, i: &Insn, next: u64, size: u8) -> ExecResult<()> {
+        let loc = self.modrm_location(i, next);
         let kind = i.reg & 7;
-        let src = self.ld(loc, size, i)?;
+        let src = self.load_operand(loc, size, i)?;
         let bits = size as u32 * 8;
         let m = mask(size);
-        let rax = self.gpr[0] & m;
-        let rdx = self.gpr[2] & m;
+        let rax = self.gpr[GPR_RAX] & m;
+        let rdx = self.gpr[GPR_RDX] & m;
         match kind {
-            4 | 5 => {
-                let (lo, hi, ovf) = if kind == 4 {
+            GROUP3_MUL | GROUP3_IMUL => {
+                let (lo, hi, overflow) = if kind == GROUP3_MUL {
                     let p = rax as u128 * src as u128;
                     let lo = p as u64 & m;
                     let hi = (p >> bits) as u64 & m;
                     (lo, hi, hi != 0)
                 } else {
-                    let sh = 64 - bits;
-                    let sx = |v: u64| ((v << sh) as i64) >> sh;
-                    let p = sx(rax) as i128 * sx(src) as i128;
+                    let p = sign_extend(rax, bits) as i128 * sign_extend(src, bits) as i128;
                     let lo = p as u64 & m;
                     let hi = (p >> bits) as u64 & m;
-                    (lo, hi, p != sx(lo) as i128)
+                    // The high half is just the sign of the low half iff the product fits.
+                    (lo, hi, p != sign_extend(lo, bits) as i128)
                 };
                 if size == 1 {
-                    self.wr_reg(0, 2, true, lo | (hi << 8));
+                    self.write_gpr(0, 2, true, lo | (hi << 8));
                 } else {
-                    self.wr_reg(0, size, true, lo);
-                    self.wr_reg(2, size, true, hi);
+                    self.write_gpr(0, size, true, lo);
+                    self.write_gpr(2, size, true, hi);
                 }
                 let mut f = szp_flags(lo, size);
-                if ovf {
+                if overflow {
                     f |= CF | OF;
                 }
                 self.set_eflags_arith(f);
             }
             _ => {
                 if src == 0 {
-                    return Err(Exc::de());
+                    return Err(Exception::divide_error());
                 }
-                let (q, r);
-                if kind == 6 {
-                    let n = if size == 1 {
-                        self.gpr[0] as u128 & 0xffff
+                let (quotient, remainder);
+                if kind == GROUP3_DIV {
+                    let dividend = if size == 1 {
+                        self.gpr[GPR_RAX] as u128 & WORD_MASK as u128
                     } else {
                         (rdx as u128) << bits | rax as u128
                     };
-                    let (qq, rr) = (n / src as u128, n % src as u128);
-                    if qq > m as u128 {
-                        return Err(Exc::de());
+                    let (q, r) = (dividend / src as u128, dividend % src as u128);
+                    if q > m as u128 {
+                        return Err(Exception::divide_error());
                     }
-                    q = qq as u64;
-                    r = rr as u64;
+                    quotient = q as u64;
+                    remainder = r as u64;
                 } else {
-                    let sh = 64 - bits;
-                    let sx = |v: u64| ((v << sh) as i64) >> sh;
-                    let n: i128 = if size == 1 {
-                        (self.gpr[0] as u16 as i16) as i128
+                    let dividend: i128 = if size == 1 {
+                        (self.gpr[GPR_RAX] as u16 as i16) as i128
                     } else {
+                        // Sign-extend the 2 * bits wide rDX:rAX value to 128 bits.
                         (((rdx as u128) << bits | rax as u128) << (128 - 2 * bits)) as i128
                             >> (128 - 2 * bits)
                     };
-                    let d = sx(src) as i128;
-                    let (qq, rr) = (n / d, n % d);
-                    let lim = 1i128 << (bits - 1);
-                    if qq >= lim || qq < -lim {
-                        return Err(Exc::de());
+                    let divisor = sign_extend(src, bits) as i128;
+                    let (q, r) = (dividend / divisor, dividend % divisor);
+                    let limit = 1i128 << (bits - 1);
+                    if q >= limit || q < -limit {
+                        return Err(Exception::divide_error());
                     }
-                    q = qq as u64 & m;
-                    r = rr as u64 & m;
+                    quotient = q as u64 & m;
+                    remainder = r as u64 & m;
                 }
                 if size == 1 {
-                    self.wr_reg(0, 2, true, q | (r << 8));
+                    self.write_gpr(0, 2, true, quotient | (remainder << 8));
                 } else {
-                    self.wr_reg(0, size, true, q);
-                    self.wr_reg(2, size, true, r);
+                    self.write_gpr(0, size, true, quotient);
+                    self.write_gpr(2, size, true, remainder);
                 }
             }
         }
         Ok(())
     }
 
-    fn imul3(&mut self, a: u64, b: u64, size: u8) -> u64 {
+    /// Signed multiply truncated to `size` (imul r, r/m and the three-operand forms). CF and OF
+    /// are set when the full product does not fit.
+    fn imul_truncated(&mut self, a: u64, b: u64, size: u8) -> u64 {
         let bits = size as u32 * 8;
-        let sh = 64 - bits;
-        let sx = |v: u64| ((v << sh) as i64) >> sh;
-        let p = sx(a) as i128 * sx(b) as i128;
+        let p = sign_extend(a, bits) as i128 * sign_extend(b, bits) as i128;
         let r = p as u64 & mask(size);
         let mut f = szp_flags(r, size);
-        if p != sx(r) as i128 {
+        if p != sign_extend(r, bits) as i128 {
             f |= CF | OF;
         }
         self.set_eflags_arith(f);
         r
     }
 
-    fn bit_op(&mut self, i: &Insn, next: u64, kind: u8, imm: bool) -> R<()> {
+    /// bt/bts/btr/btc. With a register bit offset and a memory operand the offset is signed and
+    /// may reach outside the addressed operand: the address moves by whole operands and the bit
+    /// index is the remainder. An immediate offset is taken modulo the operand width instead.
+    fn bit_op(&mut self, i: &Insn, next: u64, operation: u8, imm_offset: bool) -> ExecResult<()> {
         let size = i.opsize;
         let bits = size as i64 * 8;
-        let off = if imm {
+        let offset = if imm_offset {
             i.imm as u64
         } else {
-            self.rd_reg(i.reg, size, true)
+            self.read_gpr(i.reg, size, true)
         };
         let loc = if i.md == 3 {
             Loc::Reg(i.rm)
         } else {
-            let mut a = self.ea(i, next);
-            if !imm {
-                let sh = 64 - bits as u32;
-                let so = ((off << sh) as i64) >> sh;
-                a = a.wrapping_add((so.div_euclid(bits) * size as i64) as u64);
+            let mut address = self.effective_address(i, next);
+            if !imm_offset {
+                let signed_offset = sign_extend(offset, bits as u32);
+                address =
+                    address.wrapping_add((signed_offset.div_euclid(bits) * size as i64) as u64);
             }
-            Loc::Mem(self.lin(i, a))
+            Loc::Mem(self.linear_address(i, address))
         };
-        let bit = if imm || i.md == 3 {
-            (off as i64).rem_euclid(bits) as u32
+        let bit = if imm_offset || i.md == 3 {
+            (offset as i64).rem_euclid(bits) as u32
         } else {
-            let sh = 64 - bits as u32;
-            (((off << sh) as i64) >> sh).rem_euclid(bits) as u32
+            sign_extend(offset, bits as u32).rem_euclid(bits) as u32
         };
-        let v = self.ld(loc, size, i)?;
+        let v = self.load_operand(loc, size, i)?;
         let old = (v >> bit) & 1;
-        let nv = match kind {
-            1 => v | (1 << bit),
-            2 => v & !(1 << bit),
-            3 => v ^ (1 << bit),
+        let new_value = match operation {
+            BIT_SET => v | (1 << bit),
+            BIT_RESET => v & !(1 << bit),
+            BIT_COMPLEMENT => v ^ (1 << bit),
             _ => v,
         };
-        if kind != 0 {
-            self.st(loc, size, i, nv)?;
+        if operation != BIT_TEST {
+            self.store_operand(loc, size, i, new_value)?;
         }
         let f = self.eflags_full();
         self.set_eflags_arith((f & !CF) | old);
         Ok(())
     }
 
-    fn string_op(&mut self, i: &Insn, next: u64) -> R<()> {
+    /// movs/stos/lods/cmps/scas with optional rep. State is committed per iteration, so a fault
+    /// mid-rep leaves GPR_RSI/GPR_RDI/GPR_RCX consistent with the iterations already done.
+    fn string_op(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
         let op = i.op as u8;
         let size = if op & 1 == 0 { 1 } else { i.opsize };
-        let amask = if i.addr32 { 0xffff_ffff } else { u64::MAX };
+        let amask = address_mask(i);
         let step: u64 = if self.eflags & DF != 0 {
             (size as u64).wrapping_neg()
         } else {
             size as u64
         };
         let rep = i.rep != 0;
-        let cmp = matches!(op, 0xa6 | 0xa7 | 0xae | 0xaf);
-        let mut n = 0;
+        let compares = matches!(op, 0xa6 | 0xa7 | 0xae | 0xaf);
+        let mut iterations = 0;
         loop {
-            if rep && self.gpr[1] & amask == 0 {
+            if rep && self.gpr[GPR_RCX] & amask == 0 {
                 break;
             }
-            let src = self.lin(i, self.gpr[6] & amask);
-            let dst = self.gpr[7] & amask;
+            // Only the source honours a segment override; the destination is always ES, which has
+            // no base in 64-bit mode.
+            let src = self.linear_address(i, self.gpr[GPR_RSI] & amask);
+            let dst = self.gpr[GPR_RDI] & amask;
             match op {
+                // movs
                 0xa4 | 0xa5 => {
                     let v = self.read(src, size)?;
                     self.write(dst, size, v)?;
-                    self.gpr[6] = self.gpr[6].wrapping_add(step);
-                    self.gpr[7] = self.gpr[7].wrapping_add(step);
+                    self.gpr[GPR_RSI] = self.gpr[GPR_RSI].wrapping_add(step);
+                    self.gpr[GPR_RDI] = self.gpr[GPR_RDI].wrapping_add(step);
                 }
+                // stos
                 0xaa | 0xab => {
-                    let v = self.rd_reg(0, size, true);
+                    let v = self.read_gpr(0, size, true);
                     self.write(dst, size, v)?;
-                    self.gpr[7] = self.gpr[7].wrapping_add(step);
+                    self.gpr[GPR_RDI] = self.gpr[GPR_RDI].wrapping_add(step);
                 }
+                // lods
                 0xac | 0xad => {
                     let v = self.read(src, size)?;
-                    self.wr_reg(0, size, true, v);
-                    self.gpr[6] = self.gpr[6].wrapping_add(step);
+                    self.write_gpr(0, size, true, v);
+                    self.gpr[GPR_RSI] = self.gpr[GPR_RSI].wrapping_add(step);
                 }
+                // cmps: flags of [rsi] - [rdi]
                 0xa6 | 0xa7 => {
                     let a = self.read(src, size)?;
                     let b = self.read(dst, size)?;
-                    self.set_cc(Cc::Sub, size, a.wrapping_sub(b) & mask(size), b, 0);
-                    self.gpr[6] = self.gpr[6].wrapping_add(step);
-                    self.gpr[7] = self.gpr[7].wrapping_add(step);
+                    self.set_lazy_flags(
+                        LazyFlagsOp::Sub,
+                        size,
+                        a.wrapping_sub(b) & mask(size),
+                        b,
+                        0,
+                    );
+                    self.gpr[GPR_RSI] = self.gpr[GPR_RSI].wrapping_add(step);
+                    self.gpr[GPR_RDI] = self.gpr[GPR_RDI].wrapping_add(step);
                 }
+                // scas: flags of rAX - [rdi]
                 _ => {
-                    let a = self.rd_reg(0, size, true);
+                    let a = self.read_gpr(0, size, true);
                     let b = self.read(dst, size)?;
-                    self.set_cc(Cc::Sub, size, a.wrapping_sub(b) & mask(size), b, 0);
-                    self.gpr[7] = self.gpr[7].wrapping_add(step);
+                    self.set_lazy_flags(
+                        LazyFlagsOp::Sub,
+                        size,
+                        a.wrapping_sub(b) & mask(size),
+                        b,
+                        0,
+                    );
+                    self.gpr[GPR_RDI] = self.gpr[GPR_RDI].wrapping_add(step);
                 }
             }
             if i.addr32 {
-                self.gpr[6] &= 0xffff_ffff;
-                self.gpr[7] &= 0xffff_ffff;
+                self.gpr[GPR_RSI] &= DWORD_MASK;
+                self.gpr[GPR_RDI] &= DWORD_MASK;
             }
             if !rep {
                 break;
             }
-            let c = self.gpr[1].wrapping_sub(1);
-            self.gpr[1] = if i.addr32 { c & 0xffff_ffff } else { c };
-            n += 1;
-            if cmp {
+            let count = self.gpr[GPR_RCX].wrapping_sub(1);
+            self.gpr[GPR_RCX] = if i.addr32 { count & DWORD_MASK } else { count };
+            iterations += 1;
+            if compares {
                 let zf = self.eflags_full() & ZF != 0;
-                if (i.rep == 1 && !zf) || (i.rep == 2 && zf) {
+                if (i.rep == REP_REPE && !zf) || (i.rep == REP_REPNE && zf) {
                     break;
                 }
             }
-            if n >= 4096 && self.gpr[1] & amask != 0 {
-                self.icount += n;
+            if iterations >= REP_ITERATIONS_PER_SLICE && self.gpr[GPR_RCX] & amask != 0 {
+                // RIP stays on the instruction; the run loop re-executes it after servicing events.
+                self.icount += iterations;
                 return Ok(());
             }
         }
-        self.icount += n;
+        self.icount += iterations;
         self.rip = next;
         Ok(())
     }
 
-    pub fn load_data_seg(&mut self, idx: usize, sel: u16) -> R<()> {
-        if sel & 0xfffc == 0 {
-            if idx == 2 && self.cpl == 3 {
-                return Err(Exc::gp(0));
+    /// Loads DS/ES/FS/GS/SS (`idx` is a `SEG_*` index) from a selector in 64-bit mode. A null
+    /// selector is allowed everywhere except SS at CPL 3. Does not check DPL/RPL against CPL.
+    pub fn load_data_seg(&mut self, idx: usize, sel: u16) -> ExecResult<()> {
+        if selector_is_null(sel) {
+            if idx == SEG_SS && self.cpl == USER_CPL {
+                return Err(Exception::general_protection(0));
             }
             self.seg[idx] = Seg {
                 sel,
@@ -477,429 +694,503 @@ impl Cpu {
             return Ok(());
         }
         let s = self.load_desc_seg(sel, false)?;
-        if s.flags & (1 << 12) == 0 || (s.is_code() && s.flags & (1 << 9) == 0) {
-            return Err(Exc::gp(sel as u32 & 0xfffc));
+        // System descriptors and execute-only code segments cannot be loaded into a data register.
+        if s.flags & SEG_NON_SYSTEM == 0 || (s.is_code() && s.flags & SEG_TYPE_READ_WRITE == 0) {
+            return Err(Exception::general_protection(selector_error_code(sel)));
         }
         if !s.present() {
-            return Err(Exc::fault(
-                if idx == 2 { 12 } else { 11 },
-                Some(sel as u32 & 0xfffc),
+            // A missing stack segment is #SS, any other data segment #NP.
+            return Err(Exception::fault(
+                if idx == SEG_SS {
+                    VECTOR_STACK_FAULT
+                } else {
+                    VECTOR_SEGMENT_NOT_PRESENT
+                },
+                Some(selector_error_code(sel)),
             ));
         }
         self.seg[idx] = s;
         Ok(())
     }
 
-    fn do_iret(&mut self, i: &Insn) -> R<()> {
+    /// 64-bit iretq: pops RIP, CS, RFLAGS, GPR_RSP, SS (always all five in 64-bit mode). Only the
+    /// 8-byte operand size is implemented. CPL is switched before SS is loaded because the null-SS
+    /// rule depends on the new CPL; it is restored if the SS load faults.
+    fn iretq(&mut self, i: &Insn) -> ExecResult<()> {
+        const FRAME_CS: u64 = 8;
+        const FRAME_RFLAGS: u64 = 16;
+        const FRAME_RSP: u64 = 24;
+        const FRAME_SS: u64 = 32;
         if i.opsize != 8 {
-            return Err(Exc::ud());
+            return Err(Exception::invalid_opcode());
         }
-        let sp = self.gpr[4];
+        let sp = self.gpr[GPR_RSP];
         let rip = self.read(sp, 8)?;
-        let cs = self.read(sp + 8, 8)? as u16;
-        let rfl = self.read(sp + 16, 8)?;
-        let rsp = self.read(sp + 24, 8)?;
-        let ss = self.read(sp + 32, 8)? as u16;
-        let ncs = self.load_desc_seg(cs, true)?;
-        if !ncs.is_code() || !ncs.long() {
-            return Err(Exc::gp(cs as u32 & 0xfffc));
+        let cs = self.read(sp + FRAME_CS, 8)? as u16;
+        let new_rflags = self.read(sp + FRAME_RFLAGS, 8)?;
+        let new_rsp = self.read(sp + FRAME_RSP, 8)?;
+        let ss = self.read(sp + FRAME_SS, 8)? as u16;
+        let new_cs = self.load_desc_seg(cs, true)?;
+        if !new_cs.is_code() || !new_cs.long() {
+            return Err(Exception::general_protection(selector_error_code(cs)));
         }
-        let ncpl = (cs & 3) as u8;
-        if ncpl < self.cpl {
-            return Err(Exc::gp(cs as u32 & 0xfffc));
+        let new_cpl = (cs & SELECTOR_RPL_MASK) as u8;
+        // iret can only return to the same or a less privileged level.
+        if new_cpl < self.cpl {
+            return Err(Exception::general_protection(selector_error_code(cs)));
         }
         let old_cpl = self.cpl;
-        self.seg[1] = ncs;
-        self.seg[1].sel = cs;
-        self.set_cpl(ncpl);
-        if let Err(e) = self.load_data_seg(2, ss) {
+        // CS stays modified if the SS load below faults; only the CPL is rolled back.
+        self.seg[SEG_CS] = new_cs;
+        self.seg[SEG_CS].sel = cs;
+        // set_cpl also switches to the user or supervisor half of the soft TLB.
+        self.set_cpl(new_cpl);
+        if let Err(e) = self.load_data_seg(SEG_SS, ss) {
             self.set_cpl(old_cpl);
             return Err(e);
         }
-        let mut m = CF | PF | AF | ZF | SF | TF | DF | OF | NT | AC | (1 << 21);
-        if old_cpl <= ((self.eflags_full() >> 12) & 3) as u8 {
-            m |= IF;
-        }
-        if old_cpl == 0 {
-            m |= IOPL;
-        }
-        let cur = self.eflags_full();
-        self.eflags = ((cur & !m) | (rfl & m)) | 2;
-        self.cc = Cc::Eflags;
-        self.gpr[4] = rsp;
+        // IF and IOPL are gated by the CPL iretq started at, not the one it returns to.
+        let loadable = self.loadable_eflags(old_cpl);
+        let current = self.eflags_full();
+        self.eflags = ((current & !loadable) | (new_rflags & loadable)) | RESERVED_ONE;
+        self.lazy_op = LazyFlagsOp::Eflags;
+        self.gpr[GPR_RSP] = new_rsp;
         self.rip = rip;
-        if ncpl != 0 {
-            for k in [0usize, 3, 4, 5] {
-                let s = self.seg[k];
-                if s.sel & 0xfffc != 0 && s.dpl() < ncpl && s.flags & (1 << 11) == 0 {
-                    self.seg[k] = Seg::default();
+        if new_cpl != 0 {
+            // Returning to an outer ring: data segment registers the new CPL cannot use are nulled.
+            for reg in [SEG_ES, SEG_DS, SEG_FS, SEG_GS] {
+                let s = self.seg[reg];
+                if !selector_is_null(s.sel)
+                    && s.dpl() < new_cpl
+                    && s.flags & SEG_TYPE_EXECUTABLE == 0
+                {
+                    self.seg[reg] = Seg::default();
                 }
             }
         }
         Ok(())
     }
 
-    fn do_retf(&mut self, i: &Insn, imm: u64) -> R<()> {
+    /// Far return (0xca/0xcb) with `imm` extra bytes released after CS. Only the 8-byte operand
+    /// size (REX.W) is implemented. For a return to an outer ring GPR_RSP:SS sit above the released
+    /// bytes.
+    fn far_return(&mut self, i: &Insn, imm: u64) -> ExecResult<()> {
+        // Frame: rip, cs, `imm` released bytes, then (outer-ring returns only) rsp and ss.
+        // FRAME_RSP and FRAME_SS are offsets from RSP before `imm` is added.
+        const FRAME_CS: u64 = 8;
+        const FRAME_RSP: u64 = 16;
+        const FRAME_SS: u64 = 24;
         if i.opsize != 8 {
-            return Err(Exc::ud());
+            return Err(Exception::invalid_opcode());
         }
-        let sp = self.gpr[4];
+        let sp = self.gpr[GPR_RSP];
         let rip = self.read(sp, 8)?;
-        let cs = self.read(sp + 8, 8)? as u16;
-        let ncs = self.load_desc_seg(cs, true)?;
-        if !ncs.is_code() || !ncs.long() {
-            return Err(Exc::gp(cs as u32 & 0xfffc));
+        let cs = self.read(sp + FRAME_CS, 8)? as u16;
+        let new_cs = self.load_desc_seg(cs, true)?;
+        if !new_cs.is_code() || !new_cs.long() {
+            return Err(Exception::general_protection(selector_error_code(cs)));
         }
-        let ncpl = (cs & 3) as u8;
-        if ncpl < self.cpl {
-            return Err(Exc::gp(cs as u32 & 0xfffc));
+        let new_cpl = (cs & SELECTOR_RPL_MASK) as u8;
+        if new_cpl < self.cpl {
+            return Err(Exception::general_protection(selector_error_code(cs)));
         }
-        if ncpl != self.cpl {
-            let rsp = self.read(sp + 16 + imm, 8)?;
-            let ss = self.read(sp + 24 + imm, 8)? as u16;
-            self.seg[1] = ncs;
-            self.set_cpl(ncpl);
-            self.load_data_seg(2, ss)?;
-            self.gpr[4] = rsp;
+        if new_cpl != self.cpl {
+            let new_rsp = self.read(sp + FRAME_RSP + imm, 8)?;
+            let ss = self.read(sp + FRAME_SS + imm, 8)? as u16;
+            self.seg[SEG_CS] = new_cs;
+            self.set_cpl(new_cpl);
+            self.load_data_seg(SEG_SS, ss)?;
+            self.gpr[GPR_RSP] = new_rsp;
         } else {
-            self.seg[1] = ncs;
-            self.gpr[4] = sp.wrapping_add(16 + imm);
+            self.seg[SEG_CS] = new_cs;
+            self.gpr[GPR_RSP] = sp.wrapping_add(FRAME_RSP + imm);
         }
         self.rip = rip;
         Ok(())
     }
 
-    pub fn exec(&mut self, i: &Insn) -> R<()> {
+    /// Executes one decoded instruction; also the slow path the JIT calls for instructions it does
+    /// not compile (`jit/helpers.rs`), which makes it the oracle for `--verify`.
+    ///
+    /// On `Ok` RIP is already advanced (next instruction or branch target). On `Err` RIP is still
+    /// the faulting instruction, except int/int3 which set it to the next instruction first so the
+    /// pushed return address is right. Opcodes are `Insn::op`: one-byte opcodes as is, `0f xx` as
+    /// `0x1xx`.
+    pub fn exec(&mut self, i: &Insn) -> ExecResult<()> {
         let next = self.rip.wrapping_add(i.len as u64);
         let osz = i.opsize;
         let op = i.op;
         let rex = i.rex_present;
         match op {
+            // The eight ALU ops (add/or/adc/sbb/and/sub/xor/cmp), forms 0..=5: r/m,r (byte, full),
+            // r,r/m (byte, full), al,imm and eax,imm.
             0x00..=0x3f if op & 7 < 6 => {
-                let k = ((op >> 3) & 7) as u8;
+                let operation = ((op >> 3) & 7) as u8;
                 let form = op & 7;
                 let size = if form & 1 == 0 { 1 } else { osz };
                 match form {
                     0 | 1 => {
-                        let loc = self.rm_loc(i, next);
-                        let a = self.ld(loc, size, i)?;
-                        let b = self.rd_reg(i.reg, size, rex);
-                        let r = self.alu(k, a, b, size);
-                        if k != 7 {
-                            self.st(loc, size, i, r)?;
+                        let loc = self.modrm_location(i, next);
+                        let a = self.load_operand(loc, size, i)?;
+                        let b = self.read_gpr(i.reg, size, rex);
+                        let r = self.alu(operation, a, b, size);
+                        if operation != ALU_CMP {
+                            self.store_operand(loc, size, i, r)?;
                         }
                     }
                     2 | 3 => {
-                        let loc = self.rm_loc(i, next);
-                        let b = self.ld(loc, size, i)?;
-                        let a = self.rd_reg(i.reg, size, rex);
-                        let r = self.alu(k, a, b, size);
-                        if k != 7 {
-                            self.wr_reg(i.reg, size, rex, r);
+                        let loc = self.modrm_location(i, next);
+                        let b = self.load_operand(loc, size, i)?;
+                        let a = self.read_gpr(i.reg, size, rex);
+                        let r = self.alu(operation, a, b, size);
+                        if operation != ALU_CMP {
+                            self.write_gpr(i.reg, size, rex, r);
                         }
                     }
                     _ => {
-                        let a = self.rd_reg(0, size, true);
-                        let r = self.alu(k, a, i.imm as u64, size);
-                        if k != 7 {
-                            self.wr_reg(0, size, true, r);
+                        let a = self.read_gpr(0, size, true);
+                        let r = self.alu(operation, a, i.imm as u64, size);
+                        if operation != ALU_CMP {
+                            self.write_gpr(0, size, true, r);
                         }
                     }
                 }
             }
+            // push r64
             0x50..=0x57 => {
-                let r = (op as u8 & 7) | ((i.rex & 1) << 3);
-                let sz = if i.p66 { 2 } else { 8 };
+                let r = opcode_register(i);
+                let sz = stack_operand_size(i);
                 let v = self.gpr[r as usize];
                 self.push(sz, v)?;
             }
+            // pop r64
             0x58..=0x5f => {
-                let r = (op as u8 & 7) | ((i.rex & 1) << 3);
-                let sz = if i.p66 { 2 } else { 8 };
+                let r = opcode_register(i);
+                let sz = stack_operand_size(i);
                 let v = self.pop(sz)?;
-                self.wr_reg(r, sz, true, v);
+                self.write_gpr(r, sz, true, v);
             }
+            // movsxd
             0x63 => {
-                let loc = self.rm_loc(i, next);
-                let v = self.ld(loc, 4, i)?;
+                let loc = self.modrm_location(i, next);
+                let v = self.load_operand(loc, 4, i)?;
                 if osz == 8 {
                     self.gpr[i.reg as usize] = v as u32 as i32 as i64 as u64;
                 } else {
-                    self.wr_reg(i.reg, osz, true, v);
+                    self.write_gpr(i.reg, osz, true, v);
                 }
             }
+            // push imm32 / imm8
             0x68 | 0x6a => {
-                let sz = if i.p66 { 2 } else { 8 };
+                let sz = stack_operand_size(i);
                 self.push(sz, i.imm as u64)?;
             }
+            // imul r, r/m, imm32 / imm8
             0x69 | 0x6b => {
-                let loc = self.rm_loc(i, next);
-                let a = self.ld(loc, osz, i)?;
-                let r = self.imul3(a, i.imm as u64, osz);
-                self.wr_reg(i.reg, osz, true, r);
+                let loc = self.modrm_location(i, next);
+                let a = self.load_operand(loc, osz, i)?;
+                let r = self.imul_truncated(a, i.imm as u64, osz);
+                self.write_gpr(i.reg, osz, true, r);
             }
+            // jcc rel8
             0x70..=0x7f => {
-                if self.cond((op & 15) as u8) {
+                if self.condition_holds((op & 15) as u8) {
                     self.rip = next.wrapping_add(i.imm as u64);
                     return Ok(());
                 }
             }
+            // group 1: ALU r/m, imm
             0x80 | 0x81 | 0x83 => {
                 let size = if op == 0x80 { 1 } else { osz };
-                let loc = self.rm_loc(i, next);
-                let a = self.ld(loc, size, i)?;
-                let k = i.reg & 7;
-                let r = self.alu(k, a, i.imm as u64, size);
-                if k != 7 {
-                    self.st(loc, size, i, r)?;
+                let loc = self.modrm_location(i, next);
+                let a = self.load_operand(loc, size, i)?;
+                let operation = i.reg & 7;
+                let r = self.alu(operation, a, i.imm as u64, size);
+                if operation != ALU_CMP {
+                    self.store_operand(loc, size, i, r)?;
                 }
             }
+            // test r/m, r
             0x84 | 0x85 => {
                 let size = if op == 0x84 { 1 } else { osz };
-                let loc = self.rm_loc(i, next);
-                let a = self.ld(loc, size, i)?;
-                let b = self.rd_reg(i.reg, size, rex);
-                self.set_cc(Cc::Logic, size, a & b, 0, 0);
+                let loc = self.modrm_location(i, next);
+                let a = self.load_operand(loc, size, i)?;
+                let b = self.read_gpr(i.reg, size, rex);
+                self.set_lazy_flags(LazyFlagsOp::Logic, size, a & b, 0, 0);
             }
+            // xchg r/m, r
             0x86 | 0x87 => {
                 let size = if op == 0x86 { 1 } else { osz };
-                let loc = self.rm_loc(i, next);
-                let a = self.ld(loc, size, i)?;
-                let b = self.rd_reg(i.reg, size, rex);
-                self.st(loc, size, i, b)?;
-                self.wr_reg(i.reg, size, rex, a);
+                let loc = self.modrm_location(i, next);
+                let a = self.load_operand(loc, size, i)?;
+                let b = self.read_gpr(i.reg, size, rex);
+                self.store_operand(loc, size, i, b)?;
+                self.write_gpr(i.reg, size, rex, a);
             }
+            // mov r/m, r
             0x88 | 0x89 => {
                 let size = if op == 0x88 { 1 } else { osz };
-                let loc = self.rm_loc(i, next);
-                let v = self.rd_reg(i.reg, size, rex);
-                self.st(loc, size, i, v)?;
+                let loc = self.modrm_location(i, next);
+                let v = self.read_gpr(i.reg, size, rex);
+                self.store_operand(loc, size, i, v)?;
             }
+            // mov r, r/m
             0x8a | 0x8b => {
                 let size = if op == 0x8a { 1 } else { osz };
-                let loc = self.rm_loc(i, next);
-                let v = self.ld(loc, size, i)?;
-                self.wr_reg(i.reg, size, rex, v);
+                let loc = self.modrm_location(i, next);
+                let v = self.load_operand(loc, size, i)?;
+                self.write_gpr(i.reg, size, rex, v);
             }
+            // mov r/m, sreg: a memory destination is always 16 bits, a register one takes the
+            // operand size (upper bits zeroed).
             0x8c => {
-                if i.reg > 5 {
-                    return Err(Exc::ud());
+                if i.reg as usize > SEG_GS {
+                    return Err(Exception::invalid_opcode());
                 }
                 let v = self.seg[i.reg as usize].sel as u64;
-                let loc = self.rm_loc(i, next);
+                let loc = self.modrm_location(i, next);
                 let size = if i.md == 3 { osz } else { 2 };
-                self.st(loc, size, i, v)?;
+                self.store_operand(loc, size, i, v)?;
             }
+            // lea
             0x8d => {
                 if i.md == 3 {
-                    return Err(Exc::ud());
+                    return Err(Exception::invalid_opcode());
                 }
-                let a = self.ea(i, next);
-                self.wr_reg(i.reg, osz, true, a);
+                let a = self.effective_address(i, next);
+                self.write_gpr(i.reg, osz, true, a);
             }
+            // mov sreg, r/m. CS cannot be loaded this way.
             0x8e => {
                 let idx = (i.reg & 7) as usize;
-                if idx == 1 || idx > 5 {
-                    return Err(Exc::ud());
+                if idx == SEG_CS || idx > SEG_GS {
+                    return Err(Exception::invalid_opcode());
                 }
-                let loc = self.rm_loc(i, next);
-                let sel = self.ld(loc, 2, i)? as u16;
+                let loc = self.modrm_location(i, next);
+                let sel = self.load_operand(loc, 2, i)? as u16;
                 self.load_data_seg(idx, sel)?;
-                if idx == 2 {
-                    self.shadow = true;
+                // Interrupts are held off until after the instruction following mov ss, so that
+                // a mov ss / mov rsp pair is atomic.
+                if idx == SEG_SS {
+                    self.interrupt_shadow = true;
                 }
             }
+            // pop r/m
             0x8f => {
-                let sz = if i.p66 { 2 } else { 8 };
-                let loc = self.rm_loc(i, next);
-                let sp = self.gpr[4];
+                let sz = stack_operand_size(i);
+                let loc = self.modrm_location(i, next);
+                let sp = self.gpr[GPR_RSP];
                 let v = self.read(sp, sz)?;
-                self.gpr[4] = sp.wrapping_add(sz as u64);
+                self.gpr[GPR_RSP] = sp.wrapping_add(sz as u64);
+                // A memory destination addressed through GPR_RSP uses the value after the pop.
                 let loc = match loc {
-                    Loc::Mem(a) if i.base == 4 => Loc::Mem(a.wrapping_add(sz as u64)),
+                    Loc::Mem(a) if i.base == GPR_RSP as u8 => Loc::Mem(a.wrapping_add(sz as u64)),
                     l => l,
                 };
-                if let Err(e) = self.st(loc, sz, i, v) {
-                    self.gpr[4] = sp;
+                if let Err(e) = self.store_operand(loc, sz, i, v) {
+                    self.gpr[GPR_RSP] = sp;
                     return Err(e);
                 }
             }
+            // nop, or xchg r8, rax with REX.B. pause (f3 90) is a plain nop.
             0x90 => {
-                if i.rex & 1 != 0 {
+                if i.rex & REX_B != 0 {
                     let r = 8;
-                    let a = self.rd_reg(0, osz, true);
-                    let b = self.rd_reg(r, osz, true);
-                    self.wr_reg(0, osz, true, b);
-                    self.wr_reg(r, osz, true, a);
+                    let a = self.read_gpr(0, osz, true);
+                    let b = self.read_gpr(r, osz, true);
+                    self.write_gpr(0, osz, true, b);
+                    self.write_gpr(r, osz, true, a);
                 }
             }
+            // xchg r, rax
             0x91..=0x97 => {
-                let r = (op as u8 & 7) | ((i.rex & 1) << 3);
-                let a = self.rd_reg(0, osz, true);
-                let b = self.rd_reg(r, osz, true);
-                self.wr_reg(0, osz, true, b);
-                self.wr_reg(r, osz, true, a);
+                let r = opcode_register(i);
+                let a = self.read_gpr(0, osz, true);
+                let b = self.read_gpr(r, osz, true);
+                self.write_gpr(0, osz, true, b);
+                self.write_gpr(r, osz, true, a);
             }
+            // cdqe / cwde / cbw
             0x98 => match osz {
-                8 => self.gpr[0] = self.gpr[0] as u32 as i32 as i64 as u64,
-                4 => self.gpr[0] = self.gpr[0] as u16 as i16 as i32 as u32 as u64,
+                8 => self.gpr[GPR_RAX] = self.gpr[GPR_RAX] as u32 as i32 as i64 as u64,
+                4 => self.gpr[GPR_RAX] = self.gpr[GPR_RAX] as u16 as i16 as i32 as u32 as u64,
                 _ => {
-                    let v = self.gpr[0] as u8 as i8 as i16 as u16 as u64;
-                    self.wr_reg(0, 2, true, v)
+                    let v = self.gpr[GPR_RAX] as u8 as i8 as i16 as u16 as u64;
+                    self.write_gpr(0, 2, true, v)
                 }
             },
+            // cqo / cdq / cwd: fill rDX with the sign of rAX
             0x99 => match osz {
-                8 => self.gpr[2] = ((self.gpr[0] as i64) >> 63) as u64,
-                4 => self.gpr[2] = (((self.gpr[0] as u32 as i32) >> 31) as u32) as u64,
+                8 => self.gpr[GPR_RDX] = ((self.gpr[GPR_RAX] as i64) >> 63) as u64,
+                4 => self.gpr[GPR_RDX] = (((self.gpr[GPR_RAX] as u32 as i32) >> 31) as u32) as u64,
                 _ => {
-                    let v = (((self.gpr[0] as u16 as i16) >> 15) as u16) as u64;
-                    self.wr_reg(2, 2, true, v)
+                    let v = (((self.gpr[GPR_RAX] as u16 as i16) >> 15) as u16) as u64;
+                    self.write_gpr(2, 2, true, v)
                 }
             },
+            // fwait: #NM when both CR0.MP and CR0.TS are set
             0x9b => {
-                if self.cr0 & 0xa == 0xa {
-                    return Err(Exc::nm());
+                if self.cr0 & (CR0_MP | CR0_TS) == (CR0_MP | CR0_TS) {
+                    return Err(Exception::device_not_available());
                 }
             }
+            // pushf: the pushed image has RF and VM clear
             0x9c => {
-                let sz = if i.p66 { 2 } else { 8 };
+                let sz = stack_operand_size(i);
                 let f = self.eflags_full() & !(RF | VM);
                 self.push(sz, f)?;
             }
+            // popf
             0x9d => {
-                let sz = if i.p66 { 2 } else { 8 };
+                let sz = stack_operand_size(i);
                 let v = self.pop(sz)?;
-                let iopl = ((self.eflags_full() >> 12) & 3) as u8;
-                let mut m = CF | PF | AF | ZF | SF | TF | DF | OF | NT | AC | (1 << 21);
-                if self.cpl <= iopl {
-                    m |= IF;
-                }
-                if self.cpl == 0 {
-                    m |= IOPL;
-                }
+                let mut loadable = self.loadable_eflags(self.cpl);
                 if sz == 2 {
-                    m &= 0xffff;
+                    loadable &= WORD_MASK;
                 }
-                let cur = self.eflags_full();
-                self.eflags = ((cur & !m) | (v & m)) | 2;
-                self.cc = Cc::Eflags;
+                let current = self.eflags_full();
+                self.eflags = ((current & !loadable) | (v & loadable)) | RESERVED_ONE;
+                self.lazy_op = LazyFlagsOp::Eflags;
             }
+            // sahf
             0x9e => {
-                let ah = (self.gpr[0] >> 8) & 0xd5;
+                let ah = (self.gpr[GPR_RAX] >> 8) & LAHF_SAHF_FLAGS;
                 let f = self.eflags_full();
-                self.set_eflags_arith((f & !0xd5) | ah);
+                self.set_eflags_arith((f & !LAHF_SAHF_FLAGS) | ah);
             }
+            // lahf: bit 1 of AH always reads 1
             0x9f => {
-                let f = self.eflags_full() & 0xd5 | 2;
-                self.wr_reg(4, 1, false, f);
+                let f = (self.eflags_full() & LAHF_SAHF_FLAGS) | RESERVED_ONE;
+                self.write_gpr(BYTE_REG_AH, 1, false, f);
             }
+            // mov al/eax, moffs and mov moffs, al/eax
             0xa0..=0xa3 => {
                 let size = if op & 1 == 0 { 1 } else { osz };
-                let a = self.lin(
+                let a = self.linear_address(
                     i,
                     if i.addr32 {
-                        i.imm as u64 & 0xffff_ffff
+                        i.imm as u64 & DWORD_MASK
                     } else {
                         i.imm as u64
                     },
                 );
                 if op < 0xa2 {
                     let v = self.read(a, size)?;
-                    self.wr_reg(0, size, true, v);
+                    self.write_gpr(0, size, true, v);
                 } else {
-                    let v = self.rd_reg(0, size, true);
+                    let v = self.read_gpr(0, size, true);
                     self.write(a, size, v)?;
                 }
             }
+            // movs, cmps, stos, lods, scas
             0xa4..=0xa7 | 0xaa..=0xaf => return self.string_op(i, next),
+            // test al/eax, imm
             0xa8 | 0xa9 => {
                 let size = if op == 0xa8 { 1 } else { osz };
-                let a = self.rd_reg(0, size, true);
-                self.set_cc(Cc::Logic, size, a & i.imm as u64 & mask(size), 0, 0);
+                let a = self.read_gpr(0, size, true);
+                self.set_lazy_flags(
+                    LazyFlagsOp::Logic,
+                    size,
+                    a & i.imm as u64 & mask(size),
+                    0,
+                    0,
+                );
             }
+            // mov r8, imm8
             0xb0..=0xb7 => {
-                let r = (op as u8 & 7) | ((i.rex & 1) << 3);
-                self.wr_reg(r, 1, rex, i.imm as u64);
+                let r = opcode_register(i);
+                self.write_gpr(r, 1, rex, i.imm as u64);
             }
+            // mov r, imm (imm64 with REX.W)
             0xb8..=0xbf => {
-                let r = (op as u8 & 7) | ((i.rex & 1) << 3);
-                self.wr_reg(r, osz, true, i.imm as u64);
+                let r = opcode_register(i);
+                self.write_gpr(r, osz, true, i.imm as u64);
             }
+            // shift/rotate group: imm8, 1 or CL count
             0xc0 | 0xc1 | 0xd0..=0xd3 => {
                 let size = if op & 1 == 0 { 1 } else { osz };
-                let loc = self.rm_loc(i, next);
-                let cnt = match op {
+                let loc = self.modrm_location(i, next);
+                let count = match op {
                     0xc0 | 0xc1 => i.imm as u64,
                     0xd0 | 0xd1 => 1,
-                    _ => self.gpr[1] & 0xff,
+                    _ => self.gpr[GPR_RCX] & BYTE_MASK,
                 };
-                let a = self.ld(loc, size, i)?;
-                let r = self.shift(i.reg & 7, a, cnt, size);
-                self.st(loc, size, i, r)?;
+                let a = self.load_operand(loc, size, i)?;
+                let r = self.shift_rotate(i.reg & 7, a, count, size);
+                self.store_operand(loc, size, i, r)?;
             }
+            // ret / ret imm16
             0xc2 | 0xc3 => {
-                let t = self.read(self.gpr[4], 8)?;
+                let target = self.read(self.gpr[GPR_RSP], 8)?;
                 let extra = if op == 0xc2 { i.imm as u64 } else { 0 };
-                self.gpr[4] = self.gpr[4].wrapping_add(8 + extra);
-                self.rip = t;
+                self.gpr[GPR_RSP] = self.gpr[GPR_RSP].wrapping_add(8 + extra);
+                self.rip = target;
                 return Ok(());
             }
+            // mov r/m, imm
             0xc6 | 0xc7 => {
                 let size = if op == 0xc6 { 1 } else { osz };
-                let loc = self.rm_loc(i, next);
-                self.st(loc, size, i, i.imm as u64)?;
+                let loc = self.modrm_location(i, next);
+                self.store_operand(loc, size, i, i.imm as u64)?;
             }
+            // enter: only nesting level 0 (the level is taken modulo 32)
             0xc8 => {
                 if i.imm2 & 31 != 0 {
-                    return Err(self.unimpl(i));
+                    return Err(self.unimplemented_opcode(i));
                 }
-                let bp = self.gpr[5];
+                let bp = self.gpr[GPR_RBP];
                 self.push(8, bp)?;
-                self.gpr[5] = self.gpr[4];
-                self.gpr[4] = self.gpr[4].wrapping_sub(i.imm as u64);
+                self.gpr[GPR_RBP] = self.gpr[GPR_RSP];
+                self.gpr[GPR_RSP] = self.gpr[GPR_RSP].wrapping_sub(i.imm as u64);
             }
+            // leave: GPR_RSP is only committed after the load of GPR_RBP succeeded
             0xc9 => {
-                let bp = self.gpr[5];
+                let bp = self.gpr[GPR_RBP];
                 let v = self.read(bp, 8)?;
-                self.gpr[4] = bp.wrapping_add(8);
-                self.gpr[5] = v;
+                self.gpr[GPR_RSP] = bp.wrapping_add(8);
+                self.gpr[GPR_RBP] = v;
             }
+            // far ret imm16 / far ret
             0xca | 0xcb => {
                 let imm = if op == 0xca { i.imm as u64 } else { 0 };
-                return self.do_retf(i, imm);
+                return self.far_return(i, imm);
             }
+            // int3
             0xcc => {
                 self.rip = next;
-                return Err(Exc::Fault {
-                    vec: 3,
-                    err: None,
-                    soft: true,
+                return Err(Exception::Fault {
+                    vector: VECTOR_BREAKPOINT,
+                    error_code: None,
+                    software: true,
                 });
             }
+            // int imm8
             0xcd => {
                 self.rip = next;
-                return Err(Exc::Fault {
-                    vec: i.imm as u8,
-                    err: None,
-                    soft: true,
+                return Err(Exception::Fault {
+                    vector: i.imm as u8,
+                    error_code: None,
+                    software: true,
                 });
             }
-            0xcf => return self.do_iret(i),
+            0xcf => return self.iretq(i),
+            // xlat: al = [rbx + al]
             0xd7 => {
-                let a = self.gpr[3].wrapping_add(self.gpr[0] & 0xff);
-                let v = self.read(self.lin(i, a), 1)?;
-                self.wr_reg(0, 1, true, v);
+                let a = self.gpr[GPR_RBX].wrapping_add(self.gpr[GPR_RAX] & BYTE_MASK);
+                let v = self.read(self.linear_address(i, a), 1)?;
+                self.write_gpr(0, 1, true, v);
             }
             0xd8..=0xdf => return self.x87(i, next),
+            // loopne, loope, loop, jrcxz (jecxz with the 67 prefix)
             0xe0..=0xe3 => {
-                let amask = if i.addr32 { 0xffff_ffff } else { u64::MAX };
+                let amask = address_mask(i);
                 let take = if op == 0xe3 {
-                    self.gpr[1] & amask == 0
+                    self.gpr[GPR_RCX] & amask == 0
                 } else {
-                    let c = self.gpr[1].wrapping_sub(1) & amask;
-                    self.gpr[1] = c;
+                    let count = self.gpr[GPR_RCX].wrapping_sub(1) & amask;
+                    self.gpr[GPR_RCX] = count;
                     let zf = self.eflags_full() & ZF != 0;
-                    c != 0
+                    count != 0
                         && match op {
                             0xe0 => !zf,
                             0xe1 => zf,
@@ -911,116 +1202,135 @@ impl Cpu {
                     return Ok(());
                 }
             }
+            // in/out with imm8 port (e4..e7) or DX (ec..ef)
             0xe4..=0xe7 | 0xec..=0xef => return self.port_io(i, next),
+            // call rel32
             0xe8 => {
                 self.push(8, next)?;
                 self.rip = next.wrapping_add(i.imm as u64);
                 return Ok(());
             }
+            // jmp rel32 / rel8
             0xe9 | 0xeb => {
                 self.rip = next.wrapping_add(i.imm as u64);
                 return Ok(());
             }
+            // hlt
             0xf4 => {
                 if self.cpl != 0 {
-                    return Err(Exc::gp(0));
+                    return Err(Exception::general_protection(0));
                 }
                 self.halted = true;
             }
+            // cmc
             0xf5 => {
                 let f = self.eflags_full();
                 self.set_eflags_arith(f ^ CF);
             }
+            // group 3: test/not/neg/mul/imul/div/idiv
             0xf6 | 0xf7 => {
                 let size = if op == 0xf6 { 1 } else { osz };
                 match i.reg & 7 {
-                    0 | 1 => {
-                        let loc = self.rm_loc(i, next);
-                        let a = self.ld(loc, size, i)?;
-                        self.set_cc(Cc::Logic, size, a & i.imm as u64 & mask(size), 0, 0);
+                    GROUP3_TEST | GROUP3_TEST_ALIAS => {
+                        let loc = self.modrm_location(i, next);
+                        let a = self.load_operand(loc, size, i)?;
+                        self.set_lazy_flags(
+                            LazyFlagsOp::Logic,
+                            size,
+                            a & i.imm as u64 & mask(size),
+                            0,
+                            0,
+                        );
                     }
-                    2 => {
-                        let loc = self.rm_loc(i, next);
-                        let a = self.ld(loc, size, i)?;
-                        self.st(loc, size, i, !a)?;
+                    GROUP3_NOT => {
+                        let loc = self.modrm_location(i, next);
+                        let a = self.load_operand(loc, size, i)?;
+                        self.store_operand(loc, size, i, !a)?;
                     }
-                    3 => {
-                        let loc = self.rm_loc(i, next);
-                        let a = self.ld(loc, size, i)?;
+                    GROUP3_NEG => {
+                        let loc = self.modrm_location(i, next);
+                        let a = self.load_operand(loc, size, i)?;
                         let r = 0u64.wrapping_sub(a) & mask(size);
-                        self.set_cc(Cc::Sub, size, r, a & mask(size), 0);
-                        self.st(loc, size, i, r)?;
+                        self.set_lazy_flags(LazyFlagsOp::Sub, size, r, a & mask(size), 0);
+                        self.store_operand(loc, size, i, r)?;
                     }
                     _ => self.mul_div(i, next, size)?,
                 }
             }
+            // clc
             0xf8 => {
                 let f = self.eflags_full();
                 self.set_eflags_arith(f & !CF);
             }
+            // stc
             0xf9 => {
                 let f = self.eflags_full();
                 self.set_eflags_arith(f | CF);
             }
+            // cli / sti: need CPL <= IOPL (VME/PVI are not emulated)
             0xfa | 0xfb => {
-                let iopl = ((self.eflags >> 12) & 3) as u8;
-                if self.cpl > iopl {
-                    return Err(Exc::gp(0));
+                if self.cpl > self.iopl() {
+                    return Err(Exception::general_protection(0));
                 }
                 if op == 0xfa {
                     self.eflags &= !IF;
                 } else {
+                    // Only the transition from IF=0 opens the one-instruction interrupt shadow.
                     if self.eflags & IF == 0 {
-                        self.shadow = true;
+                        self.interrupt_shadow = true;
                     }
                     self.eflags |= IF;
                 }
             }
+            // cld / std
             0xfc => self.eflags &= !DF,
             0xfd => self.eflags |= DF,
+            // group 4/5: inc, dec, call, jmp, push (far forms are not implemented)
             0xfe | 0xff => {
                 let size = if op == 0xfe { 1 } else { osz };
-                let loc = self.rm_loc(i, next);
+                let loc = self.modrm_location(i, next);
                 match i.reg & 7 {
-                    0 | 1 => {
-                        let a = self.ld(loc, size, i)?;
+                    GROUP5_INC | GROUP5_DEC => {
+                        let a = self.load_operand(loc, size, i)?;
+                        // inc/dec leave CF alone: the lazy op takes the current CF as its source.
                         let cf = self.cf() as u64;
-                        let (r, cc) = if i.reg & 7 == 0 {
-                            (a.wrapping_add(1) & mask(size), Cc::Inc)
+                        let (r, lazy_op) = if i.reg & 7 == GROUP5_INC {
+                            (a.wrapping_add(1) & mask(size), LazyFlagsOp::Inc)
                         } else {
-                            (a.wrapping_sub(1) & mask(size), Cc::Dec)
+                            (a.wrapping_sub(1) & mask(size), LazyFlagsOp::Dec)
                         };
-                        self.set_cc(cc, size, r, cf, 0);
-                        self.st(loc, size, i, r)?;
+                        self.set_lazy_flags(lazy_op, size, r, cf, 0);
+                        self.store_operand(loc, size, i, r)?;
                     }
-                    2 if op == 0xff => {
-                        let t = self.ld(loc, 8, i)?;
+                    GROUP5_CALL_NEAR if op == 0xff => {
+                        // The target is read before the push so `call [rsp+x]` sees the old GPR_RSP.
+                        let target = self.load_operand(loc, 8, i)?;
                         self.push(8, next)?;
-                        self.rip = t;
+                        self.rip = target;
                         return Ok(());
                     }
-                    4 if op == 0xff => {
-                        self.rip = self.ld(loc, 8, i)?;
+                    GROUP5_JMP_NEAR if op == 0xff => {
+                        self.rip = self.load_operand(loc, 8, i)?;
                         return Ok(());
                     }
-                    6 if op == 0xff => {
-                        let sz = if i.p66 { 2 } else { 8 };
-                        let v = self.ld(loc, sz, i)?;
+                    GROUP5_PUSH if op == 0xff => {
+                        let sz = stack_operand_size(i);
+                        let v = self.load_operand(loc, sz, i)?;
                         self.push(sz, v)?;
                     }
-                    _ => return Err(self.unimpl(i)),
+                    _ => return Err(self.unimplemented_opcode(i)),
                 }
             }
-            _ => return self.exec_0f(i, next),
+            _ => return self.exec_two_byte(i, next),
         }
         self.rip = next;
         Ok(())
     }
 
-    fn port_io(&mut self, i: &Insn, next: u64) -> R<()> {
-        let iopl = ((self.eflags >> 12) & 3) as u8;
-        if self.cpl > iopl {
-            return Err(Exc::gp(0));
+    /// in/out. Only the CPL > IOPL check is done; the TSS I/O permission bitmap is not consulted.
+    fn port_io(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
+        if self.cpl > self.iopl() {
+            return Err(Exception::general_protection(0));
         }
         let op = i.op;
         let size = if op & 1 == 0 {
@@ -1030,132 +1340,163 @@ impl Cpu {
         } else {
             4
         };
+        // e4..e7 take an imm8 port, ec..ef use DX.
         let port = if op < 0xe8 {
-            i.imm as u16 & 0xff
+            i.imm as u8 as u16
         } else {
-            self.gpr[2] as u16
+            self.gpr[GPR_RDX] as u16
         };
         let now = self.now_ns();
         if op & 2 == 0 {
             let v = self.dev.io_in(port, size, now);
-            self.wr_reg(0, size, true, v as u64);
+            self.write_gpr(0, size, true, v as u64);
         } else {
-            let v = self.rd_reg(0, size, true) as u32;
+            let v = self.read_gpr(0, size, true) as u32;
             self.dev.io_out(port, size, v, now);
+            // A device asked for a machine reset; RIP is advanced first so the exit state is
+            // after the out.
             if self.dev.reset_requested {
                 self.rip = next;
-                return Err(Exc::Exit(ExitReason::Reset));
+                return Err(Exception::Exit(ExitReason::Reset));
             }
         }
         self.rip = next;
         Ok(())
     }
 
-    pub fn unimpl(&mut self, i: &Insn) -> Exc {
+    /// Raises #UD for an opcode that is valid but not implemented, logging each distinct
+    /// (opcode, ModRM.reg) once.
+    pub fn unimplemented_opcode(&mut self, i: &Insn) -> Exception {
+        // ModRM.reg has 8 values, so this keeps each opcode's /0../7 variants on distinct keys.
+        const REG_VALUES_PER_OPCODE: u64 = 8;
         let rip = self.rip;
-        self.log_once(0x4000_0000 + i.op as u64 * 8 + (i.reg as u64 & 7), || {
-            format!(
-                "unimplemented opcode {:#05x} /{} at rip {:#x} (modrm {:#04x})",
-                i.op,
-                i.reg & 7,
-                rip,
-                i.modrm
-            )
-        });
-        Exc::ud()
+        self.log_once(
+            UNIMPLEMENTED_OPCODE_LOG_BASE
+                + i.op as u64 * REG_VALUES_PER_OPCODE
+                + (i.reg as u64 & 7),
+            || {
+                format!(
+                    "unimplemented opcode {:#05x} /{} at rip {:#x} (modrm {:#04x})",
+                    i.op,
+                    i.reg & 7,
+                    rip,
+                    i.modrm
+                )
+            },
+        );
+        Exception::invalid_opcode()
     }
 
-    fn exec_0f(&mut self, i: &Insn, next: u64) -> R<()> {
+    /// `0f xx` opcodes (`Insn::op` is `0x100 | xx`); anything not handled here goes to SSE.
+    fn exec_two_byte(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
         let op = i.op;
         let osz = i.opsize;
         let rex = i.rex_present;
         match op {
+            // group 6 / group 7 (sldt, ltr, sgdt, lidt, ...)
             0x100 | 0x101 => return self.sys_group(i, next),
             0x105 => return self.do_syscall(next),
             0x107 => return self.do_sysret(i),
+            // clts
             0x106 => {
                 self.need_cpl0()?;
-                self.cr0 &= !8;
+                self.cr0 &= !CR0_TS;
             }
+            // invd / wbinvd: privileged no-ops
             0x108 | 0x109 => self.need_cpl0()?,
-            0x10b => return Err(Exc::ud()),
+            // ud2
+            0x10b => return Err(Exception::invalid_opcode()),
+            // prefetch and the reserved hint-nop space (includes multi-byte nop, endbr64)
             0x10d | 0x118..=0x11f => {}
+            // mov to/from cr and dr
             0x120..=0x123 => self.mov_cr_dr(i)?,
+            // wrmsr: MSR in ECX, value in EDX:EAX
             0x130 => {
                 self.need_cpl0()?;
-                let v = (self.gpr[0] & 0xffff_ffff) | (self.gpr[2] << 32);
-                self.wrmsr(self.gpr[1] as u32, v)?;
+                let v = combine_dwords(self.gpr[GPR_RAX], self.gpr[GPR_RDX]);
+                self.wrmsr(self.gpr[GPR_RCX] as u32, v)?;
             }
+            // rdtsc
             0x131 => {
-                if self.cr4 & 4 != 0 && self.cpl != 0 {
-                    return Err(Exc::gp(0));
+                if self.cr4 & CR4_TSD != 0 && self.cpl != 0 {
+                    return Err(Exception::general_protection(0));
                 }
                 let t = self.tsc();
-                self.gpr[0] = t & 0xffff_ffff;
-                self.gpr[2] = t >> 32;
+                self.set_edx_eax(t);
             }
+            // rdmsr
             0x132 => {
                 self.need_cpl0()?;
-                let v = self.rdmsr(self.gpr[1] as u32)?;
-                self.gpr[0] = v & 0xffff_ffff;
-                self.gpr[2] = v >> 32;
+                let v = self.rdmsr(self.gpr[GPR_RCX] as u32)?;
+                self.set_edx_eax(v);
             }
+            // cmovcc: the source is always read (it can fault); a 32-bit cmov that does not move
+            // still zero-extends the destination.
             0x140..=0x14f => {
-                let loc = self.rm_loc(i, next);
-                let v = self.ld(loc, osz, i)?;
-                if self.cond((i.op & 15) as u8) {
-                    self.wr_reg(i.reg, osz, true, v);
+                let loc = self.modrm_location(i, next);
+                let v = self.load_operand(loc, osz, i)?;
+                if self.condition_holds((i.op & 15) as u8) {
+                    self.write_gpr(i.reg, osz, true, v);
                 } else if osz == 4 {
-                    self.gpr[i.reg as usize] &= 0xffff_ffff;
+                    self.gpr[i.reg as usize] &= DWORD_MASK;
                 }
             }
+            // jcc rel32
             0x180..=0x18f => {
-                if self.cond((i.op & 15) as u8) {
+                if self.condition_holds((i.op & 15) as u8) {
                     self.rip = next.wrapping_add(i.imm as u64);
                     return Ok(());
                 }
             }
+            // setcc
             0x190..=0x19f => {
-                let loc = self.rm_loc(i, next);
-                let v = self.cond((i.op & 15) as u8) as u64;
-                self.st(loc, 1, i, v)?;
+                let loc = self.modrm_location(i, next);
+                let v = self.condition_holds((i.op & 15) as u8) as u64;
+                self.store_operand(loc, 1, i, v)?;
             }
+            // push fs / push gs
             0x1a0 | 0x1a8 => {
-                let sel = self.seg[if op == 0x1a0 { 4 } else { 5 }].sel as u64;
-                let sz = if i.p66 { 2 } else { 8 };
+                let reg = if op == 0x1a0 { SEG_FS } else { SEG_GS };
+                let sel = self.seg[reg].sel as u64;
+                let sz = stack_operand_size(i);
                 self.push(sz, sel)?;
             }
+            // pop fs / pop gs: GPR_RSP is rolled back if the segment load faults
             0x1a1 | 0x1a9 => {
-                let sz = if i.p66 { 2 } else { 8 };
+                let sz = stack_operand_size(i);
                 let v = self.pop(sz)? as u16;
-                if let Err(e) = self.load_data_seg(if op == 0x1a1 { 4 } else { 5 }, v) {
-                    self.gpr[4] = self.gpr[4].wrapping_sub(sz as u64);
+                let reg = if op == 0x1a1 { SEG_FS } else { SEG_GS };
+                if let Err(e) = self.load_data_seg(reg, v) {
+                    self.gpr[GPR_RSP] = self.gpr[GPR_RSP].wrapping_sub(sz as u64);
                     return Err(e);
                 }
             }
             0x1a2 => self.cpuid(),
-            0x1a3 => self.bit_op(i, next, 0, false)?,
-            0x1ab => self.bit_op(i, next, 1, false)?,
-            0x1b3 => self.bit_op(i, next, 2, false)?,
-            0x1bb => self.bit_op(i, next, 3, false)?,
+            // bt / bts / btr / btc r/m, r
+            0x1a3 => self.bit_op(i, next, BIT_TEST, false)?,
+            0x1ab => self.bit_op(i, next, BIT_SET, false)?,
+            0x1b3 => self.bit_op(i, next, BIT_RESET, false)?,
+            0x1bb => self.bit_op(i, next, BIT_COMPLEMENT, false)?,
+            // group 8: bt/bts/btr/btc r/m, imm8
             0x1ba => {
-                let k = i.reg & 7;
-                if k < 4 {
-                    return Err(Exc::ud());
+                let group_op = i.reg & 7;
+                if group_op < GROUP8_FIRST_BIT_OP {
+                    return Err(Exception::invalid_opcode());
                 }
-                self.bit_op(i, next, k - 4, true)?
+                self.bit_op(i, next, group_op - GROUP8_FIRST_BIT_OP, true)?
             }
+            // shld imm8 / cl, shrd imm8 / cl
             0x1a4 | 0x1a5 | 0x1ac | 0x1ad => {
-                let loc = self.rm_loc(i, next);
-                let a = self.ld(loc, osz, i)?;
-                let b = self.rd_reg(i.reg, osz, rex);
-                let cnt = if op & 1 == 0 {
+                let loc = self.modrm_location(i, next);
+                let a = self.load_operand(loc, osz, i)?;
+                let b = self.read_gpr(i.reg, osz, rex);
+                let count = if op & 1 == 0 {
                     i.imm as u64
                 } else {
-                    self.gpr[1] & 0xff
+                    self.gpr[GPR_RCX] & BYTE_MASK
                 };
                 let bits = osz as u32 * 8;
-                let c = (cnt & if osz == 8 { 0x3f } else { 0x1f }) as u32;
+                let c = (count & shift_count_mask(osz)) as u32;
                 if c != 0 {
                     let m = mask(osz);
                     let (r, cf) = if op < 0x1a8 {
@@ -1165,6 +1506,7 @@ impl Cpu {
                         let r = ((a >> c) | (b << (bits - c))) & m;
                         (r, (a >> (c - 1)) & 1)
                     };
+                    // OF is set when the sign bit changed.
                     let of = ((r ^ a) >> (bits - 1)) & 1;
                     let mut f = szp_flags(r, osz);
                     if cf != 0 {
@@ -1174,101 +1516,110 @@ impl Cpu {
                         f |= OF;
                     }
                     self.set_eflags_arith(f);
-                    self.st(loc, osz, i, r)?;
+                    self.store_operand(loc, osz, i, r)?;
                 }
             }
+            // group 15 (fences, fxsave, ldmxcsr, ...)
             0x1ae => return self.group_ae(i, next),
+            // imul r, r/m
             0x1af => {
-                let loc = self.rm_loc(i, next);
-                let b = self.ld(loc, osz, i)?;
-                let a = self.rd_reg(i.reg, osz, true);
-                let r = self.imul3(a, b, osz);
-                self.wr_reg(i.reg, osz, true, r);
+                let loc = self.modrm_location(i, next);
+                let b = self.load_operand(loc, osz, i)?;
+                let a = self.read_gpr(i.reg, osz, true);
+                let r = self.imul_truncated(a, b, osz);
+                self.write_gpr(i.reg, osz, true, r);
             }
+            // cmpxchg r/m, r. The destination is stored even when the compare fails, as on
+            // hardware, so a write fault is taken either way.
             0x1b0 | 0x1b1 => {
                 let size = if op == 0x1b0 { 1 } else { osz };
-                let loc = self.rm_loc(i, next);
-                let d = self.ld(loc, size, i)?;
-                let acc = self.rd_reg(0, size, true);
+                let loc = self.modrm_location(i, next);
+                let dest = self.load_operand(loc, size, i)?;
+                let acc = self.read_gpr(0, size, true);
                 let m = mask(size);
-                self.set_cc(Cc::Sub, size, acc.wrapping_sub(d) & m, d, 0);
-                if acc == d {
-                    let s = self.rd_reg(i.reg, size, rex);
-                    self.st(loc, size, i, s)?;
+                self.set_lazy_flags(LazyFlagsOp::Sub, size, acc.wrapping_sub(dest) & m, dest, 0);
+                if acc == dest {
+                    let src = self.read_gpr(i.reg, size, rex);
+                    self.store_operand(loc, size, i, src)?;
                 } else {
-                    self.st(loc, size, i, d)?;
-                    self.wr_reg(0, size, true, d);
+                    self.store_operand(loc, size, i, dest)?;
+                    self.write_gpr(0, size, true, dest);
                 }
             }
+            // xadd r/m, r
             0x1c0 | 0x1c1 => {
                 let size = if op == 0x1c0 { 1 } else { osz };
-                let loc = self.rm_loc(i, next);
-                let d = self.ld(loc, size, i)?;
-                let s = self.rd_reg(i.reg, size, rex);
-                let r = self.alu(0, d, s, size);
-                self.st(loc, size, i, r)?;
-                self.wr_reg(i.reg, size, rex, d);
+                let loc = self.modrm_location(i, next);
+                let dest = self.load_operand(loc, size, i)?;
+                let src = self.read_gpr(i.reg, size, rex);
+                let sum = self.alu(ALU_ADD, dest, src, size);
+                self.store_operand(loc, size, i, sum)?;
+                self.write_gpr(i.reg, size, rex, dest);
             }
+            // movnti
             0x1c3 => {
                 if i.md == 3 {
-                    return Err(Exc::ud());
+                    return Err(Exception::invalid_opcode());
                 }
-                let loc = self.rm_loc(i, next);
-                let v = self.rd_reg(i.reg, osz, true);
-                self.st(loc, osz, i, v)?;
+                let loc = self.modrm_location(i, next);
+                let v = self.read_gpr(i.reg, osz, true);
+                self.store_operand(loc, osz, i, v)?;
             }
+            // cmpxchg8b m64 (group 9 /1); cmpxchg16b (REX.W) is not implemented
             0x1c7 => {
                 if i.md == 3 || i.reg & 7 != 1 || osz == 8 {
-                    return Err(self.unimpl(i));
+                    return Err(self.unimplemented_opcode(i));
                 }
-                let a = self.lin(i, self.ea(i, next));
-                let cur = self.read(a, 8)?;
-                let cmp = (self.gpr[0] & 0xffff_ffff) | (self.gpr[2] << 32);
+                let a = self.linear_address(i, self.effective_address(i, next));
+                let current = self.read(a, 8)?;
+                let expected = combine_dwords(self.gpr[GPR_RAX], self.gpr[GPR_RDX]);
                 let f = self.eflags_full();
-                if cur == cmp {
-                    let nv = (self.gpr[3] & 0xffff_ffff) | (self.gpr[1] << 32);
-                    self.write(a, 8, nv)?;
+                if current == expected {
+                    let replacement = combine_dwords(self.gpr[GPR_RBX], self.gpr[GPR_RCX]);
+                    self.write(a, 8, replacement)?;
                     self.set_eflags_arith(f | ZF);
                 } else {
-                    self.gpr[0] = cur & 0xffff_ffff;
-                    self.gpr[2] = cur >> 32;
+                    self.set_edx_eax(current);
                     self.set_eflags_arith(f & !ZF);
                 }
             }
+            // bswap: a 16-bit bswap is undefined; it is treated as the 32-bit form
             0x1c8..=0x1cf => {
-                let r = (op as u8 & 7) | ((i.rex & 1) << 3);
+                let r = opcode_register(i) as usize;
                 if osz == 8 {
-                    self.gpr[r as usize] = self.gpr[r as usize].swap_bytes();
+                    self.gpr[r] = self.gpr[r].swap_bytes();
                 } else {
-                    self.gpr[r as usize] = (self.gpr[r as usize] as u32).swap_bytes() as u64;
+                    self.gpr[r] = (self.gpr[r] as u32).swap_bytes() as u64;
                 }
             }
+            // movzx / movsx from byte or word
             0x1b6 | 0x1b7 | 0x1be | 0x1bf => {
-                let ssz = if op & 1 == 0 { 1 } else { 2 };
-                let loc = self.rm_loc(i, next);
-                let v = self.ld(loc, ssz, i)?;
+                let source_size = if op & 1 == 0 { 1 } else { 2 };
+                let loc = self.modrm_location(i, next);
+                let v = self.load_operand(loc, source_size, i)?;
                 let v = if op < 0x1b8 {
                     v
-                } else if ssz == 1 {
+                } else if source_size == 1 {
                     v as u8 as i8 as i64 as u64
                 } else {
                     v as u16 as i16 as i64 as u64
                 };
-                self.wr_reg(i.reg, osz, true, v);
+                self.write_gpr(i.reg, osz, true, v);
             }
+            // bsf / bsr: a zero source sets ZF and leaves the destination unchanged
             0x1bc | 0x1bd => {
-                let loc = self.rm_loc(i, next);
-                let v = self.ld(loc, osz, i)? & mask(osz);
+                let loc = self.modrm_location(i, next);
+                let v = self.load_operand(loc, osz, i)? & mask(osz);
                 let f = self.eflags_full();
                 if v == 0 {
                     self.set_eflags_arith(f | ZF);
                 } else {
-                    let idx = if op == 0x1bc {
+                    let bit_index = if op == 0x1bc {
                         v.trailing_zeros()
                     } else {
                         63 - v.leading_zeros()
                     };
-                    self.wr_reg(i.reg, osz, true, idx as u64);
+                    self.write_gpr(i.reg, osz, true, bit_index as u64);
                     self.set_eflags_arith(f & !ZF);
                 }
             }
@@ -1277,7 +1628,7 @@ impl Cpu {
                     self.rip = next;
                     return Ok(());
                 }
-                return Err(self.unimpl(i));
+                return Err(self.unimplemented_opcode(i));
             }
         }
         self.rip = next;

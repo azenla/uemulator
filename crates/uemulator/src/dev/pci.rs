@@ -1,95 +1,250 @@
 use super::guestmem::GuestMem;
-use super::virtio::Transport;
+use super::virtio::{
+    COMMON_CFG_OFFSET, DEVICE_CFG_OFFSET, DEVICE_TYPE_BLOCK, DEVICE_TYPE_CONSOLE, DEVICE_TYPE_NET,
+    ISR_OFFSET, NOTIFY_OFF_MULTIPLIER, NOTIFY_OFFSET, REGION_SIZE, Transport,
+};
 #[cfg(target_os = "uefi")]
 use crate::prelude::*;
 
+/// Start of the MMIO window; everything at or above guest RAM size dispatches to the devices.
+/// RAM is capped at 0xC000_0000 so the two never overlap (plans/11).
 pub(crate) const MMIO_BASE: u64 = 0xc000_0000;
-const BAR_SIZE: u64 = 0x4000;
-const IRQS: [u8; 3] = [9, 10, 11];
+/// Each virtio function gets one BAR0 of this size, laid out back to back from `MMIO_BASE`.
+/// Four `REGION_SIZE` regions: common cfg, ISR, device cfg, notify.
+const BAR_SIZE: u64 = 4 * REGION_SIZE;
+/// Legacy PIC lines handed out to functions in order. There is no IOAPIC or ACPI, so the
+/// kernel takes `int_line` as the IRQ. Never 0, `mmio_write` uses 0 for "no interrupt".
+const LEGACY_IRQS: [u8; 3] = [9, 10, 11];
 
-struct Function {
-    t: Transport,
+/// Config mechanism #1 ports (0xCF8 address, 0xCFC data window, 4 bytes wide).
+pub(crate) const CONFIG_ADDRESS_PORT: u16 = 0xcf8;
+const CONFIG_ADDRESS_ENABLE: u32 = 1 << 31;
+const CONFIG_ADDRESS_BUS_SHIFT: u32 = 16;
+const CONFIG_ADDRESS_DEVFN_SHIFT: u32 = 8;
+/// Dword-aligned register number in the low byte; the low two bits are the byte offset
+/// within the dword and come from the data port instead.
+const CONFIG_ADDRESS_REGISTER_MASK: u32 = 0xfc;
+/// devfn = slot << 3 | function.
+const DEVFN_SLOT_SHIFT: u32 = 3;
+/// Slot 0 is the host bridge, virtio functions start at slot 1.
+const FIRST_VIRTIO_SLOT: u8 = 1;
+const CONFIG_SPACE_SIZE: usize = 256;
+
+/// Standard config header offsets.
+const CFG_VENDOR_ID: usize = 0x00;
+const CFG_DEVICE_ID: usize = 0x02;
+const CFG_COMMAND: usize = 0x04;
+const CFG_COMMAND_HIGH_BYTE: usize = CFG_COMMAND + 1;
+const CFG_STATUS: usize = 0x06;
+const CFG_REVISION: usize = 0x08;
+const CFG_SUBCLASS: usize = 0x0a;
+const CFG_CLASS: usize = 0x0b;
+const CFG_BAR0: usize = 0x10;
+const CFG_BAR0_LAST_BYTE: usize = CFG_BAR0 + 3;
+const CFG_SUBSYSTEM_VENDOR_ID: usize = 0x2c;
+const CFG_SUBSYSTEM_ID: usize = 0x2e;
+const CFG_CAPABILITIES_POINTER: usize = 0x34;
+const CFG_INTERRUPT_LINE: usize = 0x3c;
+const CFG_INTERRUPT_PIN: usize = 0x3d;
+
+const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
+const COMMAND_INTX_DISABLE: u16 = 1 << 10;
+const STATUS_CAPABILITIES_LIST: u16 = 1 << 4;
+/// Interrupt pin register value for INTA#.
+const INTERRUPT_PIN_INTA: u8 = 1;
+
+const VENDOR_INTEL: u16 = 0x8086;
+/// 440FX host bridge (QEMU's default), only needs to exist and have class 0x0600 so the
+/// kernel's `pci_sanity_check` accepts config mechanism #1.
+const DEVICE_I440FX_HOST: u16 = 0x1237;
+const CLASS_BRIDGE: u8 = 0x06;
+const SUBCLASS_HOST_BRIDGE: u8 = 0x00;
+
+const VENDOR_VIRTIO: u16 = 0x1af4;
+/// Modern (non-transitional) PCI device id is this plus the virtio device type.
+const VIRTIO_PCI_DEVICE_ID_BASE: u16 = 0x1040;
+/// Non-transitional virtio devices report revision 1 or higher.
+const VIRTIO_PCI_REVISION: u8 = 1;
+/// Class codes follow QEMU: net is ethernet, block is SCSI storage, everything else (console)
+/// is "communication, other".
+const CLASS_NETWORK: u8 = 0x02;
+const SUBCLASS_ETHERNET: u8 = 0x00;
+const CLASS_STORAGE: u8 = 0x01;
+const SUBCLASS_SCSI: u8 = 0x00;
+const CLASS_COMMUNICATION: u8 = 0x07;
+const SUBCLASS_COMMUNICATION_OTHER: u8 = 0x80;
+
+/// Vendor-specific capability id used by every virtio PCI capability.
+const CAP_ID_VENDOR_SPECIFIC: u8 = 0x09;
+/// `cfg_type` of the virtio capabilities we expose (`VIRTIO_PCI_CAP_*`). The PCI-config-access
+/// capability (type 5) is not provided.
+const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
+const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
+const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+/// Capability structure: id, next, len, cfg_type, bar (+4), padding, offset u32 (+8), length
+/// u32 (+12). The notify capability adds a u32 multiplier at +16, so it is 20 bytes, others 16.
+const VIRTIO_CAP_LEN: u8 = 16;
+const VIRTIO_NOTIFY_CAP_LEN: u8 = 20;
+const VIRTIO_CAP_OFFSET_FIELD: usize = 8;
+const VIRTIO_CAP_LENGTH_FIELD: usize = 12;
+const VIRTIO_CAP_NOTIFY_MULTIPLIER_FIELD: usize = 16;
+/// The capability chain is fixed: common -> notify -> ISR -> device, each placed right after the previous.
+const CAP_COMMON_AT: usize = 0x40;
+const CAP_NOTIFY_AT: usize = 0x50;
+const CAP_ISR_AT: usize = 0x64;
+const CAP_DEVICE_AT: usize = 0x74;
+/// `struct virtio_pci_common_cfg` is 56 bytes.
+const COMMON_CFG_LENGTH: u32 = 0x38;
+const ISR_LENGTH: u32 = 4;
+const DEVICE_CFG_LENGTH: u32 = 0x100;
+
+/// One virtio device on bus 0. Config space is synthesized on every read from this state.
+struct PciFunction {
+    transport: Transport,
     devfn: u8,
+    /// Preassigned at construction because there is no firmware to program it; the guest may relocate it.
     bar0: u32,
     command: u16,
     int_line: u8,
 }
 
 pub(crate) struct PciHost {
-    cfg_addr: u32,
-    funcs: Vec<Function>,
+    /// Last value written to 0xCF8.
+    config_address: u32,
+    funcs: Vec<PciFunction>,
 }
 
-fn cap(buf: &mut [u8; 256], at: usize, next: usize, len: u8, ty: u8, off: u32, size: u32) {
-    buf[at] = 0x09;
-    buf[at + 1] = next as u8;
-    buf[at + 2] = len;
-    buf[at + 3] = ty;
-    buf[at + 4] = 0;
-    buf[at + 8..at + 12].copy_from_slice(&off.to_le_bytes());
-    buf[at + 12..at + 16].copy_from_slice(&size.to_le_bytes());
+/// Fills in one virtio vendor capability at `at`; `next` is the config-space offset of the
+/// following capability (0 ends the list). All regions live in BAR0 (the `bar` byte stays 0).
+fn write_virtio_cap(
+    config: &mut [u8; CONFIG_SPACE_SIZE],
+    at: usize,
+    next: usize,
+    len: u8,
+    cfg_type: u8,
+    region_offset: u32,
+    region_length: u32,
+) {
+    config[at] = CAP_ID_VENDOR_SPECIFIC;
+    config[at + 1] = next as u8;
+    config[at + 2] = len;
+    config[at + 3] = cfg_type;
+    config[at + 4] = 0;
+    config[at + VIRTIO_CAP_OFFSET_FIELD..at + VIRTIO_CAP_OFFSET_FIELD + 4]
+        .copy_from_slice(&region_offset.to_le_bytes());
+    config[at + VIRTIO_CAP_LENGTH_FIELD..at + VIRTIO_CAP_LENGTH_FIELD + 4]
+        .copy_from_slice(&region_length.to_le_bytes());
 }
 
-impl Function {
-    fn config(&self) -> [u8; 256] {
-        let mut b = [0u8; 256];
-        let id = self.t.dev.id();
-        b[0..2].copy_from_slice(&0x1af4u16.to_le_bytes());
-        b[2..4].copy_from_slice(&(0x1040 + id).to_le_bytes());
-        b[4..6].copy_from_slice(&self.command.to_le_bytes());
-        b[6..8].copy_from_slice(&0x0010u16.to_le_bytes());
-        b[8] = 1;
-        let (sub, class) = match id {
-            1 => (0x00, 0x02),
-            2 => (0x00, 0x01),
-            _ => (0x80, 0x07),
+impl PciFunction {
+    fn config(&self) -> [u8; CONFIG_SPACE_SIZE] {
+        let mut b = [0u8; CONFIG_SPACE_SIZE];
+        let device_type = self.transport.dev.device_type();
+        let device_id = VIRTIO_PCI_DEVICE_ID_BASE + device_type;
+        b[CFG_VENDOR_ID..CFG_VENDOR_ID + 2].copy_from_slice(&VENDOR_VIRTIO.to_le_bytes());
+        b[CFG_DEVICE_ID..CFG_DEVICE_ID + 2].copy_from_slice(&device_id.to_le_bytes());
+        b[CFG_COMMAND..CFG_COMMAND + 2].copy_from_slice(&self.command.to_le_bytes());
+        b[CFG_STATUS..CFG_STATUS + 2].copy_from_slice(&STATUS_CAPABILITIES_LIST.to_le_bytes());
+        b[CFG_REVISION] = VIRTIO_PCI_REVISION;
+        let (subclass, class) = match device_type {
+            DEVICE_TYPE_NET => (SUBCLASS_ETHERNET, CLASS_NETWORK),
+            DEVICE_TYPE_BLOCK => (SUBCLASS_SCSI, CLASS_STORAGE),
+            _ => (SUBCLASS_COMMUNICATION_OTHER, CLASS_COMMUNICATION),
         };
-        b[10] = sub;
-        b[11] = class;
-        b[0x10..0x14].copy_from_slice(&self.bar0.to_le_bytes());
-        b[0x2c..0x2e].copy_from_slice(&0x1af4u16.to_le_bytes());
-        b[0x2e..0x30].copy_from_slice(&id.to_le_bytes());
-        b[0x34] = 0x40;
-        b[0x3c] = self.int_line;
-        b[0x3d] = 1;
-        cap(&mut b, 0x40, 0x50, 16, 1, 0, 0x38);
-        cap(&mut b, 0x50, 0x64, 20, 2, 0x3000, 0x1000);
-        b[0x50 + 16..0x50 + 20].copy_from_slice(&4u32.to_le_bytes());
-        cap(&mut b, 0x64, 0x74, 16, 3, 0x1000, 4);
-        cap(&mut b, 0x74, 0, 16, 4, 0x2000, 0x100);
+        b[CFG_SUBCLASS] = subclass;
+        b[CFG_CLASS] = class;
+        b[CFG_BAR0..CFG_BAR0 + 4].copy_from_slice(&self.bar0.to_le_bytes());
+        b[CFG_SUBSYSTEM_VENDOR_ID..CFG_SUBSYSTEM_VENDOR_ID + 2]
+            .copy_from_slice(&VENDOR_VIRTIO.to_le_bytes());
+        b[CFG_SUBSYSTEM_ID..CFG_SUBSYSTEM_ID + 2].copy_from_slice(&device_type.to_le_bytes());
+        b[CFG_CAPABILITIES_POINTER] = CAP_COMMON_AT as u8;
+        b[CFG_INTERRUPT_LINE] = self.int_line;
+        b[CFG_INTERRUPT_PIN] = INTERRUPT_PIN_INTA;
+        write_virtio_cap(
+            &mut b,
+            CAP_COMMON_AT,
+            CAP_NOTIFY_AT,
+            VIRTIO_CAP_LEN,
+            VIRTIO_PCI_CAP_COMMON_CFG,
+            COMMON_CFG_OFFSET as u32,
+            COMMON_CFG_LENGTH,
+        );
+        write_virtio_cap(
+            &mut b,
+            CAP_NOTIFY_AT,
+            CAP_ISR_AT,
+            VIRTIO_NOTIFY_CAP_LEN,
+            VIRTIO_PCI_CAP_NOTIFY_CFG,
+            NOTIFY_OFFSET as u32,
+            REGION_SIZE as u32,
+        );
+        let multiplier_at = CAP_NOTIFY_AT + VIRTIO_CAP_NOTIFY_MULTIPLIER_FIELD;
+        b[multiplier_at..multiplier_at + 4].copy_from_slice(&NOTIFY_OFF_MULTIPLIER.to_le_bytes());
+        write_virtio_cap(
+            &mut b,
+            CAP_ISR_AT,
+            CAP_DEVICE_AT,
+            VIRTIO_CAP_LEN,
+            VIRTIO_PCI_CAP_ISR_CFG,
+            ISR_OFFSET as u32,
+            ISR_LENGTH,
+        );
+        write_virtio_cap(
+            &mut b,
+            CAP_DEVICE_AT,
+            0,
+            VIRTIO_CAP_LEN,
+            VIRTIO_PCI_CAP_DEVICE_CFG,
+            DEVICE_CFG_OFFSET as u32,
+            DEVICE_CFG_LENGTH,
+        );
         b
     }
 
+    /// Byte-wise so sub-dword writes to the data port work. Only the command register, BAR0
+    /// and the interrupt line are writable; everything else is read-only.
     fn write_config(&mut self, reg: usize, size: usize, val: u32) {
         for k in 0..size {
-            let r = reg + k;
+            let byte_reg = reg + k;
             let byte = (val >> (8 * k)) as u8;
-            match r {
-                0x04 => self.command = (self.command & 0xff00) | byte as u16,
-                0x05 => self.command = (self.command & 0x00ff) | ((byte as u16) << 8),
-                0x10..=0x13 => {
-                    let sh = 8 * (r - 0x10);
-                    let mask = !((BAR_SIZE - 1) as u32);
-                    self.bar0 = (self.bar0 & !(0xff << sh)) | ((byte as u32) << sh);
-                    self.bar0 &= mask;
+            match byte_reg {
+                CFG_COMMAND => self.command = (self.command & 0xff00) | byte as u16,
+                CFG_COMMAND_HIGH_BYTE => {
+                    self.command = (self.command & 0x00ff) | ((byte as u16) << 8)
                 }
-                0x3c => self.int_line = byte,
+                CFG_BAR0..=CFG_BAR0_LAST_BYTE => {
+                    let shift = 8 * (byte_reg - CFG_BAR0);
+                    // Low bits are hardwired to zero: this is what makes the all-ones sizing
+                    // write read back as !(BAR_SIZE - 1).
+                    let size_mask = !((BAR_SIZE - 1) as u32);
+                    self.bar0 = (self.bar0 & !(0xff << shift)) | ((byte as u32) << shift);
+                    self.bar0 &= size_mask;
+                }
+                CFG_INTERRUPT_LINE => self.int_line = byte,
                 _ => {}
             }
         }
     }
 
-    fn mem_enabled(&self) -> bool {
-        self.command & 2 != 0
+    fn memory_space_enabled(&self) -> bool {
+        self.command & COMMAND_MEMORY_SPACE != 0
     }
 
-    fn hit(&self, pa: u64) -> Option<u64> {
+    /// Offset into BAR0 if `phys_addr` is decoded by this function, honoring the command
+    /// register's memory-space enable and an unassigned (zero) BAR.
+    fn bar0_offset(&self, phys_addr: u64) -> Option<u64> {
         let base = self.bar0 as u64 & !(BAR_SIZE - 1);
-        (self.mem_enabled() && base != 0 && pa >= base && pa < base + BAR_SIZE).then(|| pa - base)
+        (self.memory_space_enabled()
+            && base != 0
+            && phys_addr >= base
+            && phys_addr < base + BAR_SIZE)
+            .then(|| phys_addr - base)
     }
 
-    fn irq_ok(&self) -> bool {
-        self.command & 0x400 == 0
+    /// False when the guest set the command register's INTx-disable bit.
+    fn intx_enabled(&self) -> bool {
+        self.command & COMMAND_INTX_DISABLE == 0
     }
 }
 
@@ -98,101 +253,124 @@ impl PciHost {
         let funcs = devs
             .into_iter()
             .enumerate()
-            .map(|(i, t)| Function {
-                t,
-                devfn: ((i as u8 + 1) << 3),
+            .map(|(i, transport)| PciFunction {
+                transport,
+                devfn: ((i as u8 + FIRST_VIRTIO_SLOT) << DEVFN_SLOT_SHIFT),
                 bar0: (MMIO_BASE + i as u64 * BAR_SIZE) as u32,
                 command: 0,
-                int_line: IRQS[i % IRQS.len()],
+                int_line: LEGACY_IRQS[i % LEGACY_IRQS.len()],
             })
             .collect();
-        PciHost { cfg_addr: 0, funcs }
+        PciHost {
+            config_address: 0,
+            funcs,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.funcs.is_empty()
     }
 
+    /// True once a virtio-console driver is up; the UART stops taking host input then so
+    /// keystrokes go to hvc0 only.
     pub fn console_active(&self) -> bool {
-        self.funcs
-            .iter()
-            .any(|f| f.t.dev.id() == 3 && f.t.driver_ok())
+        self.funcs.iter().any(|f| {
+            f.transport.dev.device_type() == DEVICE_TYPE_CONSOLE && f.transport.driver_ok()
+        })
     }
 
-    fn host_bridge() -> [u8; 256] {
-        let mut b = [0u8; 256];
-        b[0..2].copy_from_slice(&0x8086u16.to_le_bytes());
-        b[2..4].copy_from_slice(&0x1237u16.to_le_bytes());
-        b[10] = 0;
-        b[11] = 6;
+    fn host_bridge() -> [u8; CONFIG_SPACE_SIZE] {
+        let mut b = [0u8; CONFIG_SPACE_SIZE];
+        b[CFG_VENDOR_ID..CFG_VENDOR_ID + 2].copy_from_slice(&VENDOR_INTEL.to_le_bytes());
+        b[CFG_DEVICE_ID..CFG_DEVICE_ID + 2].copy_from_slice(&DEVICE_I440FX_HOST.to_le_bytes());
+        b[CFG_SUBCLASS] = SUBCLASS_HOST_BRIDGE;
+        b[CFG_CLASS] = CLASS_BRIDGE;
         b
     }
 
+    /// `byte` is the byte lane within the dword (low two bits of the data port). Absent
+    /// devices read all ones.
     fn config_read(&self, addr: u32, size: usize, byte: usize) -> u32 {
         let (bus, devfn, reg) = (
-            (addr >> 16) & 0xff,
-            ((addr >> 8) & 0xff) as u8,
-            (addr & 0xfc) as usize,
+            (addr >> CONFIG_ADDRESS_BUS_SHIFT) & 0xff,
+            ((addr >> CONFIG_ADDRESS_DEVFN_SHIFT) & 0xff) as u8,
+            (addr & CONFIG_ADDRESS_REGISTER_MASK) as usize,
         );
         let ones = u32::MAX >> (32 - 8 * size as u32);
         if bus != 0 {
             return ones;
         }
-        let cfg = if devfn == 0 {
+        let config = if devfn == 0 {
             Self::host_bridge()
         } else if let Some(f) = self.funcs.iter().find(|f| f.devfn == devfn) {
             f.config()
         } else {
             return ones;
         };
-        let d = u32::from_le_bytes(cfg[reg..reg + 4].try_into().unwrap());
-        (d >> (8 * byte)) & ones
+        let dword = u32::from_le_bytes(config[reg..reg + 4].try_into().unwrap());
+        (dword >> (8 * byte)) & ones
     }
 
     pub fn io_in(&self, port: u16, size: u8) -> u32 {
-        if port == 0xcf8 {
-            return self.cfg_addr;
+        if port == CONFIG_ADDRESS_PORT {
+            return self.config_address;
         }
-        if self.cfg_addr & 0x8000_0000 == 0 {
+        if self.config_address & CONFIG_ADDRESS_ENABLE == 0 {
             return u32::MAX >> (32 - 8 * size as u32);
         }
-        self.config_read(self.cfg_addr, size as usize, (port & 3) as usize)
+        self.config_read(self.config_address, size as usize, (port & 3) as usize)
     }
 
     pub fn io_out(&mut self, port: u16, size: u8, val: u32) {
-        if port == 0xcf8 {
-            self.cfg_addr = val;
+        if port == CONFIG_ADDRESS_PORT {
+            self.config_address = val;
             return;
         }
-        if self.cfg_addr & 0x8000_0000 == 0 || (self.cfg_addr >> 16) & 0xff != 0 {
+        let bus = (self.config_address >> CONFIG_ADDRESS_BUS_SHIFT) & 0xff;
+        if self.config_address & CONFIG_ADDRESS_ENABLE == 0 || bus != 0 {
             return;
         }
-        let devfn = ((self.cfg_addr >> 8) & 0xff) as u8;
-        let reg = (self.cfg_addr & 0xfc) as usize + (port & 3) as usize;
+        let devfn = ((self.config_address >> CONFIG_ADDRESS_DEVFN_SHIFT) & 0xff) as u8;
+        let reg =
+            (self.config_address & CONFIG_ADDRESS_REGISTER_MASK) as usize + (port & 3) as usize;
         if let Some(f) = self.funcs.iter_mut().find(|f| f.devfn == devfn) {
             f.write_config(reg, size as usize, val);
         }
     }
 
-    fn find(&mut self, pa: u64) -> Option<(&mut Function, u64)> {
+    fn find_by_address(&mut self, phys_addr: u64) -> Option<(&mut PciFunction, u64)> {
         self.funcs
             .iter_mut()
-            .find_map(|f| f.hit(pa).map(|o| (f, o)))
+            .find_map(|f| f.bar0_offset(phys_addr).map(|offset| (f, offset)))
     }
 
-    pub fn mmio_read(&mut self, pa: u64, size: u8) -> Option<u32> {
-        self.find(pa).map(|(f, off)| f.t.mmio_read(off, size))
+    /// None if no BAR decodes `phys_addr`.
+    pub fn mmio_read(&mut self, phys_addr: u64, size: u8) -> Option<u32> {
+        self.find_by_address(phys_addr)
+            .map(|(f, offset)| f.transport.mmio_read(offset, size))
     }
 
-    pub fn mmio_write(&mut self, pa: u64, size: u8, val: u32, mem: &mut GuestMem) -> Option<u8> {
-        let (f, off) = self.find(pa)?;
-        let raise = f.t.mmio_write(off, size, val, mem);
-        Some(if raise && f.irq_ok() { f.int_line } else { 0 })
+    /// None if no BAR decodes `phys_addr`; otherwise the PIC IRQ to raise, or 0 for none.
+    pub fn mmio_write(
+        &mut self,
+        phys_addr: u64,
+        size: u8,
+        val: u32,
+        mem: &mut GuestMem,
+    ) -> Option<u8> {
+        let (f, offset) = self.find_by_address(phys_addr)?;
+        let raise = f.transport.mmio_write(offset, size, val, mem);
+        Some(if raise && f.intx_enabled() {
+            f.int_line
+        } else {
+            0
+        })
     }
 
+    /// Appends the IRQ of every function that has a new interrupt to `raise`.
     pub fn poll(&mut self, mem: &mut GuestMem, raise: &mut Vec<u8>) {
         for f in &mut self.funcs {
-            if f.t.poll(mem) && f.irq_ok() {
+            if f.transport.poll(mem) && f.intx_enabled() {
                 raise.push(f.int_line);
             }
         }
@@ -205,46 +383,72 @@ mod tests {
     use crate::console::ConsoleHandle;
     use crate::dev::vcons::VirtioConsole;
 
+    const CONFIG_DATA_PORT: u16 = 0xcfc;
+
     fn host() -> PciHost {
         PciHost::new(vec![Transport::new(Box::new(VirtioConsole::new(
             ConsoleHandle::default(),
         )))])
     }
 
-    fn rd(h: &mut PciHost, dev: u32, reg: u32) -> u32 {
-        h.io_out(0xcf8, 4, 0x8000_0000 | dev << 11 | reg);
-        h.io_in(0xcfc, 4)
+    fn config_address(slot: u32, reg: u32) -> u32 {
+        CONFIG_ADDRESS_ENABLE | slot << (CONFIG_ADDRESS_DEVFN_SHIFT + DEVFN_SLOT_SHIFT) | reg
+    }
+
+    fn rd(h: &mut PciHost, slot: u32, reg: u32) -> u32 {
+        h.io_out(CONFIG_ADDRESS_PORT, 4, config_address(slot, reg));
+        h.io_in(CONFIG_DATA_PORT, 4)
     }
 
     #[test]
     fn enumerate_and_size_bar() {
         let mut h = host();
-        assert_eq!(rd(&mut h, 0, 0) & 0xffff, 0x8086);
-        assert_eq!(rd(&mut h, 0, 8) >> 16, 0x0600);
-        assert_eq!(rd(&mut h, 1, 0), 0x1af4 | 0x1043 << 16);
-        assert_eq!(rd(&mut h, 2, 0), u32::MAX);
-        let bar = rd(&mut h, 1, 0x10);
-        h.io_out(0xcf8, 4, 0x8000_0000 | 1 << 11 | 0x10);
-        h.io_out(0xcfc, 4, u32::MAX);
-        assert_eq!(h.io_in(0xcfc, 4), !(BAR_SIZE as u32 - 1));
-        h.io_out(0xcfc, 4, bar);
-        assert_eq!(h.io_in(0xcfc, 4), bar);
+        assert_eq!(
+            rd(&mut h, 0, CFG_VENDOR_ID as u32) & 0xffff,
+            VENDOR_INTEL as u32
+        );
+        // Dword at 8 is revision, prog_if, subclass, class: the upper half is the class code.
+        assert_eq!(rd(&mut h, 0, CFG_REVISION as u32) >> 16, 0x0600);
+        assert_eq!(
+            rd(&mut h, 1, CFG_VENDOR_ID as u32),
+            VENDOR_VIRTIO as u32 | ((VIRTIO_PCI_DEVICE_ID_BASE + DEVICE_TYPE_CONSOLE) as u32) << 16
+        );
+        assert_eq!(rd(&mut h, 2, CFG_VENDOR_ID as u32), u32::MAX);
+        let bar = rd(&mut h, 1, CFG_BAR0 as u32);
+        h.io_out(CONFIG_ADDRESS_PORT, 4, config_address(1, CFG_BAR0 as u32));
+        h.io_out(CONFIG_DATA_PORT, 4, u32::MAX);
+        assert_eq!(h.io_in(CONFIG_DATA_PORT, 4), !(BAR_SIZE as u32 - 1));
+        h.io_out(CONFIG_DATA_PORT, 4, bar);
+        assert_eq!(h.io_in(CONFIG_DATA_PORT, 4), bar);
         let mut caps = Vec::new();
-        let mut p = rd(&mut h, 1, 0x34) & 0xff;
+        let mut p = rd(&mut h, 1, CFG_CAPABILITIES_POINTER as u32) & 0xff;
         while p != 0 {
             let w = rd(&mut h, 1, p);
             caps.push((w >> 24) as u8);
             p = (w >> 8) & 0xff;
         }
-        assert_eq!(caps, vec![1, 2, 3, 4]);
+        assert_eq!(
+            caps,
+            vec![
+                VIRTIO_PCI_CAP_COMMON_CFG,
+                VIRTIO_PCI_CAP_NOTIFY_CFG,
+                VIRTIO_PCI_CAP_ISR_CFG,
+                VIRTIO_PCI_CAP_DEVICE_CFG
+            ]
+        );
     }
 
     #[test]
     fn bar_decode_follows_command() {
         let mut h = host();
         assert!(h.mmio_read(MMIO_BASE + 0x14, 1).is_none());
-        h.io_out(0xcf8, 4, 0x8000_0000 | 1 << 11 | 4);
-        h.io_out(0xcfc, 2, 2);
+        h.io_out(
+            CONFIG_ADDRESS_PORT,
+            4,
+            config_address(1, CFG_COMMAND as u32),
+        );
+        h.io_out(CONFIG_DATA_PORT, 2, COMMAND_MEMORY_SPACE as u32);
+        // BAR0 offset 0x12 is the common config num_queues field; the console has 2 queues.
         assert_eq!(h.mmio_read(MMIO_BASE + 0x12, 2), Some(2));
     }
 }
