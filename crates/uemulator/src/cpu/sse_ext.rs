@@ -14,6 +14,15 @@
 
 use super::*;
 
+#[path = "crypto.rs"]
+mod crypto;
+#[path = "string_compare.rs"]
+mod string_compare;
+
+const GPR_RAX: usize = 0;
+const GPR_RCX: usize = 1;
+const GPR_RDX: usize = 2;
+
 /// Opcode maps of `Insn::op` (the high byte) that this file adds to the `0F` map of `sse.rs`.
 const OPCODE_MAP_0F38: u16 = 2;
 const OPCODE_MAP_0F3A: u16 = 3;
@@ -66,6 +75,12 @@ enum Op {
     /// insertps: one dword of the source (register form) or the m32 into one dword of the
     /// destination, then zeroing by mask.
     Insertps,
+    /// pcmpistri/pcmpistrm (lengths from the first zero element) and pcmpestri/pcmpestrm
+    /// (lengths in EAX and EDX, or RAX and RDX under REX.W).
+    StringCompare {
+        explicit: bool,
+        mask_output: bool,
+    },
 }
 
 /// The element a pextr*/pinsr*/extractps instruction moves between a vector register and a
@@ -288,6 +303,36 @@ fn decode_sse41_op(map: u16, opcode: u8) -> Option<Op> {
         (OPCODE_MAP_0F3A, 0x40) => Op::DotProduct { double: false },
         (OPCODE_MAP_0F3A, 0x41) => Op::DotProduct { double: true },
         (OPCODE_MAP_0F3A, 0x42) => Op::WithImm(mpsadbw),
+        _ => return decode_sse42_op(map, opcode),
+    })
+}
+
+/// SSE4.2's vector instructions (CRC32 is dispatched separately: it has no vector operands).
+fn decode_sse42_op(map: u16, opcode: u8) -> Option<Op> {
+    Some(match (map, opcode) {
+        (OPCODE_MAP_0F38, 0x37) => Op::Binary(|a, b| {
+            zip_lanes::<u64>(
+                a,
+                b,
+                |x, y| if (x as i64) > (y as i64) { u64::MAX } else { 0 },
+            )
+        }),
+        (OPCODE_MAP_0F3A, 0x60) => Op::StringCompare {
+            explicit: true,
+            mask_output: true,
+        },
+        (OPCODE_MAP_0F3A, 0x61) => Op::StringCompare {
+            explicit: true,
+            mask_output: false,
+        },
+        (OPCODE_MAP_0F3A, 0x62) => Op::StringCompare {
+            explicit: false,
+            mask_output: true,
+        },
+        (OPCODE_MAP_0F3A, 0x63) => Op::StringCompare {
+            explicit: false,
+            mask_output: false,
+        },
         _ => return None,
     })
 }
@@ -672,6 +717,77 @@ fn insertps(dst: u128, src: u128, selector: u8, from_memory: bool) -> u128 {
 }
 
 impl Cpu {
+    /// CRC32 (F2 0F 38 F0/F1): accumulates the source operand into the CRC-32C in the low 32 bits
+    /// of the destination register. The source is a byte (F0) or 16/32/64 bits by operand size
+    /// (F1); the destination is 32 bits, or 64 under REX.W (the upper half is then zero). No SSE
+    /// enable rules apply.
+    fn crc32(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
+        let source_bytes = if i.op & 0xff == 0xf0 { 1 } else { i.opsize };
+        let value = if i.md == MODRM_MOD_REGISTER {
+            self.read_gpr(i.rm, source_bytes, i.rex_present)
+        } else {
+            let addr = self.linear_address(i, self.effective_address(i, next));
+            self.read(addr, source_bytes)?
+        };
+        let crc = self.read_gpr(i.reg, 4, true) as u32;
+        let result = crypto::crc32c(crc, value, source_bytes);
+        let destination_bytes = if i.opsize == 8 { 8 } else { 4 };
+        self.write_gpr(i.reg, destination_bytes, true, result as u64);
+        Ok(())
+    }
+
+    /// pcmpistri/pcmpistrm/pcmpestri/pcmpestrm. Explicit lengths are the absolute values of
+    /// EAX (first string) and EDX (second), or of RAX and RDX under REX.W, saturated to the
+    /// element count. Flags: CF = result nonzero, ZF = second string shorter than a full register,
+    /// SF = first string shorter, OF = result bit 0; AF and PF are cleared.
+    fn string_compare(
+        &mut self,
+        wide: bool,
+        explicit: bool,
+        mask_output: bool,
+        first: u128,
+        second: u128,
+        control: u8,
+    ) {
+        let count = string_compare::element_count(control);
+        let (first_length, second_length) = if explicit {
+            let clamp = |register: u64| -> usize {
+                let magnitude = if wide {
+                    (register as i64).unsigned_abs()
+                } else {
+                    (register as u32 as i32).unsigned_abs() as u64
+                };
+                magnitude.min(count as u64) as usize
+            };
+            (clamp(self.gpr[GPR_RAX]), clamp(self.gpr[GPR_RDX]))
+        } else {
+            (
+                string_compare::implicit_length(first, control),
+                string_compare::implicit_length(second, control),
+            )
+        };
+        let comparison =
+            string_compare::compare(control, first, first_length, second, second_length);
+        let mut flags = 0;
+        for (set, flag) in [
+            (comparison.carry, CF),
+            (comparison.zero, ZF),
+            (comparison.sign, SF),
+            (comparison.overflow, OF),
+        ] {
+            if set {
+                flags |= flag;
+            }
+        }
+        self.set_eflags_arith(flags);
+        if mask_output {
+            self.xmm[0] = string_compare::result_mask(control, comparison.result);
+        } else {
+            let index = string_compare::result_index(control, comparison.result);
+            self.write_gpr(GPR_RCX as u8, 4, true, index as u64);
+        }
+    }
+
     /// pextrb/pextrw/pextrd/pextrq/extractps: the lane of `source` that imm8 selects goes to the
     /// ModRM.rm general register (zero-extended) or memory. imm8 is taken modulo the lane count.
     fn extract_lane(
@@ -730,6 +846,12 @@ impl Cpu {
             (_, true) => Prefix::P66,
             _ => Prefix::Np,
         };
+        if map == OPCODE_MAP_0F38 && matches!(opcode, 0xf0 | 0xf1) {
+            return match prefix {
+                Prefix::F2 => self.crc32(i, next).map(|()| true),
+                _ => Ok(false),
+            };
+        }
         let Some(op) = decode_op(map, opcode, prefix) else {
             return Ok(false);
         };
@@ -830,6 +952,13 @@ impl Cpu {
                 insert_lane(dst, kind, selector, value, i.opsize == 8)
             }
             Op::Insertps => insertps(dst, src, selector, mem_addr.is_some()),
+            Op::StringCompare {
+                explicit,
+                mask_output,
+            } => {
+                self.string_compare(i.opsize == 8, explicit, mask_output, dst, src, selector);
+                return Ok(true);
+            }
         };
         self.fp_commit(&fp)?;
         self.xmm[reg] = result;

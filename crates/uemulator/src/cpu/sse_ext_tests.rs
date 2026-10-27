@@ -1942,6 +1942,714 @@ mod sse41 {
     }
 }
 
+mod sse42 {
+    use super::*;
+
+    fn exec_imm(rig: &mut Rig, asm: &str, imm: u8) -> Stop {
+        let mut bytes = code(asm).to_vec();
+        let last = bytes.len() - 2;
+        bytes[last] = imm;
+        rig.exec_bytes(&bytes)
+    }
+
+    #[test]
+    fn pcmpgtq_compares_signed_quadwords() {
+        let mut rig = Rig::new();
+        check_binary(&mut rig, "pcmpgtq", |a, b| {
+            let (x, y) = (qwords_of(a), qwords_of(b));
+            lanes64(std::array::from_fn(|k| {
+                if (x[k] as i64) > (y[k] as i64) {
+                    u64::MAX
+                } else {
+                    0
+                }
+            }))
+        });
+        assert_eq!(
+            rig.op(
+                "pcmpgtq xmm0, xmm1",
+                lanes64([1, u64::MAX]),
+                lanes64([u64::MAX, 1])
+            ),
+            lanes64([u64::MAX, 0]),
+            "-1 < 1 as signed"
+        );
+        assert_eq!(rig.run("pcmpgtq xmm0, [rsi]"), Stop::Halted);
+        rig.reset();
+        rig.h.cpu.gpr[RSI] = DATA + 8;
+        assert_eq!(rig.exec("pcmpgtq xmm0, [rsi]"), gp0());
+    }
+
+    /// CRC-32C as software computes it around the instruction: all-ones initial value and a final
+    /// inversion.
+    const CRC_INITIAL: u64 = 0xffff_ffff;
+
+    fn crc32c_of(rig: &mut Rig, data: &[u8]) -> u32 {
+        let mut crc = CRC_INITIAL;
+        for &byte in data {
+            rig.h.cpu.gpr[RAX] = crc;
+            rig.h.cpu.gpr[RBX] = byte as u64;
+            rig.run_ok("crc32 eax, bl");
+            crc = rig.gpr(RAX);
+        }
+        !(crc as u32)
+    }
+
+    #[test]
+    fn crc32_bytes_produce_the_standard_crc32c_check_values() {
+        let mut rig = Rig::new();
+        // The CRC-32C catalogue check value, and the RFC 3720 (iSCSI) appendix B.4 patterns.
+        assert_eq!(crc32c_of(&mut rig, b"123456789"), 0xe306_9283);
+        assert_eq!(crc32c_of(&mut rig, &[0u8; 32]), 0x8a91_36aa);
+        assert_eq!(crc32c_of(&mut rig, &[0xffu8; 32]), 0x62a8_ab43);
+        let ascending: Vec<u8> = (0..32).collect();
+        assert_eq!(crc32c_of(&mut rig, &ascending), 0x46dd_794e);
+        let descending: Vec<u8> = (0..32).rev().collect();
+        assert_eq!(crc32c_of(&mut rig, &descending), 0x113f_db5c);
+    }
+
+    #[test]
+    fn wider_crc32_forms_equal_repeated_byte_steps() {
+        let mut rig = Rig::new();
+        let data: Vec<u8> = (1..=8).map(|k| k * 0x1f).collect();
+        let want = crc32c_of(&mut rig, &data);
+        let run = |rig: &mut Rig, asm: &str, chunks: &[&[u8]]| -> u32 {
+            let mut crc = CRC_INITIAL;
+            for chunk in chunks {
+                let mut value = [0u8; 8];
+                value[..chunk.len()].copy_from_slice(chunk);
+                rig.h.cpu.gpr[RAX] = crc;
+                rig.h.cpu.gpr[RBX] = u64::from_le_bytes(value);
+                rig.h.write(DATA, &value);
+                rig.run_ok(asm);
+                crc = rig.gpr(RAX);
+            }
+            !(crc as u32)
+        };
+        let words: Vec<&[u8]> = data.chunks(2).collect();
+        let dwords: Vec<&[u8]> = data.chunks(4).collect();
+        let qwords: Vec<&[u8]> = data.chunks(8).collect();
+        for (asm, chunks) in [
+            ("crc32 eax, bx", &words),
+            ("crc32 eax, word ptr [rsi]", &words),
+            ("crc32 eax, ebx", &dwords),
+            ("crc32 eax, dword ptr [rsi]", &dwords),
+            ("crc32 rax, rbx", &qwords),
+            ("crc32 rax, qword ptr [rsi]", &qwords),
+        ] {
+            assert_eq!(run(&mut rig, asm, chunks), want, "{asm}");
+        }
+    }
+
+    #[test]
+    fn crc32_destination_width_and_register_selection() {
+        let mut rig = Rig::new();
+        // A 32-bit destination zero-extends; a REX.W one with a byte source gives a 64-bit write
+        // whose upper half is zero too.
+        rig.h.cpu.gpr[RAX] = 0xdead_beef_0000_0000;
+        rig.h.cpu.gpr[RBX] = 0x55;
+        rig.run_ok("crc32 eax, bl");
+        assert_eq!(rig.gpr(RAX), crypto::crc32c(0, 0x55, 1) as u64);
+        rig.h.cpu.gpr[RAX] = 0xdead_beef_0000_0001;
+        rig.run_ok("crc32 rax, bl");
+        assert_eq!(rig.gpr(RAX), crypto::crc32c(1, 0x55, 1) as u64);
+        // Without a REX prefix byte register 7 is bh, the second byte of rbx.
+        rig.h.cpu.gpr[RAX] = 0;
+        rig.h.cpu.gpr[RBX] = 0x1234;
+        rig.run_ok("crc32 eax, bh");
+        assert_eq!(rig.gpr(RAX), crypto::crc32c(0, 0x12, 1) as u64);
+        // With a REX prefix the byte registers are the low bytes (r10b here).
+        rig.h.cpu.gpr[R9] = 0xffff_ffff_0000_0003;
+        rig.h.cpu.gpr[R10] = 0x77;
+        rig.run_ok("crc32 r9d, r10b");
+        assert_eq!(rig.gpr(R9), crypto::crc32c(3, 0x77, 1) as u64);
+        rig.h.cpu.gpr[R9] = 7;
+        rig.h.cpu.gpr[R10] = 0x0102_0304_0506_0708;
+        rig.run_ok("crc32 r9, r10");
+        assert_eq!(
+            rig.gpr(R9),
+            crypto::crc32c(7, 0x0102_0304_0506_0708, 8) as u64
+        );
+        // Memory forms.
+        rig.h.write(DATA, &[0x9a, 0xbc]);
+        rig.h.cpu.gpr[RAX] = 5;
+        rig.run_ok("crc32 eax, byte ptr [rsi]");
+        assert_eq!(rig.gpr(RAX), crypto::crc32c(5, 0x9a, 1) as u64);
+    }
+
+    #[test]
+    fn crc32_needs_the_f2_prefix_and_ignores_the_sse_enable_rules() {
+        let mut rig = Rig::new();
+        assert_eq!(rig.run(".byte 0xf3, 0x0f, 0x38, 0xf0, 0xc3"), ud());
+        rig.reset();
+        rig.h.cpu.cr4 &= !CR4_OSFXSR;
+        rig.h.cpu.cr0 |= CR0_TS | CR0_EM;
+        assert_eq!(rig.exec("crc32 eax, bl"), Stop::Halted);
+    }
+
+    fn element(register: u128, index: i32, control: u8) -> i32 {
+        let k = index as usize;
+        match (control & 1 != 0, control & 2 != 0) {
+            (false, false) => bytes_of(register)[k] as i32,
+            (false, true) => bytes_of(register)[k] as i8 as i32,
+            (true, false) => words_of(register)[k] as i32,
+            (true, true) => words_of(register)[k] as i16 as i32,
+        }
+    }
+
+    /// A second formulation of the string comparison, structured after the loops QEMU uses (bit
+    /// positions built by shifting, lengths held as index-of-last-valid). `first_length` and
+    /// `second_length` are element counts. Returns IntRes2 and (carry, zero, sign, overflow).
+    fn reference_compare(
+        control: u8,
+        first: u128,
+        first_length: i32,
+        second: u128,
+        second_length: i32,
+    ) -> (u32, [bool; 4]) {
+        let upper: i32 = if control & 1 != 0 { 7 } else { 15 };
+        let valid_first = first_length - 1;
+        let valid_second = second_length - 1;
+        let mut result: i32 = 0;
+        match (control >> 2) & 3 {
+            0 => {
+                for j in (0..=valid_second).rev() {
+                    result <<= 1;
+                    let v = element(second, j, control);
+                    for i in (0..=valid_first).rev() {
+                        result |= (v == element(first, i, control)) as i32;
+                    }
+                }
+            }
+            1 => {
+                for j in (0..=valid_second).rev() {
+                    result <<= 1;
+                    let v = element(second, j, control);
+                    let mut i = (valid_first - 1) | 1;
+                    while i >= 0 {
+                        result |= (element(first, i, control) >= v
+                            && element(first, i - 1, control) <= v)
+                            as i32;
+                        i -= 2;
+                    }
+                }
+            }
+            2 => {
+                let larger = valid_first.max(valid_second);
+                let smaller = valid_first.min(valid_second);
+                result = (1 << (upper - larger)) - 1;
+                result <<= larger - smaller;
+                for i in (0..=smaller).rev() {
+                    result <<= 1;
+                    result |= (element(second, i, control) == element(first, i, control)) as i32;
+                }
+            }
+            _ => {
+                if valid_first == -1 {
+                    result = (2 << upper) - 1;
+                } else {
+                    let start = if valid_second == upper {
+                        valid_second
+                    } else {
+                        valid_second - valid_first
+                    };
+                    for j in (0..=start).rev() {
+                        result <<= 1;
+                        let mut all = 1;
+                        for i in (0..=(upper - j).min(valid_first)).rev() {
+                            all &= (element(second, i + j, control) == element(first, i, control))
+                                as i32;
+                        }
+                        result |= all;
+                    }
+                }
+            }
+        }
+        match (control >> 4) & 3 {
+            1 => result ^= (2 << upper) - 1,
+            3 => result ^= (1 << (valid_second + 1)) - 1,
+            _ => {}
+        }
+        let result = result as u32;
+        (
+            result,
+            [
+                result != 0,
+                valid_second < upper,
+                valid_first < upper,
+                result & 1 != 0,
+            ],
+        )
+    }
+
+    fn string_alphabet(control: u8) -> Vec<u16> {
+        if control & 1 != 0 {
+            vec![0, 0, 1, 0x4142, 0x4143, 0x7fff, 0x8000, 0xffff, 0x0100]
+        } else {
+            vec![0, 0, 1, 0x41, 0x42, 0x43, 0x61, 0x7f, 0x80, 0xff]
+        }
+    }
+
+    fn random_string(rng: &mut XorShift, control: u8) -> u128 {
+        let alphabet = string_alphabet(control);
+        let words = control & 1 != 0;
+        let mut register = 0u128;
+        for k in 0..element_count(words) {
+            let pick = alphabet[(rng.next() % alphabet.len() as u64) as usize] as u128;
+            register |= pick << (k * if words { 16 } else { 8 });
+        }
+        register
+    }
+
+    fn element_count(words: bool) -> usize {
+        if words { 8 } else { 16 }
+    }
+
+    /// Index of the first zero element, or the element count.
+    fn implicit_length(register: u128, control: u8) -> i32 {
+        let count = element_count(control & 1 != 0) as i32;
+        (0..count)
+            .find(|&k| element(register, k, control) == 0)
+            .unwrap_or(count)
+    }
+
+    fn flags_of(flags: [bool; 4]) -> u64 {
+        [CF, ZF, SF, OF]
+            .into_iter()
+            .zip(flags)
+            .filter(|(_, set)| *set)
+            .fold(0, |acc, (flag, _)| acc | flag)
+    }
+
+    #[test]
+    fn implicit_length_comparisons_match_the_reference_for_every_control_byte() {
+        let mut rig = Rig::new();
+        let mut rng = XorShift(0x1357_9bdf_2468_ace0);
+        for control in 0..0x80u8 {
+            for _ in 0..24 {
+                let first = random_string(&mut rng, control);
+                let second = random_string(&mut rng, control);
+                let (la, lb) = (
+                    implicit_length(first, control),
+                    implicit_length(second, control),
+                );
+                let (result, flags) = reference_compare(control, first, la, second, lb);
+                let words = control & 1 != 0;
+                let count = element_count(words) as u32;
+                let want_index = if result == 0 {
+                    count
+                } else if control & 0x40 != 0 {
+                    31 - result.leading_zeros()
+                } else {
+                    result.trailing_zeros()
+                };
+                let width = if words { 16 } else { 8 };
+                let want_mask = if control & 0x40 == 0 {
+                    result as u128
+                } else {
+                    (0..count).fold(0u128, |acc, k| {
+                        if result >> k & 1 == 1 {
+                            acc | (((1u128 << width) - 1) << (k * width))
+                        } else {
+                            acc
+                        }
+                    })
+                };
+                for memory in [false, true] {
+                    rig.h.cpu.xmm[0] = first;
+                    rig.h.cpu.xmm[1] = second;
+                    rig.h.write(DATA, &second.to_le_bytes());
+                    rig.h.cpu.gpr[RCX] = u64::MAX;
+                    rig.reset();
+                    rig.h.cpu.set_eflags_arith(AF | PF);
+                    let asm = if memory {
+                        "pcmpistri xmm0, [rsi], 0"
+                    } else {
+                        "pcmpistri xmm0, xmm1, 0"
+                    };
+                    assert_eq!(exec_imm(&mut rig, asm, control), Stop::Halted);
+                    let context =
+                        format!("control {control:#x} first {first:#x} second {second:#x}");
+                    assert_eq!(rig.gpr(RCX), want_index as u64, "pcmpistri ecx {context}");
+                    assert_eq!(rig.flags(), flags_of(flags), "pcmpistri flags {context}");
+                    assert_eq!(rig.h.cpu.xmm[0], first, "pcmpistri leaves xmm0");
+
+                    rig.h.cpu.xmm[0] = first;
+                    rig.h.cpu.xmm[1] = second;
+                    rig.reset();
+                    let asm = if memory {
+                        "pcmpistrm xmm0, [rsi], 0"
+                    } else {
+                        "pcmpistrm xmm0, xmm1, 0"
+                    };
+                    assert_eq!(exec_imm(&mut rig, asm, control), Stop::Halted);
+                    assert_eq!(rig.h.cpu.xmm[0], want_mask, "pcmpistrm xmm0 {context}");
+                    assert_eq!(rig.flags(), flags_of(flags), "pcmpistrm flags {context}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_length_comparisons_use_eax_and_edx_saturated_and_signed() {
+        let mut rig = Rig::new();
+        let mut rng = XorShift(0x0f1e_2d3c_4b5a_6978);
+        for control in 0..0x80u8 {
+            let count = element_count(control & 1 != 0) as i64;
+            for round in 0..16 {
+                let first = random_string(&mut rng, control);
+                let second = random_string(&mut rng, control);
+                // Lengths from empty to past the register size, and negative ones.
+                let pick = |rng: &mut XorShift| -> i64 {
+                    let magnitude = (rng.next() % (count as u64 + 3)) as i64;
+                    if rng.next().is_multiple_of(4) {
+                        -magnitude
+                    } else {
+                        magnitude
+                    }
+                };
+                let (eax, edx) = (pick(&mut rng), pick(&mut rng));
+                let (la, lb) = (
+                    eax.unsigned_abs().min(count as u64) as i32,
+                    edx.unsigned_abs().min(count as u64) as i32,
+                );
+                let (result, flags) = reference_compare(control, first, la, second, lb);
+                let want_index = if result == 0 {
+                    count as u32
+                } else if control & 0x40 != 0 {
+                    31 - result.leading_zeros()
+                } else {
+                    result.trailing_zeros()
+                };
+                rig.h.cpu.xmm[0] = first;
+                rig.h.cpu.xmm[1] = second;
+                rig.h.cpu.gpr[RAX] = eax as u32 as u64 | 0xdead_0000_0000;
+                rig.h.cpu.gpr[RDX] = edx as u32 as u64 | 0xbeef_0000_0000;
+                rig.h.cpu.gpr[RCX] = u64::MAX;
+                rig.reset();
+                assert_eq!(
+                    exec_imm(&mut rig, "pcmpestri xmm0, xmm1, 0", control),
+                    Stop::Halted
+                );
+                let context = format!("control {control:#x} eax {eax} edx {edx} round {round}");
+                assert_eq!(rig.gpr(RCX), want_index as u64, "pcmpestri {context}");
+                assert_eq!(rig.flags(), flags_of(flags), "pcmpestri flags {context}");
+                // The mask form must agree with the index form on the same operands.
+                rig.h.cpu.xmm[0] = first;
+                rig.h.cpu.gpr[RAX] = eax as u32 as u64;
+                rig.h.cpu.gpr[RDX] = edx as u32 as u64;
+                rig.reset();
+                assert_eq!(
+                    exec_imm(&mut rig, "pcmpestrm xmm0, xmm1, 0", control),
+                    Stop::Halted
+                );
+                if control & 0x40 == 0 {
+                    assert_eq!(rig.h.cpu.xmm[0], result as u128, "pcmpestrm {context}");
+                } else {
+                    let nonzero_elements = (0..count)
+                        .filter(|&k| {
+                            let width = if control & 1 != 0 { 16 } else { 8 };
+                            (rig.h.cpu.xmm[0] >> (k * width)) & ((1u128 << width) - 1) != 0
+                        })
+                        .count();
+                    assert_eq!(nonzero_elements as u32, result.count_ones(), "{context}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rex_w_widens_the_explicit_lengths_to_rax_and_rdx() {
+        let mut rig = Rig::new();
+        // With 32-bit lengths 0x1_0000_0003 is 3, so the differing last byte is never reached;
+        // with REX.W it is huge and saturates to 16.
+        let first = lanes8(*b"abcdefghijklmnop");
+        let second = lanes8(*b"abcdefghijklmnoX");
+        rig.h.cpu.xmm[0] = first;
+        rig.h.cpu.xmm[1] = second;
+        rig.h.cpu.gpr[RAX] = 0x1_0000_0003;
+        rig.h.cpu.gpr[RDX] = 0x1_0000_0003;
+        rig.reset();
+        // equal each, negative polarity: the index of the first difference
+        assert_eq!(
+            exec_imm(&mut rig, "pcmpestri xmm0, xmm1, 0", 0x18),
+            Stop::Halted
+        );
+        assert_eq!(
+            rig.gpr(RCX),
+            16,
+            "three valid equal elements, the rest compare as ended"
+        );
+        rig.reset();
+        assert_eq!(
+            exec_imm(
+                &mut rig,
+                ".byte 0x66, 0x48, 0x0f, 0x3a, 0x61, 0xc1, 0x00",
+                0x18
+            ),
+            Stop::Halted
+        );
+        assert_eq!(rig.gpr(RCX), 15);
+        // A negative 64-bit length is its absolute value; as 32 bits the same pattern is huge.
+        rig.h.cpu.gpr[RAX] = (-4i64) as u64;
+        rig.h.cpu.gpr[RDX] = (-4i64) as u64;
+        rig.reset();
+        assert_eq!(
+            exec_imm(
+                &mut rig,
+                ".byte 0x66, 0x48, 0x0f, 0x3a, 0x61, 0xc1, 0x00",
+                0x18
+            ),
+            Stop::Halted
+        );
+        assert_eq!(rig.gpr(RCX), 16, "four equal elements, then both ended");
+    }
+
+    fn pad(text: &[u8]) -> u128 {
+        let mut bytes = [0u8; 16];
+        bytes[..text.len()].copy_from_slice(text);
+        lanes8(bytes)
+    }
+
+    fn index_form(rig: &mut Rig, control: u8, first: &[u8], second: &[u8]) -> (u64, u64) {
+        rig.h.cpu.xmm[0] = pad(first);
+        rig.h.cpu.xmm[1] = pad(second);
+        rig.reset();
+        assert_eq!(
+            exec_imm(rig, "pcmpistri xmm0, xmm1, 0", control),
+            Stop::Halted
+        );
+        (rig.gpr(RCX), rig.flags())
+    }
+
+    #[test]
+    fn equal_any_finds_the_first_character_of_a_set_like_strpbrk() {
+        let mut rig = Rig::new();
+        // unsigned bytes, equal any, positive polarity, least significant index
+        let (index, flags) = index_form(&mut rig, 0x00, b"aeiou", b"rhythm and blues");
+        assert_eq!(index, 7, "the 'a' of 'and'");
+        assert_eq!(
+            flags,
+            CF | SF,
+            "found; the set is shorter than a register, the text is not"
+        );
+        let (index, flags) = index_form(&mut rig, 0x00, b"aeiou", b"rhythm");
+        assert_eq!(index, 16, "no match gives the element count");
+        assert_eq!(
+            flags,
+            ZF | SF,
+            "both strings ended inside the register, nothing found"
+        );
+        let (index, flags) = index_form(&mut rig, 0x00, b"xyz", b"zebra");
+        assert_eq!(index, 0);
+        assert_eq!(flags, CF | ZF | SF | OF);
+        // most significant index
+        let (index, _) = index_form(&mut rig, 0x40, b"aeiou", b"education");
+        assert_eq!(index, 7, "the last vowel of 'education' is the 'o' at 7");
+    }
+
+    #[test]
+    fn equal_each_compares_two_strings_like_strcmp() {
+        let mut rig = Rig::new();
+        // unsigned bytes, equal each, negative polarity: the index of the first difference
+        let (index, flags) = index_form(&mut rig, 0x18, b"kernel", b"kernal");
+        assert_eq!(index, 4);
+        assert_ne!(flags & CF, 0);
+        let (index, flags) = index_form(&mut rig, 0x18, b"kernel", b"kernel");
+        assert_eq!(index, 16, "equal strings differ nowhere");
+        assert_eq!(flags, ZF | SF, "both ended");
+        let (index, _) = index_form(&mut rig, 0x18, b"kernel", b"kern");
+        assert_eq!(
+            index, 4,
+            "a shorter second string differs at its terminator"
+        );
+        let (index, _) = index_form(&mut rig, 0x08, b"abc", b"xbz");
+        assert_eq!(index, 1, "positive polarity: the first equal element");
+    }
+
+    #[test]
+    fn ranges_match_characters_between_bounds_pairs() {
+        let mut rig = Rig::new();
+        // unsigned bytes, ranges, positive: first character within 'a'..='z' or '0'..='9'
+        let (index, _) = index_form(&mut rig, 0x04, b"az09", b"__-9x");
+        assert_eq!(index, 3);
+        // negative polarity: first character outside the ranges
+        let (index, _) = index_form(&mut rig, 0x14, b"azAZ", b"abc4ef");
+        assert_eq!(index, 3);
+        // an odd trailing bound has no partner and never matches, even for a value above it
+        let (index, flags) = index_form(&mut rig, 0x04, b"az5", b"9");
+        assert_eq!(index, 16);
+        assert_eq!(flags & CF, 0);
+        // Signedness matters: the pair 0xf0..=0x10 is empty as unsigned bytes but -16..=16 as
+        // signed ones, and contains 5.
+        let (index, _) = index_form(&mut rig, 0x06, &[0xf0, 0x10], &[0x05]);
+        assert_eq!(index, 0);
+        let (index, _) = index_form(&mut rig, 0x04, &[0xf0, 0x10], &[0x05]);
+        assert_eq!(index, 16);
+    }
+
+    #[test]
+    fn equal_ordered_finds_a_substring_like_strstr() {
+        let mut rig = Rig::new();
+        // unsigned bytes, equal ordered, positive, least significant index
+        let (index, flags) = index_form(&mut rig, 0x0c, b"lo", b"hello world");
+        assert_eq!(index, 3);
+        assert_ne!(flags & CF, 0);
+        let (index, flags) = index_form(&mut rig, 0x0c, b"xyz", b"hello world");
+        assert_eq!(index, 16);
+        assert_eq!(flags & CF, 0);
+        // A needle that starts to match at the very end of a full register still reports there.
+        let (index, _) = index_form(&mut rig, 0x0c, b"pq", b"0123456789abcdep");
+        assert_eq!(index, 15);
+        // ...but not when the haystack ended inside the register.
+        let (index, _) = index_form(&mut rig, 0x0c, b"pq", b"0123456789p");
+        assert_eq!(index, 16, "the terminator after 'p' cannot be part of 'pq'");
+        // An empty needle matches at once.
+        let (index, _) = index_form(&mut rig, 0x0c, b"", b"anything");
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn word_and_signed_element_formats() {
+        let mut rig = Rig::new();
+        // unsigned words, equal any: 0x4142 (two ASCII letters) is found at word 2
+        rig.h.cpu.xmm[0] = lanes16([0x4142, 0x9999, 0, 0, 0, 0, 0, 0]);
+        rig.h.cpu.xmm[1] = lanes16([0x1111, 0x2222, 0x4142, 0x3333, 0, 0, 0, 0]);
+        rig.reset();
+        assert_eq!(
+            exec_imm(&mut rig, "pcmpistri xmm0, xmm1, 0", 0x01),
+            Stop::Halted
+        );
+        assert_eq!(rig.gpr(RCX), 2);
+        // Seen as bytes the set is 0x42 0x41 0x99 0x99, and the first member shows up at byte 4.
+        rig.reset();
+        assert_eq!(
+            exec_imm(&mut rig, "pcmpistri xmm0, xmm1, 0", 0x00),
+            Stop::Halted
+        );
+        assert_eq!(rig.gpr(RCX), 4);
+        // signed words: 0xffff is -1, below 1: ranges [-5, 5] contain it, unsigned ranges do not
+        rig.h.cpu.xmm[0] = lanes16([0xfffb, 5, 0, 0, 0, 0, 0, 0]);
+        rig.h.cpu.xmm[1] = lanes16([0xffff, 0, 0, 0, 0, 0, 0, 0]);
+        rig.reset();
+        assert_eq!(
+            exec_imm(&mut rig, "pcmpistri xmm0, xmm1, 0", 0b0000_0111),
+            Stop::Halted
+        );
+        assert_eq!(rig.gpr(RCX), 0, "-1 lies within -5..=5");
+        rig.reset();
+        assert_eq!(
+            exec_imm(&mut rig, "pcmpistri xmm0, xmm1, 0", 0b0000_0101),
+            Stop::Halted
+        );
+        assert_eq!(rig.gpr(RCX), 8, "0xffff is not within 0xfffb..=5 unsigned");
+    }
+
+    #[test]
+    fn masked_polarity_only_inverts_inside_the_second_string() {
+        let mut rig = Rig::new();
+        // equal any with polarity 2 (masked positive) and 3 (masked negative)
+        rig.h.cpu.xmm[0] = pad(b"ab");
+        rig.h.cpu.xmm[1] = pad(b"axbx");
+        rig.reset();
+        assert_eq!(
+            exec_imm(&mut rig, "pcmpistrm xmm0, xmm1, 0", 0x20),
+            Stop::Halted
+        );
+        assert_eq!(
+            rig.h.cpu.xmm[0], 0b0101,
+            "masked positive leaves the result as is"
+        );
+        rig.h.cpu.xmm[0] = pad(b"ab");
+        rig.reset();
+        assert_eq!(
+            exec_imm(&mut rig, "pcmpistrm xmm0, xmm1, 0", 0x30),
+            Stop::Halted
+        );
+        assert_eq!(
+            rig.h.cpu.xmm[0], 0b1010,
+            "masked negative inverts only the four valid bits"
+        );
+        rig.h.cpu.xmm[0] = pad(b"ab");
+        rig.reset();
+        assert_eq!(
+            exec_imm(&mut rig, "pcmpistrm xmm0, xmm1, 0", 0x10),
+            Stop::Halted
+        );
+        assert_eq!(
+            rig.h.cpu.xmm[0],
+            0xffff & !0b0101,
+            "negative inverts every position"
+        );
+        // the element-mask output form
+        rig.h.cpu.xmm[0] = pad(b"ab");
+        rig.reset();
+        assert_eq!(
+            exec_imm(&mut rig, "pcmpistrm xmm0, xmm1, 0", 0x40),
+            Stop::Halted
+        );
+        assert_eq!(
+            rig.h.cpu.xmm[0],
+            lanes8([0xff, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn string_compare_memory_operand_must_be_aligned() {
+        let mut rig = Rig::new();
+        for asm in ["pcmpistri xmm0, [rsi], 0", "pcmpestrm xmm0, [rsi], 0"] {
+            rig.reset();
+            rig.h.cpu.gpr[RSI] = DATA + 1;
+            assert_eq!(exec_imm(&mut rig, asm, 0), gp0(), "{asm}");
+        }
+    }
+
+    #[test]
+    fn enable_rules_apply() {
+        let mut rig = Rig::new();
+        for asm in [
+            "pcmpgtq xmm0, xmm1",
+            "pcmpistri xmm0, xmm1, 0",
+            "pcmpestrm xmm0, xmm1, 0",
+        ] {
+            rig.reset();
+            rig.h.cpu.cr4 &= !CR4_OSFXSR;
+            assert_eq!(rig.exec(asm), ud(), "{asm} without OSFXSR");
+            rig.reset();
+            rig.h.cpu.cr0 |= CR0_EM;
+            assert_eq!(rig.exec(asm), ud(), "{asm} with CR0.EM");
+            rig.reset();
+            rig.h.cpu.cr0 |= CR0_TS;
+            assert_eq!(rig.exec(asm), nm(), "{asm} with CR0.TS");
+        }
+    }
+
+    #[test]
+    fn jit_matches_the_interpreter() {
+        for asm in [
+            "pcmpgtq xmm0, xmm1",
+            "pcmpistri xmm0, xmm1, 0",
+            "pcmpistrm xmm0, [rsi], 0",
+            "pcmpestri xmm0, xmm1, 0",
+            "pcmpestrm xmm0, xmm1, 0",
+            "crc32 eax, bl",
+            "crc32 rax, qword ptr [rsi]",
+            "crc32 eax, bx",
+        ] {
+            assert_jit_matches_interpreter(code(asm), |h| {
+                h.cpu.cr4 |= CR4_OSFXSR;
+                h.cpu.gpr[RSI] = DATA;
+                h.cpu.gpr[RAX] = 5;
+                h.cpu.gpr[RDX] = 9;
+                h.cpu.gpr[RBX] = 0x0123_4567_89ab_cdef;
+                h.cpu.xmm[0] = pad(b"needle");
+                h.cpu.xmm[1] = pad(b"a needle in hay");
+                h.write(DATA, &h.cpu.xmm[1].to_le_bytes());
+            });
+        }
+    }
+}
+
 const SNIPPETS: &[(&str, &[u8])] = &[
     ("movddup xmm0, xmm1", &[0xf2, 0x0f, 0x12, 0xc1, 0xf4]),
     ("movddup xmm0, [rsi]", &[0xf2, 0x0f, 0x12, 0x06, 0xf4]),
@@ -2423,6 +3131,90 @@ const SNIPPETS: &[(&str, &[u8])] = &[
     (
         "movaps xmm0, xmm1; roundps xmm0, [rsi], 0",
         &[0x0f, 0x28, 0xc1, 0x66, 0x0f, 0x3a, 0x08, 0x06, 0x00, 0xf4],
+    ),
+    ("pcmpgtq xmm0, xmm1", &[0x66, 0x0f, 0x38, 0x37, 0xc1, 0xf4]),
+    ("pcmpgtq xmm0, [rsi]", &[0x66, 0x0f, 0x38, 0x37, 0x06, 0xf4]),
+    (
+        "pcmpistri xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x63, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "pcmpistri xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x63, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "pcmpistrm xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x62, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "pcmpistrm xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x62, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "pcmpestri xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x61, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "pcmpestri xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x61, 0x06, 0x00, 0xf4],
+    ),
+    (
+        "pcmpestrm xmm0, xmm1, 0",
+        &[0x66, 0x0f, 0x3a, 0x60, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        "pcmpestrm xmm0, [rsi], 0",
+        &[0x66, 0x0f, 0x3a, 0x60, 0x06, 0x00, 0xf4],
+    ),
+    (
+        ".byte 0x66, 0x48, 0x0f, 0x3a, 0x61, 0xc1, 0x00",
+        &[0x66, 0x48, 0x0f, 0x3a, 0x61, 0xc1, 0x00, 0xf4],
+    ),
+    (
+        ".byte 0x66, 0x48, 0x0f, 0x3a, 0x60, 0xc1, 0x00",
+        &[0x66, 0x48, 0x0f, 0x3a, 0x60, 0xc1, 0x00, 0xf4],
+    ),
+    ("crc32 eax, bl", &[0xf2, 0x0f, 0x38, 0xf0, 0xc3, 0xf4]),
+    ("crc32 eax, bh", &[0xf2, 0x0f, 0x38, 0xf0, 0xc7, 0xf4]),
+    ("crc32 eax, bx", &[0x66, 0xf2, 0x0f, 0x38, 0xf1, 0xc3, 0xf4]),
+    ("crc32 eax, ebx", &[0xf2, 0x0f, 0x38, 0xf1, 0xc3, 0xf4]),
+    (
+        "crc32 rax, rbx",
+        &[0xf2, 0x48, 0x0f, 0x38, 0xf1, 0xc3, 0xf4],
+    ),
+    ("crc32 rax, bl", &[0xf2, 0x48, 0x0f, 0x38, 0xf0, 0xc3, 0xf4]),
+    (
+        "crc32 r9d, r10b",
+        &[0xf2, 0x45, 0x0f, 0x38, 0xf0, 0xca, 0xf4],
+    ),
+    ("crc32 r9, r10", &[0xf2, 0x4d, 0x0f, 0x38, 0xf1, 0xca, 0xf4]),
+    (
+        "crc32 eax, byte ptr [rsi]",
+        &[0xf2, 0x0f, 0x38, 0xf0, 0x06, 0xf4],
+    ),
+    (
+        "crc32 eax, word ptr [rsi]",
+        &[0x66, 0xf2, 0x0f, 0x38, 0xf1, 0x06, 0xf4],
+    ),
+    (
+        "crc32 eax, dword ptr [rsi]",
+        &[0xf2, 0x0f, 0x38, 0xf1, 0x06, 0xf4],
+    ),
+    (
+        "crc32 rax, qword ptr [rsi]",
+        &[0xf2, 0x48, 0x0f, 0x38, 0xf1, 0x06, 0xf4],
+    ),
+    (
+        "crc32 rax, byte ptr [rsi]",
+        &[0xf2, 0x48, 0x0f, 0x38, 0xf0, 0x06, 0xf4],
+    ),
+    (
+        ".byte 0xf3, 0x0f, 0x38, 0xf0, 0xc3",
+        &[0xf3, 0x0f, 0x38, 0xf0, 0xc3, 0xf4],
+    ),
+    (
+        ".byte 0x66, 0x0f, 0x38, 0xf0, 0xc3",
+        &[0x66, 0x0f, 0x38, 0xf0, 0xc3, 0xf4],
     ),
     // SNIPPETS-END
 ];
