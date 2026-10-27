@@ -1,6 +1,7 @@
 use super::decode::*;
 use super::exception::{Exception, VECTOR_SEGMENT_NOT_PRESENT, VECTOR_STACK_FAULT};
 use super::flags::*;
+use super::mem::AccessKind;
 use super::sys::{CR0_TS, CR4_TSD};
 use super::*;
 
@@ -683,6 +684,79 @@ impl Cpu {
         Ok(())
     }
 
+    /// Bulk path of a forward `rep movs`/`rep stos` with 64-bit addressing: moves as many whole
+    /// elements as fit in the current source and destination pages (and `budget`) with one page
+    /// translation and one host copy or fill, then returns the count. Returns 0, having touched
+    /// nothing, when the plain per-element loop must do it: an element straddling a page, a
+    /// destination or source outside RAM (MMIO), a destination page holding translated code
+    /// (`phys_write` invalidates it), or a forward overlap where the copy has to re-read what it
+    /// just wrote (`rep movsb` as a memset idiom). A fault is raised exactly as the first
+    /// element would raise it: the source is translated before the destination, and a fault on a
+    /// later page comes from the next call with the registers advanced by what was done.
+    fn rep_bulk(&mut self, i: &Insn, op: u8, size: u8, budget: u64) -> ExecResult<u64> {
+        let element = size as u64;
+        let copies = matches!(op, 0xa4 | 0xa5);
+        let dst_linear = self.gpr[GPR_RDI];
+        let src_linear = self.linear_address(i, self.gpr[GPR_RSI]);
+        let room = |linear: u64| (PAGE_SIZE - (linear & PAGE_OFFSET_MASK)) / element;
+        let mut elements = self.gpr[GPR_RCX].min(budget).min(room(dst_linear));
+        if copies {
+            elements = elements.min(room(src_linear));
+        }
+        if elements == 0 {
+            return Ok(0);
+        }
+        let bytes = elements * element;
+        let src_pa = if copies {
+            Some(self.translate(src_linear, AccessKind::Read, false)?)
+        } else {
+            None
+        };
+        let dst_pa = self.translate(dst_linear, AccessKind::Write, false)?;
+        let ram_bytes = self.ram.len() as u64;
+        if dst_pa + bytes > ram_bytes || self.page_has_code[(dst_pa >> PAGE_SHIFT) as usize] != 0 {
+            return Ok(0);
+        }
+        let ram = self.ram.as_mut_ptr();
+        if let Some(src_pa) = src_pa {
+            if src_pa + bytes > ram_bytes || (dst_pa > src_pa && dst_pa < src_pa + bytes) {
+                return Ok(0);
+            }
+            // SAFETY: both ranges lie inside `ram` (checked above); a copy that moves memory
+            // down (dst below src) may overlap, which `copy` allows.
+            unsafe {
+                core::ptr::copy(
+                    ram.add(src_pa as usize),
+                    ram.add(dst_pa as usize),
+                    bytes as usize,
+                );
+            }
+            self.gpr[GPR_RSI] = self.gpr[GPR_RSI].wrapping_add(bytes);
+        } else {
+            let value = self.read_gpr(0, size, true);
+            // SAFETY: the destination range lies inside `ram`.
+            unsafe {
+                let dst = ram.add(dst_pa as usize);
+                match size {
+                    1 => core::ptr::write_bytes(dst, value as u8, bytes as usize),
+                    _ => {
+                        for k in 0..elements as usize {
+                            let at = dst.add(k * size as usize);
+                            match size {
+                                2 => (at as *mut u16).write_unaligned(value as u16),
+                                4 => (at as *mut u32).write_unaligned(value as u32),
+                                _ => (at as *mut u64).write_unaligned(value),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.gpr[GPR_RDI] = self.gpr[GPR_RDI].wrapping_add(bytes);
+        self.gpr[GPR_RCX] -= elements;
+        Ok(elements)
+    }
+
     /// movs/stos/lods/cmps/scas with optional rep. State is committed per iteration, so a fault
     /// mid-rep leaves GPR_RSI/GPR_RDI/GPR_RCX consistent with the iterations already done.
     fn string_op(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
@@ -706,6 +780,21 @@ impl Cpu {
         loop {
             if rep && self.gpr[GPR_RCX] & amask == 0 {
                 break;
+            }
+            if rep && matches!(op, 0xa4 | 0xa5 | 0xaa | 0xab) && !i.addr32 && self.eflags & DF == 0
+            {
+                let done = self.rep_bulk(i, op, size, REP_ITERATIONS_PER_SLICE - iterations)?;
+                if done > 0 {
+                    iterations += done;
+                    if self.gpr[GPR_RCX] == 0 {
+                        break;
+                    }
+                    if iterations >= REP_ITERATIONS_PER_SLICE {
+                        self.icount += iterations;
+                        return Ok(());
+                    }
+                    continue;
+                }
             }
             // Only the source honours a segment override; the destination is always ES, which has
             // no base in 64-bit mode.

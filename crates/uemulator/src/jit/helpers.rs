@@ -67,6 +67,22 @@ pub(crate) extern "C" fn helper_exec_pair(cpu: &mut Cpu, pair: &[u64; 2]) -> u64
     helper_exec(cpu, insn, pair[1])
 }
 
+/// Finishes an inlined `rol`/`ror`: they replace CF and OF and leave SF/ZF/PF/AF as the
+/// instructions before them made them (`Cpu::shift_rotate`), which only the interpreter can
+/// resolve from the lazy flags. `packed` has CF in bit 0 and OF in bit 1.
+#[cfg(target_arch = "aarch64")]
+pub(crate) extern "C" fn helper_set_rotate_flags(cpu: &mut Cpu, packed: u64) {
+    use crate::cpu::flags::{AF, CF, OF, PF, SF, ZF};
+    let mut flags = cpu.eflags_full() & (PF | AF | ZF | SF);
+    if packed & 1 != 0 {
+        flags |= CF;
+    }
+    if packed & 2 != 0 {
+        flags |= OF;
+    }
+    cpu.set_eflags_arith(flags);
+}
+
 /// Slow-path load, called when the inline TLB probe misses. Generated code does not keep
 /// `cpu.rip` current, so the faulting instruction's `rip` is passed in and stored here.
 #[cfg(target_arch = "aarch64")]

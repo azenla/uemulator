@@ -1145,22 +1145,25 @@ impl UserNet {
         }
         self.tcp.retain(|_, flow| !flow.dead);
 
-        let mut recv_buf = [0u8; UDP_RECV_BUF_LEN];
-        for (key, flow) in self.udp.iter_mut() {
-            while let Ok(n) = flow.sock.recv(&mut recv_buf) {
-                flow.last_activity = now;
-                packets.push(PendingPacket {
-                    proto: IP_PROTO_UDP,
-                    src: key.remote_ip,
-                    dst: flow.guest_ip,
-                    payload: udp_segment(
-                        key.remote_ip,
-                        flow.guest_ip,
-                        key.remote_port,
-                        key.guest_port,
-                        &recv_buf[..n],
-                    ),
-                });
+        // The buffer is zeroed on every call, so it is only made while some UDP flow can receive.
+        if !self.udp.is_empty() {
+            let mut recv_buf = [0u8; UDP_RECV_BUF_LEN];
+            for (key, flow) in self.udp.iter_mut() {
+                while let Ok(n) = flow.sock.recv(&mut recv_buf) {
+                    flow.last_activity = now;
+                    packets.push(PendingPacket {
+                        proto: IP_PROTO_UDP,
+                        src: key.remote_ip,
+                        dst: flow.guest_ip,
+                        payload: udp_segment(
+                            key.remote_ip,
+                            flow.guest_ip,
+                            key.remote_port,
+                            key.guest_port,
+                            &recv_buf[..n],
+                        ),
+                    });
+                }
             }
         }
         self.udp

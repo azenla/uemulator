@@ -324,6 +324,7 @@ fn memory_operands_with_address_size_override_or_lock_stay_out_of_line() {
 const DUMMY_ADDRESSES: Addrs = Addrs {
     exec: 0,
     cond: 0,
+    rotate_flags: 0,
     exit_ok: 0,
     exit_fail: 0,
     chain: 0,

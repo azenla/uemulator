@@ -84,6 +84,10 @@ pub(crate) fn prologue(base: u64, jump_cache_base: u64) -> Prologue {
             helpers::helper_exec_pair as *const () as usize as u64,
         ),
         cond: tail_call_stub(&mut asm, helpers::helper_cond as *const () as usize as u64),
+        rotate_flags: tail_call_stub(
+            &mut asm,
+            helpers::helper_set_rotate_flags as *const () as usize as u64,
+        ),
         exit_ok,
         exit_fail,
         chain,

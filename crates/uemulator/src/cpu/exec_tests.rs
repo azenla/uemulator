@@ -6599,6 +6599,55 @@ fn overlapping_forward_rep_movsb_replicates_the_first_byte() {
     assert_eq!(pair.interp.read(DATA, 8), [1, 1, 2, 3, 4, 5, 6, 8]);
 }
 
+/// The bulk path of `rep stos`/`rep movs` works a page at a time, so the interesting starts are
+/// unaligned ones that cross several pages and elements that straddle a page boundary.
+#[test]
+fn rep_stos_of_every_size_fills_across_page_boundaries_and_straddling_elements() {
+    for (snippet, size) in [
+        (code::REP_STOS_1, 1usize),
+        (code::REP_STOS_2, 2),
+        (code::REP_STOS_4, 4),
+    ] {
+        // Starts 3 bytes before a page end, so for sizes above 1 the first element straddles.
+        let start = DATA + 0x1000 - 3;
+        let elements = 0x1800 / size as u64;
+        let mut pair = Pair::new(snippet);
+        pair.halted(|h| {
+            h.write(DATA, &vec![0u8; 0x4000]);
+            h.cpu.gpr[RDI] = start;
+            h.cpu.gpr[RCX] = elements;
+            h.cpu.gpr[RAX] = 0x1122_3344_5566_7788;
+        });
+        let bytes = elements as usize * size;
+        let written = pair.interp.read(start, bytes + 4);
+        let pattern = 0x1122_3344_5566_7788u64.to_le_bytes();
+        for (k, byte) in written[..bytes].iter().enumerate() {
+            assert_eq!(*byte, pattern[k % size], "size {size} byte {k}");
+        }
+        assert!(written[bytes..].iter().all(|&b| b == 0), "size {size}");
+        assert_eq!(pair.reg(RDI), start + bytes as u64);
+        assert_eq!(pair.reg(RCX), 0);
+    }
+}
+
+#[test]
+fn rep_movs_copies_forward_across_pages_without_touching_the_source() {
+    let source: Vec<u8> = (0..0x2800u32).map(|k| (k * 7 + 1) as u8).collect();
+    let mut pair = Pair::new(code::REP_MOVS_8);
+    pair.halted(|h| {
+        h.write(DATA, &vec![0u8; 0x6000]);
+        h.write(DATA + 0x100, &source);
+        h.cpu.gpr[RSI] = DATA + 0x100;
+        h.cpu.gpr[RDI] = DATA + 0x3ff8;
+        h.cpu.gpr[RCX] = 0x2800 / 8;
+    });
+    assert_eq!(pair.interp.read(DATA + 0x3ff8, 0x2800), source);
+    assert_eq!(pair.interp.read(DATA + 0x100, 0x2800), source);
+    assert_eq!(pair.reg(RSI), DATA + 0x100 + 0x2800);
+    assert_eq!(pair.reg(RDI), DATA + 0x3ff8 + 0x2800);
+    assert_eq!(pair.reg(RCX), 0);
+}
+
 #[test]
 fn rep_instructions_resume_correctly_across_the_per_slice_iteration_limit() {
     // More iterations than one slice (4096): the run loop re-enters the same instruction.
