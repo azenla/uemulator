@@ -13,7 +13,7 @@
 //!   from x86 only for values within half a subnormal ulp of the smallest normal number.
 //! - A subnormal operand raises the denormal flag even when the other operand is a NaN, as in
 //!   QEMU.
-//! - No SSE3 and later, no maskmovdqu.
+//! - SSE3 and later live in `sse_ext.rs` (a child module). No maskmovdqu.
 //! - MMX: mmN is the low 64 bits of physical x87 register N (`Cpu::st`); see `Cpu::mmx`. Pending
 //!   x87 exceptions (#MF) are not modelled.
 
@@ -1177,7 +1177,8 @@ impl Cpu {
     /// Executes an SSE/SSE2 instruction from the `0f xx` map. Returns `Ok(false)` for anything
     /// else, which the caller turns into #UD; on `Ok(true)` the caller sets rip to `next`.
     /// CPUID (`cpu/sys.rs`) advertises MMX, SSE and SSE2 and this covers those (the MMX register
-    /// forms are in `mmx`): no SSE3 and later, no VEX.
+    /// forms are in `mmx`). SSE3 and later, which have their own opcodes and mandatory prefixes,
+    /// are in `sse_ext`; there is no VEX.
     ///
     /// Vector registers are `u128` in `self.xmm`. The `src!` operand is the whole register in the
     /// register form, so scalar arms truncate it to the lane they use. Every instruction that can
@@ -1186,7 +1187,7 @@ impl Cpu {
     pub fn sse(&mut self, i: &Insn, next: u64) -> ExecResult<bool> {
         let map = i.op >> 8;
         if map != OPCODE_MAP_0F {
-            return Ok(false);
+            return self.sse_ext(i, next);
         }
         let opcode = (i.op & 0xff) as u8;
         let prefix = match (i.rep, i.p66) {
@@ -1196,7 +1197,7 @@ impl Cpu {
             _ => Prefix::Np,
         };
         if !allowed(opcode, prefix) {
-            return Ok(false);
+            return self.sse_ext(i, next);
         }
         // An encoding that is invalid for this ModRM form is #UD even with CR0.TS set (#UD has
         // priority over #NM, as in QEMU).
@@ -2008,6 +2009,9 @@ fn put_u64<T: Lane>(r: &mut u128, k: usize, v: u64, width: u32) {
     };
     *r |= ((v & m) as u128) << (k * width as usize);
 }
+
+#[path = "sse_ext.rs"]
+mod ext;
 
 #[cfg(test)]
 #[path = "sse_tests.rs"]

@@ -5644,15 +5644,8 @@ fn invalid_prefix_combinations_raise_invalid_opcode() {
         ".byte 0xf2, 0x0f, 0x7f, 0xc1",
         ".byte 0x0f, 0xd6, 0xc1",
         ".byte 0xf3, 0x0f, 0xc6, 0xc1, 0x00",
-        ".byte 0x66, 0x0f, 0xd0, 0xc1",
         ".byte 0x66, 0x0f, 0xf7, 0xc1",
-        ".byte 0x66, 0x0f, 0x38, 0x00, 0xc1",
         ".byte 0x66, 0x0f, 0x78, 0xc1",
-        ".byte 0x66, 0x0f, 0x7c, 0xc1",
-        ".byte 0xf2, 0x0f, 0xd0, 0xc1",
-        ".byte 0xf3, 0x0f, 0x12, 0xc1",
-        ".byte 0xf2, 0x0f, 0x12, 0xc1",
-        ".byte 0xf3, 0x0f, 0x16, 0xc1",
     ];
     for key in invalid {
         rig.h.cpu.xmm[0] = A;
@@ -5702,20 +5695,6 @@ fn invalid_encoding_is_ud_even_with_cr0_ts_set() {
         rig.reset();
         rig.h.cpu.cr0 |= CR0_TS;
         assert_eq!(rig.exec(key), ud(), "{key}");
-    }
-}
-
-#[test]
-fn sse3_and_later_opcodes_are_not_implemented() {
-    // CPUID does not advertise them, so #UD is the architecturally correct answer.
-    let mut rig = Rig::new();
-    for key in [
-        ".byte 0x66, 0x0f, 0x38, 0x00, 0xc1",
-        ".byte 0x66, 0x0f, 0x7c, 0xc1",
-        ".byte 0xf2, 0x0f, 0xd0, 0xc1",
-        ".byte 0xf3, 0x0f, 0x12, 0xc1",
-    ] {
-        assert_eq!(rig.run(key), ud(), "{key}");
     }
 }
 
@@ -8025,7 +8004,7 @@ fn only_the_two_byte_map_is_handled_here() {
 fn unassigned_opcodes_are_reported_as_not_handled() {
     let mut rig = Rig::new();
     rig.reset();
-    for opcode in [0x00u16, 0x0b, 0x38, 0x3a, 0x7c, 0xd0, 0xf0, 0xf7, 0xff] {
+    for opcode in [0x00u16, 0x0b, 0x38, 0x3a, 0xf0, 0xf7, 0xff] {
         let result = rig
             .h
             .cpu

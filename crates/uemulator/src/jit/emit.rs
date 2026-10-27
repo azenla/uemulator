@@ -336,6 +336,8 @@ pub(crate) struct Addrs {
     /// Tail-call stubs for `helper_exec_pair` and `helper_cond`.
     pub exec: u64,
     pub cond: u64,
+    /// Tail-call stub for `helper_set_rotate_flags(cpu, packed CF/OF)`.
+    pub rotate_flags: u64,
     pub exit_ok: u64,
     pub exit_fail: u64,
     /// The block-to-block transfer stub (see `arch_a64::chain_stub`), or 0 when chaining is off
@@ -1275,6 +1277,80 @@ impl<'a> Gen<'a> {
         self.live = None;
     }
 
+    /// `rol`/`ror` of a 32- or 64-bit operand by an immediate or CL. The rotation is inline; CF
+    /// and OF are packed (CF in bit 0, OF in bit 1) for `helper_set_rotate_flags`, which merges
+    /// them into the guest flags because rotates keep SF/ZF/PF/AF, so the host flags stop
+    /// mirroring the guest's afterwards. As for shifts, a CL count that is zero after masking
+    /// changes no flag and no value, but a 32-bit destination is still zero-extended. OF is
+    /// computed for every count, as in `Cpu::shift_rotate`.
+    #[allow(clippy::too_many_arguments)]
+    fn rotate(
+        &mut self,
+        insn: &Insn,
+        left: bool,
+        dst: Dst,
+        count: Option<u32>,
+        size: u8,
+        next_rip: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let is64 = size == 8;
+        let bits = 8 * size as u32;
+        self.load_dst(insn, dst, 0, size, next_rip, insn_index, rip);
+        if size == 4 {
+            self.asm.uxtw(0, 0);
+        }
+        let skip = self.asm.label();
+        let (result, flags, scratch) = (SCRATCH_A, 1, SCRATCH_C);
+        match count {
+            // A left rotation is a right rotation by the complement.
+            Some(count) => {
+                let amount = if left { bits - count } else { count };
+                self.asm.ror_imm(result, 0, amount, is64);
+            }
+            None => {
+                self.asm.ldr(flags, CPU, GPR_OFFSET + GPR_SIZE * RCX_INDEX);
+                assert!(self.asm.and_imm(flags, flags, bits as u64 - 1, true));
+                self.asm.mov(SAVED_EXTRA, flags);
+                self.asm.cbz(SAVED_EXTRA, skip, true);
+                if left {
+                    self.asm.mov_imm(scratch, bits as u64);
+                    self.asm.sub(scratch, scratch, flags, false);
+                    self.asm.rorv(result, 0, scratch, is64);
+                } else {
+                    self.asm.rorv(result, 0, flags, is64);
+                }
+            }
+        }
+        if left {
+            // CF = the new low bit, OF = new msb ^ CF
+            self.asm.ubfx(flags, result, 0, 1, is64);
+            self.asm.ubfx(scratch, result, bits - 1, 1, is64);
+        } else {
+            // CF = the new msb, OF = new msb ^ the bit below it
+            self.asm.ubfx(flags, result, bits - 1, 1, is64);
+            self.asm.ubfx(scratch, result, bits - 2, 1, is64);
+        }
+        self.asm.eor(scratch, scratch, flags, false);
+        self.asm.bfi(flags, scratch, CF_OF_OF_BIT, 1, false);
+        self.asm.mov(0, result);
+        if count.is_none() {
+            self.asm.bind(skip);
+        }
+        let stored = self.store_dst(dst, size, true, insn_index, rip);
+        let no_flags = self.asm.label();
+        if count.is_none() {
+            self.asm.cbz(SAVED_EXTRA, no_flags, true);
+        }
+        // x1 still holds the packed CF/OF.
+        self.asm.mov(0, CPU);
+        self.call(self.addrs.rotate_flags);
+        self.asm.bind(no_flags);
+        self.live = None;
+        stored
+    }
+
     /// Branch condition for x86 condition code `cc` from the host flags: the live ones when
     /// they can express it, otherwise `helper_cond` over the lazy flags and a compare of its
     /// result. Either way the host flags afterwards are not the guest's any more only in the
@@ -1426,6 +1502,28 @@ impl<'a> Gen<'a> {
                     insn.reg & 7 == 1,
                     Self::rm_dst(&insn, size),
                     size,
+                    next_rip,
+                    insn_index,
+                    rip,
+                );
+            }
+            // rol/ror r/m, imm8 | 1 | cl at 32 and 64 bits (a zero immediate count goes to the
+            // interpreter)
+            0xc1 | 0xd1 | 0xd3 if wide_operand && insn.reg & 7 <= 1 => {
+                let count = match insn.op {
+                    0xc1 => Some(insn.imm as u32 & (8 * operand_size as u32 - 1)),
+                    0xd1 => Some(1),
+                    _ => None,
+                };
+                if count == Some(0) {
+                    return false;
+                }
+                is_store = self.rotate(
+                    &insn,
+                    insn.reg & 7 == 0,
+                    Self::rm_dst(&insn, operand_size),
+                    count,
+                    operand_size,
                     next_rip,
                     insn_index,
                     rip,

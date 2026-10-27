@@ -4040,22 +4040,19 @@ fn bsf_and_bsr_find_the_lowest_and_highest_set_bit() {
 }
 
 #[test]
-fn rep_bsf_and_rep_bsr_run_as_bsf_and_bsr_like_tzcnt_and_lzcnt_on_older_cpus() {
-    // BMI1/ABM are not advertised, so the F3-prefixed forms keep their old meaning.
+fn rep_bsf_runs_as_bsf_like_tzcnt_on_a_cpu_without_bmi1() {
+    // BMI1 is not advertised, so F3 0F BC keeps its old meaning. (LZCNT and POPCNT are
+    // implemented: see sse_ext_tests.rs.)
     let pair = run_regs(code::TZCNT_64, &[(RBX, 0x100)]);
     assert_eq!(pair.reg(RAX), 8);
     let pair = run_regs(code::LZCNT_64, &[(RBX, 0x100)]);
-    assert_eq!(
-        pair.reg(RAX),
-        8,
-        "bsr semantics: index of the highest set bit"
-    );
+    assert_eq!(pair.reg(RAX), 55, "lzcnt counts leading zeros");
 }
 
 #[test]
-fn popcnt_is_not_implemented() {
-    let (_, stop) = run_regs_stop(code::POPCNT_64, &[(RBX, 0xff)]);
-    assert_eq!(stop, ud());
+fn popcnt_counts_set_bits() {
+    let pair = run_regs(code::POPCNT_64, &[(RBX, 0xff)]);
+    assert_eq!(pair.reg(RAX), 8);
 }
 
 /// Signed product truncated to `size`, with CF = OF set when the full product does not fit.
@@ -6599,6 +6596,55 @@ fn overlapping_forward_rep_movsb_replicates_the_first_byte() {
     assert_eq!(pair.interp.read(DATA, 8), [1, 1, 2, 3, 4, 5, 6, 8]);
 }
 
+/// The bulk path of `rep stos`/`rep movs` works a page at a time, so the interesting starts are
+/// unaligned ones that cross several pages and elements that straddle a page boundary.
+#[test]
+fn rep_stos_of_every_size_fills_across_page_boundaries_and_straddling_elements() {
+    for (snippet, size) in [
+        (code::REP_STOS_1, 1usize),
+        (code::REP_STOS_2, 2),
+        (code::REP_STOS_4, 4),
+    ] {
+        // Starts 3 bytes before a page end, so for sizes above 1 the first element straddles.
+        let start = DATA + 0x1000 - 3;
+        let elements = 0x1800 / size as u64;
+        let mut pair = Pair::new(snippet);
+        pair.halted(|h| {
+            h.write(DATA, &vec![0u8; 0x4000]);
+            h.cpu.gpr[RDI] = start;
+            h.cpu.gpr[RCX] = elements;
+            h.cpu.gpr[RAX] = 0x1122_3344_5566_7788;
+        });
+        let bytes = elements as usize * size;
+        let written = pair.interp.read(start, bytes + 4);
+        let pattern = 0x1122_3344_5566_7788u64.to_le_bytes();
+        for (k, byte) in written[..bytes].iter().enumerate() {
+            assert_eq!(*byte, pattern[k % size], "size {size} byte {k}");
+        }
+        assert!(written[bytes..].iter().all(|&b| b == 0), "size {size}");
+        assert_eq!(pair.reg(RDI), start + bytes as u64);
+        assert_eq!(pair.reg(RCX), 0);
+    }
+}
+
+#[test]
+fn rep_movs_copies_forward_across_pages_without_touching_the_source() {
+    let source: Vec<u8> = (0..0x2800u32).map(|k| (k * 7 + 1) as u8).collect();
+    let mut pair = Pair::new(code::REP_MOVS_8);
+    pair.halted(|h| {
+        h.write(DATA, &vec![0u8; 0x6000]);
+        h.write(DATA + 0x100, &source);
+        h.cpu.gpr[RSI] = DATA + 0x100;
+        h.cpu.gpr[RDI] = DATA + 0x3ff8;
+        h.cpu.gpr[RCX] = 0x2800 / 8;
+    });
+    assert_eq!(pair.interp.read(DATA + 0x3ff8, 0x2800), source);
+    assert_eq!(pair.interp.read(DATA + 0x100, 0x2800), source);
+    assert_eq!(pair.reg(RSI), DATA + 0x100 + 0x2800);
+    assert_eq!(pair.reg(RDI), DATA + 0x3ff8 + 0x2800);
+    assert_eq!(pair.reg(RCX), 0);
+}
+
 #[test]
 fn rep_instructions_resume_correctly_across_the_per_slice_iteration_limit() {
     // More iterations than one slice (4096): the run loop re-enters the same instruction.
@@ -6895,7 +6941,7 @@ fn push_and_pop_helpers_move_rsp_by_the_operand_size() {
 fn unimplemented_opcode_is_logged_once_per_opcode_and_reg_and_raises_ud() {
     let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let sink = messages.clone();
-    let mut pair = Pair::interpreter_only(code::CMPXCHG16B);
+    let mut pair = Pair::interpreter_only(code::GROUP9_REG0);
     pair.interp.cpu.log = Some(std::sync::Arc::new(move |message: &str| {
         sink.lock().unwrap().push(message.to_string());
     }));
@@ -6910,7 +6956,7 @@ fn unimplemented_opcode_is_logged_once_per_opcode_and_reg_and_raises_ud() {
         "the same opcode and reg field is reported once: {logged:?}"
     );
     assert!(
-        logged[0].contains("0x1c7") && logged[0].contains("/1"),
+        logged[0].contains("0x1c7") && logged[0].contains("/0"),
         "{}",
         logged[0]
     );
@@ -6920,7 +6966,7 @@ fn unimplemented_opcode_is_logged_once_per_opcode_and_reg_and_raises_ud() {
         logged[0]
     );
     // A different /reg of the same opcode is a different key.
-    let mut other = Pair::interpreter_only(code::GROUP9_REG0);
+    let mut other = Pair::interpreter_only(code::CMPXCHG8B_REG);
     other.interp.cpu.log = pair.interp.cpu.log.clone();
     other.interp.cpu.logged = pair.interp.cpu.logged.clone();
     let stop = other.run(|h| h.cpu.gpr[RDX] = DATA);
@@ -7931,8 +7977,8 @@ fn locked_cmpxchg8b_behaves_like_the_unlocked_form() {
 }
 
 #[test]
-fn cmpxchg16b_register_form_and_group9_other_forms_are_not_implemented() {
-    for snippet in [code::CMPXCHG16B, code::CMPXCHG8B_REG, code::GROUP9_REG0] {
+fn cmpxchg8b_register_form_and_group9_other_forms_are_not_implemented() {
+    for snippet in [code::CMPXCHG8B_REG, code::GROUP9_REG0] {
         let (_, stop) = run_regs_stop(snippet, &[(RDX, DATA)]);
         assert_eq!(stop, ud(), "{snippet:02x?}");
     }
@@ -11787,6 +11833,7 @@ fn cpuid_feature_bits_cover_the_instructions_tested_here() {
     const NX: u64 = 1 << 20;
     const LONG_MODE: u64 = 1 << 29;
     const LAHF_SAHF: u64 = 1;
+    const LZCNT_ABM: u64 = 1 << 5;
     let [_, _, ecx, edx] = cpuid(1, 0);
     for (bit, name) in [
         (TSC, "tsc"),
@@ -11803,16 +11850,25 @@ fn cpuid_feature_bits_cover_the_instructions_tested_here() {
             "{name} is not implemented and must not be advertised"
         );
     }
-    assert_eq!(
-        ecx, 0,
-        "no leaf 1 ECX feature is advertised (no cmpxchg16b, popcnt, ...)"
-    );
+    // The exact set of leaf 1 ECX bits is pinned in sys_tests.rs; these must stay clear because
+    // their instructions (or the OS support behind them) do not exist.
+    for (bit, name) in [
+        (1 << 3, "monitor/mwait"),
+        (1 << 5, "vmx"),
+        (1 << 26, "xsave"),
+        (1 << 27, "osxsave"),
+        (1 << 28, "avx"),
+        (1 << 30, "rdrand"),
+        (1 << 31, "hypervisor"),
+    ] {
+        assert_eq!(ecx & bit, 0, "{name} must not be advertised");
+    }
     let [_, _, ecx, edx] = cpuid(0x8000_0001, 0);
     assert_ne!(edx & SYSCALL, 0);
     assert_ne!(edx & NX, 0);
     assert_ne!(edx & LONG_MODE, 0);
     assert_ne!(ecx & LAHF_SAHF, 0, "lahf/sahf work in 64-bit mode");
-    assert_eq!(ecx & !LAHF_SAHF, 0, "no lzcnt, svm, ...");
+    assert_eq!(ecx & !(LAHF_SAHF | LZCNT_ABM), 0, "no svm, ...");
 }
 
 #[test]
@@ -15573,9 +15629,6 @@ mod code {
     // lock xadd byte ptr [rdx], bl
     // hlt
     pub(super) const LOCK_XADD_MEM_1: &[u8] = &[0xf0, 0x0f, 0xc0, 0x1a, 0xf4];
-    // cmpxchg16b [rdx]
-    // hlt
-    pub(super) const CMPXCHG16B: &[u8] = &[0x48, 0x0f, 0xc7, 0x0a, 0xf4];
     // .byte 0x0f, 0xc7, 0xca
     // hlt
     pub(super) const CMPXCHG8B_REG: &[u8] = &[0x0f, 0xc7, 0xca, 0xf4];

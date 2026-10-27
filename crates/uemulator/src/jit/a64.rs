@@ -410,6 +410,14 @@ impl Asm {
     pub fn asrv(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
         self.reg3(0x1ac0_2800, rd, rn, rm, is64);
     }
+    pub fn rorv(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
+        self.reg3(0x1ac0_2c00, rd, rn, rm, is64);
+    }
+    /// `ror rd, rn, #amount`, the alias of `extr rd, rn, rn, #amount`.
+    pub fn ror_imm(&mut self, rd: u32, rn: u32, amount: u32, is64: bool) {
+        let opcode = if is64 { 0x93c0_0000 } else { 0x1380_0000 };
+        self.emit(opcode | rn << RM_SHIFT | amount << IMMS_SHIFT | rn << RN_SHIFT | rd);
+    }
 
     /// 64-bit `add rd, rn, rm, lsl #shift`.
     pub fn add_lsl(&mut self, rd: u32, rn: u32, rm: u32, shift: u32) {

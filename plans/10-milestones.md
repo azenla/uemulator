@@ -5,13 +5,15 @@
 - M0-M3 done: kernel banner, VFS panic then `ExitReason::Reset`, and the Debian installer userspace (dialogs drawn) with both interpreter and JIT.
 - M4 done: aarch64 JIT (block translator, inline TLB fast paths, ALU/mov/lea/push/pop/jcc/call/ret inlined, helper fallback for everything else, lazy-flag-aware jcc, per-page invalidation, self-modifying-code exit). ~5x faster than the interpreter (no-initrd boot: 6.4 s vs 32 s; roughly 300 MIPS). A lockstep verifier (`MachineConfig::verify_jit`, `--verify` in the example) runs the JIT against the interpreter per block; the whole installer boot is divergence-free.
 - M6 done (see 11-storage-net-console.md): configurable RAM (`--mem`), virtio-pci disk, network and console (with resize), guest-verified: ping through the gateway responder, `stty size` follows `resize()`, disk read/write through `virtio_blk`.
-- M5 partly done: realtime idle (`ClockMode::Realtime`), raw tty in the example, fixed RTC time option. Not done: block chaining, guest register caching, LAPIC/IOAPIC, SMP.
+- M5 partly done: realtime idle (`ClockMode::Realtime`), raw tty in the example, fixed RTC time option, aarch64 block chaining and wide inline lowering (see 06: roughly 3-4x over the M4 JIT; no-initrd Alpine boot 4.8 s -> 1.3 s CPU, initrd boot to the installer 13.9 s -> 4.7 s, interpreter ~60 s, lockstep-verified over the whole no-initrd boot). Not done: guest register caching, dead-flag elimination, LAPIC/IOAPIC, SMP.
 
 - Machine lifecycle done: a guest reset reboots the machine in place by default (`MachineConfig::reboot`, CLI `--no-reboot` to end with `ExitReason::Reset`; checked on the real Alpine kernel with `busybox reboot -f`, interpreter and JIT), `hlt` with IF=0 is `ExitReason::Shutdown` (checked with `busybox poweroff -f`; the UEFI hardware-virtualization loop applies the same rule, but has no in-process reboot). `ConsoleKind::Virtio` (hvc0) is the default everywhere except the UEFI hardware-virtualization path (no virtio in `Platform`). The M2 criterion "VFS panic then clean Reset" now needs `--no-reboot`; by default `panic=-1` reboots forever.
 
 - Workspace split done: `crates/uemulator` (library) + `crates/uemulator-cli` (`uemulator boot|quick`, clap). 
 - `jit` feature (default on) gates `libc`/`windows-sys`; `--no-default-features` is dependency-free and interpreter-only.
 - x86_64 host JIT done (see 06): same inlined subset as aarch64, verified in lockstep. Exercised on macOS x86_64 under Rosetta; Linux and Windows x86_64 hosts compile but are untested.
+
+- Instruction extensions done (see 03, "Instruction extensions"): POPCNT/LZCNT, CMPXCHG16B, SSE3, SSSE3 (XMM forms), SSE4.1, SSE4.2 (incl. CRC32 and pcmp[ei]str[im]), PCLMULQDQ, AES-NI, MOVBE and FSGSBASE are implemented and advertised in CPUID (leaf 1 ECX, 0x80000001 ECX, leaf 7). The Alpine boot now executes cmpxchg16b, popcnt, pshufb and palignr in the kernel. Not advertised: ERMS/FSRM, AVX*, BMI, RDRAND, XSAVE, MONITOR/MWAIT.
 
 - UEFI application done (see 12): `crates/uemulator-uefi`, library `no_std` on `target_os = "uefi"`, `hack/uefi/boot.sh`; emulator (interpreter) everywhere, plus a hardware-virtualization path on x86_64 (AMD SVM verified under TCG, Intel VMX untested), no disk/net.
 
