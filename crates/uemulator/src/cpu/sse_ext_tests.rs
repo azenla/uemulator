@@ -2981,6 +2981,87 @@ mod crypto_instructions {
     }
 }
 
+mod movbe {
+    use super::*;
+
+    const PATTERN: u64 = 0x0102_0304_0506_0708;
+
+    #[test]
+    fn loads_swap_the_bytes_at_the_operand_size() {
+        let mut rig = Rig::new();
+        rig.h.write(DATA, &PATTERN.to_le_bytes());
+        rig.h.cpu.gpr[RAX] = u64::MAX;
+        rig.run_ok("movbe rax, [rsi]");
+        assert_eq!(rig.gpr(RAX), 0x0807_0605_0403_0201);
+        rig.h.cpu.gpr[RAX] = u64::MAX;
+        rig.run_ok("movbe eax, [rsi]");
+        assert_eq!(rig.gpr(RAX), 0x0807_0605, "32-bit loads zero-extend");
+        rig.h.cpu.gpr[RAX] = 0xffff_ffff_ffff_ffff;
+        rig.run_ok("movbe ax, [rsi]");
+        assert_eq!(rig.gpr(RAX), 0xffff_ffff_ffff_0807, "16-bit loads merge");
+    }
+
+    #[test]
+    fn stores_swap_the_bytes_and_write_only_the_operand_size() {
+        let mut rig = Rig::new();
+        rig.h.cpu.gpr[RAX] = 0x1122_3344_5566_7788;
+        for (asm, size, want) in [
+            ("movbe [rsi], rax", 8usize, 0x8877_6655_4433_2211u64),
+            ("movbe [rsi], eax", 4, 0x8877_6655),
+            ("movbe [rsi], ax", 2, 0x8877),
+        ] {
+            rig.h.write(DATA, &[0xaa; 16]);
+            rig.run_ok(asm);
+            let written = rig.h.read(DATA, 16);
+            assert_eq!(written[..size], want.to_le_bytes()[..size], "{asm}");
+            assert!(
+                written[size..].iter().all(|&b| b == 0xaa),
+                "{asm} wrote too much"
+            );
+        }
+    }
+
+    #[test]
+    fn movbe_leaves_flags_alone_and_needs_no_alignment() {
+        let mut rig = Rig::new();
+        rig.h.write(DATA + 1, &PATTERN.to_le_bytes());
+        rig.reset();
+        rig.h.cpu.gpr[RSI] = DATA + 1;
+        rig.h.cpu.set_eflags_arith(ARITH_FLAGS);
+        assert_eq!(rig.exec("movbe rax, [rsi]"), Stop::Halted);
+        assert_eq!(rig.gpr(RAX), PATTERN.swap_bytes());
+        assert_eq!(rig.flags(), ARITH_FLAGS);
+    }
+
+    #[test]
+    fn register_forms_and_the_f3_prefix_are_invalid() {
+        let mut rig = Rig::new();
+        for asm in [
+            ".byte 0x0f, 0x38, 0xf0, 0xc3",
+            ".byte 0x0f, 0x38, 0xf1, 0xc3",
+            ".byte 0xf3, 0x0f, 0x38, 0xf0, 0x06",
+        ] {
+            assert_eq!(rig.run(asm), ud(), "{asm}");
+        }
+    }
+
+    #[test]
+    fn movbe_needs_no_sse_enable_bits_and_matches_the_jit() {
+        let mut rig = Rig::new();
+        rig.reset();
+        rig.h.cpu.cr4 &= !CR4_OSFXSR;
+        rig.h.cpu.cr0 |= CR0_TS | CR0_EM;
+        assert_eq!(rig.exec("movbe eax, [rsi]"), Stop::Halted);
+        for asm in ["movbe rax, [rsi]", "movbe [rsi], ax", "movbe ax, [rsi]"] {
+            assert_jit_matches_interpreter(code(asm), |h| {
+                h.cpu.gpr[RSI] = DATA;
+                h.cpu.gpr[RAX] = 0x1122_3344_5566_7788;
+                h.write(DATA, &PATTERN.to_le_bytes());
+            });
+        }
+    }
+}
+
 const SNIPPETS: &[(&str, &[u8])] = &[
     ("movddup xmm0, xmm1", &[0xf2, 0x0f, 0x12, 0xc1, 0xf4]),
     ("movddup xmm0, [rsi]", &[0xf2, 0x0f, 0x12, 0x06, 0xf4]),
@@ -3614,5 +3695,56 @@ const SNIPPETS: &[(&str, &[u8])] = &[
         &[0x66, 0x0f, 0x38, 0xdf, 0xc4, 0xf4],
     ),
     ("aesimc xmm2, xmm1", &[0x66, 0x0f, 0x38, 0xdb, 0xd1, 0xf4]),
+    ("rdfsbase rax", &[0xf3, 0x48, 0x0f, 0xae, 0xc0, 0xf4]),
+    ("rdfsbase eax", &[0xf3, 0x0f, 0xae, 0xc0, 0xf4]),
+    ("rdgsbase rax", &[0xf3, 0x48, 0x0f, 0xae, 0xc8, 0xf4]),
+    ("rdgsbase eax", &[0xf3, 0x0f, 0xae, 0xc8, 0xf4]),
+    ("wrfsbase rbx", &[0xf3, 0x48, 0x0f, 0xae, 0xd3, 0xf4]),
+    ("wrfsbase ebx", &[0xf3, 0x0f, 0xae, 0xd3, 0xf4]),
+    ("wrgsbase rbx", &[0xf3, 0x48, 0x0f, 0xae, 0xdb, 0xf4]),
+    ("wrgsbase ebx", &[0xf3, 0x0f, 0xae, 0xdb, 0xf4]),
+    ("rdfsbase r9", &[0xf3, 0x49, 0x0f, 0xae, 0xc1, 0xf4]),
+    ("wrfsbase r9", &[0xf3, 0x49, 0x0f, 0xae, 0xd1, 0xf4]),
+    (
+        "wrfsbase rbx; mov rax, fs:[0]",
+        &[
+            0xf3, 0x48, 0x0f, 0xae, 0xd3, 0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
+            0xf4,
+        ],
+    ),
+    (
+        "wrgsbase rbx; mov rax, gs:[0]",
+        &[
+            0xf3, 0x48, 0x0f, 0xae, 0xdb, 0x65, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
+            0xf4,
+        ],
+    ),
+    (
+        ".byte 0xf3, 0x0f, 0xae, 0xe0",
+        &[0xf3, 0x0f, 0xae, 0xe0, 0xf4],
+    ),
+    (
+        ".byte 0xf2, 0x0f, 0xae, 0xc0",
+        &[0xf2, 0x0f, 0xae, 0xc0, 0xf4],
+    ),
+    (".byte 0x0f, 0xae, 0xc0", &[0x0f, 0xae, 0xc0, 0xf4]),
+    ("movbe ax, [rsi]", &[0x66, 0x0f, 0x38, 0xf0, 0x06, 0xf4]),
+    ("movbe eax, [rsi]", &[0x0f, 0x38, 0xf0, 0x06, 0xf4]),
+    ("movbe rax, [rsi]", &[0x48, 0x0f, 0x38, 0xf0, 0x06, 0xf4]),
+    ("movbe [rsi], ax", &[0x66, 0x0f, 0x38, 0xf1, 0x06, 0xf4]),
+    ("movbe [rsi], eax", &[0x0f, 0x38, 0xf1, 0x06, 0xf4]),
+    ("movbe [rsi], rax", &[0x48, 0x0f, 0x38, 0xf1, 0x06, 0xf4]),
+    (
+        ".byte 0x0f, 0x38, 0xf0, 0xc3",
+        &[0x0f, 0x38, 0xf0, 0xc3, 0xf4],
+    ),
+    (
+        ".byte 0x0f, 0x38, 0xf1, 0xc3",
+        &[0x0f, 0x38, 0xf1, 0xc3, 0xf4],
+    ),
+    (
+        ".byte 0xf3, 0x0f, 0x38, 0xf0, 0x06",
+        &[0xf3, 0x0f, 0x38, 0xf0, 0x06, 0xf4],
+    ),
     // SNIPPETS-END
 ];

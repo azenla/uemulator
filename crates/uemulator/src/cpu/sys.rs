@@ -34,10 +34,19 @@ pub(crate) const CR4_PGE: u64 = 1 << 7;
 pub(crate) const CR4_PCE: u64 = 1 << 8;
 pub(crate) const CR4_OSFXSR: u64 = 1 << 9;
 pub(crate) const CR4_OSXMMEXCPT: u64 = 1 << 10;
-/// CR4 bits a guest may set. Everything else (VME, PVI, MCE, UMIP, LA57, FSGSBASE, PCIDE,
-/// OSXSAVE, SMEP, SMAP...) is rejected with #GP because CPUID does not advertise it.
-const CR4_SUPPORTED: u64 =
-    CR4_TSD | CR4_DE | CR4_PSE | CR4_PAE | CR4_PGE | CR4_PCE | CR4_OSFXSR | CR4_OSXMMEXCPT;
+/// Enables rdfsbase/rdgsbase/wrfsbase/wrgsbase (advertised in CPUID.7.0:EBX).
+pub(crate) const CR4_FSGSBASE: u64 = 1 << 16;
+/// CR4 bits a guest may set. Everything else (VME, PVI, MCE, UMIP, LA57, PCIDE, OSXSAVE, SMEP,
+/// SMAP...) is rejected with #GP because CPUID does not advertise it.
+const CR4_SUPPORTED: u64 = CR4_TSD
+    | CR4_DE
+    | CR4_PSE
+    | CR4_PAE
+    | CR4_PGE
+    | CR4_PCE
+    | CR4_OSFXSR
+    | CR4_OSXMMEXCPT
+    | CR4_FSGSBASE;
 
 /// Address widths reported by CPUID 0x8000_0008. CR3 and the canonical-address checks follow them.
 const PHYSICAL_ADDRESS_BITS: u32 = 40;
@@ -124,6 +133,7 @@ const LOG_KEY_WRMSR_FAULT: u64 = 1 << 59;
 // features that have tests behind them are advertised; everything else reads as zero.
 const CPUID_LEAF_VENDOR: u32 = 0;
 const CPUID_LEAF_FEATURES: u32 = 1;
+const CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES: u32 = 7;
 const CPUID_LEAF_EXT_MAX: u32 = 0x8000_0000;
 const CPUID_LEAF_EXT_FEATURES: u32 = 0x8000_0001;
 const CPUID_LEAF_BRAND_FIRST: u32 = 0x8000_0002;
@@ -133,8 +143,9 @@ const CPUID_LEAF_L2_CACHE_TLB: u32 = 0x8000_0006;
 const CPUID_LEAF_ADVANCED_POWER: u32 = 0x8000_0007;
 const CPUID_LEAF_ADDRESS_SIZES: u32 = 0x8000_0008;
 
-/// Highest standard leaf. Leaf 7 is within range but returns all zeros (no extended features).
-const CPUID_MAX_STANDARD_LEAF: u32 = 7;
+/// Highest standard leaf. Leaves 2-6 are within range and read as zero (no cache or thermal
+/// descriptors; Linux only consults them on Intel).
+const CPUID_MAX_STANDARD_LEAF: u32 = CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES;
 const CPUID_MAX_EXTENDED_LEAF: u32 = 0x8000_0008;
 
 /// Vendor string "AuthenticAMD" is returned in EBX, EDX, ECX order.
@@ -196,6 +207,8 @@ const FEATURE_SSSE3: u32 = 1 << 9;
 const FEATURE_SSE4_1: u32 = 1 << 19;
 /// SSE4.2: pcmpgtq, CRC32 and the pcmp[ei]str[im] string instructions.
 const FEATURE_SSE4_2: u32 = 1 << 20;
+/// MOVBE.
+const FEATURE_MOVBE: u32 = 1 << 22;
 const FEATURE_POPCNT: u32 = 1 << 23;
 /// AES-NI: aesenc, aesenclast, aesdec, aesdeclast, aesimc, aeskeygenassist.
 const FEATURE_AES: u32 = 1 << 25;
@@ -205,8 +218,15 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
     | FEATURE_CX16
     | FEATURE_SSE4_1
     | FEATURE_SSE4_2
+    | FEATURE_MOVBE
     | FEATURE_POPCNT
     | FEATURE_AES;
+
+/// Leaf 7 subleaf 0 EBX bit 0: rdfsbase, rdgsbase, wrfsbase, wrgsbase. ERMS/FSRM (bits 9 and 4)
+/// stay clear on purpose: they make the kernel's memcpy and clear_page use `rep movsb`/`rep stosb`,
+/// which this interpreter runs one byte per iteration, while the `rep movsq` it uses today moves
+/// eight. Advertise them only together with a bulk fast path in `Cpu::string_op`.
+const STRUCTURED_FEATURE_FSGSBASE: u32 = 1 << 0;
 
 /// Leaf 0x8000_0001 EDX repeats this subset of the leaf 1 bits (the AMD aliases); DE and PSE
 /// are not mirrored.
@@ -261,11 +281,19 @@ impl Cpu {
         }
     }
 
-    /// Subleaf (ECX) is ignored; unknown leaves return zeros.
+    /// The subleaf (ECX) only matters for leaf 7; unknown leaves return zeros.
     pub fn cpuid(&mut self) {
         let leaf = self.gpr[RAX] as u32;
         let (eax, ebx, ecx, edx): (u32, u32, u32, u32) = match leaf {
             CPUID_LEAF_VENDOR => (CPUID_MAX_STANDARD_LEAF, VENDOR_EBX, VENDOR_ECX, VENDOR_EDX),
+            CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES => {
+                // Only subleaf 0 exists; EAX is the highest subleaf.
+                if self.gpr[RCX] as u32 == 0 {
+                    (0, STRUCTURED_FEATURE_FSGSBASE, 0, 0)
+                } else {
+                    (0, 0, 0, 0)
+                }
+            }
             CPUID_LEAF_FEATURES => (
                 CPUID_SIGNATURE,
                 CPUID_LEAF1_EBX,
@@ -802,12 +830,47 @@ impl Cpu {
         Ok(())
     }
 
+    /// F3 0F AE /0../3 with a register operand: rdfsbase, rdgsbase, wrfsbase, wrgsbase. They exist
+    /// only while CR4.FSGSBASE is set (#UD otherwise) and work at any CPL. The operand is 32 bits
+    /// without REX.W (a read zero-extends, a write zero-extends into the base) and 64 bits with it;
+    /// writing a non-canonical 64-bit base is #GP(0), as for wrmsr.
+    fn fs_gs_base(&mut self, i: &Insn) -> ExecResult<()> {
+        const OP_READ_FS: u8 = 0;
+        const OP_READ_GS: u8 = 1;
+        const OP_WRITE_FS: u8 = 2;
+        if self.cr4 & CR4_FSGSBASE == 0 {
+            return Err(Exception::invalid_opcode());
+        }
+        let operation = i.reg & 7;
+        let segment = if operation == OP_READ_FS || operation == OP_WRITE_FS {
+            SEG_FS
+        } else {
+            SEG_GS
+        };
+        let size = if i.opsize == 8 { 8 } else { 4 };
+        if operation == OP_READ_FS || operation == OP_READ_GS {
+            let base = self.seg[segment].base;
+            self.write_gpr(i.rm, size, true, base);
+        } else {
+            let base = self.read_gpr(i.rm, size, true);
+            if !is_canonical(base) {
+                return Err(Exception::general_protection(0));
+            }
+            self.seg[segment].base = base;
+        }
+        Ok(())
+    }
+
     /// 0F AE: fxsave, fxrstor, ldmxcsr, stmxcsr, clflush (memory forms) and lfence/mfence/sfence
-    /// (register forms /5../7, no-ops). xsave/xrstor are not advertised and fault with #UD.
+    /// (register forms /5../7, no-ops), and with an F3 prefix the register forms /0../3 that read
+    /// and write the FS and GS bases. xsave/xrstor are not advertised and fault with #UD.
     pub fn group_ae(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
+        const REP_REPE: u8 = 1;
         let reg = i.reg & 7;
         if i.md == 3 {
-            if i.rep != 0 || !(5..=7).contains(&reg) {
+            if i.rep == REP_REPE && reg < 4 {
+                self.fs_gs_base(i)?;
+            } else if i.rep != 0 || !(5..=7).contains(&reg) {
                 return Err(Exception::invalid_opcode());
             }
         } else {

@@ -761,6 +761,30 @@ fn insertps(dst: u128, src: u128, selector: u8, from_memory: bool) -> u128 {
 }
 
 impl Cpu {
+    /// MOVBE (0F 38 F0 load, F1 store): a general register and a memory operand with the bytes
+    /// swapped; 16, 32 or 64 bits by operand size. There is no register form (#UD), and no flags
+    /// change.
+    fn movbe(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
+        if i.md == MODRM_MOD_REGISTER {
+            return Err(Exception::invalid_opcode());
+        }
+        let size = i.opsize;
+        let swap = |value: u64| match size {
+            2 => (value as u16).swap_bytes() as u64,
+            4 => (value as u32).swap_bytes() as u64,
+            _ => value.swap_bytes(),
+        };
+        let addr = self.linear_address(i, self.effective_address(i, next));
+        if i.op & 0xff == 0xf0 {
+            let value = swap(self.read(addr, size)?);
+            self.write_gpr(i.reg, size, true, value);
+        } else {
+            let value = swap(self.read_gpr(i.reg, size, true));
+            self.write(addr, size, value)?;
+        }
+        Ok(())
+    }
+
     /// CRC32 (F2 0F 38 F0/F1): accumulates the source operand into the CRC-32C in the low 32 bits
     /// of the destination register. The source is a byte (F0) or 16/32/64 bits by operand size
     /// (F1); the destination is 32 bits, or 64 under REX.W (the upper half is then zero). No SSE
@@ -893,7 +917,8 @@ impl Cpu {
         if map == OPCODE_MAP_0F38 && matches!(opcode, 0xf0 | 0xf1) {
             return match prefix {
                 Prefix::F2 => self.crc32(i, next).map(|()| true),
-                _ => Ok(false),
+                Prefix::Np | Prefix::P66 => self.movbe(i, next).map(|()| true),
+                Prefix::F3 => Ok(false),
             };
         }
         let Some(op) = decode_op(map, opcode, prefix) else {
