@@ -1,6 +1,6 @@
 # uemulator
 
-Minimal embeddable x86_64 system emulator in Rust. Boots an unmodified Linux bzImage with a virtio console (`hvc0`; the 16550 serial port is always present but silent during boot), no firmware. Design is modeled on QEMU TCG: decode to micro-ops, TB cache, interpreter plus aarch64 and x86_64 host JITs with runtime fallback.
+Minimal embeddable x86_64 system emulator in Rust. Boots an unmodified Linux bzImage with a virtio console (`hvc0`; the 16550 serial port is always present and carries early boot text), no firmware. Design is modeled on QEMU TCG: decode to micro-ops, TB cache, interpreter plus aarch64 and x86_64 host JITs with runtime fallback.
 
 Read `plans/README.md` first; the plans are the source of truth for design and milestones (`plans/10-milestones.md` for current status).
 
