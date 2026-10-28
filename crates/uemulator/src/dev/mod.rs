@@ -1,10 +1,12 @@
 #[cfg(freestanding)]
 use crate::prelude::*;
+pub(crate) mod acpi_pm;
 pub(crate) mod apic;
 pub(crate) mod guestmem;
-mod ioapic;
+pub(crate) mod hpet;
+pub(crate) mod ioapic;
 pub(crate) mod iommu;
-mod pci;
+pub(crate) mod pci;
 mod pic;
 mod pit;
 mod serial;
@@ -18,9 +20,12 @@ use crate::console::ConsoleHandle;
 #[cfg(not(freestanding))]
 use crate::disk::Disk;
 use crate::netdev::NetHandle;
+use acpi_pm::AcpiPm;
 use apic::{Interrupt, Lapic};
 use guestmem::GuestMem;
+use hpet::{Hpet, HpetOutput};
 use ioapic::IoApic;
+use iommu::{InterruptRequest, IommuInterrupt, PhysRead, ioapic_request_raw};
 use pci::PciHost;
 use pic::Pics;
 use pit::Pit;
@@ -114,6 +119,23 @@ const CMOS_STATUS_B_VALUE: u8 = 0x02;
 /// Status D: battery good (VRT), so the kernel trusts the time.
 const CMOS_STATUS_D_VALUE: u8 = 0x80;
 
+/// Requester ids the IOMMU sees for interrupts that do not come from a PCI function. Linux's
+/// AMD IOMMU driver insists on finding an I/O APIC at the "southbridge" id 00:14.0 in the IVRS
+/// (`IOAPIC_SB_DEVID`) and turns interrupt remapping off otherwise; the HPET gets the next
+/// function. A virtio function in slot 0x14 (the 20th) would share the IOAPIC's table entry,
+/// which still works because both only need the same interrupt table. Must match the IVRS
+/// special-device entries (`acpi`).
+pub(crate) const IOAPIC_REQUESTER: u16 = 0x00a0;
+pub(crate) const HPET_REQUESTER: u16 = 0x00a1;
+
+/// A device interrupt on its way to the LAPIC.
+enum Source {
+    /// An I/O APIC redirection entry's message and the pin that sent it.
+    IoApic { pin: usize, interrupt: Interrupt },
+    /// An MSI write from a PCI function, the HPET or the IOMMU itself.
+    Message(InterruptRequest),
+}
+
 /// What to attach to the PCI bus; every device is optional and may repeat. Functions take slots
 /// (and legacy IRQ lines) in this order: virtio consoles, disks, nets, each in list order.
 #[derive(Default)]
@@ -148,6 +170,13 @@ pub(crate) struct Devices {
     pci: PciHost,
     pub lapic: Lapic,
     ioapic: IoApic,
+    pm: AcpiPm,
+    hpet: Hpet,
+    /// Level of the SCI line as last driven.
+    sci_level: bool,
+    /// Interrupts that need the IOMMU's interrupt table in guest RAM, waiting for a call that
+    /// has RAM (`deliver`).
+    deferred: Vec<Source>,
     /// Virtual time of the last tick or port access, for MMIO accesses that arrive without one.
     now_ns: u64,
     /// Position of the virtio console that shares the UART's console handle, if any: the UART
@@ -239,6 +268,10 @@ impl Devices {
             pci: PciHost::new(virtio_devices).with_iommu(cfg.iommu),
             lapic: Lapic::new(),
             ioapic: IoApic::new(),
+            pm: AcpiPm::new(),
+            hpet: Hpet::new(),
+            sci_level: false,
+            deferred: Vec::new(),
             now_ns: 0,
             uart_peer_console,
             reset_requested: false,
@@ -279,11 +312,16 @@ impl Devices {
     /// Only the PIT schedules deadlines. The UART and virtio devices are polled from `tick`
     /// instead, which the CPU calls every `EVENT_INTERVAL` instructions and while idle, so
     /// host input and received frames wait at most one such interval.
-    pub fn next_deadline(&self, _now: u64) -> Option<u64> {
-        [self.pit.next_deadline(), self.lapic.next_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
+    pub fn next_deadline(&self, now: u64) -> Option<u64> {
+        [
+            self.pit.next_deadline(),
+            self.lapic.next_deadline(),
+            self.hpet.next_deadline(),
+            self.pm.next_deadline(now),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// The ISA line a device raised on the PIC, as an I/O APIC pin: the PIT's IRQ 0 is wired to
@@ -292,15 +330,80 @@ impl Devices {
         if irq == IRQ_PIT { 2 } else { irq as usize }
     }
 
-    fn deliver_to_lapic(&mut self, interrupts: Vec<Interrupt>) {
-        for interrupt in interrupts {
-            self.lapic.accept(&interrupt);
+    /// Sends what the I/O APIC just produced towards the LAPIC. The pins come from
+    /// `IoApic::take_sent_pins`, one per message in the same order.
+    fn deliver_ioapic(&mut self, interrupts: Vec<Interrupt>, mem: Option<&dyn PhysRead>) {
+        let pins = self.ioapic.take_sent_pins();
+        debug_assert_eq!(pins.len(), interrupts.len());
+        for (pin, interrupt) in pins.into_iter().zip(interrupts) {
+            self.deliver(Source::IoApic { pin, interrupt }, mem);
+        }
+    }
+
+    /// Hands a device interrupt to the LAPIC, through the IOMMU's interrupt remapping when the
+    /// guest has the IOMMU on. Remapping reads the IRTE from guest RAM, which the callers that
+    /// run on the CPU's interrupt-polling path do not have: `mem` is `None` there and the
+    /// interrupt waits in `deferred` for the next `tick` (at most `EVENT_INTERVAL`
+    /// instructions) or MMIO write.
+    fn deliver(&mut self, source: Source, mem: Option<&dyn PhysRead>) {
+        let remapping = self.pci.iommu().is_some_and(|iommu| iommu.enabled());
+        if !remapping {
+            let interrupt = match source {
+                Source::IoApic { interrupt, .. } => Some(interrupt),
+                Source::Message(request) => iommu::decode_message(&request)
+                    .ok()
+                    .map(|message| message.into_interrupt()),
+            };
+            if let Some(interrupt) = interrupt {
+                self.lapic.accept(&interrupt);
+            }
+            return;
+        }
+        let Some(mem) = mem else {
+            self.deferred.push(source);
+            return;
+        };
+        let (request, pin) = match source {
+            Source::IoApic { pin, interrupt } => {
+                let request = ioapic_request_raw(
+                    IOAPIC_REQUESTER,
+                    interrupt.vector,
+                    interrupt.delivery_mode,
+                    interrupt.logical,
+                    interrupt.level_triggered,
+                    interrupt.destination as u8,
+                );
+                (request, Some(pin))
+            }
+            Source::Message(request) => (request, None),
+        };
+        let Some(iommu) = self.pci.iommu() else {
+            return;
+        };
+        // A refused interrupt is dropped; the IOMMU has logged the fault.
+        let Ok(remapped) = iommu.remap_interrupt(mem, request) else {
+            return;
+        };
+        let interrupt = remapped.into_interrupt();
+        if let Some(pin) = pin {
+            self.ioapic.note_delivered(pin, interrupt.vector);
+        }
+        self.lapic.accept(&interrupt);
+    }
+
+    fn drain_deferred(&mut self, mem: &dyn PhysRead) {
+        for source in core::mem::take(&mut self.deferred) {
+            self.deliver(source, Some(mem));
         }
     }
 
     /// Forwards the device line changes the PIC logged to the I/O APIC, which turns them into
     /// messages for the local APIC. Cheap when nothing changed: the CPU calls it per instruction.
     fn route_line_events(&mut self) {
+        self.route_line_events_with(None);
+    }
+
+    fn route_line_events_with(&mut self, mem: Option<&dyn PhysRead>) {
         if !self.pic.has_line_events() {
             return;
         }
@@ -309,7 +412,74 @@ impl Devices {
             self.ioapic
                 .set_line(Self::ioapic_pin(irq), level, &mut messages);
         }
-        self.deliver_to_lapic(messages);
+        self.deliver_ioapic(messages, mem);
+    }
+
+    /// Queued HPET interrupts: I/O APIC pins (24 pins, so pins 20..=23 are not ISA lines and
+    /// bypass the PIC) or MSI messages.
+    fn route_hpet(&mut self, mem: Option<&dyn PhysRead>) {
+        if !self.hpet.has_outputs() {
+            return;
+        }
+        let mut messages = Vec::new();
+        for output in self.hpet.take_outputs() {
+            match output {
+                HpetOutput::Pulse { pin } => {
+                    self.ioapic.set_line(pin as usize, true, &mut messages);
+                    self.ioapic.set_line(pin as usize, false, &mut messages);
+                }
+                HpetOutput::Level { pin, high } => {
+                    self.ioapic.set_line(pin as usize, high, &mut messages);
+                }
+                HpetOutput::Message { address, data } => self.deliver(
+                    Source::Message(InterruptRequest {
+                        requester: HPET_REQUESTER,
+                        address,
+                        data,
+                    }),
+                    mem,
+                ),
+            }
+        }
+        self.deliver_ioapic(messages, mem);
+    }
+
+    /// The IOMMU's own event and completion-wait interrupt: its MSI (through interrupt
+    /// remapping, like any device's) or, with IntCapXT, straight to the LAPIC.
+    fn route_iommu_msi(&mut self, mem: &dyn PhysRead) {
+        match self.pci.iommu().and_then(|iommu| iommu.take_interrupt()) {
+            Some(IommuInterrupt::Message(message)) => self.deliver(
+                Source::Message(InterruptRequest {
+                    requester: iommu::REQUESTER_ID,
+                    address: message.address,
+                    data: message.data,
+                }),
+                Some(mem),
+            ),
+            Some(IommuInterrupt::Direct(interrupt)) => {
+                self.lapic.accept(&interrupt);
+            }
+            None => {}
+        }
+    }
+
+    /// Drives the SCI line to what the PM block wants.
+    fn update_sci(&mut self, now: u64) {
+        let level = self.pm.sci_asserted(now);
+        if level == self.sci_level {
+            return;
+        }
+        self.sci_level = level;
+        if level {
+            self.pic.raise(acpi_pm::SCI_IRQ);
+        } else {
+            self.pic.lower(acpi_pm::SCI_IRQ);
+        }
+    }
+
+    /// The guest wrote SLP_EN with the S5 type: nothing wakes the machine from that.
+    pub fn shutdown_requested(&self) -> bool {
+        self.pm.shutdown_requested()
     }
 
     /// Whether an interrupt is waiting for the CPU (the CPU still checks IF and the interrupt
@@ -378,7 +548,7 @@ impl Devices {
         if let Some(vector) = effect.eoi_vector {
             let mut messages = Vec::new();
             self.ioapic.eoi(vector, &mut messages);
-            self.deliver_to_lapic(messages);
+            self.deliver_ioapic(messages, None);
         }
         Ok(())
     }
@@ -415,12 +585,15 @@ impl Devices {
         if self.pit.tick(now) {
             self.pic.raise(IRQ_PIT);
         }
+        self.hpet.tick(now);
         let mut raise = Vec::new();
-        self.pci.poll(mem, &mut raise);
+        let mut messages = Vec::new();
+        self.pci.poll_collecting(mem, &mut raise, &mut messages);
         for irq in raise {
             self.pic.raise(irq);
         }
         self.update_pci_irqs();
+        self.update_sci(now);
         // A UART that shares its console with a virtio console gives way once that driver is up:
         // host input belongs to hvc and the UART must not also take it. A UART with a console of
         // its own (`--console serial` next to a virtio one) always listens.
@@ -430,6 +603,17 @@ impl Devices {
         self.uart.set_rx_enabled(!yielded);
         self.uart.poll();
         self.update_uart_irq();
+        self.deliver_messages(messages, mem);
+        self.route_line_events_with(Some(mem));
+        self.route_hpet(Some(mem));
+        self.route_iommu_msi(mem);
+        self.drain_deferred(mem);
+    }
+
+    fn deliver_messages(&mut self, messages: Vec<InterruptRequest>, mem: &dyn PhysRead) {
+        for request in messages {
+            self.deliver(Source::Message(request), Some(mem));
+        }
     }
 
     /// None means no device decodes `phys_addr` and the caller treats it as unmapped.
@@ -445,6 +629,12 @@ impl Devices {
             self.route_line_events();
             return Some(self.ioapic.mmio_read(phys_addr, size));
         }
+        if Hpet::decodes(phys_addr) {
+            return Some(self.hpet.mmio_read(phys_addr, size, self.now_ns));
+        }
+        if PciHost::ecam_decodes(phys_addr) {
+            return Some(self.pci.ecam_read(phys_addr, size) as u64);
+        }
         let value = self.pci.mmio_read(phys_addr, size);
         // Reading the ISR register acknowledges the interrupt.
         self.update_pci_irqs();
@@ -454,6 +644,8 @@ impl Devices {
     /// Returns false if no device decodes `phys_addr`.
     pub fn mmio_write(&mut self, phys_addr: u64, size: u8, val: u64, mem: &mut GuestMem) -> bool {
         if self.pci.iommu_mmio_write(phys_addr, size, val, mem) {
+            self.route_iommu_msi(mem);
+            self.drain_deferred(mem);
             return true;
         }
         if self.lapic.mmio_decodes(phys_addr) {
@@ -467,14 +659,28 @@ impl Devices {
             return true;
         }
         if self.ioapic.decodes(phys_addr) {
-            self.route_line_events();
+            self.route_line_events_with(Some(mem));
             let mut messages = Vec::new();
             self.ioapic.mmio_write(phys_addr, val, &mut messages);
-            self.deliver_to_lapic(messages);
+            self.deliver_ioapic(messages, Some(mem));
+            // Reprogramming an entry can release interrupts that were waiting on the IOMMU.
+            self.drain_deferred(mem);
             return true;
         }
-        let result = self.pci.mmio_write(phys_addr, size, val as u32, mem);
-        match result {
+        if Hpet::decodes(phys_addr) {
+            self.hpet.mmio_write(phys_addr, size, val, self.now_ns);
+            self.route_hpet(Some(mem));
+            return true;
+        }
+        if PciHost::ecam_decodes(phys_addr) {
+            self.pci.ecam_write(phys_addr, size, val as u32);
+            return true;
+        }
+        let mut messages = Vec::new();
+        let result =
+            self.pci
+                .mmio_write_collecting(phys_addr, size, val as u32, mem, &mut messages);
+        let handled = match result {
             Some(irq) => {
                 // IRQ 0 is the PIT and never a PCI line: it means "no interrupt".
                 if irq != 0 {
@@ -484,7 +690,12 @@ impl Devices {
                 true
             }
             None => false,
+        };
+        if handled {
+            self.deliver_messages(messages, mem);
+            self.route_iommu_msi(mem);
         }
+        handled
     }
 
     /// `now` is virtual nanoseconds. Time registers are computed on read from `boot_unix`
@@ -533,6 +744,7 @@ impl Devices {
             CMOS_DATA_PORT => self.cmos_read(now),
             FAST_A20_PORT => self.system_control_port_a,
             RESET_CONTROL_PORT => self.reset_control,
+            port if AcpiPm::decodes(port) => return self.pm.read(port, size, now),
             UART_COM1_BASE..=UART_COM1_LAST => self.uart.read(port - UART_COM1_BASE),
             PCI_CONFIG_PORT_FIRST..=PCI_CONFIG_PORT_LAST if !self.pci.is_empty() => {
                 return self.pci.io_in(port, size);
@@ -576,6 +788,10 @@ impl Devices {
             PCI_CONFIG_PORT_FIRST..=PCI_CONFIG_PORT_LAST if !self.pci.is_empty() => {
                 self.pci.io_out(port, size, value)
             }
+            port if AcpiPm::decodes(port) => {
+                self.pm.write(port, size, value, now);
+                self.update_sci(now);
+            }
             UART_COM1_BASE..=UART_COM1_LAST => {
                 self.uart.write(port - UART_COM1_BASE, byte);
                 self.update_uart_irq();
@@ -595,6 +811,8 @@ mod tests {
     const NOW_ZERO: u64 = 0;
     const ONE_SECOND_NS: u64 = 1_000_000_000;
     const RAM_BYTES: usize = 0x2000;
+    /// The BAR of the only function is 32 KiB: common, ISR, device, notify, MSI-X table and PBA.
+    const FIRST_BYTE_PAST_THE_BAR: u64 = 0x8000;
     const PCI_ENABLE: u32 = 1 << 31;
     const SLOT_SHIFT: u32 = 11;
     const COMMAND_REGISTER: u32 = 0x04;
@@ -1506,9 +1724,9 @@ mod tests {
         let mut ram = vec![0u8; RAM_BYTES];
         let mut mem = test_mem(&mut ram);
         assert_eq!(dev.mmio_read(MMIO_BASE - 1, 1), None);
-        assert_eq!(dev.mmio_read(MMIO_BASE + 0x4000, 1), None);
+        assert_eq!(dev.mmio_read(MMIO_BASE + FIRST_BYTE_PAST_THE_BAR, 1), None);
         assert_eq!(dev.mmio_read(0xffff_f000, 1), None);
-        assert!(!dev.mmio_write(MMIO_BASE + 0x4000, 4, 0, &mut mem));
+        assert!(!dev.mmio_write(MMIO_BASE + FIRST_BYTE_PAST_THE_BAR, 4, 0, &mut mem));
     }
 
     #[test]
@@ -1917,5 +2135,548 @@ mod tests {
             },
         );
         assert_eq!(shared.uart_peer_console, Some(1));
+    }
+
+    const LAPIC_SPURIOUS_VECTOR_REGISTER: u64 = 0xfee0_00f0;
+    const LAPIC_SOFTWARE_ENABLE: u64 = 0x1ff;
+    const IOAPIC_SELECT: u64 = 0xfec0_0000;
+    const IOAPIC_WINDOW: u64 = 0xfec0_0010;
+    const IOAPIC_ID_REGISTER: u64 = 0;
+    const IOAPIC_FIRST_REDIRECTION: u64 = 0x10;
+    const HPET_CONFIG: u64 = 0xfed0_0010;
+    const HPET_TIMER0_CONFIG: u64 = 0xfed0_0100;
+    const HPET_TIMER0_COMPARATOR: u64 = 0xfed0_0108;
+    const HPET_TIMER0_FSB_ROUTE: u64 = 0xfed0_0110;
+    const HPET_ENABLE: u64 = 1;
+    const HPET_TIMER_INTERRUPT_ENABLE: u64 = 1 << 2;
+    const HPET_TIMER_LEVEL: u64 = 1 << 1;
+    const HPET_TIMER_FSB_ENABLE: u64 = 1 << 14;
+    const HPET_ROUTE_SHIFT: u32 = 9;
+    const HPET_PIN: u64 = 22;
+    const TEST_VECTOR: u8 = 0x55;
+    const FSB_VECTOR: u32 = 0x66;
+    const MSI_ADDRESS_BASE: u64 = 0xfee0_0000;
+    const PM_TIMER_ENABLE_PORT: u16 = 0x602;
+    const PM_CONTROL_PORT: u16 = 0x604;
+    const PM_TIMER_PORT: u16 = 0x608;
+    const PM_SLEEP_S5: u32 = 0x3401;
+    const PM_TIMER_STATUS_PORT: u16 = 0x600;
+    const SCI_VECTOR: u8 = 0x28 + 4;
+
+    /// A machine with the local APIC software-enabled and pin `pin` of the I/O APIC routed to
+    /// `vector` (edge, fixed, destination 0).
+    fn with_routed_pin(pin: u64, vector: u8, level: bool) -> (Devices, Vec<u8>) {
+        let mut dev = bus();
+        let mut ram = vec![0u8; RAM_BYTES];
+        {
+            let mut mem = test_mem(&mut ram);
+            assert!(dev.mmio_write(
+                LAPIC_SPURIOUS_VECTOR_REGISTER,
+                4,
+                LAPIC_SOFTWARE_ENABLE,
+                &mut mem
+            ));
+            let register = IOAPIC_FIRST_REDIRECTION + 2 * pin;
+            let low = vector as u64 | (level as u64) << 15;
+            for (select, value) in [(register + 1, 0), (register, low)] {
+                assert!(dev.mmio_write(IOAPIC_SELECT, 4, select, &mut mem));
+                assert!(dev.mmio_write(IOAPIC_WINDOW, 4, value, &mut mem));
+            }
+        }
+        (dev, ram)
+    }
+
+    fn mmio_write(dev: &mut Devices, ram: &mut [u8], address: u64, size: u8, value: u64) {
+        let mut mem = test_mem(ram);
+        assert!(
+            dev.mmio_write(address, size, value, &mut mem),
+            "{address:#x}"
+        );
+    }
+
+    #[test]
+    fn the_s5_sleep_write_requests_shutdown_through_the_pm_control_port() {
+        let mut dev = bus();
+        assert!(!dev.shutdown_requested());
+        out(&mut dev, PM_CONTROL_PORT, 2, 0x3001);
+        assert!(!dev.shutdown_requested(), "sleep type 4 is not offered");
+        out(&mut dev, PM_CONTROL_PORT, 2, PM_SLEEP_S5);
+        assert!(dev.shutdown_requested());
+        assert!(!dev.reset_requested);
+    }
+
+    #[test]
+    fn the_pm_timer_reads_through_its_port_and_follows_virtual_time() {
+        let mut dev = bus();
+        assert_eq!(dev.io_in(PM_TIMER_PORT, 4, 0), 0);
+        let one_second = dev.io_in(PM_TIMER_PORT, 4, ONE_SECOND_NS);
+        assert_eq!(one_second, 3_579_545);
+    }
+
+    #[test]
+    fn the_pm_timer_overflow_interrupts_on_the_sci_line_and_clearing_the_status_drops_it() {
+        let mut dev = bus();
+        init_pics(&mut dev);
+        out(&mut dev, PIC_MASTER_DATA, 1, 0);
+        out(&mut dev, PIC_SLAVE_DATA, 1, 0);
+        out(&mut dev, PM_TIMER_ENABLE_PORT, 2, 1);
+        let deadline = dev
+            .next_deadline(0)
+            .expect("the timer overflow is scheduled");
+        tick(&mut dev, deadline - 1_000);
+        assert!(!dev.pic.has_pending());
+        tick(&mut dev, deadline);
+        assert!(dev.pic.has_pending());
+        assert_eq!(dev.pic.ack(), Some(SCI_VECTOR));
+        dev.io_out(PM_TIMER_STATUS_PORT, 2, 1, deadline);
+        tick(&mut dev, deadline + 1);
+        assert!(!dev.sci_level);
+    }
+
+    #[test]
+    fn ecam_reads_the_same_config_space_as_the_cf8_ports() {
+        let mut dev = bus_with_pci();
+        let via_ports = |dev: &mut Devices, slot: u32, register: u32| {
+            out(dev, PCI_CONFIG_PORT_FIRST, 4, pci_address(slot, register));
+            inp(dev, 0xcfc, 4)
+        };
+        for (slot, register) in [(0, 0), (1, 0), (1, 8), (1, 0x2c), (1, 0x40), (2, 0)] {
+            let address = pci::ECAM_BASE + (slot << 15) + register as u64;
+            assert_eq!(
+                dev.mmio_read(address, 4),
+                Some(via_ports(&mut dev, slot as u32, register) as u64),
+                "slot {slot} register {register:#x}"
+            );
+        }
+        assert_eq!(dev.mmio_read(pci::ECAM_BASE, 2), Some(0x8086));
+        assert_eq!(
+            dev.mmio_read(pci::ECAM_BASE + (1 << 15), 2),
+            Some(VIRTIO_VENDOR as u64)
+        );
+    }
+
+    #[test]
+    fn ecam_reports_absent_functions_as_all_ones_and_extended_space_as_zero() {
+        let mut dev = bus_with_pci();
+        assert_eq!(
+            dev.mmio_read(pci::ECAM_BASE + (9 << 15), 4),
+            Some(0xffff_ffff)
+        );
+        assert_eq!(
+            dev.mmio_read(pci::ECAM_BASE + (9 << 15) + 0x100, 4),
+            Some(0xffff_ffff)
+        );
+        assert_eq!(
+            dev.mmio_read(pci::ECAM_BASE + (1 << 15) + 0x100, 4),
+            Some(0)
+        );
+        assert_eq!(
+            dev.mmio_read(pci::ECAM_BASE + (1 << 15) + 0xffc, 4),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn ecam_writes_reach_the_functions_config_space() {
+        let mut dev = bus_with_pci();
+        let mut ram = vec![0u8; RAM_BYTES];
+        let command = pci::ECAM_BASE + (1 << 15) + COMMAND_REGISTER as u64;
+        mmio_write(&mut dev, &mut ram, command, 2, MEMORY_SPACE_ENABLE as u64);
+        assert_eq!(dev.mmio_read(command, 2), Some(MEMORY_SPACE_ENABLE as u64));
+        // Memory decoding is now on: BAR0 answers.
+        assert!(
+            dev.mmio_read(MMIO_BASE + COMMON_DEVICE_STATUS_OFFSET, 1)
+                .is_some()
+        );
+        // Extended space is read-only nothing.
+        mmio_write(&mut dev, &mut ram, command + 0x100, 4, 0xdead_beef);
+        assert_eq!(dev.mmio_read(command + 0x100, 4), Some(0));
+    }
+
+    #[test]
+    fn the_ioapic_id_is_the_one_the_madt_names() {
+        let mut dev = bus();
+        let mut ram = vec![0u8; RAM_BYTES];
+        mmio_write(&mut dev, &mut ram, IOAPIC_SELECT, 4, IOAPIC_ID_REGISTER);
+        assert_eq!(
+            dev.mmio_read(IOAPIC_WINDOW, 4),
+            Some((ioapic::IOAPIC_ID as u64) << 24)
+        );
+    }
+
+    #[test]
+    fn an_hpet_timer_interrupts_through_the_ioapic_pin_the_guest_chose() {
+        let (mut dev, mut ram) = with_routed_pin(HPET_PIN, TEST_VECTOR, false);
+        mmio_write(&mut dev, &mut ram, HPET_CONFIG, 8, HPET_ENABLE);
+        let config = HPET_TIMER_INTERRUPT_ENABLE | HPET_PIN << HPET_ROUTE_SHIFT;
+        mmio_write(&mut dev, &mut ram, HPET_TIMER0_CONFIG, 8, config);
+        mmio_write(&mut dev, &mut ram, HPET_TIMER0_COMPARATOR, 8, 1000);
+        let deadline = dev.next_deadline(0).expect("armed");
+        assert!(!dev.interrupt_pending());
+        tick(&mut dev, deadline);
+        assert!(dev.interrupt_pending());
+        assert_eq!(dev.interrupt_ack(), Some(TEST_VECTOR));
+        assert_eq!(dev.next_deadline(deadline), None, "one-shot");
+    }
+
+    #[test]
+    fn a_level_hpet_timer_re_interrupts_after_the_eoi_until_its_status_is_cleared() {
+        let (mut dev, mut ram) = with_routed_pin(HPET_PIN, TEST_VECTOR, true);
+        mmio_write(&mut dev, &mut ram, HPET_CONFIG, 8, HPET_ENABLE);
+        let config = HPET_TIMER_INTERRUPT_ENABLE | HPET_TIMER_LEVEL | HPET_PIN << HPET_ROUTE_SHIFT;
+        mmio_write(&mut dev, &mut ram, HPET_TIMER0_CONFIG, 8, config);
+        mmio_write(&mut dev, &mut ram, HPET_TIMER0_COMPARATOR, 8, 1000);
+        let deadline = dev.next_deadline(0).unwrap();
+        tick(&mut dev, deadline);
+        assert_eq!(dev.interrupt_ack(), Some(TEST_VECTOR));
+        // The handler EOIs without clearing the status: the line is still high.
+        mmio_write(&mut dev, &mut ram, 0xfee0_00b0, 4, 0);
+        assert_eq!(dev.interrupt_ack(), Some(TEST_VECTOR));
+        mmio_write(&mut dev, &mut ram, 0xfed0_0020, 8, 1);
+        mmio_write(&mut dev, &mut ram, 0xfee0_00b0, 4, 0);
+        assert_eq!(dev.interrupt_ack(), None);
+    }
+
+    #[test]
+    fn an_hpet_timer_with_fsb_delivery_sends_its_message_to_the_lapic() {
+        let (mut dev, mut ram) = with_routed_pin(HPET_PIN, TEST_VECTOR, false);
+        mmio_write(&mut dev, &mut ram, HPET_CONFIG, 8, HPET_ENABLE);
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            HPET_TIMER0_FSB_ROUTE,
+            8,
+            MSI_ADDRESS_BASE << 32 | FSB_VECTOR as u64,
+        );
+        let config = HPET_TIMER_INTERRUPT_ENABLE | HPET_TIMER_FSB_ENABLE;
+        mmio_write(&mut dev, &mut ram, HPET_TIMER0_CONFIG, 8, config);
+        mmio_write(&mut dev, &mut ram, HPET_TIMER0_COMPARATOR, 8, 500);
+        let deadline = dev.next_deadline(0).unwrap();
+        tick(&mut dev, deadline);
+        assert_eq!(dev.interrupt_ack(), Some(FSB_VECTOR as u8));
+    }
+
+    const IOMMU_BASE: u64 = 0xfed8_0000;
+    const IOMMU_DEVICE_TABLE_REGISTER: u64 = 0x00;
+    const IOMMU_CONTROL_REGISTER: u64 = 0x18;
+    const IOMMU_ENABLE: u64 = 1;
+    const IOMMU_RAM_BYTES: usize = 1 << 20;
+    const DEVICE_TABLE_AT: usize = 0x1_0000;
+    const DEVICE_TABLE_TWO_PAGES: u64 = 1;
+    const INTERRUPT_TABLE_AT: usize = 0x2_0000;
+    const DEVICE_TABLE_ENTRY_BYTES: usize = 32;
+    /// The I/O APIC's entry has V clear, as Linux leaves it: only IV matters for interrupts.
+    const DTE_INTERRUPT_QUAD: usize = 16;
+    /// IV, IntTabLen 9 (512 entries), IntCtl 2 (remap).
+    const DTE_REMAP_9: u64 = 1 | 9 << 1 | 2 << 60;
+    const IRTE_REMAP_ENABLE: u32 = 1;
+    const IRTE_VECTOR_SHIFT: u32 = 16;
+    const ISA_IRQ_1_PIN: u64 = 1;
+    const REMAPPED_VECTOR: u8 = 0x77;
+    const IRTE_INDEX: u8 = 5;
+    const MSI_ADDRESS_LOW_OFFSET: u64 = iommu::MSI_ADDRESS_LOW as u64;
+    const MSI_DATA_OFFSET: u64 = iommu::MSI_DATA as u64;
+    const MSI_CONTROL_OFFSET: u64 = iommu::MSI_CONTROL as u64;
+    const IOMMU_FUNCTION_ECAM: u64 = pci::ECAM_BASE + (2 << 12);
+
+    /// A machine with the IOMMU and a console, the local APIC on and the I/O APIC pin `pin`
+    /// routed to the IRTE index `IRTE_INDEX`; a megabyte of RAM for the guest's tables.
+    fn iommu_machine(pin: u64, level: bool) -> (Devices, Vec<u8>) {
+        let mut dev = Devices::new(
+            ConsoleHandle::default(),
+            DevConfig {
+                iommu: true,
+                virtio_consoles: vec![ConsoleHandle::default()],
+                ..Default::default()
+            },
+        );
+        let mut ram = vec![0u8; IOMMU_RAM_BYTES];
+        let mut mem = test_mem(&mut ram);
+        assert!(dev.mmio_write(
+            LAPIC_SPURIOUS_VECTOR_REGISTER,
+            4,
+            LAPIC_SOFTWARE_ENABLE,
+            &mut mem
+        ));
+        let register = IOAPIC_FIRST_REDIRECTION + 2 * pin;
+        let low = IRTE_INDEX as u64 | (level as u64) << 15;
+        for (select, value) in [(register + 1, 0), (register, low)] {
+            assert!(dev.mmio_write(IOAPIC_SELECT, 4, select, &mut mem));
+            assert!(dev.mmio_write(IOAPIC_WINDOW, 4, value, &mut mem));
+        }
+        (dev, ram)
+    }
+
+    fn write_u64(ram: &mut [u8], at: usize, value: u64) {
+        ram[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Gives `requester` a remapping device table entry over the one interrupt table, and IRTE
+    /// `IRTE_INDEX` the vector `vector` (or a disabled entry for `None`).
+    fn remap_requester(ram: &mut [u8], requester: u16, vector: Option<u8>) {
+        let entry = DEVICE_TABLE_AT + requester as usize * DEVICE_TABLE_ENTRY_BYTES;
+        write_u64(
+            ram,
+            entry + DTE_INTERRUPT_QUAD,
+            DTE_REMAP_9 | INTERRUPT_TABLE_AT as u64,
+        );
+        let irte = vector.map_or(0, |vector| {
+            IRTE_REMAP_ENABLE | (vector as u32) << IRTE_VECTOR_SHIFT
+        });
+        let at = INTERRUPT_TABLE_AT + 4 * IRTE_INDEX as usize;
+        ram[at..at + 4].copy_from_slice(&irte.to_le_bytes());
+    }
+
+    fn enable_iommu(dev: &mut Devices, ram: &mut [u8]) {
+        // Two pages of device table (the size field is pages - 1): entries up to device id 255.
+        let table = DEVICE_TABLE_AT as u64 | DEVICE_TABLE_TWO_PAGES;
+        mmio_write(dev, ram, IOMMU_BASE + IOMMU_DEVICE_TABLE_REGISTER, 8, table);
+        mmio_write(
+            dev,
+            ram,
+            IOMMU_BASE + IOMMU_CONTROL_REGISTER,
+            8,
+            IOMMU_ENABLE,
+        );
+    }
+
+    fn fire_hpet_timer(dev: &mut Devices, ram: &mut [u8], pin: u64, level: bool) {
+        mmio_write(dev, ram, HPET_CONFIG, 8, HPET_ENABLE);
+        let mut config = HPET_TIMER_INTERRUPT_ENABLE | pin << HPET_ROUTE_SHIFT;
+        if level {
+            config |= HPET_TIMER_LEVEL;
+        }
+        mmio_write(dev, ram, HPET_TIMER0_CONFIG, 8, config);
+        mmio_write(dev, ram, HPET_TIMER0_COMPARATOR, 8, 1000);
+        let deadline = dev.next_deadline(0).unwrap();
+        let mut mem = test_mem(ram);
+        dev.tick(deadline, &mut mem);
+    }
+
+    #[test]
+    fn ioapic_interrupts_are_remapped_through_the_irte_once_the_iommu_is_on() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        remap_requester(&mut ram, IOAPIC_REQUESTER, Some(REMAPPED_VECTOR));
+        enable_iommu(&mut dev, &mut ram);
+        fire_hpet_timer(&mut dev, &mut ram, HPET_PIN, false);
+        assert!(dev.interrupt_pending());
+        assert_eq!(dev.interrupt_ack(), Some(REMAPPED_VECTOR));
+        assert_eq!(
+            dev.interrupt_ack(),
+            None,
+            "the index itself is never delivered"
+        );
+    }
+
+    #[test]
+    fn with_the_iommu_off_the_ioapics_vector_field_is_the_vector() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        remap_requester(&mut ram, IOAPIC_REQUESTER, Some(REMAPPED_VECTOR));
+        // The table is programmed but IOMMUEn is clear.
+        let table = DEVICE_TABLE_AT as u64 | DEVICE_TABLE_TWO_PAGES;
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            IOMMU_BASE + IOMMU_DEVICE_TABLE_REGISTER,
+            8,
+            table,
+        );
+        // Vector 5 is below the first valid one: give the entry a real vector instead.
+        let register = IOAPIC_FIRST_REDIRECTION + 2 * HPET_PIN;
+        mmio_write(&mut dev, &mut ram, IOAPIC_SELECT, 4, register);
+        mmio_write(&mut dev, &mut ram, IOAPIC_WINDOW, 4, TEST_VECTOR as u64);
+        fire_hpet_timer(&mut dev, &mut ram, HPET_PIN, false);
+        assert_eq!(dev.interrupt_ack(), Some(TEST_VECTOR));
+    }
+
+    #[test]
+    fn an_interrupt_the_irte_does_not_enable_is_dropped() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        remap_requester(&mut ram, IOAPIC_REQUESTER, None);
+        enable_iommu(&mut dev, &mut ram);
+        fire_hpet_timer(&mut dev, &mut ram, HPET_PIN, false);
+        assert!(!dev.interrupt_pending());
+        assert_eq!(dev.interrupt_ack(), None);
+    }
+
+    #[test]
+    fn an_isa_line_raised_on_the_cpu_path_waits_for_the_next_tick_to_be_remapped() {
+        let (mut dev, mut ram) = iommu_machine(ISA_IRQ_1_PIN, false);
+        remap_requester(&mut ram, IOAPIC_REQUESTER, Some(REMAPPED_VECTOR));
+        enable_iommu(&mut dev, &mut ram);
+        // As a kernel running on the APIC leaves it: every PIC input masked.
+        out(&mut dev, PIC_MASTER_DATA, 1, 0xff);
+        dev.pic.raise(1);
+        // `interrupt_pending` has no RAM to read the IRTE from.
+        assert!(!dev.interrupt_pending());
+        let mut mem = test_mem(&mut ram);
+        dev.tick(1, &mut mem);
+        assert!(dev.interrupt_pending());
+        assert_eq!(dev.interrupt_ack(), Some(REMAPPED_VECTOR));
+    }
+
+    #[test]
+    fn a_level_interrupt_is_re_sent_after_the_eoi_of_the_remapped_vector() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, true);
+        remap_requester(&mut ram, IOAPIC_REQUESTER, Some(REMAPPED_VECTOR));
+        enable_iommu(&mut dev, &mut ram);
+        fire_hpet_timer(&mut dev, &mut ram, HPET_PIN, true);
+        assert_eq!(dev.interrupt_ack(), Some(REMAPPED_VECTOR));
+        // The EOI carries the delivered vector, not the index in the redirection entry.
+        mmio_write(&mut dev, &mut ram, 0xfee0_00b0, 4, 0);
+        let mut mem = test_mem(&mut ram);
+        dev.tick(2_000_000, &mut mem);
+        assert_eq!(
+            dev.interrupt_ack(),
+            Some(REMAPPED_VECTOR),
+            "the line is still high"
+        );
+    }
+
+    #[test]
+    fn hpet_fsb_messages_go_through_the_iommu_as_the_hpets_requester() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        remap_requester(&mut ram, HPET_REQUESTER, Some(REMAPPED_VECTOR));
+        enable_iommu(&mut dev, &mut ram);
+        mmio_write(&mut dev, &mut ram, HPET_CONFIG, 8, HPET_ENABLE);
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            HPET_TIMER0_FSB_ROUTE,
+            8,
+            MSI_ADDRESS_BASE << 32 | IRTE_INDEX as u64,
+        );
+        let config = HPET_TIMER_INTERRUPT_ENABLE | HPET_TIMER_FSB_ENABLE;
+        mmio_write(&mut dev, &mut ram, HPET_TIMER0_CONFIG, 8, config);
+        mmio_write(&mut dev, &mut ram, HPET_TIMER0_COMPARATOR, 8, 500);
+        let deadline = dev.next_deadline(0).unwrap();
+        let mut mem = test_mem(&mut ram);
+        dev.tick(deadline, &mut mem);
+        assert_eq!(dev.interrupt_ack(), Some(REMAPPED_VECTOR));
+    }
+
+    /// Brings the console's MSI-X up by hand: memory space on, MSI-X on, driver OK, table entry
+    /// 0 pointing at the local APIC with data `data`, the configuration vector assigned to it.
+    fn console_with_msix_config_vector(dev: &mut Devices, ram: &mut [u8], data: u64) {
+        const CONSOLE_DEVFN: u64 = 8;
+        const MSIX_CONTROL_HIGH_BYTE: u64 = 0x87;
+        const MSIX_ENABLE_BIT_IN_HIGH_BYTE: u64 = 0x80;
+        const COMMON_MSIX_CONFIG_OFFSET: u64 = 0x10;
+        const MSIX_TABLE: u64 = 0x4000;
+        let function = pci::ECAM_BASE + (CONSOLE_DEVFN << 12);
+        let command = function + COMMAND_REGISTER as u64;
+        mmio_write(dev, ram, command, 2, MEMORY_SPACE_ENABLE as u64);
+        mmio_write(
+            dev,
+            ram,
+            function + MSIX_CONTROL_HIGH_BYTE,
+            1,
+            MSIX_ENABLE_BIT_IN_HIGH_BYTE,
+        );
+        let bar = |offset: u64| MMIO_BASE + offset;
+        let status = bar(COMMON_DEVICE_STATUS_OFFSET);
+        mmio_write(dev, ram, status, 1, STATUS_DRIVER_OK as u64);
+        mmio_write(dev, ram, bar(MSIX_TABLE), 4, MSI_ADDRESS_BASE);
+        mmio_write(dev, ram, bar(MSIX_TABLE + 4), 4, 0);
+        mmio_write(dev, ram, bar(MSIX_TABLE + 8), 4, data);
+        mmio_write(dev, ram, bar(MSIX_TABLE + 12), 4, 0);
+        mmio_write(dev, ram, bar(COMMON_MSIX_CONFIG_OFFSET), 2, 0);
+    }
+
+    #[test]
+    fn a_virtio_msix_message_reaches_the_lapic_without_the_iommu() {
+        let console = ConsoleHandle::default();
+        let mut dev = bus_with_console(&console);
+        let mut ram = vec![0u8; IOMMU_RAM_BYTES];
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            LAPIC_SPURIOUS_VECTOR_REGISTER,
+            4,
+            LAPIC_SOFTWARE_ENABLE,
+        );
+        console_with_msix_config_vector(&mut dev, &mut ram, TEST_VECTOR as u64);
+        console.resize(100, 30);
+        let mut mem = test_mem(&mut ram);
+        dev.tick(1, &mut mem);
+        assert_eq!(dev.interrupt_ack(), Some(TEST_VECTOR));
+    }
+
+    #[test]
+    fn a_virtio_msix_message_is_remapped_with_the_functions_requester_id() {
+        const CONSOLE_REQUESTER: u16 = 8;
+        let console = ConsoleHandle::default();
+        let mut dev = Devices::new(
+            ConsoleHandle::default(),
+            DevConfig {
+                iommu: true,
+                virtio_consoles: vec![console.clone()],
+                ..Default::default()
+            },
+        );
+        let mut ram = vec![0u8; IOMMU_RAM_BYTES];
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            LAPIC_SPURIOUS_VECTOR_REGISTER,
+            4,
+            LAPIC_SOFTWARE_ENABLE,
+        );
+        remap_requester(&mut ram, CONSOLE_REQUESTER, Some(REMAPPED_VECTOR));
+        enable_iommu(&mut dev, &mut ram);
+        console_with_msix_config_vector(&mut dev, &mut ram, IRTE_INDEX as u64);
+        console.resize(100, 30);
+        let mut mem = test_mem(&mut ram);
+        dev.tick(1, &mut mem);
+        assert_eq!(dev.interrupt_ack(), Some(REMAPPED_VECTOR));
+    }
+
+    #[test]
+    fn the_iommus_own_msi_is_delivered_to_the_lapic_once() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        let function = IOMMU_FUNCTION_ECAM;
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            function + MSI_ADDRESS_LOW_OFFSET,
+            4,
+            MSI_ADDRESS_BASE,
+        );
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            function + MSI_DATA_OFFSET,
+            2,
+            TEST_VECTOR as u64,
+        );
+        mmio_write(&mut dev, &mut ram, function + MSI_CONTROL_OFFSET, 2, 1);
+        dev.pci.iommu().unwrap().raise_msi();
+        let mut mem = test_mem(&mut ram);
+        dev.tick(1, &mut mem);
+        assert_eq!(dev.interrupt_ack(), Some(TEST_VECTOR));
+        dev.tick(2, &mut mem);
+        assert_eq!(dev.interrupt_ack(), None);
+    }
+
+    #[test]
+    fn with_intcapxt_the_iommus_interrupt_uses_the_xt_register_and_skips_remapping() {
+        const XT_GENERAL_REGISTER: u64 = 0x170;
+        const CONTROL_XT: u64 = 1 << 50 | 1 << 51;
+        const XT_VECTOR_SHIFT: u32 = 32;
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        let control = IOMMU_BASE + IOMMU_CONTROL_REGISTER;
+        mmio_write(&mut dev, &mut ram, control, 8, CONTROL_XT);
+        let register = IOMMU_BASE + XT_GENERAL_REGISTER;
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            register,
+            8,
+            (TEST_VECTOR as u64) << XT_VECTOR_SHIFT,
+        );
+        dev.pci.iommu().unwrap().raise_msi();
+        let mut mem = test_mem(&mut ram);
+        dev.tick(1, &mut mem);
+        assert_eq!(dev.interrupt_ack(), Some(TEST_VECTOR));
     }
 }

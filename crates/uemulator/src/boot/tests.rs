@@ -784,6 +784,67 @@ mod boot_params_contents {
         assert_eq!(entry(3), (0, 0, 0), "no fourth entry");
     }
 
+    fn load_with_tables() -> (BootState, Vec<u8>) {
+        let mut ram = vec![0u8; TEST_RAM];
+        let acpi = AcpiConfig::default();
+        let state =
+            load_with_acpi(&mut ram, &kernel().build(), None, "", Some(&acpi)).expect("loads");
+        (state, ram)
+    }
+
+    #[test]
+    fn without_acpi_there_is_no_rsdp_pointer_and_no_tables() {
+        let (_, ram) = load_ok(&kernel(), None, "");
+        assert_eq!(u64_at(boot_params(&ram), ACPI_RSDP_ADDR_OFFSET), 0);
+        assert!(
+            ram[acpi::REGION_BASE as usize..][..64]
+                .iter()
+                .all(|b| *b == 0)
+        );
+    }
+
+    #[test]
+    fn acpi_puts_the_rsdp_in_boot_params_and_the_tables_in_ram() {
+        let (_, ram) = load_with_tables();
+        let rsdp = u64_at(boot_params(&ram), ACPI_RSDP_ADDR_OFFSET);
+        assert_eq!(rsdp, acpi::REGION_BASE);
+        assert_eq!(&ram[rsdp as usize..][..8], b"RSD PTR ");
+    }
+
+    #[test]
+    fn acpi_e820_marks_the_tables_as_acpi_data_and_reserves_the_ecam_window() {
+        let (_, ram) = load_with_tables();
+        let params = boot_params(&ram);
+        let entries: Vec<(u64, u64, u32)> = (0..params[E820_ENTRIES_OFFSET] as usize)
+            .map(|index| {
+                let at = E820_TABLE_OFFSET + index * E820_ENTRY_SIZE;
+                (
+                    u64_at(params, at),
+                    u64_at(params, at + 8),
+                    u32_at(params, at + 16),
+                )
+            })
+            .collect();
+        assert!(entries.contains(&(acpi::REGION_BASE, acpi::REGION_BYTES, E820_ACPI)));
+        assert!(entries.contains(&(acpi::ECAM_RANGE.0, acpi::ECAM_RANGE.1, E820_RESERVED)));
+        // Sorted and non-overlapping, as Linux expects of the BIOS map.
+        for pair in entries.windows(2) {
+            assert!(pair[0].0 + pair[0].1 <= pair[1].0, "{pair:?}");
+        }
+        assert_eq!(entries[0], (0, EXPECTED_LOW_RAM_END, E820_RAM));
+        assert!(entries.contains(&(ONE_MIB, TEST_RAM as u64 - ONE_MIB, E820_RAM)));
+    }
+
+    #[test]
+    fn acpi_does_not_move_the_kernel_or_the_entry_state() {
+        let (with, _) = load_with_tables();
+        let (without, _) = load_ok(&kernel(), None, "");
+        assert_eq!(
+            (with.rip, with.rsi, with.cr3),
+            (without.rip, without.rsi, without.cr3)
+        );
+    }
+
     #[test]
     fn e820_extended_range_follows_the_ram_size() {
         for ram_mib in [64usize, 100, 512] {

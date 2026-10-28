@@ -324,6 +324,90 @@ fn msi_message_is_delivered_only_when_the_capability_is_enabled() {
     assert_eq!(iommu.take_msi(), None, "delivered once");
 }
 
+const CONTROL_XT_INTERRUPTS: u64 = CONTROL_XT_ENABLE | CONTROL_INTCAPXT_ENABLE;
+
+/// What `iommu_init_intcapxt` writes: DM, destination in two pieces, vector.
+fn intcapxt_register(destination: u32, vector: u8, logical: bool) -> u64 {
+    (logical as u64) << 2
+        | ((destination as u64) & 0xff_ffff) << 8
+        | (vector as u64) << 32
+        | ((destination >> 24) as u64) << 56
+}
+
+#[test]
+fn x2apic_support_is_advertised_and_xten_is_a_control_bit() {
+    let mut f = Fixture::new();
+    assert_ne!(f.read(REG_EXTENDED_FEATURE) & EFR_X2APIC, 0);
+    f.mmio_write(REG_CONTROL, 8, CONTROL_XT_INTERRUPTS);
+    assert_eq!(f.read(REG_CONTROL), CONTROL_XT_INTERRUPTS);
+}
+
+#[test]
+fn the_xt_interrupt_registers_store_what_software_writes() {
+    let mut f = Fixture::new();
+    for register in [
+        REG_XT_GENERAL_INTERRUPT,
+        REG_XT_PPR_INTERRUPT,
+        REG_XT_GA_LOG_INTERRUPT,
+    ] {
+        f.mmio_write(register, 8, 0x1234_5678_9abc_def0);
+        assert_eq!(f.read(register), 0x1234_5678_9abc_def0, "{register:#x}");
+    }
+}
+
+#[test]
+fn with_intcapxt_the_event_interrupt_goes_straight_to_the_apic_with_a_32_bit_destination() {
+    let mut f = Fixture::enabled();
+    f.mmio_write(REG_CONTROL, 8, CONTROL_ALL | CONTROL_XT_INTERRUPTS);
+    f.mmio_write(
+        REG_XT_GENERAL_INTERRUPT,
+        8,
+        intcapxt_register(0x12ab_cdef, 0x71, false),
+    );
+    f.iommu.raise_msi();
+    let Some(IommuInterrupt::Direct(interrupt)) = f.iommu.take_interrupt() else {
+        panic!("expected a direct interrupt");
+    };
+    assert_eq!(interrupt.vector, 0x71);
+    assert_eq!(interrupt.destination, 0x12ab_cdef);
+    assert!(!interrupt.logical);
+    assert_eq!(interrupt.delivery_mode, crate::dev::apic::DELIVERY_FIXED);
+    assert!(f.iommu.take_interrupt().is_none(), "once");
+}
+
+#[test]
+fn without_intcapxt_the_event_interrupt_is_the_msi_capabilitys_message() {
+    let mut f = Fixture::enabled();
+    f.mmio_write(REG_CONTROL, 8, CONTROL_ALL | CONTROL_XT_ENABLE);
+    f.iommu.raise_msi();
+    let Some(IommuInterrupt::Message(message)) = f.iommu.take_interrupt() else {
+        panic!("expected an MSI");
+    };
+    assert_eq!(message.data, MSI_DATA_VALUE);
+}
+
+#[test]
+fn with_xten_the_irte_destination_gains_the_top_byte_from_the_high_qword() {
+    let mut f = interrupt_fixture(9, CONTROL_GUEST_APIC_ENABLE | CONTROL_XT_ENABLE);
+    let low: u64 = 1 | 0x00ab_cdef << 8;
+    let high: u64 = 0x77 | 0x12 << 16;
+    let at = INTERRUPT_TABLE_AT + 16 * 3;
+    f.write64(at, low);
+    f.write64(at + 8, high);
+    let remapped = remap(&mut f, msi(DEVICE, 3, 0)).unwrap();
+    assert_eq!(remapped.vector, 0x77);
+    assert_eq!(remapped.destination, 0x12ab_cdef);
+}
+
+#[test]
+fn without_xten_the_high_qwords_destination_bits_are_ignored() {
+    let mut f = interrupt_fixture(9, CONTROL_GUEST_APIC_ENABLE);
+    let at = INTERRUPT_TABLE_AT;
+    f.write64(at, 1 | 0x34 << 8);
+    f.write64(at + 8, 0x77 | 0x12 << 16);
+    assert_eq!(remap(&mut f, msi(DEVICE, 0, 0)).unwrap().destination, 0x34);
+}
+
 #[test]
 fn extended_feature_register_advertises_what_is_implemented() {
     let f = Fixture::new();
@@ -1165,6 +1249,23 @@ fn legacy_irte_supplies_vector_destination_and_type() {
     assert_eq!(remapped.destination, 0x12);
     assert!(remapped.logical_destination);
     assert_eq!(remapped.delivery_mode, DeliveryMode::Fixed);
+}
+
+#[test]
+fn interrupts_are_remapped_by_iv_alone_even_when_the_entry_is_not_valid() {
+    // Linux clears V in the I/O APIC's entry and still expects its interrupts remapped.
+    let mut f = interrupt_fixture(9, 0);
+    f.set_dte(DEVICE, [0, 0, 1 | 9 << 1 | INTERRUPT_TABLE_AT | 2 << 60, 0]);
+    let irte: u32 = 1 | 0x66 << 16;
+    f.ram[INTERRUPT_TABLE_AT as usize + 4 * 7..][..4].copy_from_slice(&irte.to_le_bytes());
+    assert_eq!(remap(&mut f, msi(DEVICE, 7, 0)).unwrap().vector, 0x66);
+}
+
+#[test]
+fn an_entry_without_iv_passes_the_message_through_whatever_else_it_says() {
+    let mut f = interrupt_fixture(9, 0);
+    f.set_dte(DEVICE, [DTE_V, 0, INTERRUPT_TABLE_AT | 2 << 60, 0]);
+    assert_eq!(remap(&mut f, msi(DEVICE, 0x41, 0)).unwrap().vector, 0x41);
 }
 
 #[test]

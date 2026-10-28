@@ -35,4 +35,11 @@ Written by the first session on this work; update the status list as pieces land
 
 ## Status
 
-(none of this is done yet)
+Steps 1 and 2 are done and checked in real guests (the interpreter and the JIT run the same code; nothing under `jit/` changed).
+
+- `MachineConfig::acpi` (default on) publishes RSDP rev 2, RSDT/XSDT, FACS, FADT rev 6, DSDT, MADT, MCFG, HPET and, with `MachineConfig::iommu`, IVRS at 0xE0000, marked ACPI data in e820. The default command line drops `acpi=off`; `acpi(false)` restores the table-less machine, and `Platform` hosts keep `acpi=off`.
+- Devices: ACPI PM1 block and 24-bit PM timer (S5 write = `ExitReason::Shutdown`, FADT reset register = reset), a three-timer HPET (I/O APIC pin or FSB delivery), PCIe ECAM for bus 0, MSI-X on every virtio function, a Linux-compatible `_PRT` and the interrupt line plumbing (SCI on IRQ 12).
+- IOMMU: all interrupt sources meet in `Devices::deliver`, which remaps through the IOMMU once the guest enables it; the IOMMU's event/completion interrupts reach the LAPIC (MSI, or IntCapXT with XTSup); IRTEs honour the 32-bit destination under XTEn; virtio functions offer `ACCESS_PLATFORM` behind the IOMMU; the CLI has `--iommu`.
+- Guests: Alpine 6.18 virt kernel (no AMD IOMMU driver): ACPI parsed without errors, `hpet` and `acpi_pm` clocksource candidates (the kernel settles on `tsc`), I/O APIC interrupts, virtio-pci with MSI-X, virtio disk read/write and virtio-net through the NAT, `poweroff` through ACPI S5. Debian trixie 6.12 installer kernel with `--iommu`: `AMD-Vi: Interrupt remapping enabled`, `X2APIC enabled`, `IR-IO-APIC`/`IR-PCI-MSIX`/`IOMMU-MSI` in `/proc/interrupts`, virtio-net pings through the IOMMU, `reboot: Power down` through S5, no unhandled IRQs.
+
+Known gaps: no SMP; virtio-blk behind the IOMMU is only unit-tested (no cached guest with both `AMD_IOMMU` and `virtio_blk` built in); interrupts that need the IOMMU's interrupt table and are raised on the CPU's polling path wait for the next device tick (at most 4096 instructions); no power button, GPE blocks, S3/S4 or hotplug; the 20th virtio function (PCI slot 0x14) shares its device-table entry with the I/O APIC's requester id; the BIOS boot path (`boot_disk`) does not publish ACPI tables.

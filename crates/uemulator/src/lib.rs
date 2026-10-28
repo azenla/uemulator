@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+mod acpi;
 mod boot;
 mod console;
 mod cpu;

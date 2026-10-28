@@ -22,5 +22,6 @@ Index. Read in order; each file ends with open questions where the answer needs 
 | 15-legacy-modes.md | real mode, protected mode, compatibility mode, virtual-8086, task switching, firmware boot |
 | 16-iommu.md | AMD IOMMU: registers, command buffer, event log, device table, I/O page tables, interrupt remapping, IVRS |
 | 17-bios.md | BIOS services as host code, booting a disk's boot sector |
+| 18-xen-dom0.md | Fedora Xen dom0 through UEFI: ACPI, IOMMU wiring, SMP and what follows; status per step |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. Zero crate dependencies.

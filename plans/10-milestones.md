@@ -37,13 +37,13 @@
 
 - Speculation control, XSAVE and RDRAND done (see 03, "Speculation control" and "XSAVE and RDRAND"): guests see an in-order CPU immune to every speculative-execution bug (no retpolines, return thunks, KPTI or VERW), use `xsaveopt` for context switches, and seed the crng from `rdrand`/`rdseed`.
 
-- AMD IOMMU done (see 16): `MachineConfig::iommu(true)` adds PCI function 00:00.2 with the IOMMU and MSI capabilities, the MMIO registers, command buffer, event log, device table, 1-6 level I/O page tables (large and arbitrary-size pages), an IOTLB, DMA translation for every virtio function through `GuestMem::with_dma`, interrupt remapping (32- and 128-bit IRTEs) behind `Iommu::remap_interrupt`, and an IVRS table builder. Unit-tested with a fake driver only: no guest finds it until firmware/ACPI publishes the IVRS table and the LAPIC/IOAPIC call the remapper.
+- AMD IOMMU done (see 16): `MachineConfig::iommu(true)` adds PCI function 00:00.2 with the IOMMU and MSI capabilities, the MMIO registers, command buffer, event log, device table, 1-6 level I/O page tables (large and arbitrary-size pages), an IOTLB, DMA translation for every virtio function through `GuestMem::with_dma`, interrupt remapping (32- and 128-bit IRTEs) behind `Iommu::remap_interrupt`, and an IVRS table builder. XTSup (x2APIC IRTEs, IntCapXT) came with the ACPI work; a Debian 6.12 guest enables interrupt remapping and x2APIC on it and runs virtio-net through it (16).
 
 - WebAssembly port done (see 13): `crates/uemulator-web` + `hack/web.sh serve`; interpreter in a Web Worker with an xterm.js console, boots Alpine to a busybox shell in Chrome. No JIT, disk or network.
 
 - UEFI application done (see 12): `crates/uemulator-uefi`, library `no_std` on `target_os = "uefi"`, `hack/uefi/boot.sh`; emulator (interpreter) everywhere, plus a hardware-virtualization path on x86_64 (AMD SVM verified under TCG, Intel VMX untested), no disk/net.
 
-- Interrupt controllers and CPU platform state for Windows done (see 07, "LAPIC and IOAPIC"): xAPIC and x2APIC local APIC with timer and TSC-deadline, 24-pin I/O APIC fed by the same device lines as the PIC, CR8/TPR priority, NMI delivery with `iret` unblocking, MTRRs, PAT validation, inert machine-check banks, AMD memory-typing MSRs, CPUID leaf 0xB. The Alpine kernel boots with the APIC advertised (virtual wire mode, TSC-deadline timer). Not done: SMP, HPET, ACPI PM timer, ACPI tables and firmware.
+- Interrupt controllers and CPU platform state for Windows done (see 07, "LAPIC and IOAPIC"): xAPIC and x2APIC local APIC with timer and TSC-deadline, 24-pin I/O APIC fed by the same device lines as the PIC, CR8/TPR priority, NMI delivery with `iret` unblocking, MTRRs, PAT validation, inert machine-check banks, AMD memory-typing MSRs, CPUID leaf 0xB. The Alpine kernel boots with the APIC advertised (virtual wire mode, TSC-deadline timer). Not done: SMP. The HPET, the ACPI PM timer and ACPI tables are done (below).
 
 Each has an observable serial-output exit criterion. Interpreter first.
 
@@ -71,3 +71,5 @@ Each has an observable serial-output exit criterion. Interpreter first.
 3. Interpreter + helpers; `tlb`/`mmu`; exceptions/IDT delivery.
 4. Devices from 07; run loop with clock and HLT warp.
 5. Iterate on the boot: each unimplemented opcode/MSR/port is logged once; fix in order of appearance.
+
+- ACPI platform done (see 07, "ACPI, PM block, HPET, ECAM"): `acpi/` builds RSDP/XSDT/FADT/DSDT/MADT/MCFG/HPET/IVRS into the BIOS area for direct Linux boots (`boot_params.acpi_rsdp_addr`, e820 ACPI data), with the PM1 block and PM timer, ACPI S5 power-off as `ExitReason::Shutdown`, a three-timer HPET, PCIe ECAM, virtio MSI-X and `MachineConfig::acpi` (default on; the default command line loses `acpi=off`). Alpine 6.18 and Debian 6.12 boot on the I/O APIC with `hpet` and `acpi_pm` clocksource candidates, virtio disk and network work, `poweroff` ends the run through the sleep register. Steps 1 and 2 of 18-xen-dom0.md.
