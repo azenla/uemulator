@@ -351,6 +351,11 @@ impl Pic {
 pub(crate) struct Pics {
     master: Pic,
     slave: Pic,
+    /// Device-side level of each of the 16 ISA lines, whatever the PIC's own trigger mode is.
+    line_levels: u16,
+    /// Changes of `line_levels` (and every raise, which is also a pulse for an edge-triggered
+    /// consumer) in order, for the I/O APIC: the same device lines feed both controllers.
+    line_events: Vec<(u8, bool)>,
 }
 
 impl Default for Pics {
@@ -358,6 +363,8 @@ impl Default for Pics {
         Pics {
             master: Pic::new(true),
             slave: Pic::new(false),
+            line_levels: 0,
+            line_events: Vec::new(),
         }
     }
 }
@@ -401,6 +408,10 @@ impl Pics {
         if irq >= IRQ_COUNT {
             return;
         }
+        // The I/O APIC hears about every raise, even on the PIC's cascade pin or while the line
+        // is already high: an edge-triggered pin counts each call as one pulse.
+        self.line_levels |= 1 << irq;
+        self.line_events.push((irq, true));
         let (chip, line) = self.chip_for_irq(irq);
         if line == CASCADE_IRQ && chip.is_master {
             return;
@@ -419,6 +430,10 @@ impl Pics {
         if irq >= IRQ_COUNT {
             return;
         }
+        if self.line_levels & (1 << irq) != 0 {
+            self.line_levels &= !(1 << irq);
+            self.line_events.push((irq, false));
+        }
         let (chip, line) = self.chip_for_irq(irq);
         if line == CASCADE_IRQ && chip.is_master {
             return;
@@ -427,6 +442,15 @@ impl Pics {
             chip.drive_line(line, false);
         }
         self.sync_cascade();
+    }
+
+    /// Line changes since the last call, for the I/O APIC.
+    pub fn take_line_events(&mut self) -> Vec<(u8, bool)> {
+        core::mem::take(&mut self.line_events)
+    }
+
+    pub fn has_line_events(&self) -> bool {
+        !self.line_events.is_empty()
     }
 
     /// Polled by the CPU between instructions while IF=1, so the first check must stay cheap:

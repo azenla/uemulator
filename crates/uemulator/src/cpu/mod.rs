@@ -15,8 +15,10 @@ pub(crate) mod legacy_support;
 mod legacy_task;
 #[cfg(test)]
 mod legacy_tests;
+pub(crate) mod mca;
 pub(crate) mod mem;
 pub(crate) mod modes;
+pub(crate) mod mtrr;
 mod protection;
 mod sse;
 mod svm;
@@ -62,6 +64,8 @@ pub(crate) const NS_PER_INSN: u64 = 1;
 /// Instructions between `service_events` polls (stop flag, device timers). The check happens
 /// at step boundaries, so with the JIT it can overshoot by up to one block.
 const EVENT_INTERVAL: u64 = 4096;
+/// Vector of the non-maskable interrupt.
+const NMI_VECTOR: u8 = 2;
 
 pub(crate) const PAGE_SHIFT: u32 = 12;
 pub(crate) const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
@@ -287,8 +291,10 @@ pub(crate) struct Cpu {
     /// changes the paging mode) is written, as hardware does: later stores to the PDPT are not
     /// seen until the next reload. Meaningful only while PAE paging is active.
     pub pdpte: [u64; 4],
-    /// Stored only; there is no local APIC to apply the task priority to.
-    pub cr8: u64,
+    /// Set while an NMI handler runs: further NMIs wait for `iret` (SDM 6.7.1).
+    pub nmi_blocked: bool,
+    pub mtrr: mtrr::Mtrr,
+    pub mca: mca::Mca,
     pub efer: u64,
     pub star: u64,
     pub lstar: u64,
@@ -420,8 +426,19 @@ impl Cpu {
         const MSR_AMD64_LS_CFG: u32 = 0xc001_1020;
         const MSR_AMD64_DE_CFG: u32 = 0xc001_1029;
         const HWCR_INITIAL: u64 = 1 << 24;
+        /// AMD's memory-typing MSRs (APM vol. 2 sec. 7.9): SYSCFG enables the fixed and variable
+        /// MTRRs (bits 18 and 20), and TOP_MEM / TOP_MEM2 bound DRAM below and above 4 GiB.
+        /// Stored only, like the MTRRs themselves.
+        const MSR_AMD64_SYSCFG: u32 = 0xc001_0010;
+        const MSR_AMD64_IORR_FIRST: u32 = 0xc001_0016;
+        const MSR_AMD64_IORR_LAST: u32 = 0xc001_0019;
+        const MSR_AMD64_TOP_MEM: u32 = 0xc001_001a;
+        const MSR_AMD64_TOP_MEM2: u32 = 0xc001_001d;
+        const SYSCFG_INITIAL: u64 = (1 << 18) | (1 << 20);
 
         let pages = ram.len() >> PAGE_SHIFT;
+        // RAM never reaches 4 GiB (the PCI window starts at 3 GiB), so TOP_MEM2 stays zero.
+        let top_of_memory = ram.len() as u64;
         let flat = |sel: u16, flags: u32| Seg {
             sel,
             base: 0,
@@ -458,7 +475,9 @@ impl Cpu {
             cr3: boot.cr3,
             cr4: CR4_PAE,
             pdpte: [0; 4],
-            cr8: 0,
+            nmi_blocked: false,
+            mtrr: mtrr::Mtrr::new(),
+            mca: mca::Mca::new(),
             efer: EFER_LMA | EFER_LME,
             star: 0,
             lstar: 0,
@@ -482,8 +501,12 @@ impl Cpu {
                 (MSR_AMD64_NB_CFG, 0),
                 (MSR_AMD64_LS_CFG, 0),
                 (MSR_AMD64_DE_CFG, 0),
+                (MSR_AMD64_SYSCFG, SYSCFG_INITIAL),
+                (MSR_AMD64_TOP_MEM, top_of_memory),
+                (MSR_AMD64_TOP_MEM2, 0),
             ]
             .into_iter()
+            .chain((MSR_AMD64_IORR_FIRST..=MSR_AMD64_IORR_LAST).map(|msr| (msr, 0)))
             .collect(),
             cpl: 0,
             xmm: [0; 16],
@@ -607,7 +630,18 @@ impl Cpu {
         if self.eflags & flags::IF == 0 || self.interrupt_shadow {
             return None;
         }
-        self.dev.pic.ack()
+        self.dev.interrupt_ack()
+    }
+
+    /// Takes a pending NMI at this instruction boundary. NMIs ignore IF but not the one-instruction
+    /// shadow of `mov ss`, and a second one waits until the handler's `iret` (SDM 6.7.1).
+    fn take_pending_nmi(&mut self) -> bool {
+        if self.nmi_blocked || self.interrupt_shadow || !self.dev.nmi_pending() {
+            return false;
+        }
+        self.dev.take_nmi();
+        self.nmi_blocked = true;
+        true
     }
 
     /// Runs the per-step housekeeping: device/stop polling, interrupt delivery, halt handling.
@@ -621,10 +655,16 @@ impl Cpu {
         // has_pending() is a cheap pre-check; pending_interrupt() does the acknowledge.
         // A guest may intercept physical interrupts (and takes its virtual ones) before the host does.
         self.svm_before_step();
+        if self.svm.gif && self.take_pending_nmi() {
+            self.halted = false;
+            if let Some(reason) = self.deliver_event(NMI_VECTOR, None, false) {
+                return BeforeStep::Exit(reason);
+            }
+        }
         if self.eflags & flags::IF != 0
             && self.svm.gif
             && !self.interrupt_shadow
-            && self.dev.pic.has_pending()
+            && self.dev.interrupt_pending()
             && let Some(vector) = self.pending_interrupt()
         {
             self.halted = false;
@@ -872,7 +912,7 @@ impl Cpu {
         // poweroff and halt end without ACPI (`stop_this_cpu`: `cli; hlt` in a loop). Only IF is
         // tested, not `interrupt_shadow` or a queued event: `sti; hlt` has IF=1 by the time
         // `hlt` runs, and a PIC line pending behind IF=0 never wakes the CPU either.
-        if self.eflags & flags::IF == 0 {
+        if self.eflags & flags::IF == 0 && !self.dev.nmi_pending() {
             return Some(ExitReason::Shutdown);
         }
         let now = self.now_ns();
@@ -898,7 +938,7 @@ impl Cpu {
             None => {
                 // No timer will ever wake the guest; only host input (console, network) can.
                 self.tick_devices(now);
-                if self.dev.pic.has_pending() {
+                if self.dev.interrupt_pending() || self.dev.nmi_pending() {
                     return None;
                 }
                 #[cfg(not(freestanding))]
@@ -1105,7 +1145,7 @@ mod cpu_tests {
             assert_eq!(h.cpu.cr4, 0x20);
             assert_eq!(h.cpu.efer, 0x500);
             assert_eq!(h.cpu.cr2, 0);
-            assert_eq!(h.cpu.cr8, 0);
+            assert_eq!(h.cpu.dev.lapic.tpr(), 0);
             assert_eq!(h.cpu.cr3 & PTE_ADDRESS_BITS, 0x9000);
         }
 
@@ -1189,10 +1229,17 @@ mod cpu_tests {
         #[test]
         fn stored_only_msrs_are_seeded() {
             let h = harness();
-            let expected: [(u32, u64); 6] = [
+            let expected: [(u32, u64); 13] = [
                 (0x8b, 0),
                 (0x1d9, 0),
+                (0xc001_0010, (1 << 18) | (1 << 20)),
                 (0xc001_0015, 1 << 24),
+                (0xc001_0016, 0),
+                (0xc001_0017, 0),
+                (0xc001_0018, 0),
+                (0xc001_0019, 0),
+                (0xc001_001a, h.cpu.ram.len() as u64),
+                (0xc001_001d, 0),
                 (0xc001_001f, 0),
                 (0xc001_1020, 0),
                 (0xc001_1029, 0),
@@ -1762,6 +1809,212 @@ mod cpu_tests {
                 h.cpu.before_step(),
                 BeforeStep::Exit(ExitReason::TripleFault)
             ));
+        }
+    }
+
+    mod apic_delivery {
+        use super::*;
+
+        const APIC_BASE: u64 = 0xfee0_0000;
+        const IOAPIC_BASE: u64 = 0xfec0_0000;
+        const APIC_SVR: u64 = 0xf0;
+        const APIC_EOI: u64 = 0xb0;
+        const APIC_ICR_LOW: u64 = 0x300;
+        const APIC_LVT_TIMER: u64 = 0x320;
+        const APIC_LVT_LINT0: u64 = 0x350;
+        const APIC_TIMER_INITIAL: u64 = 0x380;
+        const APIC_TIMER_DIVIDE: u64 = 0x3e0;
+        const SVR_ENABLE_ALL: u32 = 0x1ff;
+        const DIVIDE_BY_ONE: u32 = 0b1011;
+        const LVT_MASKED: u32 = 1 << 16;
+        const LVT_EXTINT: u32 = 7 << 8;
+        const ICR_SHORTHAND_SELF: u32 = 1 << 18;
+        const ICR_DELIVERY_NMI: u32 = 4 << 8;
+        const IOAPIC_SELECT: u64 = 0x00;
+        const IOAPIC_WINDOW: u64 = 0x10;
+        const IOAPIC_LEVEL: u32 = 1 << 15;
+        const NMI_VECTOR: u8 = 2;
+        const BUS_CLOCK_PERIOD_NS: u64 = 10;
+
+        fn apic_write(h: &mut Harness, offset: u64, value: u32) {
+            h.cpu.phys_write(APIC_BASE + offset, 4, value as u64);
+        }
+
+        fn enabled_apic() -> Harness {
+            let mut h = with_idt();
+            h.cpu.next_event = 1_000;
+            apic_write(&mut h, APIC_SVR, SVR_ENABLE_ALL);
+            h
+        }
+
+        fn program_ioapic_pin(h: &mut Harness, pin: u32, low: u32) {
+            let register = 0x10 + 2 * pin;
+            h.cpu
+                .phys_write(IOAPIC_BASE + IOAPIC_SELECT, 4, register as u64 + 1);
+            h.cpu.phys_write(IOAPIC_BASE + IOAPIC_WINDOW, 4, 0);
+            h.cpu
+                .phys_write(IOAPIC_BASE + IOAPIC_SELECT, 4, register as u64);
+            h.cpu.phys_write(IOAPIC_BASE + IOAPIC_WINDOW, 4, low as u64);
+        }
+
+        #[test]
+        fn timer_interrupt_is_delivered_with_the_lvt_vector() {
+            let mut h = enabled_apic();
+            apic_write(&mut h, APIC_LVT_TIMER, 0x40);
+            apic_write(&mut h, APIC_TIMER_DIVIDE, DIVIDE_BY_ONE);
+            apic_write(&mut h, APIC_TIMER_INITIAL, 1000);
+            let deadline = h.cpu.dev.next_deadline(0).expect("armed timer");
+            assert_eq!(deadline, 1000 * BUS_CLOCK_PERIOD_NS);
+            h.cpu.tick_devices(deadline);
+            assert!(matches!(h.cpu.before_step(), BeforeStep::Execute));
+            assert_eq!(h.cpu.rip, handler_for(0x40));
+        }
+
+        #[test]
+        fn a_halted_cpu_sleeps_until_the_apic_timer_and_wakes() {
+            let mut h = enabled_apic();
+            apic_write(&mut h, APIC_LVT_TIMER, 0x40);
+            apic_write(&mut h, APIC_TIMER_DIVIDE, DIVIDE_BY_ONE);
+            apic_write(&mut h, APIC_TIMER_INITIAL, 1000);
+            h.cpu.halted = true;
+            h.cpu.realtime = false;
+            assert!(matches!(h.cpu.before_step(), BeforeStep::Idled));
+            assert!(matches!(h.cpu.before_step(), BeforeStep::Execute));
+            assert!(!h.cpu.halted);
+            assert_eq!(h.cpu.rip, handler_for(0x40));
+        }
+
+        #[test]
+        fn ioapic_routes_a_device_line_to_the_programmed_vector() {
+            let mut h = enabled_apic();
+            init_pics(&mut h.cpu);
+            // The guest has moved to the I/O APIC: the PIC is fully masked.
+            h.cpu.dev.io_out(PIC_MASTER_DATA, 1, 0xff, 0);
+            program_ioapic_pin(&mut h, 1, 0x50);
+            h.cpu.dev.pic.raise(1);
+            assert!(matches!(h.cpu.before_step(), BeforeStep::Execute));
+            assert_eq!(h.cpu.rip, handler_for(0x50));
+        }
+
+        #[test]
+        fn pit_irq_0_arrives_on_ioapic_pin_2() {
+            let mut h = enabled_apic();
+            init_pics(&mut h.cpu);
+            h.cpu.dev.io_out(PIC_MASTER_DATA, 1, 0xff, 0);
+            program_ioapic_pin(&mut h, 2, 0x51);
+            h.cpu.dev.pic.raise(0);
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, handler_for(0x51));
+        }
+
+        #[test]
+        fn masked_ioapic_pin_delivers_nothing() {
+            let mut h = enabled_apic();
+            init_pics(&mut h.cpu);
+            h.cpu.dev.io_out(PIC_MASTER_DATA, 1, 0xff, 0);
+            h.cpu.dev.pic.raise(1);
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, OLD_RIP);
+        }
+
+        #[test]
+        fn level_interrupt_is_resent_after_eoi_while_the_line_stays_high() {
+            let mut h = enabled_apic();
+            h.cpu.dev.io_out(PIC_MASTER_DATA, 1, 0xff, 0);
+            program_ioapic_pin(&mut h, 9, 0x60 | IOAPIC_LEVEL);
+            h.cpu.dev.pic.raise(9);
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, handler_for(0x60));
+            // The handler returns to the interrupted code with IF set, and EOIs.
+            h.cpu.rip = OLD_RIP;
+            h.cpu.eflags = RESERVED_ONE | IF;
+            apic_write(&mut h, APIC_EOI, 0);
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, handler_for(0x60), "line still asserted");
+            h.cpu.rip = OLD_RIP;
+            h.cpu.eflags = RESERVED_ONE | IF;
+            h.cpu.dev.pic.lower(9);
+            apic_write(&mut h, APIC_EOI, 0);
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, OLD_RIP, "line released");
+        }
+
+        #[test]
+        fn task_priority_holds_back_lower_priority_vectors() {
+            let mut h = enabled_apic();
+            apic_write(&mut h, APIC_ICR_LOW, 0x41 | ICR_SHORTHAND_SELF);
+            h.cpu.dev.lapic.set_tpr(0x40);
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, OLD_RIP);
+            h.cpu.dev.lapic.set_tpr(0x30);
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, handler_for(0x41));
+        }
+
+        #[test]
+        fn pic_interrupts_reach_the_cpu_through_the_virtual_wire_until_lint0_is_masked() {
+            let mut h = enabled_apic();
+            init_pics(&mut h.cpu);
+            apic_write(&mut h, APIC_LVT_LINT0, LVT_MASKED | LVT_EXTINT);
+            h.cpu.dev.pic.raise(1);
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, OLD_RIP);
+            apic_write(&mut h, APIC_LVT_LINT0, LVT_EXTINT);
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, handler_for(IRQ_VECTOR_BASE + 1));
+        }
+
+        #[test]
+        fn nmi_ignores_if_and_is_held_until_iret() {
+            let mut h = enabled_apic();
+            h.cpu.eflags = RESERVED_ONE;
+            apic_write(&mut h, APIC_ICR_LOW, ICR_DELIVERY_NMI | ICR_SHORTHAND_SELF);
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, handler_for(NMI_VECTOR));
+            assert!(h.cpu.nmi_blocked);
+            h.cpu.rip = OLD_RIP;
+            apic_write(&mut h, APIC_ICR_LOW, ICR_DELIVERY_NMI | ICR_SHORTHAND_SELF);
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, OLD_RIP, "second NMI waits for iret");
+            h.cpu.nmi_blocked = false;
+            h.cpu.before_step();
+            assert_eq!(h.cpu.rip, handler_for(NMI_VECTOR));
+        }
+
+        #[test]
+        fn nmi_wakes_a_cpu_halted_with_interrupts_disabled() {
+            let mut h = enabled_apic();
+            h.cpu.eflags = RESERVED_ONE;
+            h.cpu.halted = true;
+            apic_write(&mut h, APIC_ICR_LOW, ICR_DELIVERY_NMI | ICR_SHORTHAND_SELF);
+            assert!(matches!(h.cpu.before_step(), BeforeStep::Execute));
+            assert!(!h.cpu.halted);
+            assert_eq!(h.cpu.rip, handler_for(NMI_VECTOR));
+        }
+
+        #[test]
+        fn iret_unblocks_nmis() {
+            // iretq with a frame that returns to the next instruction
+            let mut h = Harness::new(&[0x48, 0xcf]);
+            h.cpu.nmi_blocked = true;
+            let rsp = h.cpu.gpr[GPR_RSP] - 40;
+            h.write_u64(rsp, CODE_BASE + 2);
+            h.write_u64(rsp + 8, h.cpu.seg[SEG_CS].sel as u64);
+            h.write_u64(rsp + 16, RESERVED_ONE);
+            h.write_u64(rsp + 24, h.cpu.gpr[GPR_RSP]);
+            h.write_u64(rsp + 32, h.cpu.seg[SEG_SS].sel as u64);
+            h.cpu.gpr[GPR_RSP] = rsp;
+            h.cpu.step().unwrap();
+            assert!(!h.cpu.nmi_blocked);
+        }
+
+        #[test]
+        fn cr8_reads_and_writes_the_apic_task_priority() {
+            let mut h = enabled_apic();
+            h.cpu.dev.lapic.set_tpr(0x70);
+            // mov rax, cr8
+            let value = (h.cpu.dev.lapic.tpr() >> 4) as u64;
+            assert_eq!(value, 7);
         }
     }
 

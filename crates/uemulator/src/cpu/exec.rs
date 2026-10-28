@@ -1517,7 +1517,14 @@ impl Cpu {
                     software: true,
                 });
             }
-            0xcf => return self.iretq(i),
+            0xcf => {
+                let result = self.iretq(i);
+                // Only a completed iret re-enables NMIs; one that faulted left them blocked.
+                if result.is_ok() {
+                    self.nmi_blocked = false;
+                }
+                return result;
+            }
             // xlat: al = [rbx + al]; with the 67 prefix the sum is formed and wrapped at 32 bits
             0xd7 => {
                 let a =
@@ -13929,10 +13936,10 @@ mod exec_tests {
         ] {
             assert_ne!(edx & bit, 0, "{name} is implemented and advertised");
         }
-        assert_eq!(
+        assert_ne!(
             edx & APIC,
             0,
-            "apic is not implemented and must not be advertised"
+            "the local APIC is implemented and advertised"
         );
         // The exact set of leaf 1 ECX bits is pinned in the tests in sys.rs; these must stay clear because
         // their instructions (or the OS support behind them) do not exist.

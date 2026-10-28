@@ -1,6 +1,8 @@
 #[cfg(freestanding)]
 use crate::prelude::*;
+pub(crate) mod apic;
 pub(crate) mod guestmem;
+mod ioapic;
 mod pci;
 mod pic;
 mod pit;
@@ -15,7 +17,9 @@ use crate::console::ConsoleHandle;
 #[cfg(not(freestanding))]
 use crate::disk::Disk;
 use crate::netdev::NetHandle;
+use apic::{Interrupt, Lapic};
 use guestmem::GuestMem;
+use ioapic::IoApic;
 use pci::PciHost;
 use pic::Pics;
 use pit::Pit;
@@ -75,6 +79,9 @@ const PORT_B_TIMER2_OUT: u8 = 1 << 5;
 /// guests busy-waiting on it see time pass. Derived from virtual time to stay deterministic.
 const REFRESH_TOGGLE_PERIOD_NS: u64 = 15085;
 
+/// xAPIC registers are 16 bytes apart; the offset within the 4 KiB page is at most 0xff0 + 0xf.
+const APIC_REGISTER_MASK: u64 = 0xff0;
+
 const NS_PER_SECOND: u64 = 1_000_000_000;
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 3600;
@@ -130,6 +137,10 @@ pub(crate) struct Devices {
     system_control_port_a: u8,
     reset_control: u8,
     pci: PciHost,
+    pub lapic: Lapic,
+    ioapic: IoApic,
+    /// Virtual time of the last tick or port access, for MMIO accesses that arrive without one.
+    now_ns: u64,
     /// Set by the reset ports (i8042, 0x92, 0xCF9); the CPU turns it into `ExitReason::Reset`.
     pub reset_requested: bool,
 }
@@ -212,6 +223,9 @@ impl Devices {
             system_control_port_a: 0,
             reset_control: 0,
             pci: PciHost::new(virtio_devices),
+            lapic: Lapic::new(),
+            ioapic: IoApic::new(),
+            now_ns: 0,
             reset_requested: false,
         }
     }
@@ -237,7 +251,111 @@ impl Devices {
     /// instead, which the CPU calls every `EVENT_INTERVAL` instructions and while idle, so
     /// host input and received frames wait at most one such interval.
     pub fn next_deadline(&self, _now: u64) -> Option<u64> {
-        self.pit.next_deadline()
+        [self.pit.next_deadline(), self.lapic.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// The ISA line a device raised on the PIC, as an I/O APIC pin: the PIT's IRQ 0 is wired to
+    /// pin 2 on PCs (the cascade has no device behind it), the rest map straight through.
+    fn ioapic_pin(irq: u8) -> usize {
+        if irq == IRQ_PIT { 2 } else { irq as usize }
+    }
+
+    fn deliver_to_lapic(&mut self, interrupts: Vec<Interrupt>) {
+        for interrupt in interrupts {
+            self.lapic.accept(&interrupt);
+        }
+    }
+
+    /// Forwards the device line changes the PIC logged to the I/O APIC, which turns them into
+    /// messages for the local APIC. Cheap when nothing changed: the CPU calls it per instruction.
+    fn route_line_events(&mut self) {
+        if !self.pic.has_line_events() {
+            return;
+        }
+        let mut messages = Vec::new();
+        for (irq, level) in self.pic.take_line_events() {
+            self.ioapic
+                .set_line(Self::ioapic_pin(irq), level, &mut messages);
+        }
+        self.deliver_to_lapic(messages);
+    }
+
+    /// Whether an interrupt is waiting for the CPU (the CPU still checks IF and the interrupt
+    /// shadow). Local APIC vectors win over the PIC's ExtINT.
+    pub fn interrupt_pending(&mut self) -> bool {
+        self.route_line_events();
+        self.lapic.pending_vector().is_some()
+            || (self.lapic.extint_connected() && self.pic.has_pending())
+    }
+
+    /// Interrupt acknowledge: the vector the CPU takes, if any.
+    pub fn interrupt_ack(&mut self) -> Option<u8> {
+        self.route_line_events();
+        if let Some(vector) = self.lapic.ack() {
+            return Some(vector);
+        }
+        if self.lapic.extint_connected() {
+            return self.pic.ack();
+        }
+        None
+    }
+
+    /// An NMI the CPU should take at the next instruction boundary.
+    pub fn take_nmi(&mut self) -> bool {
+        self.lapic.take_nmi()
+    }
+
+    pub fn nmi_pending(&self) -> bool {
+        self.lapic.nmi_pending()
+    }
+
+    /// Reads an x2APIC register MSR; `None` is #GP (not in x2APIC mode, or a reserved register).
+    pub fn apic_msr_read(&mut self, msr: u32, now: u64) -> Option<u64> {
+        if !self.lapic.x2apic() {
+            return None;
+        }
+        let offset = (msr - apic::X2APIC_MSR_FIRST) << 4;
+        if offset == 0x300 {
+            // The ICR is one 64-bit register in x2APIC mode.
+            return Some(self.lapic.read_icr_x2apic());
+        }
+        self.lapic.read_register(offset, now).map(u64::from)
+    }
+
+    /// Writes an x2APIC register MSR; `false` is #GP.
+    pub fn apic_msr_write(&mut self, msr: u32, value: u64, now: u64) -> bool {
+        if !self.lapic.x2apic() {
+            return false;
+        }
+        let offset = (msr - apic::X2APIC_MSR_FIRST) << 4;
+        if offset == 0x300 {
+            self.lapic.write_icr_x2apic(value);
+            return true;
+        }
+        if value >> 32 != 0 {
+            return false;
+        }
+        self.apic_register_write(offset, value as u32, now).is_ok()
+    }
+
+    fn apic_register_write(&mut self, offset: u32, value: u32, now: u64) -> Result<(), ()> {
+        // Line changes the devices made before this access must be visible to the I/O APIC first:
+        // an EOI re-sends a level interrupt only if the line is still high *now*.
+        self.route_line_events();
+        let effect = self.lapic.write_register(offset, value, now)?;
+        if let Some(vector) = effect.eoi_vector {
+            let mut messages = Vec::new();
+            self.ioapic.eoi(vector, &mut messages);
+            self.deliver_to_lapic(messages);
+        }
+        Ok(())
+    }
+
+    pub fn set_time(&mut self, now: u64) {
+        self.now_ns = now;
     }
 
     /// The devices pulse `Pics::raise` on an interrupt event; a line the guest configured as
@@ -263,6 +381,8 @@ impl Devices {
     /// `mem` collects code pages the devices wrote by DMA; the caller must pass them to
     /// `Cpu::code_written` afterwards (see `GuestMem`).
     pub fn tick(&mut self, now: u64, mem: &mut GuestMem) {
+        self.now_ns = now;
+        self.lapic.tick(now);
         if self.pit.tick(now) {
             self.pic.raise(IRQ_PIT);
         }
@@ -280,6 +400,14 @@ impl Devices {
 
     /// None means no device decodes `phys_addr` and the caller treats it as unmapped.
     pub fn mmio_read(&mut self, phys_addr: u64, size: u8) -> Option<u64> {
+        if self.lapic.mmio_decodes(phys_addr) {
+            let offset = (phys_addr & APIC_REGISTER_MASK) as u32;
+            return Some(self.lapic.read_register(offset, self.now_ns).unwrap_or(0) as u64);
+        }
+        if self.ioapic.decodes(phys_addr) {
+            self.route_line_events();
+            return Some(self.ioapic.mmio_read(phys_addr, size));
+        }
         let value = self.pci.mmio_read(phys_addr, size);
         // Reading the ISR register acknowledges the interrupt.
         self.update_pci_irqs();
@@ -288,6 +416,23 @@ impl Devices {
 
     /// Returns false if no device decodes `phys_addr`.
     pub fn mmio_write(&mut self, phys_addr: u64, size: u8, val: u64, mem: &mut GuestMem) -> bool {
+        if self.lapic.mmio_decodes(phys_addr) {
+            let offset = (phys_addr & APIC_REGISTER_MASK) as u32;
+            if self
+                .apic_register_write(offset, val as u32, self.now_ns)
+                .is_err()
+            {
+                self.lapic.record_illegal_register();
+            }
+            return true;
+        }
+        if self.ioapic.decodes(phys_addr) {
+            self.route_line_events();
+            let mut messages = Vec::new();
+            self.ioapic.mmio_write(phys_addr, val, &mut messages);
+            self.deliver_to_lapic(messages);
+            return true;
+        }
         let result = self.pci.mmio_write(phys_addr, size, val as u32, mem);
         match result {
             Some(irq) => {
@@ -329,6 +474,7 @@ impl Devices {
     }
 
     pub fn io_in(&mut self, port: u16, size: u8, now: u64) -> u32 {
+        self.now_ns = now;
         let ones = size_mask(size);
         let value: u8 = match port {
             PIC_MASTER_COMMAND | PIC_MASTER_DATA | PIC_SLAVE_COMMAND | PIC_SLAVE_DATA
@@ -361,6 +507,7 @@ impl Devices {
 
     /// Port devices are byte-wide: only the low byte of `value` is used except for PCI config.
     pub fn io_out(&mut self, port: u16, size: u8, value: u32, now: u64) {
+        self.now_ns = now;
         let byte = value as u8;
         match port {
             PIC_MASTER_COMMAND | PIC_MASTER_DATA | PIC_SLAVE_COMMAND | PIC_SLAVE_DATA

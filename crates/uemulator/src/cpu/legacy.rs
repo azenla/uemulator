@@ -400,7 +400,13 @@ impl Cpu {
                 };
                 return self.far_return_legacy(i, extra).map(|()| true);
             }
-            0xcf => return self.iret_legacy(i).map(|()| true),
+            0xcf => {
+                let result = self.iret_legacy(i);
+                if result.is_ok() {
+                    self.nmi_blocked = false;
+                }
+                return result.map(|()| true);
+            }
             0xd7 => {
                 let offset =
                     self.gpr[GPR_RBX].wrapping_add(self.gpr[GPR_RAX] & BYTE_MASK) & address_mask(i);

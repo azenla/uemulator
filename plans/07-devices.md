@@ -36,6 +36,17 @@ Time registers (BCD, 24h) from host wall clock at boot (optional `fixed_time` co
 - DMA controller 0x00–0x0F, 0x81–0x8F: accept writes, reads 0 (kernel may touch for `dma` reservation).
 - Kernel `x86_platform`/`legacy_pic`: with `acpi=off` and no APIC it expects PIC+PIT+RTC; no HPET.
 
-## LAPIC/IOAPIC (phase 2, optional)
+## LAPIC and IOAPIC (`dev/apic.rs`, `dev/ioapic.rs`)
 
-Test whether the no-APIC path boots first (CPUID.APIC clear). LAPIC timer and IOAPIC are only needed for SMP or if a later kernel/userspace needs them. If added: LAPIC at 0xFEE00000 via MMIO (this is where the Bus MMIO path gets its first user), timer in one-shot/periodic/TSC-deadline off the same clock.
+One local APIC at 0xFEE00000 (xAPIC MMIO, or x2APIC through MSRs 0x800..=0x8ff once IA32_APIC_BASE.EXTD is set) and one 24-pin I/O APIC at 0xFEC00000. Advertised in CPUID leaf 1 (APIC, x2APIC, TSC-deadline) together with leaf 0xB (one logical processor).
+
+- **Reset state is the firmware-left virtual wire** (LINT0 = ExtINT unmasked, LINT1 = NMI masked, SVR disabled), so a kernel that finds no ACPI/MP tables still gets PIC interrupts through the APIC (`extint_connected`, QEMU's `apic_accept_pic_intr`: only LINT0's mask bit counts). Linux boots in `APIC_VIRTUAL_WIRE_NO_CONFIG` mode with the TSC-deadline timer.
+- **Interrupt path.** Devices still call `Pics::raise/lower`; the PIC logs each line change (`line_events`) and `Devices::route_line_events` feeds it to the I/O APIC, so the same lines drive both controllers as on a PC. IRQ0 maps to pin 2 (the PIT's wiring), the other lines map straight through. `Devices::interrupt_pending`/`interrupt_ack` are what the CPU polls; LAPIC vectors win over ExtINT, and delivery honours TPR/PPR. CR8 is TPR[7:4] and lives in the LAPIC.
+- **Level triggering**: an I/O APIC pin sets remote IRR when it sends and sends again after the LAPIC's EOI (broadcast to the I/O APIC through `WriteEffect::eoi_vector`, plus the version-0x20 EOI register) only if the line is still high. Device lines must be routed before an EOI is processed, hence `route_line_events` at the start of every APIC/IOAPIC register access.
+- **Timer**: 100 MHz bus clock, divide configuration, one-shot, periodic and TSC-deadline (the TSC is virtual ns). Deadlines join `Devices::next_deadline`, so a halted guest sleeps to the APIC timer.
+- **NMI** (LINT1, ICR, I/O APIC entries): `Cpu::nmi_blocked` is set on delivery and cleared by a completed `iret`; NMIs ignore IF and wake `hlt` with IF=0 (which otherwise ends the machine).
+- Not modeled: other CPUs (IPIs to them go nowhere, INIT/SIPI/SMI are dropped), MSI delivery from devices (no device has MSI yet), the AMD extended APIC space (reads as zero), interrupt remapping of I/O APIC entries.
+
+## MTRR, PAT and machine checks (`cpu/mtrr.rs`, `cpu/mca.rs`)
+
+Validated storage only, because nothing here has caches: MTRR capability/default/fixed/variable registers (reserved memory types and bits are #GP), PAT validation, AMD SYSCFG/IORR/TOP_MEM/TOP_MEM2 (TOP_MEM = RAM size), and an inert machine-check architecture (MCG_CAP/STATUS/CTL and six banks, status always zero) behind CPUID MCE/MCA and CR4.MCE.

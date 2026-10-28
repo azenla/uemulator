@@ -39,6 +39,8 @@
 
 - UEFI application done (see 12): `crates/uemulator-uefi`, library `no_std` on `target_os = "uefi"`, `hack/uefi/boot.sh`; emulator (interpreter) everywhere, plus a hardware-virtualization path on x86_64 (AMD SVM verified under TCG, Intel VMX untested), no disk/net.
 
+- Interrupt controllers and CPU platform state for Windows done (see 07, "LAPIC and IOAPIC"): xAPIC and x2APIC local APIC with timer and TSC-deadline, 24-pin I/O APIC fed by the same device lines as the PIC, CR8/TPR priority, NMI delivery with `iret` unblocking, MTRRs, PAT validation, inert machine-check banks, AMD memory-typing MSRs, CPUID leaf 0xB. The Alpine kernel boots with the APIC advertised (virtual wire mode, TSC-deadline timer). Not done: SMP, HPET, ACPI PM timer, ACPI tables and firmware.
+
 Each has an observable serial-output exit criterion. Interpreter first.
 
 | # | deliverable | exit criterion |

@@ -557,7 +557,12 @@ impl Cpu {
             let mut bytes = [0u8; 8];
             bytes[..len].copy_from_slice(src);
             u64::from_le_bytes(bytes)
-        } else if let Some(value) = self.dev.mmio_read(pa, size) {
+        } else if let Some(value) = {
+            // Device registers with timers (the APIC) need the time of this very access.
+            let now = self.now_ns();
+            self.dev.set_time(now);
+            self.dev.mmio_read(pa, size)
+        } {
             value
         } else {
             self.log_once(LOG_KEY_UNMAPPED_READ + (pa >> PAGE_SHIFT), || {
@@ -577,6 +582,8 @@ impl Cpu {
             }
             self.ram[start..start + len].copy_from_slice(&val.to_le_bytes()[..len]);
         } else {
+            let now = self.now_ns();
+            self.dev.set_time(now);
             let written_code_pages = {
                 let mut mem = GuestMem::new(&mut self.ram, &self.page_has_code);
                 if self.dev.mmio_write(pa, size, val, &mut mem) {

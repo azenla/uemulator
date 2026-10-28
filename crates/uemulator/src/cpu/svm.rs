@@ -753,7 +753,7 @@ impl Cpu {
         let Some(guest) = &self.svm.guest else {
             return false;
         };
-        if self.dev.pic.has_pending() && guest.intercept3 & INTERCEPT_INTR != 0 {
+        if self.dev.interrupt_pending() && guest.intercept3 & INTERCEPT_INTR != 0 {
             let next = self.rip;
             self.vmexit(VMEXIT_INTR, 0, 0, next);
             return true;

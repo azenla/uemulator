@@ -4,6 +4,7 @@ use super::exec::Loc;
 use super::flags::*;
 use super::fpu::MXCSR_VALID_BITS;
 use super::*;
+use crate::dev::apic;
 
 pub(crate) const MSR_TSC: u32 = 0x10;
 pub(crate) const MSR_APIC_BASE: u32 = 0x1b;
@@ -77,6 +78,8 @@ const CR0_CD: u64 = 1 << 30;
 
 pub(crate) const CR4_TSD: u64 = 1 << 2;
 pub(crate) const CR4_DE: u64 = 1 << 3;
+/// Machine-check enable: advertised with the (inert) machine-check architecture in `mca.rs`.
+pub(crate) const CR4_MCE: u64 = 1 << 6;
 pub(crate) const CR4_PSE: u64 = 1 << 4;
 pub(crate) const CR4_PGE: u64 = 1 << 7;
 pub(crate) const CR4_PCE: u64 = 1 << 8;
@@ -94,12 +97,13 @@ pub(crate) const CR4_PCIDE: u64 = 1 << 17;
 pub(crate) const CR4_SMEP: u64 = 1 << 20;
 /// Supervisor-mode access prevention: no data accesses to user pages at CPL < 3 unless EFLAGS.AC.
 pub(crate) const CR4_SMAP: u64 = 1 << 21;
-/// CR4 bits a guest may set. Everything else (VME, PVI, MCE, UMIP, LA57, PCIDE, OSXSAVE, SMEP,
+/// CR4 bits a guest may set. Everything else (VME, PVI, UMIP, LA57, PCIDE, OSXSAVE, SMEP,
 /// SMAP...) is rejected with #GP because CPUID does not advertise it.
 const CR4_SUPPORTED: u64 = CR4_TSD
     | CR4_DE
     | CR4_PSE
     | CR4_PAE
+    | CR4_MCE
     | CR4_PGE
     | CR4_PCE
     | CR4_OSFXSR
@@ -135,6 +139,8 @@ const CR3_RESERVED: u64 = !0u64 << PHYSICAL_ADDRESS_BITS;
 /// CR8 holds the 4-bit task priority; it is stored but no APIC consumes it. Higher bits are
 /// reserved.
 const CR8_MASK: u64 = 0xf;
+/// CR8 is TPR[7:4] (SDM 10.8.6.1).
+const CR8_TPR_SHIFT: u32 = 4;
 
 /// DR6 bits software may write: B0-B3 (3:0), BD (13), BS (14), BT (15). Bits 31:16 and 11:4
 /// always read as one (no RTM, no bus-lock detect) and bit 12 as zero.
@@ -222,6 +228,16 @@ const CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES: u32 = 7;
 const CPUID_LEAF_XSTATE: u32 = 0xd;
 /// MONITOR/MWAIT parameters.
 const CPUID_LEAF_MONITOR: u32 = 5;
+/// Extended topology enumeration: x2APIC id and the SMT/core levels.
+const CPUID_LEAF_EXTENDED_TOPOLOGY: u32 = 0xb;
+/// ECX of leaf 0xB: level type in bits 15:8 (1 = SMT, 2 = core), level number in 7:0.
+const TOPOLOGY_LEVEL_SMT: u32 = 1 << 8;
+const TOPOLOGY_LEVEL_CORE: u32 = 2 << 8;
+/// One logical processor in the package: each level is a single unit and shifts x2APIC ids by 0
+/// bits (SMT) or 1 bit (core: a one-bit field still has to exist to be well formed).
+const TOPOLOGY_SMT_SHIFT: u32 = 0;
+const TOPOLOGY_CORE_SHIFT: u32 = 1;
+const TOPOLOGY_LOGICAL_PROCESSORS: u32 = 1;
 /// Leaf 5 smallest/largest monitor-line size, and ECX bits: extensions enumerated, interrupts
 /// break MWAIT even when masked.
 const MONITOR_LINE_BYTES: u32 = 64;
@@ -265,6 +281,11 @@ const FEATURE_PSE: u32 = 1 << 3;
 const FEATURE_TSC: u32 = 1 << 4;
 const FEATURE_MSR: u32 = 1 << 5;
 const FEATURE_PAE: u32 = 1 << 6;
+const FEATURE_MCE: u32 = 1 << 7;
+/// On-chip local APIC (`dev/apic.rs`); its MMIO window is enabled by IA32_APIC_BASE.
+const FEATURE_APIC: u32 = 1 << 9;
+const FEATURE_MTRR: u32 = 1 << 12;
+const FEATURE_MCA: u32 = 1 << 14;
 const FEATURE_SEP: u32 = 1 << 11;
 const FEATURE_CX8: u32 = 1 << 8;
 const FEATURE_PGE: u32 = 1 << 13;
@@ -278,7 +299,7 @@ const FEATURE_SSE: u32 = 1 << 25;
 const FEATURE_SSE2: u32 = 1 << 26;
 /// Leaf 1 EDX. MMX is advertised because glibc's x86-64 baseline ISA check (CMOV, CX8, FPU,
 /// FXSR, MMX, SSE, SSE2) needs the bit; without it every Debian binary refuses to start ("CPU ISA
-/// level is lower than required"). APIC is clear. SEP is set for protected-mode sysenter/sysexit (`do_sysenter`). PSE-36 is set together with the 4 MiB
+/// level is lower than required"). SEP is set for protected-mode sysenter/sysexit (`do_sysenter`). PSE-36 is set together with the 4 MiB
 /// PDE address bits 39:32 (`mem.rs`), which match the 40 physical address bits of leaf 0x8000_0008.
 const CPUID_LEAF1_EDX: u32 = FEATURE_FPU
     | FEATURE_DE
@@ -286,6 +307,10 @@ const CPUID_LEAF1_EDX: u32 = FEATURE_FPU
     | FEATURE_TSC
     | FEATURE_MSR
     | FEATURE_PAE
+    | FEATURE_MCE
+    | FEATURE_APIC
+    | FEATURE_MTRR
+    | FEATURE_MCA
     | FEATURE_CX8
     | FEATURE_SEP
     | FEATURE_PGE
@@ -328,6 +353,10 @@ const FEATURE_FMA: u32 = 1 << 12;
 const FEATURE_AVX: u32 = 1 << 28;
 /// F16C: vcvtph2ps and vcvtps2ph.
 const FEATURE_F16C: u32 = 1 << 29;
+/// x2APIC mode of the local APIC: register access by MSR (0x800..=0x8ff), 32-bit APIC ids.
+const FEATURE_X2APIC: u32 = 1 << 21;
+/// IA32_TSC_DEADLINE (0x6e0) and the LVT timer's deadline mode.
+const FEATURE_TSC_DEADLINE: u32 = 1 << 24;
 /// Mirrors CR4.OSXSAVE; computed in `cpuid`, never part of the static mask.
 const FEATURE_OSXSAVE: u32 = 1 << 27;
 /// rdrand (see `MachineConfig::random_seed`).
@@ -347,7 +376,9 @@ const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
     | FEATURE_PCID
     | FEATURE_FMA
     | FEATURE_AVX
-    | FEATURE_F16C;
+    | FEATURE_F16C
+    | FEATURE_X2APIC
+    | FEATURE_TSC_DEADLINE;
 
 /// Leaf 7 subleaf 0 EBX bit 0: rdfsbase, rdgsbase, wrfsbase, wrgsbase.
 ///
@@ -534,6 +565,25 @@ impl Cpu {
                     CPUID_LEAF1_EDX,
                 )
             }
+            CPUID_LEAF_EXTENDED_TOPOLOGY => {
+                let x2apic_id = 0;
+                match self.gpr[RCX] as u32 {
+                    0 => (
+                        TOPOLOGY_SMT_SHIFT,
+                        TOPOLOGY_LOGICAL_PROCESSORS,
+                        TOPOLOGY_LEVEL_SMT,
+                        x2apic_id,
+                    ),
+                    1 => (
+                        TOPOLOGY_CORE_SHIFT,
+                        TOPOLOGY_LOGICAL_PROCESSORS,
+                        TOPOLOGY_LEVEL_CORE | 1,
+                        x2apic_id,
+                    ),
+                    // Level 2 is the invalid terminator; ECX echoes the subleaf.
+                    subleaf => (0, 0, subleaf, x2apic_id),
+                }
+            }
             CPUID_LEAF_MONITOR => (
                 MONITOR_LINE_BYTES,
                 MONITOR_LINE_BYTES,
@@ -603,9 +653,18 @@ impl Cpu {
     pub fn rdmsr(&mut self, msr: u32) -> ExecResult<u64> {
         Ok(match msr {
             MSR_TSC => self.tsc(),
-            // no local APIC is advertised
-            MSR_APIC_BASE => return Err(Exception::general_protection(0)),
+            MSR_APIC_BASE => self.dev.lapic.base_msr(),
+            apic::X2APIC_MSR_FIRST..=apic::X2APIC_MSR_LAST => {
+                let now = self.now_ns();
+                match self.dev.apic_msr_read(msr, now) {
+                    Some(value) => value,
+                    None => return Err(Exception::general_protection(0)),
+                }
+            }
+            apic::MSR_TSC_DEADLINE => self.dev.lapic.tsc_deadline(),
             MSR_PAT => self.pat,
+            _ if mtrr::Mtrr::owns(msr) => self.mtrr.read(msr).unwrap_or(0),
+            _ if mca::Mca::owns(msr) => self.mca.read(msr).unwrap_or(0),
             MSR_EFER => self.efer,
             MSR_STAR => self.star,
             MSR_LSTAR => self.lstar,
@@ -653,7 +712,37 @@ impl Cpu {
             return Err(Exception::general_protection(0));
         }
         match msr {
-            MSR_PAT => self.pat = v,
+            MSR_APIC_BASE => {
+                if !self.dev.lapic.set_base_msr(v) {
+                    return Err(Exception::general_protection(0));
+                }
+            }
+            apic::X2APIC_MSR_FIRST..=apic::X2APIC_MSR_LAST => {
+                let now = self.now_ns();
+                if !self.dev.apic_msr_write(msr, v, now) {
+                    return Err(Exception::general_protection(0));
+                }
+            }
+            apic::MSR_TSC_DEADLINE => {
+                let now = self.now_ns();
+                self.dev.lapic.set_tsc_deadline(v, now);
+            }
+            MSR_PAT => {
+                if !mtrr::pat_is_valid(v) {
+                    return Err(Exception::general_protection(0));
+                }
+                self.pat = v;
+            }
+            _ if mtrr::Mtrr::owns(msr) => {
+                if !self.mtrr.write(msr, v) {
+                    return Err(Exception::general_protection(0));
+                }
+            }
+            _ if mca::Mca::owns(msr) => {
+                if !self.mca.write(msr, v) {
+                    return Err(Exception::general_protection(0));
+                }
+            }
             MSR_EFER => {
                 // SVME cannot be set while the firmware has disabled SVM in VM_CR
                 if v & !EFER_WRMSR_ALLOWED != 0
@@ -736,7 +825,7 @@ impl Cpu {
                     2 => self.cr2,
                     3 => self.cr3,
                     4 => self.cr4,
-                    8 => self.cr8,
+                    8 => (self.dev.lapic.tpr() >> CR8_TPR_SHIFT) as u64,
                     _ => return Err(Exception::invalid_opcode()),
                 };
                 // Outside IA-32e mode the access is 32 bits wide and clears the upper half.
@@ -780,7 +869,7 @@ impl Cpu {
                         if v & !CR8_MASK != 0 {
                             return Err(Exception::general_protection(0));
                         }
-                        self.cr8 = v;
+                        self.dev.lapic.set_tpr((v as u8) << CR8_TPR_SHIFT);
                     }
                     _ => return Err(Exception::invalid_opcode()),
                 }
@@ -1888,10 +1977,13 @@ mod sys_tests {
         fn leaf_1_edx_advertises_exactly_the_implemented_features() {
             let mut h = blank();
             let [_, _, _, edx] = cpuid(&mut h, 1, 0);
-            // FPU DE PSE TSC MSR PAE CX8 SEP PGE CMOV PAT PSE-36 CLFSH MMX FXSR SSE SSE2
-            let expected = bits(&[0, 2, 3, 4, 5, 6, 8, 11, 13, 15, 16, 17, 19, 23, 24, 25, 26]);
+            // FPU DE PSE TSC MSR PAE MCE CX8 APIC SEP MTRR PGE MCA CMOV PAT PSE-36 CLFSH MMX FXSR
+            // SSE SSE2
+            let expected = bits(&[
+                0, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 19, 23, 24, 25, 26,
+            ]);
             assert_eq!(edx, expected, "{edx:#034b}");
-            assert_eq!(edx, 0x078b_a97d);
+            assert_eq!(edx, 0x78bfbfd);
         }
 
         #[test]
@@ -1919,10 +2011,6 @@ mod sys_tests {
             let [_, _, _, edx] = cpuid(&mut h, 1, 0);
             let clear = [
                 (1, "VME"),
-                (7, "MCE"),
-                (9, "APIC"),
-                (12, "MTRR"),
-                (14, "MCA"),
                 (18, "PSN"),
                 (21, "DS"),
                 (22, "ACPI"),
@@ -1955,6 +2043,8 @@ mod sys_tests {
             const FMA: u32 = 1 << 12;
             const AVX: u32 = 1 << 28;
             const F16C: u32 = 1 << 29;
+            const X2APIC: u32 = 1 << 21;
+            const TSC_DEADLINE: u32 = 1 << 24;
             let mut h = blank();
             let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
             assert_eq!(
@@ -1973,7 +2063,9 @@ mod sys_tests {
                     | PCID
                     | FMA
                     | AVX
-                    | F16C,
+                    | F16C
+                    | X2APIC
+                    | TSC_DEADLINE,
                 "no VMX, SMX or hypervisor bit, and OSXSAVE only follows CR4"
             );
             h.cpu.cr4 |= CR4_OSXSAVE;
@@ -2031,11 +2123,18 @@ mod sys_tests {
         #[test]
         fn other_standard_leaves_are_zero() {
             let mut h = blank();
-            for leaf in [
-                2, 3, 4, 6, 8, 0xa, 0xb, 0xc, 0xe, 0xf, 0x10, 0x14, 0x15, 0x1f,
-            ] {
+            for leaf in [2, 3, 4, 6, 8, 0xa, 0xc, 0xe, 0xf, 0x10, 0x14, 0x15, 0x1f] {
                 assert_eq!(cpuid(&mut h, leaf, 0), [0, 0, 0, 0], "leaf {leaf:#x}");
             }
+        }
+
+        #[test]
+        fn leaf_0xb_describes_one_logical_processor_with_x2apic_id_0() {
+            let mut h = blank();
+            // SMT level: 0 shift bits, 1 processor, level type 1; core level: type 2; then invalid.
+            assert_eq!(cpuid(&mut h, 0xb, 0), [0, 1, 0x100, 0]);
+            assert_eq!(cpuid(&mut h, 0xb, 1), [1, 1, 0x201, 0]);
+            assert_eq!(cpuid(&mut h, 0xb, 2), [0, 0, 2, 0]);
         }
 
         #[test]
@@ -2324,10 +2423,21 @@ mod sys_tests {
         ];
 
         #[test]
+        fn pat_round_trips_valid_memory_types_and_rejects_reserved_ones() {
+            const VALID_PAT: u64 = 0x0106_0504_0007_0600;
+            let mut h = blank();
+            h.cpu.wrmsr(TEST_MSR_PAT, VALID_PAT).unwrap();
+            assert_eq!(h.cpu.rdmsr(TEST_MSR_PAT).unwrap(), VALID_PAT);
+            for invalid in [2, 3, 8, 3 << 56, 0x0706_0504_0302_0100] {
+                assert_gp0(h.cpu.wrmsr(TEST_MSR_PAT, invalid));
+            }
+            assert_eq!(h.cpu.rdmsr(TEST_MSR_PAT).unwrap(), VALID_PAT);
+        }
+
+        #[test]
         fn plain_registers_round_trip_through_wrmsr_and_rdmsr() {
             let mut h = blank();
             for msr in [
-                TEST_MSR_PAT,
                 TEST_MSR_STAR,
                 TEST_MSR_SFMASK,
                 TEST_MSR_TSC_AUX,
@@ -2478,10 +2588,71 @@ mod sys_tests {
         }
 
         #[test]
-        fn apic_base_is_absent() {
+        fn apic_base_reads_the_default_enabled_bsp_state() {
             let mut h = blank();
-            assert_gp0(h.cpu.rdmsr(TEST_MSR_APIC_BASE));
-            assert_gp0(h.cpu.wrmsr(TEST_MSR_APIC_BASE, 0xfee0_0900));
+            assert_eq!(h.cpu.rdmsr(TEST_MSR_APIC_BASE).unwrap(), 0xfee0_0900);
+        }
+
+        #[test]
+        fn apic_base_rejects_x2apic_without_enable_and_reserved_bits() {
+            let mut h = blank();
+            assert_gp0(h.cpu.wrmsr(TEST_MSR_APIC_BASE, 0xfee0_0400));
+            assert_gp0(h.cpu.wrmsr(TEST_MSR_APIC_BASE, 0xfee0_0900 | (1 << 62)));
+        }
+
+        #[test]
+        fn x2apic_registers_fault_until_x2apic_mode_is_enabled() {
+            const X2APIC_VERSION: u32 = 0x803;
+            let mut h = blank();
+            assert_gp0(h.cpu.rdmsr(X2APIC_VERSION));
+            h.cpu.wrmsr(TEST_MSR_APIC_BASE, 0xfee0_0d00).unwrap();
+            assert_eq!(h.cpu.rdmsr(X2APIC_VERSION).unwrap(), 0x0006_0014);
+        }
+
+        #[test]
+        fn x2apic_rejects_a_write_with_upper_bits_and_reserved_registers() {
+            let mut h = blank();
+            h.cpu.wrmsr(TEST_MSR_APIC_BASE, 0xfee0_0d00).unwrap();
+            assert_gp0(h.cpu.wrmsr(0x80b, 1 << 32));
+            assert_gp0(h.cpu.wrmsr(0x803, 0));
+            assert_gp0(h.cpu.rdmsr(0x8ff));
+        }
+
+        #[test]
+        fn tsc_deadline_msr_round_trips() {
+            const MSR_TSC_DEADLINE: u32 = 0x6e0;
+            let mut h = blank();
+            h.cpu.wrmsr(MSR_TSC_DEADLINE, 12345).unwrap();
+            assert_eq!(h.cpu.rdmsr(MSR_TSC_DEADLINE).unwrap(), 12345);
+        }
+
+        #[test]
+        fn mtrr_msrs_validate_memory_types() {
+            let mut h = blank();
+            assert_eq!(h.cpu.rdmsr(0xfe).unwrap(), 0x508);
+            h.cpu.wrmsr(0x2ff, 0xc06).unwrap();
+            assert_eq!(h.cpu.rdmsr(0x2ff).unwrap(), 0xc06);
+            assert_gp0(h.cpu.wrmsr(0x2ff, 2));
+            assert_gp0(h.cpu.wrmsr(0x250, 0x0302));
+            assert_gp0(h.cpu.wrmsr(0xfe, 0));
+        }
+
+        #[test]
+        fn machine_check_banks_accept_initialization_and_never_report() {
+            let mut h = blank();
+            assert_eq!(h.cpu.rdmsr(0x179).unwrap() & 0xff, 6);
+            h.cpu.wrmsr(0x17b, u64::MAX).unwrap();
+            h.cpu.wrmsr(0x400, u64::MAX).unwrap();
+            h.cpu.wrmsr(0x401, 0).unwrap();
+            assert_eq!(h.cpu.rdmsr(0x401).unwrap(), 0);
+        }
+
+        #[test]
+        fn amd_memory_typing_msrs_report_the_top_of_ram() {
+            let mut h = blank();
+            let ram = h.cpu.ram.len() as u64;
+            assert_eq!(h.cpu.rdmsr(0xc001_001a).unwrap(), ram);
+            assert_eq!(h.cpu.rdmsr(0xc001_001d).unwrap(), 0);
         }
 
         #[test]
@@ -2676,11 +2847,11 @@ mod sys_tests {
         fn wrmsr_instruction_combines_edx_eax_and_ignores_the_upper_register_halves() {
             // wrmsr; hlt
             let h = run_ok(&[0x0f, 0x30, 0xf4], |h| {
-                h.cpu.gpr[RCX] = TEST_MSR_PAT as u64;
+                h.cpu.gpr[RCX] = TEST_MSR_SFMASK as u64;
                 h.cpu.gpr[RAX] = 0xffff_ffff_5566_7788;
                 h.cpu.gpr[RDX] = 0xaaaa_aaaa_1122_3344;
             });
-            assert_eq!(h.cpu.pat, 0x1122_3344_5566_7788);
+            assert_eq!(h.cpu.sfmask, 0x1122_3344_5566_7788);
         }
 
         #[test]
@@ -3449,7 +3620,6 @@ mod sys_tests {
             for (bit, name) in [
                 (0, "VME"),
                 (1, "PVI"),
-                (6, "MCE"),
                 (12, "LA57"),
                 (13, "VMXE"),
                 (14, "SMXE"),
@@ -3516,7 +3686,7 @@ mod sys_tests {
                 let h = assert_general_protection_zero(&[0x44, 0x0f, 0x22, 0xc0, 0xf4], |h| {
                     h.cpu.gpr[RAX] = 1 << bit
                 });
-                assert_eq!(h.cpu.cr8, 0, "bit {bit}");
+                assert_eq!(h.cpu.dev.lapic.tpr(), 0, "bit {bit}");
             }
         }
 
