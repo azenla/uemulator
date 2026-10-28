@@ -987,7 +987,7 @@ impl Cpu {
         let mem_addr = if i.md == MODRM_MOD_REGISTER {
             None
         } else {
-            Some(self.linear_address(i, self.effective_address(i, next)))
+            Some(self.linear_address(i, self.effective_address(i, next))?)
         };
         let operand_size = if i.opsize == 8 { 8 } else { 4 };
         match opcode {
@@ -1090,7 +1090,7 @@ impl Cpu {
                 let selector = self.mm_get(rm);
                 for k in 0..MMX_QWORD_BYTES as u64 {
                     if (selector >> (8 * k + 7)) & 1 != 0 {
-                        let addr = self.linear_address(i, self.gpr[GPR_RDI].wrapping_add(k));
+                        let addr = self.linear_address(i, self.gpr[GPR_RDI].wrapping_add(k))?;
                         self.write(addr, 1, (data >> (8 * k)) & 0xff)?;
                     }
                 }
@@ -1247,7 +1247,7 @@ impl Cpu {
         let mem_addr = if i.md == MODRM_MOD_REGISTER {
             None
         } else {
-            Some(self.linear_address(i, self.effective_address(i, next)))
+            Some(self.linear_address(i, self.effective_address(i, next))?)
         };
         // Every 128-bit memory operand of a legacy-SSE instruction must be 16-byte aligned (#GP(0))
         // except for the explicitly unaligned forms: movups, movupd and movdqu loads.

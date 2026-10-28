@@ -103,14 +103,14 @@ impl Cpu {
         let vvvv = self.read_gpr(i.vex_v, size, true);
         match (op, i.rep, i.p66) {
             (OP_ANDN, REP_NONE, false) => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let source = self.load_operand(loc, size, i)?;
                 let result = !vvvv & source & operand_mask;
                 self.write_gpr(i.reg, size, true, result);
                 self.set_eflags_arith(result_flags(result, size));
             }
             (OP_GROUP17, REP_NONE, false) => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let source = self.load_operand(loc, size, i)? & operand_mask;
                 let (result, carry) = match i.reg & 7 {
                     GROUP17_BLSR => (source & source.wrapping_sub(1), source == 0),
@@ -123,7 +123,7 @@ impl Cpu {
                 self.set_eflags_arith(result_flags(result, size) | if carry { CF } else { 0 });
             }
             (OP_BZHI_PEXT_PDEP, REP_NONE, false) => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let source = self.load_operand(loc, size, i)? & operand_mask;
                 let index = (vvvv & BEXTR_FIELD_MASK) as u32;
                 let result = if index < bits {
@@ -136,7 +136,7 @@ impl Cpu {
                 self.set_eflags_arith(result_flags(result, size) | carry);
             }
             (OP_BZHI_PEXT_PDEP, prefix @ (REP_F3 | REP_F2), false) => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let selector = self.load_operand(loc, size, i)? & operand_mask;
                 let source = vvvv & operand_mask;
                 let result = if prefix == REP_F3 {
@@ -147,7 +147,7 @@ impl Cpu {
                 self.write_gpr(i.reg, size, true, result);
             }
             (OP_MULX, REP_F2, false) => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let source = self.load_operand(loc, size, i)? & operand_mask;
                 let multiplier = self.gpr[RDX] & operand_mask;
                 let product = source as u128 * multiplier as u128;
@@ -157,7 +157,7 @@ impl Cpu {
                 self.write_gpr(i.reg, size, true, (product >> bits) as u64 & operand_mask);
             }
             (OP_BEXTR_SHIFTS, REP_NONE, false) => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let source = self.load_operand(loc, size, i)? & operand_mask;
                 let start = (vvvv & BEXTR_FIELD_MASK) as u32;
                 let length = ((vvvv >> BEXTR_LENGTH_SHIFT) & BEXTR_FIELD_MASK) as u32;
@@ -172,7 +172,7 @@ impl Cpu {
                 self.set_eflags_arith(if result == 0 { ZF } else { 0 });
             }
             (OP_BEXTR_SHIFTS, shift_prefix, shl) if (shift_prefix == REP_NONE) == shl => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let source = self.load_operand(loc, size, i)? & operand_mask;
                 let count = (vvvv as u32) & (bits - 1);
                 let result = if shl {
@@ -190,7 +190,7 @@ impl Cpu {
                 if i.vex_v != 0 {
                     return Err(Exception::invalid_opcode());
                 }
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let source = self.load_operand(loc, size, i)? & operand_mask;
                 let count = (i.imm as u32) & (bits - 1);
                 let result = if count == 0 {

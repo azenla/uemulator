@@ -141,7 +141,7 @@ fn selector_is_null(sel: u16) -> bool {
 
 /// Descriptor type bit 10 of a code segment: conforming (callable from less privileged code and
 /// exempt from the DPL checks).
-const SEG_TYPE_CONFORMING: u32 = 1 << 10;
+pub(super) const SEG_TYPE_CONFORMING: u32 = 1 << 10;
 
 fn is_conforming_code(seg: &Seg) -> bool {
     seg.is_code() && seg.flags & SEG_TYPE_CONFORMING != 0
@@ -155,7 +155,12 @@ fn selector_error_code(sel: u16) -> u32 {
 /// Operand size of push/pop/pushf/popf in 64-bit mode: 8 bytes, or 2 with a 66 prefix. REX.W
 /// is irrelevant and 4 is not encodable, so `Insn::opsize` must not be used for these.
 fn stack_operand_size(i: &Insn) -> u8 {
-    if i.p66 { 2 } else { 8 }
+    match (i.mode, i.p66) {
+        (CodeMode::Long64, false) => 8,
+        (CodeMode::Long64, true) => 2,
+        (CodeMode::Bits32, false) | (CodeMode::Bits16, true) => 4,
+        (CodeMode::Bits32, true) | (CodeMode::Bits16, false) => 2,
+    }
 }
 
 /// Register number embedded in the low opcode bits (push/pop/mov imm/xchg/bswap), extended by REX.B.
@@ -164,7 +169,13 @@ fn opcode_register(i: &Insn) -> u8 {
 }
 
 fn address_mask(i: &Insn) -> u64 {
-    if i.addr32 { DWORD_MASK } else { u64::MAX }
+    if i.addr16 {
+        WORD_MASK
+    } else if i.addr32 {
+        DWORD_MASK
+    } else {
+        u64::MAX
+    }
 }
 
 fn shift_count_mask(size: u8) -> u64 {
@@ -287,12 +298,12 @@ impl Cpu {
         Ok(())
     }
 
-    fn iopl(&self) -> u8 {
+    pub(super) fn iopl(&self) -> u8 {
         ((self.eflags & IOPL) >> IOPL_SHIFT) as u8
     }
 
     /// EFLAGS bits that popf/iretq may change when executed at `cpl`.
-    fn loadable_eflags(&self, cpl: u8) -> u64 {
+    pub(super) fn loadable_eflags(&self, cpl: u8) -> u64 {
         let mut loadable = EFLAGS_ALWAYS_LOADABLE;
         if cpl <= self.iopl() {
             loadable |= IF;
@@ -320,25 +331,35 @@ impl Cpu {
         }
         if i.addr32 {
             a &= DWORD_MASK;
+        } else if i.addr16 {
+            a &= WORD_MASK;
         }
         a
     }
 
-    /// Applies the segment base. In 64-bit mode only FS and GS have a base; ES/CS/SS/DS
-    /// overrides are ignored.
-    pub fn linear_address(&self, i: &Insn, a: u64) -> u64 {
-        let seg = i.seg as usize;
-        match seg {
-            SEG_FS | SEG_GS => a.wrapping_add(self.seg[seg].base),
-            _ => a,
-        }
+    /// Segment-relative offset `a` to a linear address: the base and limit of the segment the
+    /// instruction names (override prefix, else SS for `bp`/`esp`-based operands, else DS). In
+    /// 64-bit mode only FS and GS have a base; ES/CS/SS/DS overrides are ignored. The limit is
+    /// checked for the first byte only, so an access that starts inside the limit and ends past
+    /// it is not caught.
+    pub fn linear_address(&self, i: &Insn, a: u64) -> ExecResult<u64> {
+        let seg = if i.seg != NO_SEG {
+            i.seg as usize
+        } else if i.ss_default {
+            SEG_SS
+        } else {
+            SEG_DS
+        };
+        self.segment_linear(seg, a)
     }
 
-    pub fn modrm_location(&self, i: &Insn, next: u64) -> Loc {
+    pub fn modrm_location(&self, i: &Insn, next: u64) -> ExecResult<Loc> {
         if i.md == 3 {
-            Loc::Reg(i.rm)
+            Ok(Loc::Reg(i.rm))
         } else {
-            Loc::Mem(self.linear_address(i, self.effective_address(i, next)))
+            Ok(Loc::Mem(
+                self.linear_address(i, self.effective_address(i, next))?,
+            ))
         }
     }
 
@@ -395,6 +416,9 @@ impl Cpu {
 
     /// GPR_RSP is only updated after the store succeeds so a fault leaves it unchanged.
     pub fn push(&mut self, size: u8, v: u64) -> ExecResult<()> {
+        if !self.is_long64() {
+            return self.push_legacy(size, v);
+        }
         let sp = self.gpr[GPR_RSP].wrapping_sub(size as u64);
         self.write_stack(sp, size, v)?;
         self.gpr[GPR_RSP] = sp;
@@ -402,6 +426,9 @@ impl Cpu {
     }
 
     pub fn pop(&mut self, size: u8) -> ExecResult<u64> {
+        if !self.is_long64() {
+            return self.pop_legacy(size);
+        }
         let v = self.read_stack(self.gpr[GPR_RSP], size)?;
         self.gpr[GPR_RSP] = self.gpr[GPR_RSP].wrapping_add(size as u64);
         Ok(v)
@@ -572,7 +599,7 @@ impl Cpu {
     /// the others use rDX:rAX. Division raises #DE for a zero divisor and for a quotient that does
     /// not fit the destination.
     fn mul_div(&mut self, i: &Insn, next: u64, size: u8) -> ExecResult<()> {
-        let loc = self.modrm_location(i, next);
+        let loc = self.modrm_location(i, next)?;
         let kind = i.reg & 7;
         let src = self.load_operand(loc, size, i)?;
         let bits = size as u32 * 8;
@@ -690,7 +717,7 @@ impl Cpu {
                 address =
                     address.wrapping_add((signed_offset.div_euclid(bits) * size as i64) as u64);
             }
-            Loc::Mem(self.linear_address(i, address))
+            Loc::Mem(self.linear_address(i, address)?)
         };
         let bit = if imm_offset || i.md == 3 {
             (offset as i64).rem_euclid(bits) as u32
@@ -726,7 +753,7 @@ impl Cpu {
         let element = size as u64;
         let copies = matches!(op, 0xa4 | 0xa5);
         let dst_linear = self.gpr[GPR_RDI];
-        let src_linear = self.linear_address(i, self.gpr[GPR_RSI]);
+        let src_linear = self.linear_address(i, self.gpr[GPR_RSI])?;
         let room = |linear: u64| (PAGE_SIZE - (linear & PAGE_OFFSET_MASK)) / element;
         let mut elements = self.gpr[GPR_RCX].min(budget).min(room(dst_linear));
         if copies {
@@ -828,7 +855,7 @@ impl Cpu {
             }
             // Only the source honours a segment override; the destination is always ES, which has
             // no base in 64-bit mode.
-            let src = self.linear_address(i, self.gpr[GPR_RSI] & amask);
+            let src = self.linear_address(i, self.gpr[GPR_RSI] & amask)?;
             let dst = self.gpr[GPR_RDI] & amask;
             match op {
                 // movs
@@ -921,7 +948,7 @@ impl Cpu {
     /// system descriptors and execute-only code are #GP for a data register; data and
     /// non-conforming code need DPL >= max(CPL, RPL), conforming code is exempt; SS must be
     /// writable data with RPL = DPL = CPL; a missing segment is #SS for SS and #NP otherwise.
-    fn checked_data_seg(&mut self, idx: usize, sel: u16, cpl: u8) -> ExecResult<Seg> {
+    pub(super) fn checked_data_seg(&mut self, idx: usize, sel: u16, cpl: u8) -> ExecResult<Seg> {
         if selector_is_null(sel) {
             if idx == SEG_SS && cpl == USER_CPL {
                 return Err(Exception::general_protection(0));
@@ -1095,6 +1122,9 @@ impl Cpu {
         if self.svm.guest.is_some() {
             self.svm_intercept(i, next)?;
         }
+        if i.mode != CodeMode::Long64 && self.exec_legacy(i, next)? {
+            return Ok(());
+        }
         if i.vex {
             return self.exec_vex(i, next);
         }
@@ -1107,7 +1137,7 @@ impl Cpu {
                 let size = if form & 1 == 0 { 1 } else { osz };
                 match form {
                     0 | 1 => {
-                        let loc = self.modrm_location(i, next);
+                        let loc = self.modrm_location(i, next)?;
                         let a = self.load_operand(loc, size, i)?;
                         let b = self.read_gpr(i.reg, size, rex);
                         let saved = self.save_flags();
@@ -1117,7 +1147,7 @@ impl Cpu {
                         }
                     }
                     2 | 3 => {
-                        let loc = self.modrm_location(i, next);
+                        let loc = self.modrm_location(i, next)?;
                         let b = self.load_operand(loc, size, i)?;
                         let a = self.read_gpr(i.reg, size, rex);
                         let r = self.alu(operation, a, b, size);
@@ -1150,7 +1180,7 @@ impl Cpu {
             }
             // movsxd
             0x63 => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let v = self.load_operand(loc, 4, i)?;
                 if osz == 8 {
                     self.gpr[i.reg as usize] = v as u32 as i32 as i64 as u64;
@@ -1165,7 +1195,7 @@ impl Cpu {
             }
             // imul r, r/m, imm32 / imm8
             0x69 | 0x6b => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let a = self.load_operand(loc, osz, i)?;
                 let r = self.imul_truncated(a, i.imm as u64, osz);
                 self.write_gpr(i.reg, osz, true, r);
@@ -1180,7 +1210,7 @@ impl Cpu {
             // group 1: ALU r/m, imm
             0x80 | 0x81 | 0x83 => {
                 let size = if op == 0x80 { 1 } else { osz };
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let a = self.load_operand(loc, size, i)?;
                 let operation = i.reg & 7;
                 let saved = self.save_flags();
@@ -1192,7 +1222,7 @@ impl Cpu {
             // test r/m, r
             0x84 | 0x85 => {
                 let size = if op == 0x84 { 1 } else { osz };
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let a = self.load_operand(loc, size, i)?;
                 let b = self.read_gpr(i.reg, size, rex);
                 self.set_lazy_flags(LazyFlagsOp::Logic, size, a & b, 0, 0);
@@ -1200,7 +1230,7 @@ impl Cpu {
             // xchg r/m, r
             0x86 | 0x87 => {
                 let size = if op == 0x86 { 1 } else { osz };
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let a = self.load_operand(loc, size, i)?;
                 let b = self.read_gpr(i.reg, size, rex);
                 self.store_operand(loc, size, i, b)?;
@@ -1209,14 +1239,14 @@ impl Cpu {
             // mov r/m, r
             0x88 | 0x89 => {
                 let size = if op == 0x88 { 1 } else { osz };
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let v = self.read_gpr(i.reg, size, rex);
                 self.store_operand(loc, size, i, v)?;
             }
             // mov r, r/m
             0x8a | 0x8b => {
                 let size = if op == 0x8a { 1 } else { osz };
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let v = self.load_operand(loc, size, i)?;
                 self.write_gpr(i.reg, size, rex, v);
             }
@@ -1229,7 +1259,7 @@ impl Cpu {
                     return Err(Exception::invalid_opcode());
                 }
                 let v = self.seg[idx].sel as u64;
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let size = if i.md == 3 { osz } else { 2 };
                 self.store_operand(loc, size, i, v)?;
             }
@@ -1247,7 +1277,7 @@ impl Cpu {
                 if idx == SEG_CS || idx > SEG_GS {
                     return Err(Exception::invalid_opcode());
                 }
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let sel = self.load_operand(loc, 2, i)? as u16;
                 self.load_data_seg(idx, sel)?;
                 // Interrupts are held off until after the instruction following mov ss, so that
@@ -1262,7 +1292,7 @@ impl Cpu {
                     return Err(Exception::invalid_opcode());
                 }
                 let sz = stack_operand_size(i);
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let sp = self.gpr[GPR_RSP];
                 let v = self.read_stack(sp, sz)?;
                 self.gpr[GPR_RSP] = sp.wrapping_add(sz as u64);
@@ -1350,14 +1380,7 @@ impl Cpu {
             // mov al/eax, moffs and mov moffs, al/eax
             0xa0..=0xa3 => {
                 let size = if op & 1 == 0 { 1 } else { osz };
-                let a = self.linear_address(
-                    i,
-                    if i.addr32 {
-                        i.imm as u64 & DWORD_MASK
-                    } else {
-                        i.imm as u64
-                    },
-                );
+                let a = self.linear_address(i, i.imm as u64 & address_mask(i))?;
                 if op < 0xa2 {
                     let v = self.read(a, size)?;
                     self.write_gpr(0, size, true, v);
@@ -1393,7 +1416,7 @@ impl Cpu {
             // shift/rotate group: imm8, 1 or CL count
             0xc0 | 0xc1 | 0xd0..=0xd3 => {
                 let size = if op & 1 == 0 { 1 } else { osz };
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let count = match op {
                     0xc0 | 0xc1 => i.imm as u64,
                     0xd0 | 0xd1 => 1,
@@ -1418,7 +1441,7 @@ impl Cpu {
                     return Err(Exception::invalid_opcode());
                 }
                 let size = if op == 0xc6 { 1 } else { osz };
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 self.store_operand(loc, size, i, i.imm as u64)?;
             }
             // enter: the nesting level is taken modulo 32. Registers are committed only after the
@@ -1483,7 +1506,7 @@ impl Cpu {
             0xd7 => {
                 let a =
                     self.gpr[GPR_RBX].wrapping_add(self.gpr[GPR_RAX] & BYTE_MASK) & address_mask(i);
-                let v = self.read(self.linear_address(i, a), 1)?;
+                let v = self.read(self.linear_address(i, a)?, 1)?;
                 self.write_gpr(0, 1, true, v);
             }
             0xd8..=0xdf => return self.x87(i, next),
@@ -1510,6 +1533,8 @@ impl Cpu {
             }
             // in/out with imm8 port (e4..e7) or DX (ec..ef)
             0xe4..=0xe7 | 0xec..=0xef => return self.port_io(i, next),
+            // insb/insw/insd, outsb/outsw/outsd
+            0x6c..=0x6f => return self.string_io(i, next),
             // call rel32
             0xe8 => {
                 self.push(8, next)?;
@@ -1538,7 +1563,7 @@ impl Cpu {
                 let size = if op == 0xf6 { 1 } else { osz };
                 match i.reg & 7 {
                     GROUP3_TEST | GROUP3_TEST_ALIAS => {
-                        let loc = self.modrm_location(i, next);
+                        let loc = self.modrm_location(i, next)?;
                         let a = self.load_operand(loc, size, i)?;
                         self.set_lazy_flags(
                             LazyFlagsOp::Logic,
@@ -1549,12 +1574,12 @@ impl Cpu {
                         );
                     }
                     GROUP3_NOT => {
-                        let loc = self.modrm_location(i, next);
+                        let loc = self.modrm_location(i, next)?;
                         let a = self.load_operand(loc, size, i)?;
                         self.store_operand(loc, size, i, !a)?;
                     }
                     GROUP3_NEG => {
-                        let loc = self.modrm_location(i, next);
+                        let loc = self.modrm_location(i, next)?;
                         let a = self.load_operand(loc, size, i)?;
                         let r = 0u64.wrapping_sub(a) & mask(size);
                         let saved = self.save_flags();
@@ -1595,7 +1620,7 @@ impl Cpu {
             // group 4/5: inc, dec, call, jmp, push (far forms are not implemented)
             0xfe | 0xff => {
                 let size = if op == 0xfe { 1 } else { osz };
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 match i.reg & 7 {
                     GROUP5_INC | GROUP5_DEC => {
                         let a = self.load_operand(loc, size, i)?;
@@ -1638,7 +1663,7 @@ impl Cpu {
     /// #GP(0) unless an I/O access of `size` bytes at `port` is permitted. At CPL <= IOPL it
     /// always is; otherwise every bit the access covers in the TSS I/O permission bitmap must be
     /// clear, and the bitmap must lie inside the TSS limit (SDM 3A 20.5; QEMU `check_io`).
-    fn check_io_permission(&mut self, port: u16, size: u8) -> ExecResult<()> {
+    pub(super) fn check_io_permission(&mut self, port: u16, size: u8) -> ExecResult<()> {
         if self.cpl <= self.iopl() {
             return Ok(());
         }
@@ -1727,6 +1752,8 @@ impl Cpu {
             // group 6 / group 7 (sldt, ltr, sgdt, lidt, ...)
             0x100 | 0x101 => return self.sys_group(i, next),
             0x105 => return self.do_syscall(next),
+            0x134 => return self.do_sysenter(),
+            0x135 => return self.do_sysexit(),
             0x107 => return self.do_sysret(i),
             // clts
             0x106 => {
@@ -1766,7 +1793,7 @@ impl Cpu {
             // cmovcc: the source is always read (it can fault); a 32-bit cmov that does not move
             // still zero-extends the destination.
             0x140..=0x14f => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let v = self.load_operand(loc, osz, i)?;
                 if self.condition_holds((i.op & 15) as u8) {
                     self.write_gpr(i.reg, osz, true, v);
@@ -1783,7 +1810,7 @@ impl Cpu {
             }
             // setcc
             0x190..=0x19f => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let v = self.condition_holds((i.op & 15) as u8) as u64;
                 self.store_operand(loc, 1, i, v)?;
             }
@@ -1820,7 +1847,7 @@ impl Cpu {
             }
             // shld imm8 / cl, shrd imm8 / cl
             0x1a4 | 0x1a5 | 0x1ac | 0x1ad => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let a = self.load_operand(loc, osz, i)?;
                 let b = self.read_gpr(i.reg, osz, rex);
                 let count = if op & 1 == 0 {
@@ -1850,7 +1877,7 @@ impl Cpu {
             0x1ae => return self.group_ae(i, next),
             // imul r, r/m
             0x1af => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let b = self.load_operand(loc, osz, i)?;
                 let a = self.read_gpr(i.reg, osz, true);
                 let r = self.imul_truncated(a, b, osz);
@@ -1860,7 +1887,7 @@ impl Cpu {
             // hardware, so a write fault is taken either way.
             0x1b0 | 0x1b1 => {
                 let size = if op == 0x1b0 { 1 } else { osz };
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let dest = self.load_operand(loc, size, i)?;
                 let acc = self.read_gpr(0, size, true);
                 let m = mask(size);
@@ -1877,7 +1904,7 @@ impl Cpu {
             // xadd r/m, r
             0x1c0 | 0x1c1 => {
                 let size = if op == 0x1c0 { 1 } else { osz };
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let dest = self.load_operand(loc, size, i)?;
                 let src = self.read_gpr(i.reg, size, rex);
                 let saved = self.save_flags();
@@ -1890,7 +1917,7 @@ impl Cpu {
                 if i.md == 3 {
                     return Err(Exception::invalid_opcode());
                 }
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let v = self.read_gpr(i.reg, osz, true);
                 self.store_operand(loc, osz, i, v)?;
             }
@@ -1905,7 +1932,7 @@ impl Cpu {
                 if i.md == 3 || i.reg & 7 != 1 {
                     return Err(self.unimplemented_opcode(i));
                 }
-                let a = self.linear_address(i, self.effective_address(i, next));
+                let a = self.linear_address(i, self.effective_address(i, next))?;
                 if osz == 8 {
                     return self.cmpxchg16b(a, next);
                 }
@@ -1933,7 +1960,7 @@ impl Cpu {
             // movzx / movsx from byte or word
             0x1b6 | 0x1b7 | 0x1be | 0x1bf => {
                 let source_size = if op & 1 == 0 { 1 } else { 2 };
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let v = self.load_operand(loc, source_size, i)?;
                 let v = if op < 0x1b8 {
                     v
@@ -1949,7 +1976,7 @@ impl Cpu {
                 if i.rep != REP_REPE {
                     return Err(self.unimplemented_opcode(i));
                 }
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let v = self.load_operand(loc, osz, i)? & mask(osz);
                 self.write_gpr(i.reg, osz, true, v.count_ones() as u64);
                 // CF, OF, SF, AF and PF are cleared; ZF reports a zero source.
@@ -1959,7 +1986,7 @@ impl Cpu {
             // gives the operand width and CF. On a CPU without ABM this opcode is plain bsr, which
             // is why CPUID must advertise ABM (0x8000_0001 ECX) together with this arm.
             0x1bd if i.rep == REP_REPE => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let v = self.load_operand(loc, osz, i)? & mask(osz);
                 let operand_bits = osz as u32 * 8;
                 let count = v.leading_zeros() - (u64::BITS - operand_bits);
@@ -1977,7 +2004,7 @@ impl Cpu {
             // operand width and CF. Plain bsf without the prefix, hence BMI1 and this arm go
             // together.
             0x1bc if i.rep == REP_REPE => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let v = self.load_operand(loc, osz, i)? & mask(osz);
                 let count = if v == 0 {
                     osz as u32 * 8
@@ -1996,7 +2023,7 @@ impl Cpu {
             }
             // bsf / bsr: a zero source sets ZF and leaves the destination unchanged
             0x1bc | 0x1bd => {
-                let loc = self.modrm_location(i, next);
+                let loc = self.modrm_location(i, next)?;
                 let v = self.load_operand(loc, osz, i)? & mask(osz);
                 let f = self.eflags_full();
                 if v == 0 {
@@ -8273,12 +8300,17 @@ mod exec_tests {
     }
 
     #[test]
-    fn ins_and_outs_are_not_implemented() {
-        // 0x6c..=0x6f are not handled by the interpreter at all; they raise #UD.
-        for snippet in [code::INSB, code::OUTSB] {
-            let (_, stop) = run_regs_stop(snippet, &[]);
-            assert_eq!(stop, ud(), "{snippet:02x?}");
-        }
+    fn ins_and_outs_move_bytes_between_a_port_and_memory() {
+        // insb; outsb; hlt: the spare port reads as all ones.
+        let mut h = Harness::new(&[0x6c, 0x6e, HLT]);
+        h.cpu.gpr[RDX] = SPARE_PORT as u64;
+        h.cpu.gpr[RDI] = SCRATCH;
+        h.cpu.gpr[RSI] = SCRATCH + 0x10;
+        h.write(SCRATCH + 0x10, &[0x5a]);
+        h.run_to_halt();
+        assert_eq!(h.read(SCRATCH, 1), [0xff]);
+        assert_eq!(h.cpu.gpr[RDI], SCRATCH + 1);
+        assert_eq!(h.cpu.gpr[RSI], SCRATCH + 0x11);
     }
 
     #[test]
@@ -8919,13 +8951,13 @@ mod exec_tests {
         cpu.gpr[RBX] = 0x40;
         let i = lea(&[0x64, 0x48, 0x8b, 0x03]);
         assert_eq!(cpu.effective_address(&i, 0), 0x40);
-        assert_eq!(cpu.linear_address(&i, 0x40), 0x1_0040);
+        assert_eq!(cpu.linear_address(&i, 0x40).unwrap(), 0x1_0040);
         // Without a segment prefix, or with CS/DS/ES/SS, nothing is added.
         let i = lea(&[0x48, 0x8b, 0x03]);
-        assert_eq!(cpu.linear_address(&i, 0x40), 0x40);
+        assert_eq!(cpu.linear_address(&i, 0x40).unwrap(), 0x40);
         cpu.seg[SEG_DS].base = 0x9999;
         let i = lea(&[0x3e, 0x48, 0x8b, 0x03]);
-        assert_eq!(cpu.linear_address(&i, 0x40), 0x40);
+        assert_eq!(cpu.linear_address(&i, 0x40).unwrap(), 0x40);
     }
 
     #[test]
@@ -8934,13 +8966,16 @@ mod exec_tests {
         let cpu = &mut pair.interp.cpu;
         cpu.gpr[RBX] = 0x1000;
         let i = decoded(&[0x48, 0x89, 0xd8]); // mov rax, rbx: reg-reg
-        assert!(matches!(cpu.modrm_location(&i, 0), Loc::Reg(0)));
+        assert!(matches!(cpu.modrm_location(&i, 0).unwrap(), Loc::Reg(0)));
         let i = decoded(&[0x48, 0x89, 0x03]); // mov [rbx], rax
-        assert!(matches!(cpu.modrm_location(&i, 0), Loc::Mem(0x1000)));
+        assert!(matches!(
+            cpu.modrm_location(&i, 0).unwrap(),
+            Loc::Mem(0x1000)
+        ));
         let i = decoded(&[0x4c, 0x89, 0xc8]); // mov rax, r9: REX.R is the reg field, rm stays rax
-        assert!(matches!(cpu.modrm_location(&i, 0), Loc::Reg(0)));
+        assert!(matches!(cpu.modrm_location(&i, 0).unwrap(), Loc::Reg(0)));
         let i = decoded(&[0x49, 0x89, 0xc1]); // mov r9, rax: REX.B extends rm
-        assert!(matches!(cpu.modrm_location(&i, 0), Loc::Reg(9)));
+        assert!(matches!(cpu.modrm_location(&i, 0).unwrap(), Loc::Reg(9)));
     }
 
     #[test]
@@ -13873,16 +13908,15 @@ mod exec_tests {
             (MSR, "msr"),
             (CX8, "cmpxchg8b"),
             (CMOV, "cmov"),
+            (SEP, "sysenter"),
         ] {
             assert_ne!(edx & bit, 0, "{name} is implemented and advertised");
         }
-        for (bit, name) in [(APIC, "apic"), (SEP, "sysenter")] {
-            assert_eq!(
-                edx & bit,
-                0,
-                "{name} is not implemented and must not be advertised"
-            );
-        }
+        assert_eq!(
+            edx & APIC,
+            0,
+            "apic is not implemented and must not be advertised"
+        );
         // The exact set of leaf 1 ECX bits is pinned in the tests in sys.rs; these must stay clear because
         // their instructions (or the OS support behind them) do not exist.
         for (bit, name) in [(1 << 5, "vmx"), (1 << 31, "hypervisor")] {
@@ -17072,12 +17106,6 @@ mod code {
     // mov rax, [rbx]
     // hlt
     pub(super) const MOV_RAX_MEM_RBX: &[u8] = &[0x48, 0x8b, 0x03, 0xf4];
-    // insb
-    // hlt
-    pub(super) const INSB: &[u8] = &[0x6c, 0xf4];
-    // outsb
-    // hlt
-    pub(super) const OUTSB: &[u8] = &[0x6e, 0xf4];
     // out dx, al
     // xor eax, eax
     // in al, dx

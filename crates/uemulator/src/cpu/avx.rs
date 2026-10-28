@@ -303,7 +303,7 @@ impl Cpu {
                 | (OPCODE_MAP_0F38, 0x2a, true)
         );
         if two_lanes && i.md != MODRM_MOD_REGISTER && explicitly_aligned {
-            let address = self.linear_address(i, self.effective_address(i, next));
+            let address = self.linear_address(i, self.effective_address(i, next))?;
             if address & 31 != 0 {
                 return Err(Exception::general_protection(0));
             }

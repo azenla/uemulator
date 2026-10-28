@@ -60,7 +60,7 @@ fn replicate(v: u128, bytes: usize) -> u128 {
 }
 
 impl Cpu {
-    pub(super) fn vex_address(&self, i: &Insn, next: u64) -> u64 {
+    pub(super) fn vex_address(&self, i: &Insn, next: u64) -> ExecResult<u64> {
         self.linear_address(i, self.effective_address(i, next))
     }
 
@@ -82,7 +82,7 @@ impl Cpu {
         if i.md == 3 {
             return Ok((self.xmm[i.rm as usize], self.ymm_hi[i.rm as usize]));
         }
-        let address = self.vex_address(i, next);
+        let address = self.vex_address(i, next)?;
         let low = self.read_partial(address, bytes.min(LANE_BYTES))?;
         let high = if bytes == YMM_BYTES {
             self.read128(address + LANE_BYTES as u64)?
@@ -214,7 +214,7 @@ impl Cpu {
             if i.addr32 {
                 address &= 0xffff_ffff;
             }
-            let linear = self.linear_address(i, address);
+            let linear = self.linear_address(i, address)?;
             match self.read(linear, element_bytes as u8) {
                 Ok(value) => {
                     let element_mask = ((1u128 << (element_bytes * 8)) - 1) << shift;
@@ -326,7 +326,7 @@ impl Cpu {
                 let count = if i.md == 3 {
                     self.xmm[rm]
                 } else {
-                    let address = self.vex_address(i, next);
+                    let address = self.vex_address(i, next)?;
                     self.read128(address)?
                 };
                 let low = self.run_legacy_registers(i, self.xmm[vvvv], count)?;
@@ -529,7 +529,7 @@ impl Cpu {
                 if i.md == 3 {
                     self.set_vector(rm, half, 0, false);
                 } else {
-                    let address = self.vex_address(i, next);
+                    let address = self.vex_address(i, next)?;
                     self.write128(address, half)?;
                 }
             }
@@ -548,7 +548,7 @@ impl Cpu {
                 let element = if i.md == 3 {
                     self.xmm[rm]
                 } else {
-                    let address = self.vex_address(i, next);
+                    let address = self.vex_address(i, next)?;
                     self.read_partial(address, bytes)?
                 };
                 let filled = replicate(element, bytes);
@@ -558,7 +558,7 @@ impl Cpu {
             (OPCODE_MAP_0F38, 0x1a | 0x5a, P66) => {
                 gate!();
                 require!(l && i.md != 3 && i.vex_v == 0 && !wide_w);
-                let address = self.vex_address(i, next);
+                let address = self.vex_address(i, next)?;
                 let value = self.read128(address)?;
                 self.set_vector(reg, value, value, true);
             }
@@ -691,7 +691,7 @@ impl Cpu {
             (OPCODE_MAP_0F, 0xae, Np) => {
                 gate!();
                 require!(i.md != 3 && !l && i.vex_v == 0 && matches!(i.reg & 7, 2 | 3));
-                let address = self.vex_address(i, next);
+                let address = self.vex_address(i, next)?;
                 if i.reg & 7 == 2 {
                     let value = self.read(address, 4)? as u32;
                     if value & !super::fpu::MXCSR_VALID_BITS != 0 {
@@ -720,7 +720,7 @@ impl Cpu {
                 };
                 // the vmaskmov forms are W0 only
                 require!(!wide_w || matches!(opcode, 0x8c | 0x8e));
-                let address = self.vex_address(i, next);
+                let address = self.vex_address(i, next)?;
                 let (mask_low, mask_high) = (self.xmm[vvvv], self.ymm_hi[vvvv]);
                 let count = operand_bytes / element_bytes;
                 let active = |k: usize| {

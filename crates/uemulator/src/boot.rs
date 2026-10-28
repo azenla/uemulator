@@ -171,6 +171,9 @@ pub struct BootState {
     pub gdt_limit: u16,
     pub cs: u16,
     pub ds: u16,
+    /// Start in real mode at the reset vector instead of in 64-bit mode (a firmware image;
+    /// the other fields are then unused).
+    pub real_mode: bool,
 }
 
 fn put(ram: &mut [u8], addr: u64, data: &[u8]) -> Result<(), Error> {
@@ -307,6 +310,29 @@ pub(crate) fn load(
         gdt_limit: (gdt_bytes.len() - 1) as u16,
         cs: BOOT_CS,
         ds: BOOT_DS,
+        real_mode: false,
+    })
+}
+
+/// Largest firmware image: it is mapped so that it ends at 1 MiB, below the video memory hole.
+const FIRMWARE_MAX_BYTES: usize = 0x6_0000;
+/// Top of the first MiB, where a BIOS image ends. The processor's reset vector (F000:FFF0, which is
+/// 0xFFFF0) is 16 bytes below it.
+const FIRMWARE_END: u64 = 0x10_0000;
+
+/// Places a firmware image at the top of the first mebibyte and returns the real-mode reset
+/// state. There is no ROM or chipset: the image sits in ordinary RAM, which is enough for a BIOS
+/// that does not write to its own range.
+pub(crate) fn load_firmware(ram: &mut [u8], image: &[u8]) -> Result<BootState, Error> {
+    if image.is_empty() || image.len() > FIRMWARE_MAX_BYTES {
+        return Err(Error::BadConfig(format!(
+            "firmware must be between 1 byte and {FIRMWARE_MAX_BYTES} bytes"
+        )));
+    }
+    put(ram, FIRMWARE_END - image.len() as u64, image)?;
+    Ok(BootState {
+        real_mode: true,
+        ..Default::default()
     })
 }
 

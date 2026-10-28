@@ -65,11 +65,11 @@ const TAG_EMPTY: u16 = 3;
 /// FIP/FCS/FDP/FDS pointer words, which are not tracked and always written as zero.
 /// FNSAVE/FRSTOR append the eight 10-byte registers in stack order right after it. The 16-bit
 /// formats selected by a 66 prefix or real mode are not implemented.
-const ENV_FSW_OFFSET: u64 = 4;
-const ENV_FTW_OFFSET: u64 = 8;
-const ENV_POINTER_FIRST_WORD: u64 = 3;
-const ENV_POINTER_END_WORD: u64 = 7;
-const ENV_SIZE: u64 = 28;
+/// The environment image is seven words (control, status, tag, then FIP, FCS/opcode, FDP, FDS).
+const ENV_FSW_INDEX: u64 = 1;
+const ENV_FTW_INDEX: u64 = 2;
+const ENV_POINTER_FIRST_INDEX: u64 = 3;
+const ENV_WORDS: u64 = 7;
 const EXT_REG_SIZE: u64 = 10;
 
 /// FXSAVE image (SDM layout, 512 bytes). FOP/FIP/FDP at 6..24 are not written.
@@ -186,6 +186,11 @@ fn round_to_integral(v: f64, rounding_control: u16) -> f64 {
         ROUND_UP => v.ceil(),
         _ => v.trunc(),
     }
+}
+
+/// Width in bytes of the words of the fnstenv/fnsave image: 2 with a 16-bit operand size.
+fn env_word(i: &Insn) -> u8 {
+    if i.opsize == 2 { 2 } else { 4 }
 }
 
 impl Cpu {
@@ -620,7 +625,7 @@ impl Cpu {
             self.rip = next;
             return Ok(());
         }
-        let a = match self.modrm_location(i, next) {
+        let a = match self.modrm_location(i, next)? {
             Loc::Mem(a) => a,
             _ => unreachable!(),
         };
@@ -653,10 +658,10 @@ impl Cpu {
                         self.fpop();
                     }
                 }
-                4 => self.fldenv(a)?,
+                4 => self.fldenv(a, env_word(i))?,
                 // fldcw: no exception unmasking is modelled
                 5 => self.fcw = self.read(a, 2)? as u16,
-                6 => self.fnstenv(a)?,
+                6 => self.fnstenv(a, env_word(i))?,
                 7 => self.write(a, 2, self.fcw as u64)?,
                 // /1 is not an instruction
                 _ => return Err(Exception::invalid_opcode()),
@@ -714,8 +719,8 @@ impl Cpu {
                     self.write(a, 8, v as u64)?;
                     self.fpop();
                 }
-                4 => self.frstor(a)?,
-                6 => self.fnsave(a)?,
+                4 => self.frstor(a, env_word(i))?,
+                6 => self.fnsave(a, env_word(i))?,
                 7 => self.write(a, 2, self.fsw as u64)?,
                 _ => return Err(self.unimplemented_opcode(i)),
             },
@@ -790,13 +795,17 @@ impl Cpu {
         tag_word
     }
 
-    fn fnstenv(&mut self, a: u64) -> ExecResult<()> {
-        self.write(a, 4, self.fcw as u64)?;
-        self.write(a + ENV_FSW_OFFSET, 4, self.fsw as u64)?;
+    /// The environment image: control, status and tag words, then the four pointer words, each
+    /// `word` bytes wide (4 normally, 2 for the 16-bit operand-size format). The pointers are
+    /// always zero.
+    fn fnstenv(&mut self, a: u64, word: u8) -> ExecResult<()> {
+        let step = word as u64;
+        self.write(a, word, self.fcw as u64)?;
+        self.write(a + ENV_FSW_INDEX * step, word, self.fsw as u64)?;
         let tag_word = self.full_tag();
-        self.write(a + ENV_FTW_OFFSET, 4, tag_word as u64)?;
-        for word in ENV_POINTER_FIRST_WORD..ENV_POINTER_END_WORD {
-            self.write(a + word * 4, 4, 0)?;
+        self.write(a + ENV_FTW_INDEX * step, word, tag_word as u64)?;
+        for index in ENV_POINTER_FIRST_INDEX..ENV_WORDS {
+            self.write(a + index * step, word, 0)?;
         }
         // fnstenv masks all exceptions after saving the environment
         self.fcw |= FCW_EXCEPTION_MASKS;
@@ -804,22 +813,24 @@ impl Cpu {
     }
 
     /// Only a 2-bit "empty or not" distinction survives into `ftw`.
-    fn fldenv(&mut self, a: u64) -> ExecResult<()> {
+    fn fldenv(&mut self, a: u64, word: u8) -> ExecResult<()> {
+        let step = word as u64;
         self.fcw = self.read(a, 2)? as u16;
-        self.fsw = self.read(a + ENV_FSW_OFFSET, 2)? as u16;
-        let tag_word = self.read(a + ENV_FTW_OFFSET, 2)? as u16;
+        self.fsw = self.read(a + ENV_FSW_INDEX * step, 2)? as u16;
+        let tag_word = self.read(a + ENV_FTW_INDEX * step, 2)? as u16;
         self.ftw = (0..STACK_DEPTH)
             .filter(|physical| (tag_word >> (2 * physical)) & 3 != TAG_EMPTY)
             .fold(0, |mask, physical| mask | (1 << physical));
         Ok(())
     }
 
-    fn fnsave(&mut self, a: u64) -> ExecResult<()> {
-        self.fnstenv(a)?;
+    fn fnsave(&mut self, a: u64, word: u8) -> ExecResult<()> {
+        self.fnstenv(a, word)?;
+        let registers = a + ENV_WORDS * word as u64;
         for stack_pos in 0..STACK_DEPTH {
             let raw = self.st_raw(stack_pos);
             for (offset, byte) in raw.iter().enumerate() {
-                let at = a + ENV_SIZE + stack_pos as u64 * EXT_REG_SIZE + offset as u64;
+                let at = registers + stack_pos as u64 * EXT_REG_SIZE + offset as u64;
                 self.write(at, 1, *byte as u64)?;
             }
         }
@@ -830,12 +841,13 @@ impl Cpu {
         Ok(())
     }
 
-    fn frstor(&mut self, a: u64) -> ExecResult<()> {
-        self.fldenv(a)?;
+    fn frstor(&mut self, a: u64, word: u8) -> ExecResult<()> {
+        self.fldenv(a, word)?;
+        let registers = a + ENV_WORDS * word as u64;
         for stack_pos in 0..STACK_DEPTH {
             let mut raw = [0u8; 10];
             for (offset, byte) in raw.iter_mut().enumerate() {
-                let at = a + ENV_SIZE + stack_pos as u64 * EXT_REG_SIZE + offset as u64;
+                let at = registers + stack_pos as u64 * EXT_REG_SIZE + offset as u64;
                 *byte = self.read(at, 1)? as u8;
             }
             let physical = (self.top() + stack_pos) & STACK_MASK;

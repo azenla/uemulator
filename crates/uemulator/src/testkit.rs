@@ -40,6 +40,9 @@ pub(crate) const HARNESS_RAM_BYTES: usize = 32 << 20;
 pub(crate) const CODE_BASE: u64 = KERNEL_LOAD + FAKE_ENTRY_OFFSET;
 /// Initial `rsp`. Grows down through identity-mapped RAM that nothing else uses.
 pub(crate) const STACK_TOP: u64 = 0x80_0000;
+/// Where `Harness::real` puts the snippet (0000:7c00) and the top of its stack.
+pub(crate) const REAL_CODE: u64 = 0x7c00;
+pub(crate) const REAL_STACK: u64 = 0x7000;
 /// 1 MiB of RAM (physical == linear) that snippets may use freely for data.
 pub(crate) const SCRATCH: u64 = 0x40_0000;
 pub(crate) const SCRATCH_BYTES: u64 = 1 << 20;
@@ -180,6 +183,23 @@ impl Harness {
         }
     }
 
+    /// A real-mode CPU (paging and long mode off) running `code` at 0000:7c00 with the stack at
+    /// 0000:7000 and every data segment 0.
+    pub fn real(code: &[u8]) -> Self {
+        let mut harness = Self::new(&[HLT]);
+        harness.cpu.reset_to_real_mode();
+        harness.write(REAL_CODE, code);
+        let code_segment = harness.cpu.seg[crate::cpu::SEG_CS];
+        harness.cpu.seg[crate::cpu::SEG_CS] = crate::cpu::Seg {
+            sel: 0,
+            base: 0,
+            ..code_segment
+        };
+        harness.cpu.rip = REAL_CODE;
+        harness.cpu.gpr[RSP] = REAL_STACK;
+        harness
+    }
+
     /// Switches this CPU to the host JIT. Returns false when the host has none (non-aarch64 and
     /// non-x86_64 hosts, or a build without the `jit` feature); the harness then stays
     /// interpreted.
@@ -217,7 +237,7 @@ impl Harness {
         while self.cpu.icount - start < max_insns {
             self.cpu.interrupt_shadow = false;
             self.cpu.icount += 1;
-            let result = if self.cpu.jit.is_some() {
+            let result = if self.cpu.jit.is_some() && self.cpu.is_long64() {
                 self.cpu.step_block()
             } else {
                 self.cpu.step()
@@ -245,6 +265,25 @@ impl Harness {
             }
         }
         Stop::Limit
+    }
+
+    /// Like `run`, but exceptions and software interrupts are delivered through the IDT/IVT as the
+    /// run loop would, and execution continues.
+    pub fn run_delivering(&mut self, max_insns: u64) -> Stop {
+        loop {
+            match self.run(max_insns) {
+                Stop::Fault {
+                    vector,
+                    error_code,
+                    software,
+                } => {
+                    if let Some(reason) = self.cpu.deliver_event(vector, error_code, software) {
+                        return Stop::Exit(format!("{reason:?}"));
+                    }
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Runs to `hlt`, panicking with the stop reason and a register dump otherwise.

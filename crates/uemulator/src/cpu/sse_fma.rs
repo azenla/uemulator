@@ -391,7 +391,7 @@ impl Cpu {
             if i.md == 3 {
                 self.set_vector(rm, packed, 0, false);
             } else {
-                let address = self.vex_address(i, next);
+                let address = self.vex_address(i, next)?;
                 if wide {
                     self.write128(address, packed)?;
                 } else {

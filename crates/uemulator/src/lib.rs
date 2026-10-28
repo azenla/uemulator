@@ -121,6 +121,7 @@ mod api_tests {
             gdt_limit: 5,
             cs: 6,
             ds: 7,
+            real_mode: false,
         };
         assert_eq!(
             (

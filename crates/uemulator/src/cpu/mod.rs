@@ -8,7 +8,15 @@ pub(crate) mod exception;
 mod exec;
 pub(crate) mod flags;
 mod fpu;
+pub(crate) mod legacy;
+mod legacy_flow;
+#[cfg(test)]
+pub(crate) mod legacy_support;
+mod legacy_task;
+#[cfg(test)]
+mod legacy_tests;
 pub(crate) mod mem;
+pub(crate) mod modes;
 mod protection;
 mod sse;
 mod svm;
@@ -156,6 +164,10 @@ impl Seg {
     }
     pub fn long(&self) -> bool {
         self.flags & SEG_LONG != 0
+    }
+    /// The descriptor type field (bits 11:8), which for a system descriptor says what it is.
+    pub fn descriptor_type(&self) -> u64 {
+        ((self.flags >> 8) & 0xf) as u64
     }
 }
 
@@ -503,6 +515,12 @@ impl Cpu {
         };
         cpu.ram_base = cpu.ram.as_ptr() as u64;
         cpu.set_cpl(0);
+        if boot.real_mode {
+            cpu.reset_to_real_mode();
+            // The chipset would alias the top of the 4 GiB space onto the BIOS; there is no ROM
+            // here, so execution starts at the same code through the plain real-mode address.
+            cpu.seg[SEG_CS].base = (cpu.seg[SEG_CS].sel as u64) << 4;
+        }
         cpu
     }
 
@@ -630,7 +648,7 @@ impl Cpu {
             }
             self.interrupt_shadow = false;
             self.icount += 1;
-            let result = if self.jit.is_some() {
+            let result = if self.jit.is_some() && self.is_long64() {
                 self.step_block()
             } else {
                 self.step()
@@ -664,7 +682,12 @@ impl Cpu {
             let start = self.rip;
             self.icount += 1;
             shadow.icount += 1;
-            let main_result = self.step_block();
+            let main_result = if self.is_long64() {
+                self.step_block()
+            } else {
+                self.last_block_insns = 1;
+                self.step()
+            };
             let retired = self.last_block_insns;
             // A faulting block reports the instructions retired before the fault, so the
             // interpreter needs one more step to reach the same fault.

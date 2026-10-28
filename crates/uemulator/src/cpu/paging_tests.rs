@@ -917,10 +917,11 @@ mod control_register_transitions {
 
     #[test]
     fn cr3_above_32_bits_is_gp_outside_long_mode() {
+        // `mov cr3` is 32 bits wide outside IA-32e mode, so this is the CR3 check itself.
         let (mut h, tables) = legacy();
-        gp(write_cr(&mut h.cpu, CR3, tables.directory | (1 << 32)));
+        gp(h.cpu.write_cr3(tables.directory | (1 << 32)));
         let (mut h, tables) = pae();
-        gp(write_cr(&mut h.cpu, CR3, tables.pdpt | (1 << 32)));
+        gp(h.cpu.write_cr3(tables.pdpt | (1 << 32)));
     }
 
     #[test]

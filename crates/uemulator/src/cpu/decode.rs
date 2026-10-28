@@ -1,5 +1,19 @@
 use super::{SEG_CS, SEG_DS, SEG_ES, SEG_FS, SEG_GS, SEG_SS};
 
+/// What decoding depends on: the code segment's default sizes, and whether REX and the 64-bit
+/// opcode map apply. Derived from CS by `Cpu::code_mode`; the decode cache is keyed on it because
+/// the same bytes decode differently in each.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) enum CodeMode {
+    /// 64-bit mode (CS.L with EFER.LMA): 32-bit operands and 64-bit addresses by default.
+    #[default]
+    Long64,
+    /// A 32-bit code segment (protected or compatibility mode): CS.D set.
+    Bits32,
+    /// A 16-bit code segment, which includes real mode and virtual-8086 mode: CS.D clear.
+    Bits16,
+}
+
 /// One decoded instruction. Cached per guest physical address in `Cpu::decode_cache` and
 /// consumed by the interpreter (`exec.rs`) and the JIT front ends (`jit/`), so field meanings
 /// are shared contracts.
@@ -25,8 +39,17 @@ pub(crate) struct Insn {
     /// Operand size in bytes from REX.W and `66` only (8, 2 or 4). Byte-sized opcodes and opcodes
     /// with a fixed or default-64-bit size (push/pop, near branches) must not use this blindly.
     pub opsize: u8,
-    /// `67` prefix: 32-bit effective addresses (and a 4-byte `Moffs`).
+    /// The effective address size is 32 bits: a `67` prefix in 64-bit or 16-bit code, or no prefix
+    /// in 32-bit code. Also gives `Moffs` four bytes.
     pub addr32: bool,
+    /// The effective address size is 16 bits (`67` in 32-bit code, no prefix in 16-bit code):
+    /// ModRM uses the `[bx+si]` table and the sum wraps at 64 KiB. Neither flag means 64 bits.
+    pub addr16: bool,
+    /// The memory operand goes through SS unless a segment-override prefix says otherwise
+    /// (`bp`/`esp`/`ebp` based addressing outside 64-bit mode); DS otherwise.
+    pub ss_default: bool,
+    /// The mode this was decoded in; sizes the stack and branch operands (see `stack_operand_size`).
+    pub mode: CodeMode,
     /// Segment-override prefix as an index into `Cpu::seg` (`SEG_ES`..`SEG_GS`), or `NO_SEG`.
     /// The last override wins. The JIT also indexes `Cpu::seg` with it directly.
     pub seg: u8,
@@ -164,7 +187,10 @@ enum Imm {
     Moffs,
     Enter,
     Rel8,
+    /// 32 bits, or 16 with a 66 prefix in 32-bit code or no prefix in 16-bit code (`opsize` 2).
     Rel32,
+    /// `call/jmp ptr16:16/32`: an offset of `opsize` bytes (`imm`) then a selector (`imm2`).
+    FarPtr,
 }
 
 struct Reader<'a> {
@@ -209,7 +235,11 @@ fn imm_kind(map: u16, opcode: u8) -> Imm {
             // 68/69 push/imul imm32, 81 group 1, c7 mov, a9 test eax
             0x68 | 0x69 | 0x81 | 0xc7 | 0xa9 => Imm::Iz,
             // 6a/6b push/imul imm8, 80/83 group 1, c0/c1 shift groups, c6 mov, a8 test al, cd int
-            0x6a | 0x6b | 0x80 | 0x83 | 0xc0 | 0xc1 | 0xc6 | 0xa8 | 0xcd => Imm::I8,
+            // d4/d5 aam/aad (not in 64-bit mode) and 82 (group 1 alias) also take imm8
+            0x6a | 0x6b | 0x80 | 0x82 | 0x83 | 0xc0 | 0xc1 | 0xc6 | 0xa8 | 0xcd | 0xd4 | 0xd5 => {
+                Imm::I8
+            }
+            0x9a | 0xea => Imm::FarPtr,
             // jcc, loopne/loope/loop/jrcxz, jmp short
             0x70..=0x7f | 0xe0..=0xe3 | 0xeb => Imm::Rel8,
             0xe8 | 0xe9 => Imm::Rel32,
@@ -281,26 +311,53 @@ fn invalid_in_long_mode(opcode: u8) -> bool {
     )
 }
 
+/// Decodes in 64-bit mode, which is the only mode the JIT compiles and the one most tests use.
+#[cfg(any(test, feature = "jit"))]
 pub(crate) fn decode(bytes: &[u8]) -> Result<Insn, DecodeErr> {
+    decode_in_mode(bytes, CodeMode::Long64)
+}
+
+/// The `[bx+si]` ... `[bx]` table of 16-bit addressing, indexed by ModRM.rm: (base, index) as
+/// register numbers, `NO_REG` where absent. Mod 0 with rm 6 is `disp16` alone instead of `[bp]`.
+const ADDRESS16_REGISTERS: [(u8, u8); 8] = [
+    (3, 6),
+    (3, 7),
+    (5, 6),
+    (5, 7),
+    (6, NO_REG),
+    (7, NO_REG),
+    (5, NO_REG),
+    (3, NO_REG),
+];
+const RM_ADDRESS16_DISP16: u8 = 6;
+/// Register numbers whose use as a base selects SS as the default segment (rsp, rbp).
+const REG_RSP: u8 = 4;
+const REG_RBP: u8 = 5;
+
+pub(crate) fn decode_in_mode(bytes: &[u8], mode: CodeMode) -> Result<Insn, DecodeErr> {
+    let long = mode == CodeMode::Long64;
     let mut r = Reader { bytes, pos: 0 };
     let mut i = Insn {
         seg: NO_SEG,
         base: NO_REG,
         index: NO_REG,
+        mode,
         ..Default::default()
     };
+    let mut address_prefix = false;
     let mut rex = 0u8;
-    // 40-4f are always REX here (never inc/dec). A REX only counts when it directly precedes the
-    // opcode: a legacy prefix after it drops it, and of two REX bytes in a row the last one wins.
+    // In 64-bit mode 40-4f are always REX (never inc/dec). A REX only counts when it directly
+    // precedes the opcode: a legacy prefix after it drops it, and of two REX bytes in a row the
+    // last one wins. Elsewhere they are inc/dec opcodes.
     let op = loop {
         let b = r.u8()?;
-        if (REX_FIRST..=REX_LAST).contains(&b) {
+        if long && (REX_FIRST..=REX_LAST).contains(&b) {
             rex = b;
             continue;
         }
         match b {
             PREFIX_OPERAND_SIZE => i.p66 = true,
-            PREFIX_ADDRESS_SIZE => i.addr32 = true,
+            PREFIX_ADDRESS_SIZE => address_prefix = true,
             PREFIX_LOCK => i.lock = true,
             PREFIX_REPNE => i.rep = 2,
             PREFIX_REP => i.rep = 1,
@@ -314,9 +371,20 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Insn, DecodeErr> {
         }
         rex = 0;
     };
+    match (mode, address_prefix) {
+        (CodeMode::Long64, true) | (CodeMode::Bits16, true) | (CodeMode::Bits32, false) => {
+            i.addr32 = true
+        }
+        (CodeMode::Bits16, false) | (CodeMode::Bits32, true) => i.addr16 = true,
+        (CodeMode::Long64, false) => {}
+    }
     let mut map = MAP_ONE_BYTE;
     let mut opb = op;
-    if op == VEX_THREE_BYTE || op == VEX_TWO_BYTE {
+    // Outside 64-bit mode c4/c5 are les/lds unless ModRM.mod would be 3, which those cannot
+    // encode (they need memory): that is VEX.
+    let is_vex = (op == VEX_THREE_BYTE || op == VEX_TWO_BYTE)
+        && (long || bytes.get(1).is_some_and(|&b| b >> 6 == MODRM_MOD_REGISTER));
+    if is_vex {
         // A legacy operand-size, repeat, lock or REX prefix before VEX is #UD (SDM 2.3.2).
         if i.p66 || i.rep != 0 || i.lock || rex != 0 {
             return Err(DecodeErr::Invalid);
@@ -347,9 +415,17 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Insn, DecodeErr> {
         if w {
             synthesized |= REX_W;
         }
-        rex = synthesized;
+        // Registers 8-15 do not exist outside 64-bit mode: the extension bits are ignored.
+        rex = if long {
+            synthesized
+        } else {
+            synthesized & REX_W | REX_FIRST
+        };
         i.vex = true;
         i.vex_v = !(payload >> VEX_VVVV_SHIFT) & VEX_VVVV_MASK;
+        if !long {
+            i.vex_v &= 7;
+        }
         i.vex_l = payload & VEX_L != 0;
         match payload & VEX_PP_MASK {
             VEX_PP_66 => i.p66 = true,
@@ -379,16 +455,16 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Insn, DecodeErr> {
             }
         }
         i.op = (map << 8) | opb as u16;
-        i.opsize = if rexw {
-            8
-        } else if i.p66 {
-            2
-        } else {
-            4
+        i.opsize = match (rexw, i.p66, mode) {
+            (true, _, _) => 8,
+            (false, true, CodeMode::Bits16) => 4,
+            (false, true, _) => 2,
+            (false, false, CodeMode::Bits16) => 2,
+            (false, false, _) => 4,
         };
     }
 
-    if map == MAP_ONE_BYTE && invalid_in_long_mode(opb) {
+    if long && map == MAP_ONE_BYTE && invalid_in_long_mode(opb) {
         return Err(DecodeErr::Invalid);
     }
 
@@ -400,7 +476,20 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Insn, DecodeErr> {
         // REX.R/X/B extend the 3-bit fields to 4 bits; shift moves the REX bit to bit 3.
         i.reg = ((m >> 3) & 7) | ((i.rex & REX_R) << 1);
         i.rm = (m & 7) | ((i.rex & REX_B) << 3);
-        if i.md != MODRM_MOD_REGISTER {
+        if i.md != MODRM_MOD_REGISTER && i.addr16 {
+            let (base, index) = ADDRESS16_REGISTERS[(m & 7) as usize];
+            i.base = base;
+            i.index = index;
+            if i.md == 0 && m & 7 == RM_ADDRESS16_DISP16 {
+                i.base = NO_REG;
+                i.disp = r.int(2)?;
+            }
+            match i.md {
+                MODRM_MOD_DISP8 => i.disp = r.int(1)?,
+                MODRM_MOD_DISP32 => i.disp = r.int(2)?,
+                _ => {}
+            }
+        } else if i.md != MODRM_MOD_REGISTER {
             let mut base_field = m & 7;
             if base_field == RM_SIB_FOLLOWS {
                 let sib = r.u8()?;
@@ -419,7 +508,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Insn, DecodeErr> {
                     i.base = base_field | ((i.rex & REX_B) << 3);
                 }
             } else if base_field == RM_DISP32_OR_RIP && i.md == 0 {
-                i.rip_rel = true;
+                // Only 64-bit mode makes this RIP-relative; elsewhere it is an absolute disp32.
+                i.rip_rel = long;
                 i.disp = r.int(4)?;
             } else {
                 i.base = base_field | ((i.rex & REX_B) << 3);
@@ -443,13 +533,26 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Insn, DecodeErr> {
         Imm::I16 => i.imm = r.int(2)? & 0xffff,
         Imm::Iz => i.imm = r.int(if i.opsize == 2 { 2 } else { 4 })?,
         Imm::Iv => i.imm = r.int(i.opsize as usize)?,
-        Imm::Rel32 => i.imm = r.int(4)?,
-        Imm::Moffs => i.imm = r.int(if i.addr32 { 4 } else { 8 })?,
+        Imm::Rel32 => i.imm = r.int(if i.opsize == 2 && !long { 2 } else { 4 })?,
+        Imm::FarPtr => {
+            i.imm = r.int(i.opsize as usize)? & if i.opsize == 2 { 0xffff } else { 0xffff_ffff };
+            i.imm2 = r.int(2)? as u16;
+        }
+        Imm::Moffs => {
+            i.imm = r.int(if i.addr16 {
+                2
+            } else if i.addr32 {
+                4
+            } else {
+                8
+            })?
+        }
         Imm::Enter => {
             i.imm = r.int(2)? & 0xffff;
             i.imm2 = r.int(1)? as u8 as u16;
         }
     }
+    i.ss_default = !long && (i.base == REG_RSP || i.base == REG_RBP);
     i.len = r.pos as u8;
     Ok(i)
 }

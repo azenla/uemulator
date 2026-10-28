@@ -1892,3 +1892,70 @@ mod reboot {
         assert!(!image_kept(base().verify_jit(true)));
     }
 }
+
+mod firmware {
+    use super::*;
+
+    /// Bytes from the top of a firmware image to its reset vector (F000:FFF0).
+    const RESET_VECTOR_FROM_END: usize = 16;
+    // mov dx, 0x3f8; mov al, 'h'; out dx, al; mov al, 'i'; out dx, al; mov al, 0xfe; out 0x64, al;
+    // hlt, as 16-bit code: it fits the 16 bytes below the end of the image.
+    const REAL_MODE_HELLO_RESET: [u8; 14] = [
+        0xba, 0xf8, 0x03, 0xb0, 0x68, 0xee, 0xb0, 0x69, 0xee, 0xb0, 0xfe, 0xe6, 0x64, 0xf4,
+    ];
+
+    fn image_with_reset_code(code: &[u8], length: usize) -> Vec<u8> {
+        let mut image = vec![0xf4; length];
+        let at = length - RESET_VECTOR_FROM_END;
+        image[at..at + code.len()].copy_from_slice(code);
+        image
+    }
+
+    #[test]
+    fn a_firmware_image_starts_in_real_mode_at_the_reset_vector() {
+        for jit in auto_and_off() {
+            let mut machine = EmulatedMachine::new(
+                MachineConfig::new()
+                    .reboot(false)
+                    .jit(jit)
+                    .firmware(image_with_reset_code(&REAL_MODE_HELLO_RESET, 0x1_0000))
+                    .memory_mib(MIN_MEMORY_MIB),
+            )
+            .expect("valid configuration");
+            let console = machine.console();
+            machine.start().unwrap();
+            assert_eq!(machine.wait(), ExitReason::Reset);
+            let mut output = [0u8; 8];
+            let length = console.read(&mut output, Some(Duration::from_millis(100)));
+            assert_eq!(&output[..length], b"hi");
+        }
+    }
+
+    #[test]
+    fn an_empty_or_oversized_firmware_image_is_refused() {
+        for length in [0, 0x6_0001] {
+            let result = EmulatedMachine::new(
+                MachineConfig::new()
+                    .firmware(vec![0u8; length])
+                    .memory_mib(MIN_MEMORY_MIB),
+            );
+            expect_config_error(result);
+        }
+    }
+
+    #[test]
+    fn a_guest_reset_with_a_firmware_image_ends_the_run() {
+        let mut machine = EmulatedMachine::new(
+            MachineConfig::new()
+                .firmware(image_with_reset_code(&REAL_MODE_HELLO_RESET, 0x2_0000))
+                .memory_mib(MIN_MEMORY_MIB),
+        )
+        .expect("valid configuration");
+        machine.start().unwrap();
+        assert_eq!(
+            machine.wait(),
+            ExitReason::Reset,
+            "reboot is on, but a firmware image is not rebooted"
+        );
+    }
+}

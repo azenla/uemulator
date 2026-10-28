@@ -39,7 +39,7 @@ impl Cpu {
         }
         self.need_cpl0()?;
         let kind = self.gpr[i.reg as usize];
-        let Loc::Mem(address) = self.modrm_location(i, next) else {
+        let Loc::Mem(address) = self.modrm_location(i, next)? else {
             return Err(Exception::invalid_opcode());
         };
         if kind > INVPCID_TYPE_MAX {

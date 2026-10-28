@@ -786,7 +786,7 @@ impl Cpu {
             4 => (value as u32).swap_bytes() as u64,
             _ => value.swap_bytes(),
         };
-        let addr = self.linear_address(i, self.effective_address(i, next));
+        let addr = self.linear_address(i, self.effective_address(i, next))?;
         if i.op & 0xff == 0xf0 {
             let value = swap(self.read(addr, size)?);
             self.write_gpr(i.reg, size, true, value);
@@ -806,7 +806,7 @@ impl Cpu {
         let value = if i.md == MODRM_MOD_REGISTER {
             self.read_gpr(i.rm, source_bytes, i.rex_present)
         } else {
-            let addr = self.linear_address(i, self.effective_address(i, next));
+            let addr = self.linear_address(i, self.effective_address(i, next))?;
             self.read(addr, source_bytes)?
         };
         let crc = self.read_gpr(i.reg, 4, true) as u32;
@@ -946,7 +946,7 @@ impl Cpu {
         let mem_addr = if is_register {
             None
         } else {
-            Some(self.linear_address(i, self.effective_address(i, next)))
+            Some(self.linear_address(i, self.effective_address(i, next))?)
         };
         let src = match (op.source(), mem_addr) {
             (Source::None, None) => 0,

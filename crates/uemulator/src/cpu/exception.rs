@@ -1,7 +1,7 @@
 use super::flags::*;
 use super::{
-    Cpu, ExecResult, GPR_RSP, SEG_CS, SEG_DEFAULT_BIG, SEG_DESCRIPTOR_FLAGS_MASK, SEG_DPL_SHIFT,
-    SEG_FLAGS_FLAT_DATA, SEG_GRANULARITY, SEG_LIMIT_4GIB, SEG_SS, Seg, USER_CPL,
+    Cpu, EFER_LMA, ExecResult, GPR_RSP, SEG_CS, SEG_DEFAULT_BIG, SEG_DESCRIPTOR_FLAGS_MASK,
+    SEG_DPL_SHIFT, SEG_FLAGS_FLAT_DATA, SEG_GRANULARITY, SEG_LIMIT_4GIB, SEG_SS, Seg, USER_CPL,
 };
 use crate::machine::ExitReason;
 
@@ -200,6 +200,9 @@ impl Cpu {
     /// until after the last push, so a fault while pushing leaves the CPU state as it was and
     /// the nested fault is delivered instead.
     fn deliver(&mut self, vector: u8, error_code: Option<u32>, software: bool) -> ExecResult<()> {
+        if self.efer & EFER_LMA == 0 {
+            return self.deliver_legacy(vector, error_code, software);
+        }
         let entry_offset = vector as u64 * IDT_ENTRY_BYTES;
         if entry_offset + (IDT_ENTRY_BYTES - 1) > self.idtr.limit as u64 {
             return Err(Exception::general_protection(idt_error_code(vector)));
@@ -340,7 +343,10 @@ impl Cpu {
             ));
         }
         let lo = self.read_sys(table_base.wrapping_add(offset), 8)?;
-        let hi = if lo & DESCRIPTOR_S_BIT == 0 && offset + 15 <= table_limit {
+        let hi = if lo & DESCRIPTOR_S_BIT == 0
+            && offset + 15 <= table_limit
+            && self.efer & EFER_LMA != 0
+        {
             self.read_sys(table_base.wrapping_add(offset + 8), 8)?
         } else {
             0

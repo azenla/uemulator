@@ -175,6 +175,17 @@ pub fn run(
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
     let cfg = build_config(kernel, initramfs, &args, tty)?;
+    run_config(cfg, args, tty)
+}
+
+/// Like `run`, for a firmware image started in real mode at the reset vector.
+pub fn run_firmware(image: Vec<u8>, args: MachineArgs) -> Result<ExitReason, String> {
+    let tty = std::io::stdin().is_terminal();
+    let cfg = build_config(Vec::new(), None, &args, tty)?.firmware(image);
+    run_config(cfg, args, tty)
+}
+
+fn run_config(cfg: MachineConfig, args: MachineArgs, tty: bool) -> Result<ExitReason, String> {
     let mut machine = EmulatedMachine::new(cfg).map_err(|e| e.to_string())?;
     let console = machine.console();
     if let Some(net) = machine.net() {
@@ -273,7 +284,7 @@ mod tests {
         argv.extend_from_slice(extra);
         match Cli::try_parse_from(argv).unwrap().cmd {
             Cmd::Boot { machine, .. } => machine,
-            Cmd::Quick { .. } => unreachable!(),
+            Cmd::Quick { .. } | Cmd::Firmware { .. } => unreachable!(),
         }
     }
 

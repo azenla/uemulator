@@ -2,12 +2,15 @@
 # Assembles Intel-syntax x86_64 (stdin or a file) and prints the bytes as a Rust array, for
 # hand-written test code. Needs clang and objdump (both ship with the Xcode tools).
 #   echo 'mov rax, 5; add rax, 7; hlt' | hack/asm.sh
+# BITS=16 or BITS=32 assembles for real mode / 32-bit protected mode instead:
+#   echo 'mov ax, 5; hlt' | BITS=16 hack/asm.sh
 set -e
 
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 {
     echo '.intel_syntax noprefix'
+    if [ -n "$BITS" ]; then echo ".code$BITS"; fi
     if [ -n "$1" ]; then cat "$1"; else cat | tr ';' '\n'; fi
 } >"$dir/in.s"
 clang -target x86_64-unknown-none-elf -c "$dir/in.s" -o "$dir/in.o"

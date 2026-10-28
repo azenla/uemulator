@@ -185,6 +185,8 @@ const SYSTEM_TYPE_BUSY_BIT: u32 = 2 << DESC_TYPE_SHIFT;
 const SEG_TYPE_CONFORMING: u32 = 1 << 10;
 /// Descriptors are 8 bytes, system descriptors (LDT, TSS) 16 in long mode.
 const DESCRIPTOR_BYTES: u64 = 8;
+/// lgdt/lidt with a 16-bit operand size use only the low 24 bits of the base.
+const TABLE_BASE_24_MASK: u64 = 0x00ff_ffff;
 const SYSTEM_DESCRIPTOR_BYTES: u64 = 16;
 /// Byte offset of the upper dword of a descriptor, where type and attributes live.
 const DESC_HIGH_DWORD_OFFSET: u64 = 4;
@@ -195,6 +197,13 @@ const FLAT_LIMIT: u32 = 0xffff_ffff;
 const DESC_DPL_USER: u32 = SEG_DPL_MASK << SEG_DPL_SHIFT;
 /// Flat segments installed by syscall/sysret (base 0, 4 GiB limit).
 const USER_CODE64_FLAGS: u32 = SEG_FLAGS_CODE64 | DESC_DPL_USER;
+/// A flat 32-bit ring-0 code segment, as sysenter installs.
+pub(crate) const SEG_FLAGS_CODE32: u32 = SEG_GRANULARITY
+    | SEG_DEFAULT_BIG
+    | SEG_PRESENT
+    | SEG_NON_SYSTEM
+    | SEG_TYPE_EXECUTABLE
+    | SEG_TYPE_READ_WRITE;
 const USER_DATA_FLAGS: u32 = SEG_FLAGS_FLAT_DATA | DESC_DPL_USER;
 
 /// `Cpu::log_once` keys for faulting MSR accesses, offset by the 32-bit MSR number so each base
@@ -256,6 +265,7 @@ const FEATURE_PSE: u32 = 1 << 3;
 const FEATURE_TSC: u32 = 1 << 4;
 const FEATURE_MSR: u32 = 1 << 5;
 const FEATURE_PAE: u32 = 1 << 6;
+const FEATURE_SEP: u32 = 1 << 11;
 const FEATURE_CX8: u32 = 1 << 8;
 const FEATURE_PGE: u32 = 1 << 13;
 const FEATURE_CMOV: u32 = 1 << 15;
@@ -268,7 +278,7 @@ const FEATURE_SSE: u32 = 1 << 25;
 const FEATURE_SSE2: u32 = 1 << 26;
 /// Leaf 1 EDX. MMX is advertised because glibc's x86-64 baseline ISA check (CMOV, CX8, FPU,
 /// FXSR, MMX, SSE, SSE2) needs the bit; without it every Debian binary refuses to start ("CPU ISA
-/// level is lower than required"). APIC and SEP are clear. PSE-36 is set together with the 4 MiB
+/// level is lower than required"). APIC is clear. SEP is set for protected-mode sysenter/sysexit (`do_sysenter`). PSE-36 is set together with the 4 MiB
 /// PDE address bits 39:32 (`mem.rs`), which match the 40 physical address bits of leaf 0x8000_0008.
 const CPUID_LEAF1_EDX: u32 = FEATURE_FPU
     | FEATURE_DE
@@ -277,6 +287,7 @@ const CPUID_LEAF1_EDX: u32 = FEATURE_FPU
     | FEATURE_MSR
     | FEATURE_PAE
     | FEATURE_CX8
+    | FEATURE_SEP
     | FEATURE_PGE
     | FEATURE_CMOV
     | FEATURE_PAT
@@ -687,17 +698,27 @@ impl Cpu {
         let gpr = i.rm as usize;
         match i.op {
             OP_MOV_FROM_CR => {
-                self.gpr[gpr] = match register {
+                let value = match register {
                     0 => self.cr0,
                     2 => self.cr2,
                     3 => self.cr3,
                     4 => self.cr4,
                     8 => self.cr8,
                     _ => return Err(Exception::invalid_opcode()),
-                }
+                };
+                // Outside IA-32e mode the access is 32 bits wide and clears the upper half.
+                self.gpr[gpr] = if self.efer & EFER_LMA != 0 {
+                    value
+                } else {
+                    value & 0xffff_ffff
+                };
             }
             OP_MOV_TO_CR => {
-                let v = self.gpr[gpr];
+                let v = if self.efer & EFER_LMA != 0 {
+                    self.gpr[gpr]
+                } else {
+                    self.gpr[gpr] & 0xffff_ffff
+                };
                 match register {
                     0 => self.write_cr0(v)?,
                     2 => self.cr2 = v,
@@ -733,7 +754,11 @@ impl Cpu {
             }
             OP_MOV_FROM_DR => {
                 let index = self.debug_register_index(register)?;
-                self.gpr[gpr] = self.dr[index];
+                self.gpr[gpr] = if self.efer & EFER_LMA != 0 {
+                    self.dr[index]
+                } else {
+                    self.dr[index] & 0xffff_ffff
+                };
             }
             _ => {
                 let index = self.debug_register_index(register)?;
@@ -818,7 +843,7 @@ impl Cpu {
 
     /// MOV to CR3. The register is 32 bits wide outside IA-32e mode, where PAE paging also
     /// latches the four PDPT entries now (#GP if one is malformed).
-    fn write_cr3(&mut self, v: u64) -> ExecResult<()> {
+    pub(crate) fn write_cr3(&mut self, v: u64) -> ExecResult<()> {
         if self.efer & EFER_LMA != 0 {
             // With CR4.PCIDE, bits 11:0 are the PCID (not PWT/PCD) and bit 63 asks
             // not to flush; the TLB is untagged, so the hint is ignored (flushing
@@ -904,6 +929,72 @@ impl Cpu {
         self.lazy_op = LazyFlagsOp::Eflags;
         self.set_cpl(0);
         self.rip = self.lstar;
+        Ok(())
+    }
+
+    /// SYSENTER, legal in protected mode only: this emulator identifies as AMD hardware, where it
+    /// (like SYSEXIT) is #UD in IA-32e mode and #GP(0) in real mode. CS = SYSENTER_CS, SS = CS + 8,
+    /// both flat ring-0 segments; ESP and EIP come from the SYSENTER MSRs; VM, IF and RF are cleared.
+    pub fn do_sysenter(&mut self) -> ExecResult<()> {
+        const SYSENTER_STACK_OFFSET: u16 = 8;
+        const SELECTOR_NULL_MASK: u64 = 0xfffc;
+        if self.efer & EFER_LMA != 0 {
+            return Err(Exception::invalid_opcode());
+        }
+        let [cs, esp, eip] = self.sysenter;
+        if self.cr0 & CR0_PE == 0 || cs & SELECTOR_NULL_MASK == 0 {
+            return Err(Exception::general_protection(0));
+        }
+        let selector = cs as u16 & !SELECTOR_RPL_MASK;
+        self.seg[SEG_CS] = Seg {
+            sel: selector,
+            base: 0,
+            limit: FLAT_LIMIT,
+            flags: SEG_FLAGS_CODE32,
+        };
+        self.seg[SEG_SS] = Seg {
+            sel: selector + SYSENTER_STACK_OFFSET,
+            base: 0,
+            limit: FLAT_LIMIT,
+            flags: SEG_FLAGS_FLAT_DATA,
+        };
+        self.materialize_lazy_flags();
+        self.eflags &= !(VM | IF | RF);
+        self.set_cpl(0);
+        self.gpr[GPR_RSP] = esp & 0xffff_ffff;
+        self.rip = eip & 0xffff_ffff;
+        Ok(())
+    }
+
+    /// SYSEXIT: back to ring 3 with CS = SYSENTER_CS + 16 and SS = SYSENTER_CS + 24, EIP from EDX
+    /// and ESP from ECX.
+    pub fn do_sysexit(&mut self) -> ExecResult<()> {
+        const SYSEXIT_CODE_OFFSET: u16 = 16;
+        const SYSEXIT_STACK_OFFSET: u16 = 24;
+        const SELECTOR_NULL_MASK: u64 = 0xfffc;
+        if self.efer & EFER_LMA != 0 {
+            return Err(Exception::invalid_opcode());
+        }
+        let cs = self.sysenter[0];
+        if self.cr0 & CR0_PE == 0 || self.cpl != 0 || cs & SELECTOR_NULL_MASK == 0 {
+            return Err(Exception::general_protection(0));
+        }
+        let selector = cs as u16 & !SELECTOR_RPL_MASK;
+        self.seg[SEG_CS] = Seg {
+            sel: (selector + SYSEXIT_CODE_OFFSET) | SELECTOR_RPL_USER,
+            base: 0,
+            limit: FLAT_LIMIT,
+            flags: SEG_FLAGS_CODE32 | DESC_DPL_USER,
+        };
+        self.seg[SEG_SS] = Seg {
+            sel: (selector + SYSEXIT_STACK_OFFSET) | SELECTOR_RPL_USER,
+            base: 0,
+            limit: FLAT_LIMIT,
+            flags: USER_DATA_FLAGS,
+        };
+        self.set_cpl(3);
+        self.rip = self.gpr[RDX] & 0xffff_ffff;
+        self.gpr[GPR_RSP] = self.gpr[RCX] & 0xffff_ffff;
         Ok(())
     }
 
@@ -993,8 +1084,14 @@ impl Cpu {
     fn load_system_descriptor(&mut self, sel: u16, required_type: u32) -> ExecResult<Seg> {
         let error_code = (sel & !SELECTOR_RPL_MASK) as u32;
         let offset = (sel & SELECTOR_OFFSET_MASK) as u64;
+        // System descriptors are 16 bytes in IA-32e mode and 8 elsewhere.
+        let descriptor_bytes = if self.efer & EFER_LMA != 0 {
+            SYSTEM_DESCRIPTOR_BYTES
+        } else {
+            DESCRIPTOR_BYTES
+        };
         if sel & SELECTOR_TABLE_INDICATOR != 0
-            || offset + SYSTEM_DESCRIPTOR_BYTES - 1 > self.gdtr.limit as u64
+            || offset + descriptor_bytes - 1 > self.gdtr.limit as u64
         {
             return Err(Exception::general_protection(error_code));
         }
@@ -1055,6 +1152,18 @@ impl Cpu {
         })
     }
 
+    /// Bytes of base address in the memory image of sgdt/sidt/lgdt/lidt: 8 in IA-32e mode, else 4
+    /// with a 32-bit operand size and 3 (a 24-bit base) with a 16-bit one.
+    fn table_register_base_bytes(&self, i: &Insn) -> u8 {
+        if self.efer & EFER_LMA != 0 {
+            8
+        } else if i.opsize == 2 {
+            3
+        } else {
+            4
+        }
+    }
+
     /// 0F 00 (group 6: sldt, str, lldt, ltr, verr, verw) and 0F 01 (group 7: sgdt, sidt,
     /// lgdt, lidt, smsw, lmsw, invlpg, swapgs), selected by ModRM.reg.
     pub fn sys_group(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
@@ -1075,7 +1184,7 @@ impl Cpu {
         const MODRM_STAC: u8 = 0xcb;
         let reg = i.reg & 7;
         if i.op == OP_GROUP6 {
-            let loc = self.modrm_location(i, next);
+            let loc = self.modrm_location(i, next)?;
             // a register destination takes the operand size, memory is always 16 bits
             let size = if i.md == 3 { i.opsize } else { 2 };
             match reg {
@@ -1155,7 +1264,7 @@ impl Cpu {
             self.rip = next;
             return Ok(());
         }
-        let loc = self.modrm_location(i, next);
+        let loc = self.modrm_location(i, next)?;
         match reg {
             // sgdt, sidt: 2-byte limit then 8-byte base
             0 | 1 => {
@@ -1166,7 +1275,12 @@ impl Cpu {
                 self.umip_check()?;
                 let table = if reg == 0 { self.gdtr } else { self.idtr };
                 self.write(addr, 2, table.limit as u64)?;
-                self.write(addr + 2, 8, table.base)?;
+                match self.table_register_base_bytes(i) {
+                    8 => self.write(addr + 2, 8, table.base)?,
+                    4 => self.write(addr + 2, 4, table.base)?,
+                    // 16-bit operand size stores a 24-bit base, with the top byte zero
+                    _ => self.write(addr + 2, 4, table.base & TABLE_BASE_24_MASK)?,
+                }
             }
             // lgdt, lidt
             2 | 3 => {
@@ -1176,7 +1290,11 @@ impl Cpu {
                     _ => return Err(Exception::invalid_opcode()),
                 };
                 let limit = self.read(addr, 2)? as u16;
-                let base = self.read(addr + 2, 8)?;
+                let base = match self.table_register_base_bytes(i) {
+                    8 => self.read(addr + 2, 8)?,
+                    4 => self.read(addr + 2, 4)?,
+                    _ => self.read(addr + 2, 4)? & TABLE_BASE_24_MASK,
+                };
                 let table = DescriptorTable { base, limit };
                 if reg == 2 {
                     self.gdtr = table;
@@ -1264,7 +1382,7 @@ impl Cpu {
             if matches!(reg, 2 | 3) {
                 self.sse_gate()?;
             }
-            let addr = self.linear_address(i, self.effective_address(i, next));
+            let addr = self.linear_address(i, self.effective_address(i, next))?;
             match reg {
                 0 => self.fxsave(addr)?,
                 1 => self.fxrstor(addr)?,
@@ -1641,10 +1759,10 @@ mod sys_tests {
         fn leaf_1_edx_advertises_exactly_the_implemented_features() {
             let mut h = blank();
             let [_, _, _, edx] = cpuid(&mut h, 1, 0);
-            // FPU DE PSE TSC MSR PAE CX8 PGE CMOV PAT PSE-36 CLFSH MMX FXSR SSE SSE2
-            let expected = bits(&[0, 2, 3, 4, 5, 6, 8, 13, 15, 16, 17, 19, 23, 24, 25, 26]);
+            // FPU DE PSE TSC MSR PAE CX8 SEP PGE CMOV PAT PSE-36 CLFSH MMX FXSR SSE SSE2
+            let expected = bits(&[0, 2, 3, 4, 5, 6, 8, 11, 13, 15, 16, 17, 19, 23, 24, 25, 26]);
             assert_eq!(edx, expected, "{edx:#034b}");
-            assert_eq!(edx, 0x078b_a17d);
+            assert_eq!(edx, 0x078b_a97d);
         }
 
         #[test]
@@ -1674,7 +1792,6 @@ mod sys_tests {
                 (1, "VME"),
                 (7, "MCE"),
                 (9, "APIC"),
-                (11, "SEP"),
                 (12, "MTRR"),
                 (14, "MCA"),
                 (18, "PSN"),

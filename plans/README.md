@@ -19,5 +19,6 @@ Index. Read in order; each file ends with open questions where the answer needs 
 | 12-uefi.md | UEFI application, `no_std` port, hardware-MMU analysis |
 | 13-web.md | WebAssembly port |
 | 14-avx-and-virtualization.md | designs for AVX/AVX2/FMA, SVM and VMX (not implemented) |
+| 15-legacy-modes.md | real mode, protected mode, compatibility mode, virtual-8086, task switching, firmware boot |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. Zero crate dependencies.

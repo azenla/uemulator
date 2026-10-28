@@ -110,6 +110,7 @@ type HostPollFn = Arc<dyn Fn(&ConsoleHandle, bool) + Send + Sync>;
 
 pub struct MachineConfig {
     kernel: Vec<u8>,
+    firmware: Option<Vec<u8>>,
     initrd: Option<Vec<u8>>,
     cmdline: Option<String>,
     cmdline_extra: Vec<String>,
@@ -133,6 +134,7 @@ impl Default for MachineConfig {
     fn default() -> Self {
         Self {
             kernel: Vec::new(),
+            firmware: None,
             initrd: None,
             cmdline: None,
             cmdline_extra: Vec::new(),
@@ -161,6 +163,14 @@ impl MachineConfig {
 
     pub fn kernel(mut self, bzimage: impl Into<Vec<u8>>) -> Self {
         self.kernel = bzimage.into();
+        self
+    }
+
+    /// Boots a firmware image (a BIOS, or any real-mode program) instead of a Linux kernel: the
+    /// image is placed so that it ends at 1 MiB and the CPU starts in real mode at F000:FFF0.
+    /// No BIOS services exist beyond what the image brings, and a guest reset ends the run.
+    pub fn firmware(mut self, image: impl Into<Vec<u8>>) -> Self {
+        self.firmware = Some(image.into());
         self
     }
 
@@ -570,7 +580,10 @@ impl EmulatedMachine {
             cmdline.push(' ');
             cmdline.push_str(extra);
         }
-        let boot = boot::load(&mut ram, &cfg.kernel, cfg.initrd.as_deref(), &cmdline)?;
+        let boot = match &cfg.firmware {
+            Some(image) => boot::load_firmware(&mut ram, image)?,
+            None => boot::load(&mut ram, &cfg.kernel, cfg.initrd.as_deref(), &cmdline)?,
+        };
         let net = cfg.net_mac.map(|mac| (mac, NetHandle::default()));
         let net_handle = net.as_ref().map(|(_, handle)| handle.clone());
         let virtio_console = cfg.console_kind == ConsoleKind::Virtio;
@@ -583,7 +596,7 @@ impl EmulatedMachine {
         let boot_ram = cfg.verify.then(|| ram.clone());
         // Verification cannot restart (the twin's devices cannot be rebuilt in step), so it keeps
         // no image and a reset ends the run.
-        let reboot = (cfg.reboot && !cfg.verify).then(|| RebootImage {
+        let reboot = (cfg.reboot && !cfg.verify && cfg.firmware.is_none()).then(|| RebootImage {
             kernel: cfg.kernel,
             initrd: cfg.initrd,
             cmdline,

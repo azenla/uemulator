@@ -67,6 +67,13 @@ enum Cmd {
         #[command(flatten)]
         machine: MachineArgs,
     },
+    /// Boot a firmware image (a BIOS, or a real-mode program) at the reset vector in real mode
+    Firmware {
+        /// Image placed so that it ends at 1 MiB; execution starts at F000:FFF0
+        image: PathBuf,
+        #[command(flatten)]
+        machine: MachineArgs,
+    },
     /// Boot a distro's netboot kernel and initramfs, downloading them on first use
     Quick {
         distro: Distro,
@@ -173,6 +180,7 @@ fn execute(cli: Cli) -> Result<ExitReason, String> {
             let initramfs_image = initramfs.as_ref().map(read).transpose()?;
             run::run(kernel_image, initramfs_image, machine)
         }
+        Cmd::Firmware { image, machine } => run::run_firmware(read(&image)?, machine),
         Cmd::Quick {
             distro,
             update,
@@ -243,7 +251,7 @@ mod tests {
                 initramfs,
                 machine,
             } => (kernel, initramfs, machine),
-            Cmd::Quick { .. } => panic!("expected boot"),
+            _ => panic!("expected boot"),
         }
     }
 
@@ -255,7 +263,7 @@ mod tests {
                 disk_size,
                 machine,
             } => (distro, update, disk_size, machine),
-            Cmd::Boot { .. } => panic!("expected quick"),
+            _ => panic!("expected quick"),
         }
     }
 
@@ -361,6 +369,25 @@ mod tests {
     #[test]
     fn command_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn firmware_takes_an_image_and_the_machine_options() {
+        match parse(&["firmware", "bios.bin", "--memory", "64", "--disable-jit"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Firmware { image, machine } => {
+                assert_eq!(image, PathBuf::from("bios.bin"));
+                assert_eq!(machine.memory, Some(64));
+                assert!(machine.disable_jit);
+            }
+            _ => panic!("expected firmware"),
+        }
+        assert_eq!(
+            error_kind(&["firmware"]),
+            ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

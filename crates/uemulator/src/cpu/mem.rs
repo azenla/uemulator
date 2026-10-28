@@ -778,12 +778,16 @@ impl Cpu {
     /// Decodes the instruction at `rip`, through the decode cache. Marks the page(s) it was
     /// read from as holding code so later stores invalidate the cache.
     pub fn fetch_decode(&mut self) -> ExecResult<Insn> {
-        let rip = self.rip;
+        let rip = self.fetch_linear()?;
+        let mode = self.code_mode();
         let pa = self.translate(rip, AccessKind::Exec, false)?;
         let slot = (pa ^ (pa >> 16)) as usize & (DECODE_CACHE_ENTRIES - 1);
         let cached = &self.decode_cache[slot];
         if cached.gpa == pa && cached.generation == self.decode_cache_generation {
-            return Ok(cached.insn);
+            let insn = cached.insn;
+            if insn.mode == mode {
+                return self.fetched_within_limit(insn);
+            }
         }
         let bytes_left_in_page = PAGE_SIZE as usize - (pa & PAGE_OFFSET_MASK) as usize;
         let len = bytes_left_in_page.min(MAX_INSN_LEN);
@@ -794,7 +798,7 @@ impl Cpu {
             return Err(self.page_fault(rip, AccessKind::Exec, self.cpl == USER_CPL, false, false));
         };
         buf[..len].copy_from_slice(src);
-        match decode::decode(&buf[..len]) {
+        match decode::decode_in_mode(&buf[..len], mode) {
             Ok(insn) => {
                 self.decode_cache[slot] = DecodeCacheEntry {
                     gpa: pa,
@@ -802,7 +806,7 @@ impl Cpu {
                     insn,
                 };
                 self.mark_code(pa);
-                Ok(insn)
+                self.fetched_within_limit(insn)
             }
             Err(DecodeErr::Invalid) => Err(Exception::invalid_opcode()),
             // The 15-byte window ended mid-instruction: it is longer than the architectural
@@ -824,17 +828,29 @@ impl Cpu {
                     return Err(Exception::invalid_opcode());
                 };
                 buf[len..MAX_INSN_LEN].copy_from_slice(next_src);
-                match decode::decode(&buf[..MAX_INSN_LEN]) {
+                match decode::decode_in_mode(&buf[..MAX_INSN_LEN], mode) {
                     Ok(insn) => {
                         self.mark_code(pa);
                         self.mark_code(next_page_pa);
-                        Ok(insn)
+                        self.fetched_within_limit(insn)
                     }
                     Err(DecodeErr::Truncated) => Err(Exception::general_protection(0)),
                     Err(DecodeErr::Invalid) => Err(Exception::invalid_opcode()),
                 }
             }
         }
+    }
+
+    /// Outside 64-bit mode the last byte of the instruction must be inside the CS limit as well
+    /// as the first one (`fetch_linear`), or it is #GP(0).
+    fn fetched_within_limit(&self, insn: Insn) -> ExecResult<Insn> {
+        if !self.is_long64() {
+            let last = (self.rip & 0xffff_ffff) + insn.len as u64 - 1;
+            if last > self.seg[SEG_CS].limit as u64 {
+                return Err(Exception::general_protection(0));
+            }
+        }
+        Ok(insn)
     }
 }
 
