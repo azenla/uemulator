@@ -191,6 +191,14 @@ pub fn run(
     run_config(cfg, settings, runtime, tty)
 }
 
+/// Like `run`, for the machine's first disk booted through the library's BIOS: the disk's own boot
+/// loader loads the system, so there is no kernel, initramfs or command line here.
+pub fn run_disk(settings: &Settings, runtime: &RuntimeArgs) -> Result<ExitReason, String> {
+    let tty = std::io::stdin().is_terminal();
+    let cfg = build_config(Vec::new(), None, settings, runtime, tty)?.boot_disk(true);
+    run_config(cfg, settings, runtime, tty)
+}
+
 /// Like `run`, for a firmware image started in real mode at the reset vector.
 pub fn run_firmware(
     image: Vec<u8>,

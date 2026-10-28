@@ -2239,3 +2239,93 @@ mod firmware {
         );
     }
 }
+
+mod boot_disk {
+    use super::*;
+
+    const DISK_BYTES: usize = MIB;
+    /// mov ax,0x0e41; int 0x10; cli; hlt
+    const PRINT_A_AND_POWER_OFF: [u8; 7] = [0xb8, 0x41, 0x0e, 0xcd, 0x10, 0xfa, 0xf4];
+    /// sti; mov ax,[0x46c]; l: cmp ax,[0x46c]; je l; mov dx,0x3f8; mov al,'T'; out dx,al; cli; hlt:
+    /// waits for the BIOS tick counter to move, which takes the PIT's IRQ0 through the PIC to the
+    /// BIOS's INT 08h.
+    const WAIT_FOR_A_TICK: [u8; 18] = [
+        0xfb, 0xa1, 0x6c, 0x04, 0x3b, 0x06, 0x6c, 0x04, 0x74, 0xfa, 0xba, 0xf8, 0x03, 0xb0, 0x54,
+        0xee, 0xfa, 0xf4,
+    ];
+
+    fn disk_with_boot_sector(code: &[u8]) -> Disk {
+        let mut image = vec![0u8; DISK_BYTES];
+        image[..code.len()].copy_from_slice(code);
+        image[510] = 0x55;
+        image[511] = 0xaa;
+        Disk::memory(image)
+    }
+
+    fn boot(disk: Disk) -> (ExitReason, Vec<u8>) {
+        let mut machine = EmulatedMachine::new(
+            MachineConfig::new()
+                .boot_disk(true)
+                .disk(disk)
+                .memory_mib(MIN_MEMORY_MIB),
+        )
+        .expect("valid configuration");
+        let console = machine.console();
+        machine.start().unwrap();
+        let exit = machine.wait();
+        let mut output = [0u8; 64];
+        let length = console.read(&mut output, Some(Duration::from_millis(100)));
+        (exit, output[..length].to_vec())
+    }
+
+    #[test]
+    fn the_first_sector_runs_with_bios_services_and_power_off_ends_the_run() {
+        let (exit, output) = boot(disk_with_boot_sector(&PRINT_A_AND_POWER_OFF));
+        assert_eq!(exit, ExitReason::Shutdown);
+        assert_eq!(output, b"A");
+    }
+
+    #[test]
+    fn the_pit_ticks_the_bios_counter_through_the_pic() {
+        let (exit, output) = boot(disk_with_boot_sector(&WAIT_FOR_A_TICK));
+        assert_eq!(exit, ExitReason::Shutdown);
+        assert_eq!(output, b"T");
+    }
+
+    #[test]
+    fn a_blank_disk_has_nothing_to_boot() {
+        let (exit, output) = boot(Disk::memory(vec![0u8; DISK_BYTES]));
+        assert_eq!(exit, ExitReason::Shutdown);
+        assert_eq!(output, b"No bootable device.\r\n");
+    }
+
+    #[test]
+    fn boot_disk_needs_a_disk_and_excludes_a_kernel_a_firmware_and_verify() {
+        let base = || {
+            MachineConfig::new()
+                .boot_disk(true)
+                .memory_mib(MIN_MEMORY_MIB)
+        };
+        expect_config_error(EmulatedMachine::new(base()));
+        expect_config_error(EmulatedMachine::new(
+            base()
+                .disk(disk_with_boot_sector(&[0xf4]))
+                .kernel(fake_bzimage(&[0xf4])),
+        ));
+        expect_config_error(EmulatedMachine::new(
+            base()
+                .disk(disk_with_boot_sector(&[0xf4]))
+                .firmware(vec![0xf4; 16]),
+        ));
+        expect_config_error(EmulatedMachine::new(
+            base().disk(disk_with_boot_sector(&[0xf4])).verify_jit(true),
+        ));
+    }
+
+    #[test]
+    fn a_guest_reset_ends_a_bios_boot_instead_of_restarting_it() {
+        // mov al,0xfe; out 0x64,al; hlt
+        let (exit, _) = boot(disk_with_boot_sector(&[0xb0, 0xfe, 0xe6, 0x64, 0xf4]));
+        assert_eq!(exit, ExitReason::Reset);
+    }
+}

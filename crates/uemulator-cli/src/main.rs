@@ -14,7 +14,10 @@ use std::process::ExitCode;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use uemulator::ExitReason;
 
-use args::{HardwareArgs, LinuxArgs, NewDiskArgs, RemoveArgs, RuntimeArgs, Settings, attach_only};
+use args::{
+    BootSourceArgs, HardwareArgs, LinuxArgs, NewDiskArgs, RemoveArgs, RuntimeArgs, Settings,
+    attach_only,
+};
 use quick::Distro;
 
 /// The machine ran and ended in a way that is not a failure of the emulator or the guest.
@@ -91,6 +94,8 @@ enum QuickCmd {
         new_disks: NewDiskArgs,
         #[command(flatten)]
         linux: LinuxArgs,
+        #[command(flatten)]
+        source: BootSourceArgs,
         /// Boot the machine once it is created
         #[arg(long)]
         boot: bool,
@@ -110,6 +115,8 @@ enum QuickCmd {
         linux: LinuxArgs,
         #[command(flatten)]
         remove: RemoveArgs,
+        #[command(flatten)]
+        source: BootSourceArgs,
     },
     /// Boot a machine, optionally with options that apply to this run only
     Boot {
@@ -121,6 +128,8 @@ enum QuickCmd {
         linux: LinuxArgs,
         #[command(flatten)]
         remove: RemoveArgs,
+        #[command(flatten)]
+        source: BootSourceArgs,
         #[command(flatten)]
         runtime: RuntimeArgs,
     },
@@ -217,9 +226,16 @@ fn settings_of(hardware: &HardwareArgs, linux: &LinuxArgs) -> Result<Settings, S
 }
 
 fn boot_launch(launch: machines::Launch, runtime: &RuntimeArgs) -> Result<ExitReason, String> {
-    let kernel = read(&launch.artifacts.kernel)?;
-    let initramfs = read(&launch.artifacts.initramfs)?;
-    run::run(kernel, Some(initramfs), &launch.settings, runtime)
+    match launch.source {
+        args::BootSource::Disk => {
+            eprintln!("booting from the disk");
+            run::run_disk(&launch.settings, runtime)
+        }
+        _ => {
+            eprintln!("booting the installer");
+            run::run(launch.kernel, launch.initramfs, &launch.settings, runtime)
+        }
+    }
 }
 
 /// `None` is a command that did not run a machine.
@@ -232,9 +248,11 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             hardware,
             new_disks: _,
             linux,
+            source,
             boot,
         } => {
-            let machine = machines::create(&home, &name, install, &hardware, &linux)?;
+            let machine =
+                machines::create(&home, &name, install, &hardware, &linux, source.boot_from)?;
             machines::fetch_artifacts(&machine, quick::download).map_err(|e| {
                 format!("{e}\nmachine {name} was created; `quick boot {name}` retries the download")
             })?;
@@ -247,6 +265,7 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 &HardwareArgs::default(),
                 &LinuxArgs::default(),
                 &RemoveArgs::default(),
+                None,
                 quick::download,
             )?;
             boot_launch(launch, &RuntimeArgs::default()).map(Some)
@@ -257,8 +276,10 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             new_disks: _,
             linux,
             remove,
+            source,
         } => {
-            let edited = machines::edit(&home, &name, &hardware, &linux, &remove)?;
+            let edited =
+                machines::edit(&home, &name, &hardware, &linux, &remove, source.boot_from)?;
             for disk in &edited.detached {
                 eprintln!(
                     "detached {} (the image is left in place)",
@@ -273,17 +294,25 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             hardware,
             linux,
             remove,
+            source,
             runtime,
         } => {
             let machine = machines::load(&home, &name)?;
-            let launch =
-                machines::prepare_boot(&machine, &hardware, &linux, &remove, quick::download)?;
+            let launch = machines::prepare_boot(
+                &machine,
+                &hardware,
+                &linux,
+                &remove,
+                source.boot_from,
+                quick::download,
+            )?;
             boot_launch(launch, &runtime).map(Some)
         }
         QuickCmd::Reinstall { name, install } => {
             let machine = machines::reinstall(&home, &name, install, quick::download)?;
             eprintln!(
-                "{name} will install {}; its disks and settings are unchanged",
+                "{name} will install {}; its disks and settings are unchanged. It boots the \
+                 installer until `quick edit {name} --boot-from auto`",
                 machine.install.name()
             );
             Ok(None)
@@ -1248,6 +1277,65 @@ mod tests {
     }
 
     #[test]
+    fn boot_from_is_on_create_edit_and_boot_only() {
+        use crate::args::BootSource;
+        let from = |args: &[&str]| match parse(args).unwrap().cmd {
+            Cmd::Quick {
+                cmd:
+                    QuickCmd::Create { source, .. }
+                    | QuickCmd::Edit { source, .. }
+                    | QuickCmd::Boot { source, .. },
+            } => source.boot_from,
+            _ => panic!("no boot source"),
+        };
+        assert_eq!(from(&["quick", "edit", "m"]), None);
+        for (value, want) in [
+            ("auto", BootSource::Auto),
+            ("installer", BootSource::Installer),
+            ("disk", BootSource::Disk),
+        ] {
+            assert_eq!(
+                from(&["quick", "edit", "m", "--boot-from", value]),
+                Some(want)
+            );
+            assert_eq!(
+                from(&["quick", "boot", "m", "--boot-from", value]),
+                Some(want)
+            );
+            assert_eq!(
+                from(&[
+                    "quick",
+                    "create",
+                    "m",
+                    "--install",
+                    "alpine",
+                    "--boot-from",
+                    value
+                ]),
+                Some(want)
+            );
+        }
+        assert_eq!(
+            error_kind(&["quick", "boot", "m", "--boot-from", "network"]),
+            ErrorKind::InvalidValue
+        );
+        for args in [
+            &["quick", "reinstall", "m", "--boot-from", "disk"][..],
+            &["advanced", "boot", "--kernel", "k", "--boot-from", "disk"],
+        ] {
+            assert_eq!(error_kind(args), ErrorKind::UnknownArgument, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn boot_from_help_explains_each_source() {
+        let help = help_of(&["quick", "boot"]);
+        for text in ["auto", "installer", "disk", "boot order of real"] {
+            assert!(help.contains(text), "{text}: {help}");
+        }
+    }
+
+    #[test]
     fn list_show_and_delete_parse() {
         assert!(matches!(
             parse(&["quick", "list"]).unwrap().cmd,
@@ -1297,7 +1385,7 @@ mod tests {
         )]);
         let (hardware, linux) = (HardwareArgs::default(), LinuxArgs::default());
         let machine =
-            machines::create(home.path(), "m", Distro::Alpine, &hardware, &linux).unwrap();
+            machines::create(home.path(), "m", Distro::Alpine, &hardware, &linux, None).unwrap();
         let error = quick_command(QuickCmd::Delete {
             name: "m".into(),
             yes: false,

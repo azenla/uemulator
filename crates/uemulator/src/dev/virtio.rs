@@ -343,6 +343,12 @@ pub(crate) trait VirtioDev: Send {
     fn into_disk(self: Box<Self>) -> Option<crate::disk::Disk> {
         None
     }
+    /// The storage behind a virtio-blk device, for the BIOS's INT 13h, which reads and writes it
+    /// without a virtqueue.
+    #[cfg(not(freestanding))]
+    fn block_backend(&mut self) -> Option<&mut dyn crate::disk::BlockBackend> {
+        None
+    }
 }
 
 /// virtio-pci modern transport for one device: decodes accesses to BAR0 and owns the common

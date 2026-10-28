@@ -7,16 +7,17 @@
 //!   where they are; neither kind is ever deleted by the CLI.
 
 use std::fs::{self, File};
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::args::{
-    ConsoleArg, DiskSpec, DiskStep, HardwareArgs, LinuxArgs, NetLink, NetModel, Nic, RemoveArgs,
-    Settings, attach_only,
+    BootSource, ConsoleArg, DiskSpec, DiskStep, HardwareArgs, LinuxArgs, NetLink, NetModel, Nic,
+    RemoveArgs, Settings, attach_only,
 };
 use crate::quick::{Artifacts, Distro, artifacts_present, ensure_in, write_atomically};
+use crate::run::DEFAULT_MEMORY_MIB;
 
 const MACHINES_DIR: &str = "machines";
 const MACHINE_FILE: &str = "machine.toml";
@@ -64,6 +65,8 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 #[derive(Serialize, Deserialize)]
 struct MachineFile {
     install: Distro,
+    #[serde(default)]
+    boot_from: BootSource,
     #[serde(flatten)]
     settings: Settings,
 }
@@ -72,6 +75,7 @@ pub struct Machine {
     pub name: String,
     pub dir: PathBuf,
     pub install: Distro,
+    pub boot_from: BootSource,
     pub settings: Settings,
 }
 
@@ -87,6 +91,7 @@ impl Machine {
     fn save(&self) -> Result<(), String> {
         let file = MachineFile {
             install: self.install,
+            boot_from: self.boot_from,
             settings: self.settings.clone(),
         };
         let text =
@@ -113,6 +118,7 @@ pub fn load(home: &Path, name: &str) -> Result<Machine, String> {
         name: name.to_string(),
         dir,
         install: file.install,
+        boot_from: file.boot_from,
         settings: file.settings,
     })
 }
@@ -183,6 +189,7 @@ pub fn create(
     install: Distro,
     hardware: &HardwareArgs,
     linux: &LinuxArgs,
+    boot_from: Option<BootSource>,
 ) -> Result<Machine, String> {
     validate_name(name)?;
     let machines = home.join(MACHINES_DIR);
@@ -216,6 +223,7 @@ pub fn create(
             name: name.to_string(),
             dir: dir.clone(),
             install,
+            boot_from: boot_from.unwrap_or_default(),
             settings,
         };
         machine.save()?;
@@ -240,24 +248,31 @@ pub fn edit(
     hardware: &HardwareArgs,
     linux: &LinuxArgs,
     remove: &RemoveArgs,
+    boot_from: Option<BootSource>,
 ) -> Result<Edited, String> {
     let mut machine = load(home, name)?;
     let detached = machine.settings.remove_devices(remove)?;
     let disks = persist_disks(&machine.dir, &hardware.disk_steps)?;
     machine.settings.add(hardware, linux, disks);
+    machine.boot_from = boot_from.unwrap_or(machine.boot_from);
     machine.save()?;
     Ok(Edited { machine, detached })
 }
 
 /// Everything `run` needs to boot a named machine.
 pub struct Launch {
-    pub artifacts: Artifacts,
+    /// What was chosen: never `Auto`.
+    pub source: BootSource,
+    /// Empty for a boot from the disk, whose boot loader brings its own kernel.
+    pub kernel: Vec<u8>,
+    pub initramfs: Option<Vec<u8>>,
     /// The saved settings with this boot's overrides and the distro's defaults applied.
     pub settings: Settings,
 }
 
-/// The distro's contribution to a boot, applied last so it never reaches the saved file: its
-/// kernel arguments come before the user's, and its memory default stands in for an unset one.
+/// The distro's contribution to an installer boot, applied last so it never reaches the saved
+/// file: its kernel arguments come before the user's, and its memory default stands in for an
+/// unset one.
 pub fn with_distro_defaults(mut settings: Settings, distro: Distro) -> Settings {
     let distro_args = distro.cmdline();
     if !distro_args.is_empty() {
@@ -270,21 +285,63 @@ pub fn with_distro_defaults(mut settings: Settings, distro: Distro) -> Settings 
     settings
 }
 
+/// A disk is blank, as far as `auto` can tell, when the start of it is all zeros: partition tables,
+/// boot sectors and the first filesystem structures all live in the first 32 KiB.
+const BLANK_CHECK_BYTES: u64 = 32 * 1024;
+
+fn disk_is_blank(path: &Path) -> Result<bool, String> {
+    let mut start = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(BLANK_CHECK_BYTES).read_to_end(&mut start))
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(start.iter().all(|byte| *byte == 0))
+}
+
+fn read_file(path: &Path) -> Result<Vec<u8>, String> {
+    fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))
+}
+
 /// A boot of a saved machine with this command line's overrides, which are not saved. Missing
-/// artifacts (never fetched, or thrown away by `reinstall`) are fetched first.
+/// installer artifacts (never fetched, or thrown away by `reinstall`) are fetched first.
 pub fn prepare_boot(
     machine: &Machine,
     hardware: &HardwareArgs,
     linux: &LinuxArgs,
     remove: &RemoveArgs,
+    boot_from: Option<BootSource>,
     fetch: impl FnMut(&str, &Path) -> Result<(), String>,
 ) -> Result<Launch, String> {
     let mut settings = machine.settings.clone();
     settings.remove_devices(remove)?;
     settings.add(hardware, linux, attach_only(&hardware.disk_steps)?);
+    let installed = match (
+        boot_from.unwrap_or(machine.boot_from),
+        settings.disks.first(),
+    ) {
+        (BootSource::Installer, _) => false,
+        (BootSource::Auto, first) => match first {
+            Some(disk) => !disk_is_blank(&disk.path)?,
+            None => false,
+        },
+        (BootSource::Disk, Some(_)) => true,
+        (BootSource::Disk, None) => return Err("the machine has no disk to boot".into()),
+    };
+    if installed {
+        // The boot loader on the disk decides the kernel and its arguments, and what memory the
+        // installer needed is over.
+        settings.memory.get_or_insert(DEFAULT_MEMORY_MIB);
+        return Ok(Launch {
+            source: BootSource::Disk,
+            kernel: Vec::new(),
+            initramfs: None,
+            settings,
+        });
+    }
     let artifacts = ensure_in(&machine.artifacts_dir(), machine.install, false, fetch)?;
     Ok(Launch {
-        artifacts,
+        source: BootSource::Installer,
+        kernel: read_file(&artifacts.kernel)?,
+        initramfs: Some(read_file(&artifacts.initramfs)?),
         settings: with_distro_defaults(settings, machine.install),
     })
 }
@@ -308,8 +365,9 @@ pub fn reinstall(
     let mut machine = load(home, name)?;
     if let Some(distro) = install {
         machine.install = distro;
-        machine.save()?;
     }
+    machine.boot_from = BootSource::Installer;
+    machine.save()?;
     let artifacts = machine.artifacts_dir();
     match fs::remove_dir_all(&artifacts) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => {
@@ -464,6 +522,12 @@ pub fn describe(machine: &Machine) -> String {
         .memory
         .unwrap_or(machine.install.default_memory_mib());
     out.push_str(&format!("  memory    {memory} MiB\n"));
+    let boot = match machine.boot_from {
+        BootSource::Auto => "auto (the disk once an install is on it, else the installer)",
+        BootSource::Installer => "installer",
+        BootSource::Disk => "disk",
+    };
+    out.push_str(&format!("  boots     {boot}\n"));
     for (index, disk) in settings.disks.iter().enumerate() {
         let mode = if disk.read_only { "ro" } else { "rw" };
         out.push_str(&format!(
@@ -560,7 +624,7 @@ mod tests {
 
     fn create_machine(home: &Path, extra: &[&str]) -> Machine {
         let (hardware, linux) = create_args(extra);
-        create(home, "m", Distro::Alpine, &hardware, &linux).unwrap()
+        create(home, "m", Distro::Alpine, &hardware, &linux, None).unwrap()
     }
 
     /// Records every requested URL and writes the URL itself as the file contents.
@@ -722,7 +786,7 @@ mod tests {
         let home = TempDir::new("machines-create-twice");
         create_machine(home.path(), &[]);
         let (hardware, linux) = create_args(&["--memory", "99"]);
-        let error = create(home.path(), "m", Distro::Debian, &hardware, &linux)
+        let error = create(home.path(), "m", Distro::Debian, &hardware, &linux, None)
             .err()
             .unwrap();
         assert!(error.contains("already exists"), "{error}");
@@ -737,7 +801,7 @@ mod tests {
         let missing = home.path().join("missing.img");
         let (hardware, linux) =
             create_args(&["--create-disk", "1", "--disk", &missing.to_string_lossy()]);
-        let error = create(home.path(), "m", Distro::Alpine, &hardware, &linux)
+        let error = create(home.path(), "m", Distro::Alpine, &hardware, &linux, None)
             .err()
             .unwrap();
         assert!(error.starts_with("disk "), "{error}");
@@ -798,7 +862,7 @@ mod tests {
         let home = TempDir::new("machines-disk-names");
         create_machine(home.path(), &[]);
         let (hardware, linux, remove) = edit_args(&["--remove-disk", "0", "--create-disk", "1"]);
-        let edited = edit(home.path(), "m", &hardware, &linux, &remove).unwrap();
+        let edited = edit(home.path(), "m", &hardware, &linux, &remove, None).unwrap();
         let dir = home.path().join("machines/m");
         assert_eq!(edited.detached.len(), 1);
         assert_eq!(edited.detached[0].path, dir.join("disk-0.img"));
@@ -831,7 +895,7 @@ mod tests {
             "--create-disk",
             "4",
         ]);
-        let edited = edit(home.path(), "m", &hardware, &linux, &remove).unwrap();
+        let edited = edit(home.path(), "m", &hardware, &linux, &remove, None).unwrap();
         let reloaded = load(home.path(), "m").unwrap().settings;
         assert_eq!(reloaded, edited.machine.settings);
         assert_eq!(reloaded.memory, Some(256));
@@ -860,7 +924,7 @@ mod tests {
         let before = fs::read_to_string(home.path().join("machines/m/machine.toml")).unwrap();
         let (hardware, linux, remove) =
             edit_args(&["--remove-disk", "5", "--create-disk", "1", "--memory", "99"]);
-        let error = edit(home.path(), "m", &hardware, &linux, &remove)
+        let error = edit(home.path(), "m", &hardware, &linux, &remove, None)
             .err()
             .unwrap();
         assert_eq!(error, "--remove-disk 5: there is 1 disk, numbered 0");
@@ -880,7 +944,7 @@ mod tests {
         );
         let (hardware, linux, remove) =
             edit_args(&["--disable-jit=false", "--no-reboot=false", "--cmdline", ""]);
-        let settings = edit(home.path(), "m", &hardware, &linux, &remove)
+        let settings = edit(home.path(), "m", &hardware, &linux, &remove, None)
             .unwrap()
             .machine
             .settings;
@@ -892,7 +956,7 @@ mod tests {
     fn edit_of_a_missing_machine_says_how_to_create_it() {
         let home = TempDir::new("machines-edit-missing");
         let (hardware, linux, remove) = edit_args(&[]);
-        let error = edit(home.path(), "m", &hardware, &linux, &remove)
+        let error = edit(home.path(), "m", &hardware, &linux, &remove, None)
             .err()
             .unwrap();
         assert!(error.contains("no machine named m"), "{error}");
@@ -930,7 +994,7 @@ mod tests {
             "serial",
         ]);
         let fetcher = FakeFetcher::new();
-        let launch = prepare_boot(&machine, &hardware, &linux, &remove, |u, d| {
+        let launch = prepare_boot(&machine, &hardware, &linux, &remove, None, |u, d| {
             fetcher.fetch(u, d)
         })
         .unwrap();
@@ -950,14 +1014,17 @@ mod tests {
         let machine = create_machine(home.path(), &["--append", "quiet"]);
         let (hardware, linux, remove) = boot_args(&[]);
         let fetcher = FakeFetcher::new();
-        let launch = prepare_boot(&machine, &hardware, &linux, &remove, |u, d| {
+        let launch = prepare_boot(&machine, &hardware, &linux, &remove, None, |u, d| {
             fetcher.fetch(u, d)
         })
         .unwrap();
         assert_eq!(fetcher.count(), 2);
-        assert_eq!(
-            launch.artifacts.kernel,
-            home.path().join("machines/m/artifacts/vmlinuz-virt")
+        assert_eq!(launch.source, BootSource::Installer);
+        assert_eq!(launch.kernel, Distro::Alpine.source_urls().0.as_bytes());
+        assert!(
+            home.path()
+                .join("machines/m/artifacts/vmlinuz-virt")
+                .is_file()
         );
         assert_eq!(
             launch.settings.append,
@@ -967,12 +1034,250 @@ mod tests {
             launch.settings.memory,
             Some(Distro::Alpine.default_memory_mib())
         );
-        prepare_boot(&machine, &hardware, &linux, &remove, |u, d| {
+        prepare_boot(&machine, &hardware, &linux, &remove, None, |u, d| {
             fetcher.fetch(u, d)
         })
         .unwrap();
         assert_eq!(fetcher.count(), 2, "cached artifacts are not fetched again");
         assert_eq!(machine.settings.append.as_deref(), Some("quiet"));
+    }
+
+    /// Puts something in the machine's first disk, the way an installer does: a partition table
+    /// entry in the first sector.
+    fn finish_install(machine: &Machine) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut disk = fs::OpenOptions::new()
+            .write(true)
+            .open(&machine.settings.disks[0].path)
+            .unwrap();
+        disk.seek(SeekFrom::Start(446)).unwrap();
+        disk.write_all(&[0x80, 0x01, 0x01, 0x00, 0x83]).unwrap();
+    }
+
+    fn launch(machine: &Machine, boot_from: Option<BootSource>) -> Result<Launch, String> {
+        let (hardware, linux, remove) = boot_args(&[]);
+        let fetcher = FakeFetcher::new();
+        prepare_boot(machine, &hardware, &linux, &remove, boot_from, |u, d| {
+            fetcher.fetch(u, d)
+        })
+    }
+
+    #[test]
+    fn auto_boots_the_installer_until_something_is_on_the_disk_and_then_the_disk() {
+        let home = TempDir::new("machines-auto");
+        let machine = create_machine(home.path(), &[]);
+        assert_eq!(machine.boot_from, BootSource::Auto);
+        let installer = launch(&machine, None).unwrap();
+        assert_eq!(installer.source, BootSource::Installer);
+        assert!(!installer.kernel.is_empty());
+
+        finish_install(&machine);
+        let installed = launch(&machine, None).unwrap();
+        assert_eq!(installed.source, BootSource::Disk);
+        assert!(installed.kernel.is_empty() && installed.initramfs.is_none());
+    }
+
+    #[test]
+    fn a_disk_is_blank_when_the_first_32_kib_are_zeros() {
+        let dir = TempDir::new("machines-blank");
+        let path = dir.path().join("d.img");
+        let with_byte_at = |offset: usize| {
+            let mut bytes = vec![0u8; 3 * BLANK_CHECK_BYTES as usize];
+            bytes[offset] = 1;
+            fs::write(&path, bytes).unwrap();
+            disk_is_blank(&path).unwrap()
+        };
+        assert!(!with_byte_at(0));
+        assert!(!with_byte_at(BLANK_CHECK_BYTES as usize - 1));
+        assert!(
+            with_byte_at(BLANK_CHECK_BYTES as usize),
+            "past the first 32 KiB is not looked at"
+        );
+        fs::write(&path, vec![0u8; 100]).unwrap();
+        assert!(
+            disk_is_blank(&path).unwrap(),
+            "a short file of zeros is blank"
+        );
+        fs::write(&path, b"").unwrap();
+        assert!(disk_is_blank(&path).unwrap());
+        fs::write(&path, [0, 0, 7]).unwrap();
+        assert!(!disk_is_blank(&path).unwrap());
+        let error = disk_is_blank(&dir.path().join("missing.img")).unwrap_err();
+        assert!(error.starts_with("read "), "{error}");
+    }
+
+    #[test]
+    fn a_disk_boot_leaves_the_installer_arguments_out_and_uses_the_plain_memory_default() {
+        let home = TempDir::new("machines-disk-defaults");
+        let machine = create_machine(home.path(), &["--append", "debug"]);
+        finish_install(&machine);
+        let settings = launch(&machine, None).unwrap().settings;
+        assert_eq!(
+            settings.append.as_deref(),
+            Some("debug"),
+            "no modloop, no ip=dhcp"
+        );
+        assert_eq!(settings.memory, Some(DEFAULT_MEMORY_MIB));
+
+        let fedora = create(
+            home.path(),
+            "f",
+            Distro::Fedora,
+            &HardwareArgs::default(),
+            &LinuxArgs::default(),
+            None,
+        )
+        .unwrap();
+        finish_install(&fedora);
+        let settings = launch(&fedora, None).unwrap().settings;
+        assert_eq!(
+            settings.memory,
+            Some(DEFAULT_MEMORY_MIB),
+            "not the installer's 3072"
+        );
+        let installer = launch(&fedora, Some(BootSource::Installer)).unwrap();
+        assert_eq!(
+            installer.settings.memory,
+            Some(Distro::Fedora.default_memory_mib())
+        );
+    }
+
+    #[test]
+    fn auto_looks_at_the_first_disk_after_this_boots_overrides() {
+        let home = TempDir::new("machines-first-disk");
+        let machine = create_machine(home.path(), &[]);
+        finish_install(&machine);
+        let blank = home.path().join("blank.img");
+        fs::write(&blank, vec![0u8; 4096]).unwrap();
+        let blank_arg = blank.to_string_lossy().into_owned();
+        // Detach the installed disk and attach a blank one: nothing is installed any more.
+        let (hardware, linux, remove) = boot_args(&["--remove-disk", "0", "--disk", &blank_arg]);
+        let fetcher = FakeFetcher::new();
+        let launch = prepare_boot(&machine, &hardware, &linux, &remove, None, |u, d| {
+            fetcher.fetch(u, d)
+        })
+        .unwrap();
+        assert_eq!(launch.source, BootSource::Installer);
+    }
+
+    #[test]
+    fn installer_ignores_an_install_and_disk_needs_a_disk() {
+        let home = TempDir::new("machines-force");
+        let machine = create_machine(home.path(), &[]);
+        assert_eq!(
+            launch(&machine, Some(BootSource::Disk)).unwrap().source,
+            BootSource::Disk,
+            "the BIOS reports an empty disk itself"
+        );
+        finish_install(&machine);
+        assert_eq!(
+            launch(&machine, Some(BootSource::Installer))
+                .unwrap()
+                .source,
+            BootSource::Installer
+        );
+
+        let (hardware, linux, _) = boot_args(&[]);
+        let remove_all = RemoveArgs {
+            remove_disk: vec![0],
+            ..RemoveArgs::default()
+        };
+        let fetcher = FakeFetcher::new();
+        let error = prepare_boot(
+            &machine,
+            &hardware,
+            &linux,
+            &remove_all,
+            Some(BootSource::Disk),
+            |u, d| fetcher.fetch(u, d),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "the machine has no disk to boot");
+    }
+
+    #[test]
+    fn the_saved_boot_source_is_used_and_an_override_is_not_saved() {
+        let home = TempDir::new("machines-saved-source");
+        let machine = create_machine(home.path(), &[]);
+        finish_install(&machine);
+        let (hardware, linux, remove) = edit_args(&[]);
+        edit(
+            home.path(),
+            "m",
+            &hardware,
+            &linux,
+            &remove,
+            Some(BootSource::Installer),
+        )
+        .unwrap();
+        let saved = load(home.path(), "m").unwrap();
+        assert_eq!(saved.boot_from, BootSource::Installer);
+        assert_eq!(launch(&saved, None).unwrap().source, BootSource::Installer);
+        assert_eq!(
+            launch(&saved, Some(BootSource::Disk)).unwrap().source,
+            BootSource::Disk
+        );
+        assert_eq!(
+            load(home.path(), "m").unwrap().boot_from,
+            BootSource::Installer
+        );
+        edit(home.path(), "m", &hardware, &linux, &remove, None).unwrap();
+        assert_eq!(
+            load(home.path(), "m").unwrap().boot_from,
+            BootSource::Installer
+        );
+    }
+
+    #[test]
+    fn a_machine_file_from_before_boot_from_existed_means_auto() {
+        let home = TempDir::new("machines-old-file");
+        create_machine(home.path(), &[]);
+        let path = home.path().join("machines/m/machine.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        let without: String = text
+            .lines()
+            .filter(|l| !l.starts_with("boot_from"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(text.contains("boot_from = \"auto\""), "{text}");
+        fs::write(&path, without).unwrap();
+        assert_eq!(load(home.path(), "m").unwrap().boot_from, BootSource::Auto);
+    }
+
+    #[test]
+    fn reinstall_goes_back_to_the_installer_and_says_so() {
+        let home = TempDir::new("machines-reinstall-source");
+        let machine = create_machine(home.path(), &[]);
+        finish_install(&machine);
+        let fetcher = FakeFetcher::new();
+        let reinstalled = reinstall(home.path(), "m", None, |u, d| fetcher.fetch(u, d)).unwrap();
+        assert_eq!(reinstalled.boot_from, BootSource::Installer);
+        assert_eq!(
+            load(home.path(), "m").unwrap().boot_from,
+            BootSource::Installer
+        );
+        assert_eq!(
+            launch(&reinstalled, None).unwrap().source,
+            BootSource::Installer
+        );
+    }
+
+    #[test]
+    fn create_can_choose_the_boot_source() {
+        let home = TempDir::new("machines-create-source");
+        let (hardware, linux) = create_args(&[]);
+        let machine = create(
+            home.path(),
+            "m",
+            Distro::Alpine,
+            &hardware,
+            &linux,
+            Some(BootSource::Disk),
+        )
+        .unwrap();
+        assert_eq!(machine.boot_from, BootSource::Disk);
+        assert!(describe(&machine).contains("boots     disk"));
     }
 
     #[test]
@@ -1165,7 +1470,7 @@ mod tests {
         let home = TempDir::new("machines-list");
         for name in ["zeta", "alpha"] {
             let (hardware, linux) = create_args(&[]);
-            create(home.path(), name, Distro::Debian, &hardware, &linux).unwrap();
+            create(home.path(), name, Distro::Debian, &hardware, &linux, None).unwrap();
         }
         fs::create_dir_all(home.path().join("machines/stray")).unwrap();
         fs::write(home.path().join("machines/file"), b"x").unwrap();
@@ -1182,7 +1487,7 @@ mod tests {
         let home = TempDir::new("machines-list-broken");
         create_machine(home.path(), &[]);
         let (hardware, linux) = create_args(&[]);
-        create(home.path(), "good", Distro::Fedora, &hardware, &linux).unwrap();
+        create(home.path(), "good", Distro::Fedora, &hardware, &linux, None).unwrap();
         fs::write(home.path().join("machines/m/machine.toml"), "install = 5").unwrap();
         let text = format_list(&list(home.path()).unwrap());
         assert!(text.contains("good  fedora"), "{text}");
@@ -1233,7 +1538,7 @@ mod tests {
         let home = TempDir::new("machines-delete-detached");
         create_machine(home.path(), &[]);
         let (hardware, linux, remove) = edit_args(&["--remove-disk", "0", "--create-disk", "1"]);
-        edit(home.path(), "m", &hardware, &linux, &remove).unwrap();
+        edit(home.path(), "m", &hardware, &linux, &remove, None).unwrap();
         assert_eq!(removal(home.path(), "m").unwrap().created_disks.len(), 2);
     }
 

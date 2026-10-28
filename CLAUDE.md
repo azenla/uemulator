@@ -9,6 +9,7 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 - Run: `cargo run --release -- quick create test --install debian` then `-- quick boot test` (a named machine in `~/.uemulator/machines/test/`: `machine.toml`, the netboot kernel and initramfs in `artifacts/`, sparse disks; `UEMULATOR_HOME` moves `~/.uemulator`; `quick update-artifacts test` refetches and `quick reinstall test --install alpine` swaps the distro and keeps the disk; `quick create` gives a machine a NAT NIC by default so the installers can reach their mirrors) or `-- advanced boot --kernel K --initramfs I`
 - Web: `./hack/web.sh serve` builds `crates/uemulator-web` for `wasm32-unknown-unknown` (`rustup target add` it first) into `target/web` and serves it on :8080 (needs the COOP/COEP headers `hack/web/serve.py` sends); `cargo clippy --release --target wasm32-unknown-unknown -p uemulator-web` must print zero warnings too
 - UEFI: `./hack/uefi/boot.sh [x86_64|aarch64]` builds `crates/uemulator-uefi` and boots it in QEMU (accelerated when the host matches; `UEFI_ACCEL=hv|emu` picks hardware virtualization or the emulator, and `-cpu max,svm=on` under TCG exercises the SVM path); `cargo clippy --release --target x86_64-unknown-uefi -p uemulator-uefi` (and `aarch64-unknown-uefi`) must print zero warnings too
+- Disk boot: `quick boot NAME` boots a machine whose disk has an install on it through the library's BIOS (`MachineConfig::boot_disk`, `plans/17-bios.md`); `--boot-from installer` runs the installer instead
 - Firmware / real mode: `uemulator advanced boot-firmware --firmware IMAGE` (image ends at 1 MiB, CPU starts in real mode at F000:FFF0); a bzImage without a 64-bit entry boots in 32-bit protected mode (`plans/15-legacy-modes.md`)
 - Linux KVM check: `hack/kvm/run.sh` loads `kvm_amd` in the emulated guest and runs vCPUs in every CPU mode on the emulator's SVM (needs `unsquashfs`, a musl cross gcc, the Alpine artifacts and network for the modloop); run it after touching `cpu/svm.rs`, paging or the 16/32-bit modes
 - Test: `cargo test --release --workspace` (also `-p uemulator --no-default-features`)
@@ -36,6 +37,7 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 - Fixing a bug: write the failing test first.
 - Under Rosetta (`--target x86_64-apple-darwin`) tests that run generated code take turns through `jit::serialize_jit_tests`; Rosetta's translation cache goes stale when one thread frees a code buffer and another maps one at the same address. `testkit::Harness::enable_jit` holds it for you; take it yourself when you use `Jit::new` directly.
 - Real-kernel lockstep check (not a test, needs a kernel you supply): `--verify` on the CLI.
+- Real boot loader check (not a test, needs a disk an installer wrote): `quick boot NAME --realtime` on an installed Alpine machine; run it after touching `cpu/bios.rs`.
 
 ## Debugging
 

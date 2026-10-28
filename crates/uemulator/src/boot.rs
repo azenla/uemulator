@@ -97,8 +97,8 @@ const E820_ENTRIES_OFFSET: usize = 0x1e8;
 const E820_TABLE_OFFSET: usize = 0x2d0;
 /// `struct boot_e820_entry` is packed: addr u64, size u64, type u32.
 const E820_ENTRY_SIZE: usize = 20;
-const E820_RAM: u32 = 1;
-const E820_RESERVED: u32 = 2;
+pub(crate) const E820_RAM: u32 = 1;
+pub(crate) const E820_RESERVED: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SetupHeader {
@@ -169,6 +169,20 @@ pub enum BootMode {
     Protected32,
     /// Real mode at the reset vector (a firmware image).
     Real16,
+    /// What a BIOS leaves behind: real mode at 0000:7C00 with the disk's first sector loaded
+    /// there (`cpu::bios`).
+    Bios,
+}
+
+/// The memory map every boot path reports, as (base, size, type): the low range, which the
+/// kernel needs usable for its real-mode trampoline, then the reserved video and ROM hole, then
+/// the RAM above 1 MiB.
+pub(crate) fn e820_map(ram_top: u64) -> [(u64, u64, u32); 3] {
+    [
+        (0, LOW_RAM_END, E820_RAM),
+        (LOW_RAM_END, ONE_MIB - LOW_RAM_END, E820_RESERVED),
+        (ONE_MIB, ram_top - ONE_MIB, E820_RAM),
+    ]
 }
 
 /// Register state of a Linux entry: in 64-bit mode paging on with `cr3`; in 32-bit mode paging
@@ -270,13 +284,7 @@ pub(crate) fn load(
             .copy_from_slice(&(initrd.len() as u32).to_le_bytes());
     }
 
-    // (base, size, type). The kernel needs the low range usable for its real-mode trampoline.
-    // RAM above 1 MiB exists: the kernel was placed there.
-    let e820: [(u64, u64, u32); 3] = [
-        (0, LOW_RAM_END, E820_RAM),
-        (LOW_RAM_END, ONE_MIB - LOW_RAM_END, E820_RESERVED),
-        (ONE_MIB, ram_top - ONE_MIB, E820_RAM),
-    ];
+    let e820 = e820_map(ram_top);
     boot_params[E820_ENTRIES_OFFSET] = e820.len() as u8;
     for (index, (base, size, kind)) in e820.iter().enumerate() {
         let entry = E820_TABLE_OFFSET + index * E820_ENTRY_SIZE;
@@ -333,6 +341,15 @@ pub(crate) fn load(
             BootMode::Protected32
         },
     })
+}
+
+/// The state for booting a disk's boot sector. The BIOS itself is host code, set up by
+/// `Cpu::bios_install` once the devices exist.
+pub(crate) fn load_bios() -> BootState {
+    BootState {
+        mode: BootMode::Bios,
+        ..Default::default()
+    }
 }
 
 /// Largest firmware image: it is mapped so that it ends at 1 MiB, below the video memory hole.

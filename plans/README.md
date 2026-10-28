@@ -21,5 +21,6 @@ Index. Read in order; each file ends with open questions where the answer needs 
 | 14-avx-and-virtualization.md | designs for AVX/AVX2/FMA, SVM and VMX (not implemented) |
 | 15-legacy-modes.md | real mode, protected mode, compatibility mode, virtual-8086, task switching, firmware boot |
 | 16-iommu.md | AMD IOMMU: registers, command buffer, event log, device table, I/O page tables, interrupt remapping, IVRS |
+| 17-bios.md | BIOS services as host code, booting a disk's boot sector |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. Zero crate dependencies.

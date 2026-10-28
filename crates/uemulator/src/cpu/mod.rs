@@ -2,6 +2,9 @@
 use crate::prelude::*;
 mod avx;
 mod avx_special;
+// Booting a disk needs the host disks, which freestanding builds do not have.
+#[cfg(not(freestanding))]
+mod bios;
 mod bmi;
 pub(crate) mod decode;
 pub(crate) mod exception;
@@ -375,6 +378,10 @@ pub(crate) struct Cpu {
     /// scanning the whole array. May list pages already cleared by `code_written`.
     pub pages_with_code: Vec<u32>,
     pub dev: Devices,
+    /// Present when the machine boots a disk's boot sector: the BIOS services run as host code
+    /// (`bios.rs`).
+    #[cfg(not(freestanding))]
+    pub bios: Option<Box<bios::Bios>>,
     /// Instructions retired; guest time is derived from it. `run` adds one before an
     /// instruction executes, so an instruction that faults is counted too.
     pub icount: u64,
@@ -538,6 +545,8 @@ impl Cpu {
             page_has_code: vec![0; pages],
             pages_with_code: Vec::new(),
             dev: Devices::new(console, dev_config),
+            #[cfg(not(freestanding))]
+            bios: None,
             icount: 0,
             idle_skipped_ns: 0,
             next_event: 0,
@@ -567,6 +576,15 @@ impl Cpu {
                 cpu.seg[SEG_CS].base = (cpu.seg[SEG_CS].sel as u64) << 4;
             }
             crate::boot::BootMode::Protected32 => cpu.enter_boot_protected_mode(boot),
+            // `MachineConfig::boot_disk` needs a disk, so a freestanding build never gets here.
+            crate::boot::BootMode::Bios => {
+                cpu.reset_to_real_mode();
+                #[cfg(not(freestanding))]
+                {
+                    cpu.bios_install();
+                    cpu.bios_boot();
+                }
+            }
         }
         cpu
     }

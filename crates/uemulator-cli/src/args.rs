@@ -176,6 +176,30 @@ pub struct NewDiskArgs {
     create_disk: Vec<u64>,
 }
 
+/// What a named machine boots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BootSource {
+    /// The disk once something is installed on it, else the installer: the boot order of real
+    /// hardware, which tries its disks before the network. A disk counts as installed when its
+    /// first 32 KiB are not all zeros
+    #[default]
+    Auto,
+    /// The distro's netboot kernel and initramfs, which run its installer
+    Installer,
+    /// The first disk, through a BIOS: its boot sector runs in real mode and loads the system
+    /// with the boot loader the installer put there, so kernel arguments come from that boot
+    /// loader and `--cmdline` and `--append` do not apply
+    Disk,
+}
+
+#[derive(Args, Default)]
+pub struct BootSourceArgs {
+    /// What to boot [default: auto; `reinstall` sets installer]
+    #[arg(long, value_enum, value_name = "SOURCE")]
+    pub boot_from: Option<BootSource>,
+}
+
 #[derive(Args, Default)]
 pub struct RuntimeArgs {
     /// Run the JIT in lockstep with the interpreter and stop at the first divergence

@@ -112,6 +112,7 @@ type HostPollFn = Arc<dyn Fn(&ConsoleHandle, bool) + Send + Sync>;
 pub struct MachineConfig {
     kernel: Vec<u8>,
     firmware: Option<Vec<u8>>,
+    boot_disk: bool,
     initrd: Option<Vec<u8>>,
     cmdline: Option<String>,
     cmdline_extra: Vec<String>,
@@ -137,6 +138,7 @@ impl Default for MachineConfig {
         Self {
             kernel: Vec::new(),
             firmware: None,
+            boot_disk: false,
             initrd: None,
             cmdline: None,
             cmdline_extra: Vec::new(),
@@ -174,6 +176,16 @@ impl MachineConfig {
     /// No BIOS services exist beyond what the image brings, and a guest reset ends the run.
     pub fn firmware(mut self, image: impl Into<Vec<u8>>) -> Self {
         self.firmware = Some(image.into());
+        self
+    }
+
+    /// Boots the first disk the way a PC with a BIOS does: its first sector is loaded at
+    /// 0000:7C00 and run in real mode with DL = 0x80, with the BIOS services a boot loader needs
+    /// (INT 10h, 11h, 12h, 13h with the extensions, 15h including E820, 16h, 18h, 19h, 1Ah and a
+    /// timer tick) provided by the library. The disk's own boot loader, GRUB or syslinux, then
+    /// loads the kernel. Needs a disk and replaces the kernel; a guest reset ends the run.
+    pub fn boot_disk(mut self, on: bool) -> Self {
+        self.boot_disk = on;
         self
     }
 
@@ -663,7 +675,25 @@ impl EmulatedMachine {
             cmdline.push(' ');
             cmdline.push_str(extra);
         }
+        if cfg.boot_disk {
+            if cfg.firmware.is_some() || !cfg.kernel.is_empty() {
+                return Err(Error::BadConfig(
+                    "boot_disk boots the disk's own boot loader: it cannot be combined with a \
+                     kernel or a firmware image"
+                        .into(),
+                ));
+            }
+            if disk_count == 0 {
+                return Err(Error::BadConfig("boot_disk needs a disk".into()));
+            }
+            if cfg.verify {
+                return Err(Error::BadConfig(
+                    "verify_jit cannot follow a BIOS boot: the JIT only runs 64-bit code".into(),
+                ));
+            }
+        }
         let boot = match &cfg.firmware {
+            _ if cfg.boot_disk => boot::load_bios(),
             Some(image) => boot::load_firmware(&mut ram, image)?,
             None => boot::load(&mut ram, &cfg.kernel, cfg.initrd.as_deref(), &cmdline)?,
         };
@@ -694,14 +724,17 @@ impl EmulatedMachine {
         let boot_ram = cfg.verify.then(|| ram.clone());
         // Verification cannot restart (the twin's devices cannot be rebuilt in step), so it keeps
         // no image and a reset ends the run.
-        let reboot = (cfg.reboot && !cfg.verify && cfg.firmware.is_none()).then(|| RebootImage {
-            kernel: cfg.kernel,
-            initrd: cfg.initrd,
-            cmdline,
-            nets: devcfg.nets.clone(),
-            virtio_consoles: devcfg.virtio_consoles.clone(),
-            iommu: cfg.iommu,
-        });
+        let reboot =
+            (cfg.reboot && !cfg.verify && cfg.firmware.is_none() && !cfg.boot_disk).then(|| {
+                RebootImage {
+                    kernel: cfg.kernel,
+                    initrd: cfg.initrd,
+                    cmdline,
+                    nets: devcfg.nets.clone(),
+                    virtio_consoles: devcfg.virtio_consoles.clone(),
+                    iommu: cfg.iommu,
+                }
+            });
         let stop = Arc::new(AtomicBool::new(false));
         Ok(Self {
             vcpu: Some(Vcpu {

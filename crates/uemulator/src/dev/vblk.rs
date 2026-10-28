@@ -153,6 +153,10 @@ impl VirtioDev for VirtioBlk {
         Some(self.disk)
     }
 
+    fn block_backend(&mut self) -> Option<&mut dyn crate::disk::BlockBackend> {
+        Some(&mut *self.disk.backend)
+    }
+
     fn features(&self) -> u64 {
         let mut features = VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_FLUSH;
         if self.disk.backend.read_only() {

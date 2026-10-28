@@ -1725,6 +1725,12 @@ impl Cpu {
             self.gpr[GPR_RDX] as u16
         };
         self.check_io_permission(port, size)?;
+        #[cfg(not(freestanding))]
+        if op & 2 != 0 && port == super::bios::TRAP_PORT && self.bios.is_some() {
+            self.bios_trap()?;
+            self.rip = next;
+            return Ok(());
+        }
         let now = self.now_ns();
         if op & 2 == 0 {
             let v = self.dev.io_in(port, size, now);

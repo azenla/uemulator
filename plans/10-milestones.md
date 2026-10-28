@@ -21,6 +21,8 @@
 
 - AVX, AVX2, FMA and F16C done (see 03): VEX.128/256 through the SSE kernels, YMM upper state in XSAVE, gathers, masked moves, a fused multiply-add on the soft-float engine, half-precision conversion. Found while booting Debian: a register-collision bug in the VEX staging that broke glibc's AVX2 `strcmp`, now covered by tests.
 
+- BIOS boot of a disk done (see 17): `MachineConfig::boot_disk` runs the first sector in real mode with the BIOS services as host code, enough for Alpine's syslinux 6.04 to load the installed kernel and boot it to a login prompt; `quick boot` uses it once the disk is not blank.
+
 - Real mode, 16/32-bit protected mode, compatibility mode and virtual-8086 mode done (see 15): mode derived from CS, a mode-aware decoder, segment bases and limits, 16/32-bit interrupt and call-gate delivery, hardware task switching, sysenter/sysexit, and `MachineConfig::firmware` / `uemulator advanced boot-firmware` to boot a real-mode image. 49 tests in `cpu/legacy_tests.rs`. The JIT stays 64-bit-only.
 
 - Non-long-mode paging done (see 04 and 03, "Control-register rules outside long mode"): paging off, 32-bit two-level paging (4 MiB pages, PSE-36 advertised), PAE with latched PDPTEs, and the CR0/CR3/CR4/EFER transition rules; 82 tests in `cpu/paging_tests.rs`.

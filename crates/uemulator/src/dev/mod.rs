@@ -253,6 +253,20 @@ impl Devices {
         self.pci.into_disks()
     }
 
+    /// How many disks the guest can see; the BIOS numbers them 0x80, 0x81, ... in this order.
+    #[cfg(not(freestanding))]
+    pub fn disk_count(&mut self) -> usize {
+        (0..)
+            .take_while(|index| self.pci.disk_backend(*index).is_some())
+            .count()
+    }
+
+    /// The storage of the `index`-th disk.
+    #[cfg(not(freestanding))]
+    pub fn disk_backend(&mut self, index: usize) -> Option<&mut dyn crate::disk::BlockBackend> {
+        self.pci.disk_backend(index)
+    }
+
     pub fn state(&self, now: u64) -> String {
         format!("{} | {}", self.pic.state(), self.pit.state(now))
     }

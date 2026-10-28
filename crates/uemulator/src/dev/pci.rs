@@ -264,6 +264,16 @@ impl PciFunction {
 }
 
 impl PciHost {
+    /// The storage of the `index`-th virtio-blk function, in slot order (the order `into_disks`
+    /// returns them in).
+    #[cfg(not(freestanding))]
+    pub fn disk_backend(&mut self, index: usize) -> Option<&mut dyn crate::disk::BlockBackend> {
+        self.funcs
+            .iter_mut()
+            .filter_map(|function| function.transport.dev.block_backend())
+            .nth(index)
+    }
+
     /// Tears the bus down and returns the disks behind its virtio-blk functions, in slot order.
     #[cfg(not(freestanding))]
     pub fn into_disks(self) -> Vec<crate::disk::Disk> {

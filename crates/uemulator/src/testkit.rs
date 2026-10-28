@@ -186,7 +186,12 @@ impl Harness {
     /// A real-mode CPU (paging and long mode off) running `code` at 0000:7c00 with the stack at
     /// 0000:7000 and every data segment 0.
     pub fn real(code: &[u8]) -> Self {
-        let mut harness = Self::new(&[HLT]);
+        Self::real_with_devices(code, DevConfig::default())
+    }
+
+    /// `real`, with devices (a disk, say) attached.
+    pub fn real_with_devices(code: &[u8], devices: DevConfig) -> Self {
+        let mut harness = Self::with_devices(&[HLT], devices);
         harness.cpu.reset_to_real_mode();
         harness.write(REAL_CODE, code);
         let code_segment = harness.cpu.seg[crate::cpu::SEG_CS];
