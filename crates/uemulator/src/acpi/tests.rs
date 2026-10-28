@@ -236,7 +236,7 @@ fn madt_lists_one_cpu_the_ioapic_and_the_interrupt_wiring() {
     );
     for irq in [5u8, 9, 10, 11, crate::dev::acpi_pm::SCI_IRQ] {
         assert!(
-            overrides.contains(&(irq, irq as u32, 0xd)),
+            overrides.contains(&(irq, irq as u32, 0xf)),
             "level-triggered IRQ {irq}: {overrides:?}"
         );
     }

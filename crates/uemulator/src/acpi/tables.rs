@@ -240,7 +240,11 @@ const NMI_PIN: u8 = 1;
 /// Source override flags (5.2.12.5): polarity in bits 1:0 and trigger in bits 3:2, 0 meaning
 /// "conforms to the bus" (ISA: active high, edge).
 const OVERRIDE_CONFORMS: u16 = 0;
-const OVERRIDE_ACTIVE_HIGH_LEVEL: u16 = 0b11_01;
+/// Level triggered, active low: what ACPI says a PCI interrupt is and what Linux asks for when
+/// it registers a `_PRT` GSI. The two must agree: a PVH dom0 has no legacy PIC, so Linux does
+/// not let the first user of a legacy IRQ reprogram the pin and fails the PCI function's
+/// probe with EBUSY on a mismatch.
+const OVERRIDE_ACTIVE_LOW_LEVEL: u16 = 0b11_11;
 /// The IOAPIC's first interrupt input.
 const GSI_BASE: u32 = 0;
 /// The PIT is wired to IOAPIC input 2, not 0 (`Devices::ioapic_pin`).
@@ -280,7 +284,7 @@ pub(super) fn madt(cpus: u32, level_triggered_irqs: &[u8]) -> Vec<u8> {
     };
     override_entry(PIT_ISA_IRQ, PIT_GSI, OVERRIDE_CONFORMS);
     for &irq in level_triggered_irqs {
-        override_entry(irq, irq as u32, OVERRIDE_ACTIVE_HIGH_LEVEL);
+        override_entry(irq, irq as u32, OVERRIDE_ACTIVE_LOW_LEVEL);
     }
     if cpus > FIRST_X2APIC_ONLY_ID {
         body.extend_from_slice(&[MADT_X2APIC_NMI, X2APIC_NMI_ENTRY_LENGTH, 0, 0]);
