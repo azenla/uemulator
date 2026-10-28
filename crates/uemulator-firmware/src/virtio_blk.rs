@@ -91,8 +91,13 @@ unsafe fn write32(base: *mut u8, offset: usize, value: u32) {
     unsafe { write_volatile(base.add(offset).cast::<u32>(), value) }
 }
 
+/// The queue address registers are 64 bits wide but the device decodes them as two 32-bit
+/// halves, low first.
 unsafe fn write64(base: *mut u8, offset: usize, value: u64) {
-    unsafe { write_volatile(base.add(offset).cast::<u64>(), value) }
+    unsafe {
+        write32(base, offset, value as u32);
+        write32(base, offset + 4, (value >> 32) as u32);
+    }
 }
 
 /// The virtio block devices on the bus, initialised and ready.

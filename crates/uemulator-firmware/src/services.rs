@@ -90,13 +90,21 @@ pub fn init(handoff: &Handoff) {
     system.runtime_services = runtime_table;
 
     kv::init(handoff);
+    crate::serial::trace!("kv done");
     variables::init();
+    crate::serial::trace!("variables done");
     rng::init(handoff);
+    crate::serial::trace!("rng done");
     console::init();
+    crate::serial::trace!("console done");
     install_utility_protocols();
+    crate::serial::trace!("install_utility_protocols done");
     install_acpi_and_smbios(handoff);
+    crate::serial::trace!("install_acpi_and_smbios done");
     pci::init(handoff);
+    crate::serial::trace!("pci done");
     disks::init();
+    crate::serial::trace!("disks done");
     tables::seal_all();
 }
 

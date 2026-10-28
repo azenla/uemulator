@@ -16,7 +16,9 @@ SECTIONS
     }
     .text : ALIGN(16) { *(.text._start) *(.text .text.*) }
     .rodata : ALIGN(16) { *(.rodata .rodata.*) }
-    .data : ALIGN(16) { *(.data .data.*) }
+    /* Rust's default relocation model reaches other symbols through the GOT; with a static link
+       its entries are plain addresses, filled in by the linker. */
+    .data : ALIGN(16) { *(.data .data.*) *(.got .got.*) }
     .bss : ALIGN(4096) {
         __bss_start = .;
         *(.bss .bss.*) *(COMMON)
@@ -24,5 +26,5 @@ SECTIONS
     }
     __image_end = .;
 
-    /DISCARD/ : { *(.comment) *(.eh_frame*) *(.note*) *(.got*) }
+    /DISCARD/ : { *(.comment) *(.eh_frame*) *(.note*) }
 }

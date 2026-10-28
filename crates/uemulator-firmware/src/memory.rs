@@ -60,6 +60,15 @@ struct Arena([u8; RUNTIME_ARENA_BYTES]);
 static RUNTIME_ARENA: Global<Arena> = Global::new(Arena([0; RUNTIME_ARENA_BYTES]));
 static RUNTIME_USED: AtomicUsize = AtomicUsize::new(0);
 
+/// Heap for the few allocations made before the memory map exists (parsing the handoff page
+/// allocates). Bump-only; its pointers are recognised by address and never freed.
+const BOOTSTRAP_BYTES: usize = 64 * 1024;
+static BOOTSTRAP: Global<Arena64k> = Global::new(Arena64k([0; BOOTSTRAP_BYTES]));
+#[repr(align(16))]
+struct Arena64k([u8; BOOTSTRAP_BYTES]);
+static BOOTSTRAP_USED: AtomicUsize = AtomicUsize::new(0);
+static MAP_READY: AtomicBool = AtomicBool::new(false);
+
 fn pages_for(bytes: u64) -> u64 {
     bytes.div_ceil(PAGE_SIZE)
 }
@@ -97,6 +106,7 @@ pub fn init(handoff: &Handoff) {
         mark(base, size, MEMORY_MAPPED_IO, UNCACHEABLE | RUNTIME);
     }
     debug_assert!(handoff.firmware_base >= ONE_MIB);
+    MAP_READY.store(true, Ordering::SeqCst);
 }
 
 pub fn map_key() -> usize {
@@ -361,6 +371,17 @@ static HEAP: Heap = Heap;
 
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if !MAP_READY.load(Ordering::SeqCst) {
+            let arena = BOOTSTRAP.get();
+            let base = arena.0.as_ptr() as usize;
+            let start = round_up(base + BOOTSTRAP_USED.load(Ordering::SeqCst), layout.align().max(POOL_ALIGNMENT)) - base;
+            let end = start + layout.size();
+            if end > BOOTSTRAP_BYTES {
+                return ptr::null_mut();
+            }
+            BOOTSTRAP_USED.store(end, Ordering::SeqCst);
+            return unsafe { arena.0.as_mut_ptr().add(start) };
+        }
         if in_runtime_mode() {
             let arena = RUNTIME_ARENA.get();
             let align = layout.align().max(POOL_ALIGNMENT);
@@ -386,7 +407,8 @@ unsafe impl GlobalAlloc for Heap {
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        if in_runtime_mode() {
+        let bootstrap = BOOTSTRAP.get().0.as_ptr_range();
+        if in_runtime_mode() || bootstrap.contains(&(pointer as *const u8)) {
             return;
         }
         if layout.align() > POOL_ALIGNMENT {

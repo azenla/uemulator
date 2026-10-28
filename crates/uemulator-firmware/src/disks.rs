@@ -250,7 +250,9 @@ fn publish(device: *mut BlockDevice, path: &DevicePath, with_file_system: bool) 
         device,
     }));
     let _ = protocols::install(handle, guids::DISK_IO, disk_io.cast());
-    if with_file_system && let Some(volume) = files::create_volume(BlockStorage { device }) {
+    let volume = if with_file_system { files::create_volume(BlockStorage { device }) } else { None };
+    crate::serial::trace!("  {}: file system {}", path.text(), volume.is_some());
+    if let Some(volume) = volume {
         let _ = protocols::install(handle, guids::SIMPLE_FILE_SYSTEM, volume.cast());
     }
     Some(handle)
@@ -279,7 +281,13 @@ pub fn init() {
         core::mem::forget(disk);
         let disk_path = DevicePath::new().acpi_pci_root().pci(function.device, function.function);
         let whole = new_device(raw, 0, unsafe { (*raw).sector_count }, false);
+        if cfg!(feature = "trace") {
+            let mut sector = [0u8; 512];
+            let ok = unsafe { (*raw).read(1, &mut sector) };
+            crate::serial::trace!("read sector 1: {ok} {:02x?}", &sector[..16]);
+        }
         let partitions = gpt::partitions(&mut BlockStorage { device: whole });
+        crate::serial::trace!("disk {}: {} sectors, {} partitions", function.device, unsafe { (*raw).sector_count }, partitions.as_ref().map_or(0, |found| found.len()));
         // A disk that has partitions does not also offer a file system spanning them.
         publish(whole, &disk_path, partitions.is_none());
         for partition in partitions.unwrap_or_default() {

@@ -30,6 +30,11 @@ fn main() {
         .env_remove("CARGO_BUILD_TARGET")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("RUSTC_WRAPPER");
+    // For debugging the firmware: progress messages on the serial port.
+    println!("cargo:rerun-if-env-changed=UEMULATOR_FIRMWARE_TRACE");
+    if std::env::var_os("UEMULATOR_FIRMWARE_TRACE").is_some() {
+        build.args(["--features", "uemulator-firmware/trace"]);
+    }
     let status = build.status();
     if !matches!(status, Ok(status) if status.success()) {
         eprintln!(

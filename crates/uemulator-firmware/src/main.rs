@@ -112,10 +112,14 @@ mod entry {
 extern "C" fn firmware_main(handoff: *const u8) -> ! {
     let handoff = handoff::Handoff::read(handoff);
     serial::init(handoff.serial_port);
+    serial::trace!("handoff read");
     cpu::init();
+    serial::trace!("idt installed");
     memory::init(&handoff);
+    serial::trace!("memory ready");
     time::init(&handoff);
     services::init(&handoff);
+    serial::trace!("services ready");
     boot::run()
 }
 

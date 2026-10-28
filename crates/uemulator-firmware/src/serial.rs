@@ -65,4 +65,13 @@ macro_rules! println {
     }};
 }
 
-pub(crate) use {print, println};
+/// Start-up progress, compiled in with the `trace` feature.
+macro_rules! trace {
+    ($($argument:tt)*) => {
+        if cfg!(feature = "trace") {
+            $crate::serial::println!($($argument)*);
+        }
+    };
+}
+
+pub(crate) use {print, println, trace};

@@ -9,3 +9,7 @@ edition.workspace = true
 [[bin]]
 name = "uemulator-firmware"
 path = "src/main.rs"
+
+[features]
+# Progress messages on the serial port while the firmware starts up.
+trace = []

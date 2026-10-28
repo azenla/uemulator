@@ -140,6 +140,7 @@ macro_rules! isr_stubs {
                 "jmp isr_common",
             )*
             ".p2align 3",
+            ".global ISR_TABLE",
             "ISR_TABLE:",
             $(concat!(".quad isr", $vector),)*
             "isr_common:",
@@ -150,6 +151,7 @@ macro_rules! isr_stubs {
             "and rsp, -16",
             "call exception_handler",
             "2: cli", "hlt", "jmp 2b",
+            ".global timer_isr",
             "timer_isr:",
             "push rax",
             "mov al, {eoi}",
