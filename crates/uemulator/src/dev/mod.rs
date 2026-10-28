@@ -3,6 +3,7 @@ use crate::prelude::*;
 pub(crate) mod apic;
 pub(crate) mod guestmem;
 mod ioapic;
+pub(crate) mod iommu;
 mod pci;
 mod pic;
 mod pit;
@@ -124,6 +125,8 @@ pub(crate) struct DevConfig {
     /// One virtio-console function per handle. The UART stays on the `Devices::new` console
     /// handle; when that is one of these (the default), the UART gives way to the virtio driver.
     pub virtio_consoles: Vec<ConsoleHandle>,
+    /// Adds the AMD IOMMU function (00:00.2) and translates every PCI function's DMA by it.
+    pub iommu: bool,
 }
 
 /// Most virtio functions one machine can hold (PCI slots 1..=31).
@@ -233,7 +236,7 @@ impl Devices {
             system_control_port_b: 0,
             system_control_port_a: 0,
             reset_control: 0,
-            pci: PciHost::new(virtio_devices),
+            pci: PciHost::new(virtio_devices).with_iommu(cfg.iommu),
             lapic: Lapic::new(),
             ioapic: IoApic::new(),
             now_ns: 0,
@@ -417,6 +420,9 @@ impl Devices {
 
     /// None means no device decodes `phys_addr` and the caller treats it as unmapped.
     pub fn mmio_read(&mut self, phys_addr: u64, size: u8) -> Option<u64> {
+        if let Some(value) = self.pci.iommu_mmio_read(phys_addr, size) {
+            return Some(value);
+        }
         if self.lapic.mmio_decodes(phys_addr) {
             let offset = (phys_addr & APIC_REGISTER_MASK) as u32;
             return Some(self.lapic.read_register(offset, self.now_ns).unwrap_or(0) as u64);
@@ -433,6 +439,9 @@ impl Devices {
 
     /// Returns false if no device decodes `phys_addr`.
     pub fn mmio_write(&mut self, phys_addr: u64, size: u8, val: u64, mem: &mut GuestMem) -> bool {
+        if self.pci.iommu_mmio_write(phys_addr, size, val, mem) {
+            return true;
+        }
         if self.lapic.mmio_decodes(phys_addr) {
             let offset = (phys_addr & APIC_REGISTER_MASK) as u32;
             if self
@@ -1410,6 +1419,7 @@ mod tests {
                 disks: vec![Disk::memory(vec![0; 4096])],
                 nets: vec![([2, 0, 0, 0, 0, 1], NetHandle::default())],
                 virtio_consoles: vec![ConsoleHandle::default()],
+                ..Default::default()
             },
         );
         let mut device_ids = Vec::new();
@@ -1800,6 +1810,7 @@ mod tests {
                 disks: vec![Disk::memory(vec![0; 4096])],
                 nets: vec![([2, 0, 0, 0, 0, 1], NetHandle::default())],
                 virtio_consoles: vec![ConsoleHandle::default()],
+                ..Default::default()
             },
         );
         let mut disks = dev.into_disks();
@@ -1833,6 +1844,7 @@ mod tests {
                 disks: (0..3u8).map(|n| Disk::memory(vec![n; 4096])).collect(),
                 nets: vec![([2, 0, 0, 0, 0, 1], NetHandle::default())],
                 virtio_consoles: vec![ConsoleHandle::default()],
+                ..Default::default()
             },
         );
         let firsts: Vec<u8> = dev
@@ -1858,6 +1870,7 @@ mod tests {
                     ([2, 0, 0, 0, 0, 2], NetHandle::default()),
                 ],
                 virtio_consoles: vec![ConsoleHandle::default(), ConsoleHandle::default()],
+                ..Default::default()
             },
         );
         let mut device_ids = Vec::new();

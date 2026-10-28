@@ -1,5 +1,7 @@
+use super::iommu::{Access, Iommu, PhysRead, PhysWrite};
 #[cfg(freestanding)]
 use crate::prelude::*;
+use core::cell::RefCell;
 
 /// Guest page size in bytes is 1 << PAGE_SHIFT; must match `Cpu::page_has_code` indexing.
 const PAGE_SHIFT: u32 = 12;
@@ -12,12 +14,51 @@ const PAGE_SHIFT: u32 = 12;
 /// page is recorded in `code_pages_written`. The caller must drain `code_pages_written` into `Cpu::code_written`
 /// once the borrow ends (see `tick_devices` and `phys_write` in cpu); skipping that
 /// leaves stale decoded blocks or JIT code for memory the device just overwrote.
+///
+/// With `with_dma` the addresses are device addresses of one requester and go through the AMD
+/// IOMMU first (see `dev/iommu`); `read_raw`/`write_raw` and `PhysRead`/`PhysWrite` always mean
+/// physical addresses, which is what the IOMMU itself uses for its tables.
 pub(crate) struct GuestMem<'a> {
     ram: &'a mut [u8],
     /// `Cpu::page_has_code`: one byte per guest page, nonzero if a translated block covers it.
     code: &'a [u8],
     /// Page numbers written while flagged in `code`, each listed once.
     pub code_pages_written: Vec<usize>,
+    /// Set only inside `with_dma`. A `RefCell` because `read` takes `&self` but a translation
+    /// fills the IOTLB and queues fault events.
+    dma: Option<DmaPort>,
+}
+
+struct DmaPort {
+    iommu: RefCell<Iommu>,
+    requester: u16,
+}
+
+/// A view of RAM for the IOMMU to read its tables through while `GuestMem` holds the IOMMU.
+struct RamView<'r>(&'r [u8]);
+
+impl PhysRead for RamView<'_> {
+    fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> bool {
+        read_slice(self.0, phys_addr, buf)
+    }
+}
+
+fn read_slice(ram: &[u8], phys_addr: u64, buf: &mut [u8]) -> bool {
+    match usize::try_from(phys_addr)
+        .ok()
+        .and_then(|start| ram.get(start..start.checked_add(buf.len())?))
+    {
+        Some(src) => {
+            buf.copy_from_slice(src);
+            true
+        }
+        None => false,
+    }
+}
+
+/// How many bytes of `remaining` one translated mapping covers.
+fn chunk_len(remaining: usize, bytes_left: u64) -> usize {
+    remaining.min(usize::try_from(bytes_left).unwrap_or(usize::MAX))
 }
 
 impl<'a> GuestMem<'a> {
@@ -26,12 +67,69 @@ impl<'a> GuestMem<'a> {
             ram,
             code,
             code_pages_written: Vec::new(),
+            dma: None,
         }
     }
 
+    /// Runs `f` with every access of this `GuestMem` translated by `iommu` as DMA from
+    /// `requester` (bus/device/function). `iommu` is moved in for the duration and put back
+    /// afterwards, so no lifetime ties it to the `GuestMem`.
+    pub fn with_dma<R>(
+        &mut self,
+        iommu: &mut Iommu,
+        requester: u16,
+        f: impl FnOnce(&mut GuestMem<'a>) -> R,
+    ) -> R {
+        let previous = self.dma.replace(DmaPort {
+            iommu: RefCell::new(core::mem::take(iommu)),
+            requester,
+        });
+        let result = f(self);
+        if let Some(port) = core::mem::replace(&mut self.dma, previous) {
+            *iommu = port.iommu.into_inner();
+        }
+        result
+    }
+
     /// True if `len` bytes at `phys_addr` are all RAM. Lets a device validate a guest-supplied
-    /// buffer once up front instead of finding out per access.
+    /// buffer once up front instead of finding out per access. Under the IOMMU: every page of
+    /// the range is mapped for this device (permissions are not checked, so a write buffer
+    /// that is not readable still passes) and lands in RAM. A range that is not mapped logs the
+    /// IOMMU's fault event, because the caller is about to refuse the device's request.
     pub fn contains(&self, phys_addr: u64, len: u64) -> bool {
+        let Some(port) = &self.dma else {
+            return self.contains_raw(phys_addr, len);
+        };
+        if len > self.ram.len() as u64 || phys_addr.checked_add(len).is_none() {
+            return false;
+        }
+        let mut done = 0;
+        while done < len {
+            let probe =
+                port.iommu
+                    .borrow_mut()
+                    .probe(&RamView(self.ram), port.requester, phys_addr + done);
+            let Some(translation) = probe else {
+                // The device is about to be refused; let the IOMMU log why, as it would for
+                // the access itself. Permissions never fail a probe, so this is a real fault.
+                let _ = port.iommu.borrow_mut().translate(
+                    &RamView(self.ram),
+                    port.requester,
+                    phys_addr + done,
+                    Access::Read,
+                );
+                return false;
+            };
+            let chunk = (len - done).min(translation.bytes_left);
+            if !self.contains_raw(translation.phys, chunk) {
+                return false;
+            }
+            done += chunk;
+        }
+        true
+    }
+
+    fn contains_raw(&self, phys_addr: u64, len: u64) -> bool {
         phys_addr
             .checked_add(len)
             .is_some_and(|end| end <= self.ram.len() as u64)
@@ -39,20 +137,72 @@ impl<'a> GuestMem<'a> {
 
     /// Out-of-range reads fail instead of faulting: a bad guest descriptor must not panic the host.
     pub fn read(&self, phys_addr: u64, buf: &mut [u8]) -> bool {
-        match usize::try_from(phys_addr)
-            .ok()
-            .and_then(|start| self.ram.get(start..start.checked_add(buf.len())?))
-        {
-            Some(src) => {
-                buf.copy_from_slice(src);
-                true
+        let Some(port) = &self.dma else {
+            return self.read_raw(phys_addr, buf);
+        };
+        let mut done = 0;
+        while done < buf.len() {
+            let Some(address) = phys_addr.checked_add(done as u64) else {
+                return false;
+            };
+            let translated = port.iommu.borrow_mut().translate(
+                &RamView(self.ram),
+                port.requester,
+                address,
+                Access::Read,
+            );
+            let Ok(translation) = translated else {
+                return false;
+            };
+            let chunk = chunk_len(buf.len() - done, translation.bytes_left);
+            if !self.read_raw(translation.phys, &mut buf[done..done + chunk]) {
+                return false;
             }
-            None => false,
+            done += chunk;
         }
+        true
     }
 
-    /// Returns false, writing nothing, if any byte of the range is outside RAM.
+    /// Returns false, writing nothing, if any byte of the range is outside RAM. Under the IOMMU
+    /// a fault part way leaves the earlier pages written, as a real device's posted writes would
+    /// be.
     pub fn write(&mut self, phys_addr: u64, data: &[u8]) -> bool {
+        if self.dma.is_none() {
+            return self.write_raw(phys_addr, data);
+        }
+        let mut done = 0;
+        while done < data.len() {
+            let Some(address) = phys_addr.checked_add(done as u64) else {
+                return false;
+            };
+            let translated = match &self.dma {
+                Some(port) => port.iommu.borrow_mut().translate(
+                    &RamView(self.ram),
+                    port.requester,
+                    address,
+                    Access::Write,
+                ),
+                None => return false,
+            };
+            let Ok(translation) = translated else {
+                return false;
+            };
+            let chunk = chunk_len(data.len() - done, translation.bytes_left);
+            if !self.write_raw(translation.phys, &data[done..done + chunk]) {
+                return false;
+            }
+            done += chunk;
+        }
+        true
+    }
+
+    /// `read` without the IOMMU: `phys_addr` is a physical address.
+    pub fn read_raw(&self, phys_addr: u64, buf: &mut [u8]) -> bool {
+        read_slice(self.ram, phys_addr, buf)
+    }
+
+    /// `write` without the IOMMU: `phys_addr` is a physical address.
+    pub fn write_raw(&mut self, phys_addr: u64, data: &[u8]) -> bool {
         let Ok(start) = usize::try_from(phys_addr) else {
             return false;
         };
@@ -99,6 +249,18 @@ impl<'a> GuestMem<'a> {
 
     pub fn write_u32(&mut self, phys_addr: u64, value: u32) {
         self.write(phys_addr, &value.to_le_bytes());
+    }
+}
+
+impl PhysRead for GuestMem<'_> {
+    fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> bool {
+        self.read_raw(phys_addr, buf)
+    }
+}
+
+impl PhysWrite for GuestMem<'_> {
+    fn write_phys(&mut self, phys_addr: u64, data: &[u8]) -> bool {
+        self.write_raw(phys_addr, data)
     }
 }
 

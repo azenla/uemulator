@@ -1,4 +1,5 @@
 use super::guestmem::GuestMem;
+use super::iommu::{self, Iommu};
 use super::size_mask;
 use super::virtio::{
     COMMON_CFG_OFFSET, DEVICE_CFG_OFFSET, DEVICE_TYPE_BLOCK, DEVICE_TYPE_CONSOLE, DEVICE_TYPE_NET,
@@ -49,6 +50,8 @@ const CFG_STATUS: usize = 0x06;
 const CFG_REVISION: usize = 0x08;
 const CFG_SUBCLASS: usize = 0x0a;
 const CFG_CLASS: usize = 0x0b;
+const CFG_HEADER_TYPE: usize = 0x0e;
+const HEADER_TYPE_MULTIFUNCTION: u8 = 0x80;
 const CFG_BAR0: usize = 0x10;
 const CFG_BAR0_LAST_BYTE: usize = CFG_BAR0 + 3;
 const CFG_SUBSYSTEM_VENDOR_ID: usize = 0x2c;
@@ -123,6 +126,8 @@ pub(crate) struct PciHost {
     /// Value of the address dword at 0xCF8.
     config_address: u32,
     funcs: Vec<PciFunction>,
+    /// The AMD IOMMU function at 00:00.2 and the translation of every function's DMA.
+    iommu: Option<Iommu>,
 }
 
 /// Fills in one virtio vendor capability at `at`; `next` is the config-space offset of the
@@ -286,11 +291,24 @@ impl PciHost {
         PciHost {
             config_address: 0,
             funcs,
+            iommu: None,
         }
     }
 
+    /// Adds the AMD IOMMU (`MachineConfig::iommu`).
+    pub fn with_iommu(mut self, enabled: bool) -> Self {
+        self.iommu = enabled.then(Iommu::new);
+        self
+    }
+
+    /// For the interrupt controllers: `Iommu::remap_interrupt` on every device interrupt.
+    #[allow(dead_code)] // no interrupt controller calls it yet
+    pub fn iommu(&mut self) -> Option<&mut Iommu> {
+        self.iommu.as_mut()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.funcs.is_empty()
+        self.funcs.is_empty() && self.iommu.is_none()
     }
 
     /// True once the driver of the virtio console at position `index` is up; when the UART shares
@@ -302,8 +320,13 @@ impl PciHost {
         })
     }
 
-    fn host_bridge() -> [u8; CONFIG_SPACE_SIZE] {
+    fn host_bridge(&self) -> [u8; CONFIG_SPACE_SIZE] {
         let mut b = [0u8; CONFIG_SPACE_SIZE];
+        // The IOMMU is function 2 of the host bridge's slot, which the OS only scans if
+        // function 0 says it is multifunction.
+        if self.iommu.is_some() {
+            b[CFG_HEADER_TYPE] = HEADER_TYPE_MULTIFUNCTION;
+        }
         b[CFG_VENDOR_ID..CFG_VENDOR_ID + 2].copy_from_slice(&VENDOR_INTEL.to_le_bytes());
         b[CFG_DEVICE_ID..CFG_DEVICE_ID + 2].copy_from_slice(&DEVICE_I440FX_HOST.to_le_bytes());
         b[CFG_SUBCLASS] = SUBCLASS_HOST_BRIDGE;
@@ -324,7 +347,9 @@ impl PciHost {
             return ones;
         }
         let config = if devfn == 0 {
-            Self::host_bridge()
+            self.host_bridge()
+        } else if let (Some(iommu), iommu::PCI_DEVFN) = (&self.iommu, devfn) {
+            *iommu.config()
         } else if let Some(f) = self.funcs.iter().find(|f| f.devfn == devfn) {
             f.config()
         } else {
@@ -362,7 +387,9 @@ impl PciHost {
         }
         let devfn = ((self.config_address >> CONFIG_ADDRESS_DEVFN_SHIFT) & 0xff) as u8;
         let reg = (self.config_address & CONFIG_ADDRESS_REGISTER_MASK) as usize + lane;
-        if let Some(f) = self.funcs.iter_mut().find(|f| f.devfn == devfn) {
+        if let (Some(iommu), iommu::PCI_DEVFN) = (&mut self.iommu, devfn) {
+            iommu.config_write(reg, bytes, val);
+        } else if let Some(f) = self.funcs.iter_mut().find(|f| f.devfn == devfn) {
             f.write_config(reg, bytes, val);
         }
     }
@@ -401,8 +428,20 @@ impl PciHost {
         val: u32,
         mem: &mut GuestMem,
     ) -> Option<u8> {
-        let (f, offset) = self.find_by_address(phys_addr)?;
-        let raise = f.transport.mmio_write(offset, size, val, mem);
+        let PciHost { funcs, iommu, .. } = self;
+        let (f, offset) = funcs
+            .iter_mut()
+            .find_map(|f| f.bar0_offset(phys_addr).map(|offset| (f, offset)))?;
+        // The device's DMA is translated by the IOMMU as requester 00:slot.0.
+        let raise = match iommu {
+            Some(iommu) => mem.with_dma(iommu, f.devfn as u16, |mem| {
+                f.transport.mmio_write(offset, size, val, mem)
+            }),
+            None => f.transport.mmio_write(offset, size, val, mem),
+        };
+        if let Some(iommu) = iommu {
+            iommu.service(mem);
+        }
         Some(if raise && f.intx_enabled() {
             f.int_line
         } else {
@@ -412,11 +451,43 @@ impl PciHost {
 
     /// Appends the IRQ of every function that has a new interrupt to `raise`.
     pub fn poll(&mut self, mem: &mut GuestMem, raise: &mut Vec<u8>) {
-        for f in &mut self.funcs {
-            if f.transport.poll(mem) && f.intx_enabled() {
+        let PciHost { funcs, iommu, .. } = self;
+        for f in funcs {
+            let interrupted = match iommu {
+                Some(iommu) => mem.with_dma(iommu, f.devfn as u16, |mem| f.transport.poll(mem)),
+                None => f.transport.poll(mem),
+            };
+            if interrupted && f.intx_enabled() {
                 raise.push(f.int_line);
             }
         }
+        if let Some(iommu) = iommu {
+            iommu.service(mem);
+        }
+    }
+
+    /// The IOMMU's register read, if its window decodes `phys_addr`.
+    pub fn iommu_mmio_read(&self, phys_addr: u64, size: u8) -> Option<u64> {
+        let iommu = self.iommu.as_ref()?;
+        Some(iommu.mmio_read(iommu.mmio_offset(phys_addr)?, size))
+    }
+
+    /// The IOMMU's register write; false if its window does not decode `phys_addr`.
+    pub fn iommu_mmio_write(
+        &mut self,
+        phys_addr: u64,
+        size: u8,
+        val: u64,
+        mem: &mut GuestMem,
+    ) -> bool {
+        let Some(iommu) = self.iommu.as_mut() else {
+            return false;
+        };
+        let Some(offset) = iommu.mmio_offset(phys_addr) else {
+            return false;
+        };
+        iommu.mmio_write(offset, size, val, mem);
+        true
     }
 }
 

@@ -35,6 +35,8 @@
 
 - Speculation control, XSAVE and RDRAND done (see 03, "Speculation control" and "XSAVE and RDRAND"): guests see an in-order CPU immune to every speculative-execution bug (no retpolines, return thunks, KPTI or VERW), use `xsaveopt` for context switches, and seed the crng from `rdrand`/`rdseed`.
 
+- AMD IOMMU done (see 16): `MachineConfig::iommu(true)` adds PCI function 00:00.2 with the IOMMU and MSI capabilities, the MMIO registers, command buffer, event log, device table, 1-6 level I/O page tables (large and arbitrary-size pages), an IOTLB, DMA translation for every virtio function through `GuestMem::with_dma`, interrupt remapping (32- and 128-bit IRTEs) behind `Iommu::remap_interrupt`, and an IVRS table builder. Unit-tested with a fake driver only: no guest finds it until firmware/ACPI publishes the IVRS table and the LAPIC/IOAPIC call the remapper.
+
 - WebAssembly port done (see 13): `crates/uemulator-web` + `hack/web.sh serve`; interpreter in a Web Worker with an xterm.js console, boots Alpine to a busybox shell in Chrome. No JIT, disk or network.
 
 - UEFI application done (see 12): `crates/uemulator-uefi`, library `no_std` on `target_os = "uefi"`, `hack/uefi/boot.sh`; emulator (interpreter) everywhere, plus a hardware-virtualization path on x86_64 (AMD SVM verified under TCG, Intel VMX untested), no disk/net.

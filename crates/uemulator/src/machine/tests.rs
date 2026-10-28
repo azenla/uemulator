@@ -301,6 +301,7 @@ mod twin_devices {
             disks: vec![Disk::from_backend(ReadOnlyFlagDisk(DISK_BYTES, read_only))],
             nets: vec![(MAC, NetHandle::default())],
             virtio_consoles: vec![ConsoleHandle::default()],
+            ..Default::default()
         }
     }
 

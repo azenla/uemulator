@@ -120,6 +120,7 @@ pub struct MachineConfig {
     disks: Vec<Disk>,
     net_macs: Vec<[u8; 6]>,
     consoles: Vec<ConsoleKind>,
+    iommu: bool,
     jit: JitMode,
     clock: ClockMode,
     log: Option<LogFn>,
@@ -144,6 +145,7 @@ impl Default for MachineConfig {
             disks: Vec::new(),
             net_macs: Vec::new(),
             consoles: Vec::new(),
+            iommu: false,
             jit: JitMode::Auto,
             clock: ClockMode::Virtual,
             log: None,
@@ -204,6 +206,15 @@ impl MachineConfig {
     /// call is the n-th handle.
     pub fn net(mut self, mac: [u8; 6]) -> Self {
         self.net_macs.push(mac);
+        self
+    }
+
+    /// Adds an AMD IOMMU (AMD-Vi) as PCI function 00:00.2, and translates the DMA of every PCI
+    /// function through it once the guest enables it. Off by default. A guest only finds it
+    /// through the ACPI IVRS table, so without firmware or ACPI that describes it (see
+    /// `plans/16-iommu.md`) it just sits on the bus.
+    pub fn iommu(mut self, on: bool) -> Self {
+        self.iommu = on;
         self
     }
 
@@ -349,6 +360,7 @@ struct RebootImage {
     /// around this very handle.
     nets: Vec<([u8; 6], NetHandle)>,
     virtio_consoles: Vec<ConsoleHandle>,
+    iommu: bool,
 }
 
 /// Wall-clock seconds, or 0 where there is no clock (UEFI keeps its own, see `unix_time`).
@@ -431,6 +443,7 @@ fn mirrored_devices(main: &DevConfig, main_uart: &ConsoleHandle) -> (DevConfig, 
                 }
             })
             .collect(),
+        iommu: main.iommu,
     };
     (devices, twin_uart)
 }
@@ -490,6 +503,7 @@ impl Vcpu {
                 disks: finished.disks,
                 nets: image.nets.clone(),
                 virtio_consoles: image.virtio_consoles.clone(),
+                iommu: image.iommu,
             };
         }
     }
@@ -675,6 +689,7 @@ impl EmulatedMachine {
             disks: cfg.disks,
             nets,
             virtio_consoles,
+            iommu: cfg.iommu,
         };
         let boot_ram = cfg.verify.then(|| ram.clone());
         // Verification cannot restart (the twin's devices cannot be rebuilt in step), so it keeps
@@ -685,6 +700,7 @@ impl EmulatedMachine {
             cmdline,
             nets: devcfg.nets.clone(),
             virtio_consoles: devcfg.virtio_consoles.clone(),
+            iommu: cfg.iommu,
         });
         let stop = Arc::new(AtomicBool::new(false));
         Ok(Self {
