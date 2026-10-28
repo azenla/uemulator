@@ -1,0 +1,185 @@
+# JIT performance: direct chaining, more inline integer ops, native SIMD
+
+> **For agentic workers:** execute task by task; steps use checkbox syntax. The interpreter is the oracle for every JIT change (`testkit::assert_jit_matches_interpreter`).
+
+**Goal:** make the initramfs unpack (and everything else a daily-driven guest does) several times faster than today's ~21 s host time for the 252 MB Fedora netboot initramfs on an Apple Silicon host.
+
+**Architecture:** three independent projects, each measured before and after with the same workload. (1) Direct block chaining in the style of QEMU's `goto_tb`. (2) Inline lowering for the integer instructions that still go through `helper_exec`. (3) Fast paths for the SIMD instructions the kernel's CRC32 and copy loops use on the Zen 4 CPU model.
+
+**Tech Stack:** Rust, the in-tree aarch64 and x86_64 assemblers (`jit/a64.rs`, `jit/x64.rs`), `jit/native.rs` (block cache, shared by both backends).
+
+## Baseline (2026-10-28, aarch64 host, `sample` 8 s window at t=6 s)
+
+Boot: `uemulator advanced boot --kernel ~/.uemulator/machines/test/artifacts/vmlinuz --initramfs .../initrd.img --console serial`, wall time to the kernel's `Freeing initrd memory` line: 21.1 s; `Run /init` at 22.2 s. Busy-thread split: ~45% generated code, ~10% `pclmulqdq`, ~8% EVEX/AVX-512 helpers, ~13% interpreter core (`shift_rotate`, `flags::compute`, `load_operand`, `write_gpr`), ~1.5% MMU. A tight ~1000-sample cluster in the prologue region is the chain stub (inferred from its address and size, not disassembled).
+
+`hack/perf/unpack.sh` (Task 0) reproduces the wall-time measurement; record each project's result in the table at the end of this file.
+
+## Global Constraints
+
+- The library never touches stdio, never panics on guest behavior, holds no global mutable state.
+- Interpreter first: a new uop or fast path gets the interpreter-oracle test before the lowering.
+- Advertise a CPUID bit only together with the tests for the instructions behind it (nothing here changes CPUID).
+- No magic constants: name offsets, encodings, sizes as `const`s.
+- Before every commit: `./hack/autofix.sh`, then `cargo clippy --release --all-targets` prints zero warnings. Never commit with warnings.
+- Tests: `cargo test --release --workspace`; x86_64 backend under Rosetta: `cargo test --release -p uemulator --target x86_64-apple-darwin`.
+- After touching `jit/`: boot to the shell prompt with `--verify` and stop (do not type into it).
+- `--verify` runs with chaining off (`Jit::new(false)`), so it does not exercise direct links; the differential tests and a normal boot are what cover them.
+
+## Review Focus
+
+- A linked block whose destination page is invalidated by the very store that runs in the source block: must not enter the stale destination (flag check at the linked entry).
+- Destination invalidated, then the same `(rip, phys)` translated again: the old source site must be relinked to the new block, not left pointing at stale code or dropped forever.
+- `Jit::reset` (buffer full) with live links: every site, pending entry and incoming list is discarded together.
+- A block whose last instruction straddles a page, and a branch to the first byte of the next page: never directly linked.
+- `next_event` reached exactly on a linked transition: the chain must stop, with no instruction lost or counted twice (`prepaid_icount`).
+
+---
+
+## Project 1: direct chaining
+
+Design: a block's exit to a static same-page target has a patchable 4-byte (aarch64) or 5-byte (x86_64) slot placed immediately before the existing `mov rip; b chain` sequence. It starts as a nop, so execution falls into the existing stub path. Once the destination exists the slot becomes `b dest.link_entry`. Each block has two entries: `link_entry` (start of the block: the `icount >= next_event` and `block_exit_requested` checks the chain stub does, then falls into the body) and `code_addr` (the body, for the run loop and the stub, which have already done those checks). A taken `jcc` and the fall-through each get their own slot. Cross-page and indirect exits keep the stub. Same-page is sufficient for skipping the TLB probe: the source was entered through a validated mapping and the destination shares its page.
+
+### Task 0: reproducible measurement
+
+**Files:**
+- Create: `hack/perf/unpack.sh`
+
+**Interfaces:**
+- Produces: `hack/perf/unpack.sh` prints `unpack <seconds>` (wall seconds from process start to the `Freeing initrd memory` line) using the `test` machine's artifacts, or the paths in `$KERNEL` and `$INITRAMFS`.
+
+- [ ] **Step 1: Write the script** (boot with `advanced boot --console serial`, poll the output file every 0.25 s, kill the emulator at the line, print elapsed).
+- [ ] **Step 2: Run it three times and write the median into the results table below as `baseline`.**
+- [ ] **Step 3: Commit** `Perf: hack/perf/unpack.sh times the initramfs unpack`.
+
+### Task 1: link bookkeeping in `native.rs` (arch-independent)
+
+**Files:**
+- Modify: `crates/uemulator/src/jit/native.rs`
+- Test: same file, `mod tests`
+
+**Interfaces:**
+- Consumes: `arch::compile_block(...)` which after Task 2/3 returns `CompiledBlock`.
+- Produces:
+  - `pub(crate) struct LinkSite { pub code_offset: u32, pub target_rip: u64 }` (offset of the patch slot inside the compiled block's bytes; the block's own page decides `target_phys`).
+  - `pub(crate) struct CompiledBlock { pub code: Vec<u8>, pub inlined: u32, pub body_offset: u32, pub links: Vec<LinkSite> }`.
+  - `Block { link_addr: u64, .. }` (`code_addr` stays the body).
+  - `Jit::link_pending(&mut self, key: (u64, u64))`, `Jit::unlink_into_pending(&mut self, index: u32)`, `JitStats::linked: u64` (sites patched, cumulative) and `JitStats::unlinked: u64`.
+  - Arch hooks in `arch_a64.rs` and `arch_x64.rs`: `pub(crate) fn link_bytes(site_addr: u64, dest_addr: u64) -> Option<Vec<u8>>` (None when out of branch range) and `pub(crate) fn unlink_bytes() -> Vec<u8>` (the nop).
+
+- [ ] **Step 1: Failing tests** (in `native.rs` tests, using `new_jit`/`translate_at_code_base` helpers): `a_loop_block_links_to_itself_once_translated` asserts `stats().linked == 1` after translating a `dec ecx; jnz loop` block; `invalidating_the_destination_unlinks_and_a_retranslation_relinks` asserts `linked`/`unlinked` counts across invalidate then retranslate; `reset_discards_links_and_pending_entries` asserts all three tables are empty afterwards (add `#[cfg(test)] fn link_state_len(&self) -> (usize, usize)` returning `(incoming sites, pending sites)`).
+- [ ] **Step 2: Run, expect compile failure / FAIL.**
+- [ ] **Step 3: Implement.** `Jit` gains `incoming: HashMap<u32, Vec<LinkedSite>>` (`LinkedSite { block: u32, code_offset: usize, key: (u64,u64) }`, offset is into `exec_mem`) and `pending: HashMap<(u64, u64), Vec<LinkedSite>>`. In `translate`, after `write_bytes`: for each `LinkSite`, only if `target_rip >> 12 == rip >> 12` and the block does not cross a page, compute `key = (target_rip, (phys_addr & !PAGE_MASK) | (target_rip & PAGE_MASK))`; if `block_map` has it, patch and record in `incoming`, else push to `pending`. After inserting the new block, take `pending.remove(&(rip, phys_addr))` and patch each to the new block's `link_addr`. In `invalidate_page`, for each dropped block take `incoming.remove(&index)`, write `unlink_bytes()` to each site and push the site into `pending` under its key. `reset` clears both maps.
+- [ ] **Step 4: Run the new tests, expect PASS (with Task 2 or 3 in place for the compiler half; until then the arch `compile_block` returns an empty `links`, which keeps the tests of this task at "linked == 0" and the bookkeeping tests use a hand-built `CompiledBlock` through a `#[cfg(test)]` hook).**
+- [ ] **Step 5: Commit** `JIT: block link bookkeeping (pending sites, incoming sites, unlink on invalidation)`.
+
+### Task 2: aarch64 emission
+
+**Files:**
+- Modify: `crates/uemulator/src/jit/emit.rs` (`Gen::chain_exit`, `Gen::chain_to`, `Gen::jcc`, block prologue), `crates/uemulator/src/jit/arch_a64.rs` (`compile_block`, `link_bytes`, `unlink_bytes`)
+
+**Interfaces:**
+- Consumes: Task 1's `CompiledBlock`, `LinkSite`.
+- Produces: blocks that begin with the link-entry checks, then the body; `Gen::links: Vec<LinkSite>`; `Gen::link_slot(target_rip: u64)` emitting the nop and recording the site.
+
+- [ ] **Step 1: Failing tests** in `native.rs`: `a_linked_loop_does_not_go_through_the_chain_stub` (run a `dec ecx; jnz` loop of 1000 iterations twice; the second run has `linked >= 1`; assert the guest result matches and that `Cpu::icount` equals the interpreter's); `a_linked_chain_stops_at_the_event_deadline` (copy of `a_chain_stops_at_the_event_deadline_and_resumes_without_losing_instructions` after warm-up so links are patched); `a_store_into_the_linked_destination_page_exits_before_the_stale_block` (variant of `a_chain_does_not_enter_a_block_whose_page_was_invalidated` where source and destination share a page and the source's own store rewrites the destination).
+- [ ] **Step 2: Run, expect FAIL.**
+- [ ] **Step 3: Implement.** Block layout: `link_entry:` ldr icount, ldr next_event, cmp, `b.cs miss`; ldrb block_exit_requested, `cbnz miss`; `body:`. Out of line at the end of the block: `miss:` (sub icount,1; str icount; store the block's own rip to `Cpu::rip`; `mov x0, 1<<EXIT_COUNT_SHIFT; b exit_ok`; the same sequence as the stub's miss path). `link_slot` emits `nop` (4 bytes, 4-aligned). In `jcc` the pay and the condition branch stay first (host flags are live), then each outcome emits `link_slot(target); mov x1, rip; b chain`. `link_bytes` encodes `b` with the imm26 range check; `unlink_bytes` is `nop`. `CompiledBlock::body_offset` is the offset of `body:`; `Jit::translate` sets `code_addr = base + body_offset`, `link_addr = base`.
+- [ ] **Step 4: Run the Task 2 tests plus the whole `jit::` suite, expect PASS.**
+- [ ] **Step 5: Run `cargo test --release --workspace`, then boot to the shell with `--verify` and stop.**
+- [ ] **Step 6: Commit** `JIT: aarch64 direct chaining for same-page static exits`.
+
+### Task 3: x86_64 emission
+
+**Files:**
+- Modify: `crates/uemulator/src/jit/emit_x64.rs` (`chain_exit`, `chain_to`, jcc, block start), `crates/uemulator/src/jit/arch_x64.rs`
+
+**Interfaces:**
+- Consumes/Produces: as Task 2. `link_slot` is the 5-byte nop `0F 1F 44 00 00`; `link_bytes` is `E9 rel32`.
+
+- [ ] **Step 1: Port the three Task 2 tests (they are arch-independent; they live in `native.rs` and run on both) and run them under `--target x86_64-apple-darwin`, expect FAIL.**
+- [ ] **Step 2: Implement like Task 2 using `x64::Asm` primitives.**
+- [ ] **Step 3: Run `cargo test --release -p uemulator --target x86_64-apple-darwin`, expect PASS.**
+- [ ] **Step 4: Commit** `JIT: x86_64 direct chaining for same-page static exits`.
+
+### Task 4: measure and document
+
+- [ ] **Step 1: `hack/perf/unpack.sh` three times; sample again; record in the results table.**
+- [ ] **Step 2: Update `plans/06-jit.md` (chaining paragraph) and `plans/10-milestones.md`; commit** `Plans: direct chaining`.
+
+---
+
+## Project 2: inline the remaining hot integer instructions
+
+Candidates, from the profile (`shift_rotate`, `flags::compute`, `load_operand`, `write_gpr`, `exec`): rotates (`rol`/`ror`), `adc`/`sbb`, `bt`/`bts`/`btr`/`btc` with register or immediate, `xchg r,r`, `bswap`, `movbe`, `tzcnt`/`lzcnt`/`popcnt`/`bsf`/`bsr`, `cmpxchg` (non-lock), 8/16-bit forms of the existing ALU set. Order is decided by data, not guesswork.
+
+### Task 5: count which instructions reach `helper_exec`
+
+**Files:**
+- Modify: `crates/uemulator/src/jit/helpers.rs` (`helper_exec_pair`), `crates/uemulator/src/jit/native.rs` (`JitStats`)
+- Test: `native.rs` tests
+
+**Interfaces:**
+- Produces: `#[cfg(feature = "jit_profile")]`-free, always-on cost kept near zero: `Jit::helper_histogram(&self) -> Vec<(u16 /*op*/, u64 /*count*/)>` backed by a `[u64; 512]` in `Cpu` incremented in `helper_exec_pair` only when `Cpu::count_helpers` is set; CLI `--jit-stats` prints the top 25 on exit.
+
+- [ ] **Step 1: Failing test** `helper_histogram_counts_non_inlined_ops`: run `adc eax, ebx` three times under the JIT with counting on, expect the `adc` opcode to have count 3.
+- [ ] **Step 2: Implement, run, expect PASS.**
+- [ ] **Step 3: Boot the unpack with `--jit-stats`; paste the top 25 into this file under Project 2 and pick the lowerings by count. Commit** `JIT: --jit-stats prints the instructions that still go through helper_exec`.
+
+### Task 6..N: one lowering per instruction family, in descending count
+
+For each family chosen from Task 5, in this order of steps:
+
+- [ ] **Step 1: Add diff cases in the matching `jit/diff_*.rs` (`diff_alu.rs` for adc/sbb/rotates/bswap, `diff_flags.rs` for flag-producing forms) covering every operand size, register and memory forms, and flag-in/flag-out combinations, using `assert_jit_matches_interpreter`.**
+- [ ] **Step 2: Run, expect PASS (still through the helper) so the oracle is known good; then add the lowering in `emit.rs` (`try_inline`) and `emit_x64.rs`, with the flag model of the existing ops (`LazyFlagsOp`, `Gen::live`).**
+- [ ] **Step 3: Run the diff tests on both hosts (`--target x86_64-apple-darwin`), `--verify` boot to the prompt, then `hack/perf/unpack.sh`; keep the lowering only if the unpack time or the helper count improves.**
+- [ ] **Step 4: Commit** `JIT: inline <family> on aarch64 and x86_64`.
+
+---
+
+## Project 3: SIMD on the hot path
+
+Guests on the Zen 4 model run `crc32` with `pclmulqdq`/`vpclmulqdq` and copy with EVEX loads/stores, so these go through `Cpu::exec` -> `sse_ext`/`evex` generic decode every instruction. Stages, cheapest first, each gated on the unpack time:
+
+### Task S1: dedicated helper for `pclmulqdq`
+
+**Files:**
+- Modify: `crates/uemulator/src/jit/helpers.rs`, `crates/uemulator/src/jit/emit.rs`, `crates/uemulator/src/jit/emit_x64.rs`, `crates/uemulator/src/cpu/sse_ext.rs` (extract the multiply into `fn clmul64(a: u64, b: u64) -> u128`, hardware `PMULL` on aarch64 behind `target_feature`, a portable shift-xor loop otherwise)
+- Test: `crates/uemulator/src/cpu/sse_ext.rs` tests, `jit/diff_misc.rs`
+
+**Interfaces:**
+- Produces: `fn clmul64(a: u64, b: u64) -> u128`; `extern "C" fn helper_pclmulqdq(cpu: *mut Cpu, dst_xmm: u64, src: u64, imm_and_form: u64) -> u64` (status like other helpers; `src` is an xmm index or a guest address when the memory form flag in `imm_and_form` is set); `Addrs::pclmulqdq`.
+
+- [ ] **Step 1: Failing tests:** `clmul64_matches_the_shift_xor_definition` (random pairs, edge cases 0, 1, u64::MAX, bit 63 times bit 63); a diff test per `imm` selector (0x00, 0x01, 0x10, 0x11), register and memory source, plus a faulting memory source (page fault delivered with the right rip).
+- [ ] **Step 2: Implement, run, expect PASS; then measure with `hack/perf/unpack.sh`.**
+- [ ] **Step 3: Commit** `JIT: dedicated pclmulqdq helper`.
+
+### Task S2: VEX/EVEX 128-512 bit moves, logic and ternary logic without the generic engine
+
+The kernel's `crc32_pclmul` and `memcpy`-style loops are made of `vmovdqu(8|16|32|64)`, `vpxor(d|q)`, `vpternlogd/q`, `vpclmulqdq` on ymm/zmm. Add `helper_vector_fast(cpu, insn_ptr, rip)` handling exactly these opcodes on the register file layout `Cpu` uses (`cpu/xsave.rs` documents it), selected at translate time so other EVEX instructions keep the generic path.
+
+- [ ] **Step 1: Failing diff tests per instruction in `jit/diff_misc.rs` (all widths, mask register and zeroing variants for the EVEX forms, memory operands crossing a page, `{k}` merge masking).**
+- [ ] **Step 2: Implement, PASS, measure.**
+- [ ] **Step 3: Commit** `JIT: fast path for common AVX-512 moves, logic and vpclmulqdq`.
+
+### Task S3: inline NEON lowering (aarch64 host) for the same set
+
+Only if S1+S2 leave SIMD above ~10% of the busy samples. Inline `ldp q`/`stp q` of the xmm/ymm/zmm lanes in `Cpu`, `eor`, `bsl`/`bif` for ternary logic, `pmull`/`pmull2`. x86_64 host keeps the helper. The tasks mirror S2 with the diff tests unchanged.
+
+- [ ] **Step 1: Re-sample; write the SIMD share in the results table; proceed only if above threshold.**
+- [ ] **Step 2: Lower each instruction with its diff test already green; PASS; measure; commit per instruction family.**
+
+### Task S4: decide on hiding features
+
+Only if the unpack is still well over 2x slower than the target after S1-S3: write the options and numbers into this file and ask before changing CPUID (it conflicts with the Zen 4 model contract in `plans/03-cpu.md`).
+
+---
+
+## Results
+
+| step | `unpack` seconds (median of 3) | notes |
+|------|-------------------------------|-------|
+| baseline | 22.1 (20.1, 22.1, 23.7) | aarch64 host, another emulator job running alongside, so noisy |
+| direct chaining | | |
+| inline integer ops | | |
+| pclmulqdq helper | | |
+| AVX-512 fast path | | |

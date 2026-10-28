@@ -25,5 +25,6 @@ Index. Read in order; each file ends with open questions where the answer needs 
 | 18-xen-dom0.md | Fedora Xen dom0 through UEFI: ACPI, IOMMU wiring, SMP and what follows; status per step |
 | 18-xen-dom0.md | plan for a Xen dom0 on a modern AMD machine |
 | 19-uefi-firmware.md | the UEFI firmware, key-value store, handoff page |
+| 20-jit-perf.md | JIT performance: direct chaining, inline integer ops, SIMD fast paths, measured against the initramfs unpack |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. Zero crate dependencies.
