@@ -3,7 +3,7 @@
 //! shifts and blends. They share operand plumbing with `avx.rs`; the arithmetic that has a legacy
 //! counterpart (conversions, shifts) is delegated to the legacy kernel on explicit registers.
 
-use super::decode::{Insn, VEX_OP_FLAG};
+use super::decode::{EVEX_OP_FLAG, Insn, VEX_OP_FLAG};
 use super::exception::Exception;
 use super::sse::Prefix;
 use super::sse::ext::{Op, decode_op};
@@ -96,6 +96,7 @@ impl Cpu {
     pub(super) fn set_vector(&mut self, register: usize, low: u128, high: u128, wide: bool) {
         self.xmm[register] = low;
         self.ymm_hi[register] = if wide { high } else { 0 };
+        self.clear_zmm_upper(register);
     }
 
     /// Runs the legacy SSE kernel for `i` with explicit register operands and returns the new
@@ -112,7 +113,7 @@ impl Cpu {
         self.xmm[SCRATCH_DEST] = destination;
         let mut legacy = *i;
         legacy.vex = false;
-        legacy.op = i.op & !VEX_OP_FLAG;
+        legacy.op = i.op & !(VEX_OP_FLAG | EVEX_OP_FLAG);
         legacy.md = 3;
         legacy.reg = SCRATCH_DEST as u8;
         legacy.rm = SCRATCH_SOURCE as u8;
@@ -239,6 +240,8 @@ impl Cpu {
         }
         (self.xmm[reg], self.ymm_hi[reg]) = (dest[0], dest[1]);
         (self.xmm[mask_reg], self.ymm_hi[mask_reg]) = (mask[0], mask[1]);
+        self.clear_zmm_upper(reg);
+        self.clear_zmm_upper(mask_reg);
         match failure {
             Some(error) => Err(error),
             None => Ok(()),

@@ -25,6 +25,8 @@
 
 - Non-long-mode paging done (see 04 and 03, "Control-register rules outside long mode"): paging off, 32-bit two-level paging (4 MiB pages, PSE-36 advertised), PAE with latched PDPTEs, and the CR0/CR3/CR4/EFER transition rules; 82 tests in `cpu/paging_tests.rs`.
 
+- AVX-512 done (see 03, "AVX-512"): EVEX decoding, 32 ZMM registers, opmasks and XSAVE components 5-7, AVX512F/VL/BW/DQ/CD/IFMA/VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ, GFNI, VAES and VPCLMULQDQ, with masking, broadcast, embedded rounding and fault suppression; advertised in CPUID. Alpine and the Debian installer boot with it on.
+
 - UMIP, SMEP/SMAP, PCID/INVPCID, MONITOR/MWAIT, RDTSCP done (see 03).
 
 - VEX decoding, BMI1 and BMI2 done (see 03, "VEX and BMI").

@@ -12,20 +12,74 @@ pub(super) const XCR0_X87: u64 = 1 << 0;
 pub(super) const XCR0_SSE: u64 = 1 << 1;
 /// YMM_Hi128: the upper halves of YMM0-15 (`Cpu::ymm_hi`).
 pub(super) const XCR0_AVX: u64 = 1 << 2;
+/// Opmask: k0-k7 (`Cpu::opmask`).
+pub(super) const XCR0_OPMASK: u64 = 1 << 5;
+/// ZMM_Hi256: bits 511:256 of ZMM0-15 (`Cpu::zmm_hi`).
+pub(super) const XCR0_ZMM_HI256: u64 = 1 << 6;
+/// Hi16_ZMM: ZMM16-31 (`Cpu::zmm_extra`).
+pub(super) const XCR0_HI16_ZMM: u64 = 1 << 7;
+/// The three AVX-512 components; xsetbv accepts all of them or none.
+pub(super) const XCR0_AVX512: u64 = XCR0_OPMASK | XCR0_ZMM_HI256 | XCR0_HI16_ZMM;
 /// Components xsetbv accepts. Extending this also means extending CPUID leaf 0xD and the save
 /// area layout below, or the kernel will size its buffers for state the instructions skip.
-pub(super) const XCR0_SUPPORTED: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX;
+pub(super) const XCR0_SUPPORTED: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX | XCR0_AVX512;
 
 /// The XSAVE area is the legacy image plus a 64-byte header: XSTATE_BV (8 bytes), XCOMP_BV (8)
 /// and 48 reserved bytes, all of which xrstor requires to be zero except XSTATE_BV.
 pub(super) const XSAVE_HEADER_SIZE: u64 = 64;
 pub(super) const XSAVE_AREA_SIZE: u64 = FXSAVE_AREA_SIZE + XSAVE_HEADER_SIZE;
-/// The AVX component sits right after the header (CPUID.0xD.2 reports this offset) and holds
-/// YMM0_H..YMM15_H, 16 bytes each.
+
+/// One extended-state component in the standard (non-compacted) format. `offset` is what
+/// CPUID.0xD.n:EBX reports; the standard format places component n after the previous one, but
+/// the opmask component starts at 1088 because Intel aligns components to the sizes the
+/// hardware gave them, and software hard-codes these numbers.
+pub(super) struct Component {
+    pub bit: u64,
+    /// The component number (CPUID.0xD subleaf).
+    pub index: u32,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// The AVX component sits right after the header and holds YMM0_H..YMM15_H, 16 bytes each.
 pub(super) const AVX_STATE_OFFSET: u64 = XSAVE_AREA_SIZE;
 pub(super) const AVX_STATE_SIZE: u64 = 256;
-pub(super) const XSAVE_AREA_SIZE_WITH_AVX: u64 = AVX_STATE_OFFSET + AVX_STATE_SIZE;
+const OPMASK_STATE_OFFSET: u64 = 1088;
+const OPMASK_STATE_SIZE: u64 = 64;
+const ZMM_HI256_STATE_OFFSET: u64 = 1152;
+const ZMM_HI256_STATE_SIZE: u64 = 512;
+const HI16_ZMM_STATE_OFFSET: u64 = 1664;
+const HI16_ZMM_STATE_SIZE: u64 = 1024;
+pub(super) const COMPONENTS: [Component; 4] = [
+    Component {
+        bit: XCR0_AVX,
+        index: 2,
+        offset: AVX_STATE_OFFSET,
+        size: AVX_STATE_SIZE,
+    },
+    Component {
+        bit: XCR0_OPMASK,
+        index: 5,
+        offset: OPMASK_STATE_OFFSET,
+        size: OPMASK_STATE_SIZE,
+    },
+    Component {
+        bit: XCR0_ZMM_HI256,
+        index: 6,
+        offset: ZMM_HI256_STATE_OFFSET,
+        size: ZMM_HI256_STATE_SIZE,
+    },
+    Component {
+        bit: XCR0_HI16_ZMM,
+        index: 7,
+        offset: HI16_ZMM_STATE_OFFSET,
+        size: HI16_ZMM_STATE_SIZE,
+    },
+];
 const YMM_HIGH_STRIDE: u64 = 16;
+const ZMM_HI256_STRIDE: u64 = 32;
+const HI16_ZMM_STRIDE: u64 = 64;
+const OPMASK_STRIDE: u64 = 8;
 const XSAVE_ALIGNMENT: u64 = 64;
 const XSTATE_BV_OFFSET: u64 = FXSAVE_AREA_SIZE;
 const XCOMP_BV_OFFSET: u64 = XSTATE_BV_OFFSET + 8;
@@ -84,6 +138,9 @@ impl Cpu {
         if value & XCR0_X87 == 0
             || value & !XCR0_SUPPORTED != 0
             || (value & XCR0_AVX != 0 && value & XCR0_SSE == 0)
+            // The AVX-512 components come together and need AVX state to hang their upper halves on.
+            || (value & XCR0_AVX512 != 0
+                && (value & XCR0_AVX512 != XCR0_AVX512 || value & XCR0_AVX == 0))
         {
             return Err(Exception::general_protection(0));
         }
@@ -121,12 +178,7 @@ impl Cpu {
             requested & XCR0_X87 != 0,
             requested & XCR0_SSE != 0,
         )?;
-        if requested & XCR0_AVX != 0 {
-            for k in 0..self.ymm_hi.len() {
-                let at = address + AVX_STATE_OFFSET + k as u64 * YMM_HIGH_STRIDE;
-                self.write128(at, self.ymm_hi[k])?;
-            }
-        }
+        self.save_vector_components(address, requested)?;
         let previous = self.read(address + XSTATE_BV_OFFSET, 8)?;
         self.write(
             address + XSTATE_BV_OFFSET,
@@ -159,32 +211,124 @@ impl Cpu {
                 LegacyRestore::Init
             }
         };
-        // Read the AVX component before anything is committed, like the legacy region.
-        let mut ymm_hi = self.ymm_hi;
-        match component(XCR0_AVX) {
-            LegacyRestore::Skip => {}
-            LegacyRestore::Init => ymm_hi = [0; 16],
-            LegacyRestore::Load => {
-                for (k, half) in ymm_hi.iter_mut().enumerate() {
-                    *half =
-                        self.read128(address + AVX_STATE_OFFSET + k as u64 * YMM_HIGH_STRIDE)?;
-                }
+        // Read every vector component before anything is committed, like the legacy region.
+        let mut pending = VectorState {
+            ymm_hi: self.ymm_hi,
+            opmask: self.opmask,
+            zmm_hi: self.zmm_hi,
+            zmm_extra: self.zmm_extra,
+        };
+        for part in &COMPONENTS {
+            match component(part.bit) {
+                LegacyRestore::Skip => {}
+                LegacyRestore::Init => pending.initialize(part.bit),
+                LegacyRestore::Load => self.load_component(address, part, &mut pending)?,
             }
         }
         self.restore_legacy_region(address, component(XCR0_X87), component(XCR0_SSE))?;
-        self.ymm_hi = ymm_hi;
+        self.ymm_hi = pending.ymm_hi;
+        self.opmask = pending.opmask;
+        self.zmm_hi = pending.zmm_hi;
+        self.zmm_extra = pending.zmm_extra;
         Ok(())
+    }
+
+    fn save_vector_components(&mut self, address: u64, requested: u64) -> ExecResult<()> {
+        if requested & XCR0_AVX != 0 {
+            for k in 0..self.ymm_hi.len() {
+                let at = address + AVX_STATE_OFFSET + k as u64 * YMM_HIGH_STRIDE;
+                self.write128(at, self.ymm_hi[k])?;
+            }
+        }
+        if requested & XCR0_OPMASK != 0 {
+            for k in 0..self.opmask.len() {
+                let at = address + OPMASK_STATE_OFFSET + k as u64 * OPMASK_STRIDE;
+                self.write(at, 8, self.opmask[k])?;
+            }
+        }
+        if requested & XCR0_ZMM_HI256 != 0 {
+            for k in 0..self.zmm_hi.len() {
+                let at = address + ZMM_HI256_STATE_OFFSET + k as u64 * ZMM_HI256_STRIDE;
+                self.write128(at, self.zmm_hi[k][0])?;
+                self.write128(at + 16, self.zmm_hi[k][1])?;
+            }
+        }
+        if requested & XCR0_HI16_ZMM != 0 {
+            for k in 0..self.zmm_extra.len() {
+                let at = address + HI16_ZMM_STATE_OFFSET + k as u64 * HI16_ZMM_STRIDE;
+                for (lane, value) in self.zmm_extra[k].into_iter().enumerate() {
+                    self.write128(at + 16 * lane as u64, value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn load_component(
+        &mut self,
+        address: u64,
+        part: &Component,
+        pending: &mut VectorState,
+    ) -> ExecResult<()> {
+        let base = address + part.offset;
+        match part.bit {
+            XCR0_AVX => {
+                for k in 0..pending.ymm_hi.len() {
+                    pending.ymm_hi[k] = self.read128(base + k as u64 * YMM_HIGH_STRIDE)?;
+                }
+            }
+            XCR0_OPMASK => {
+                for k in 0..pending.opmask.len() {
+                    pending.opmask[k] = self.read(base + k as u64 * OPMASK_STRIDE, 8)?;
+                }
+            }
+            XCR0_ZMM_HI256 => {
+                for k in 0..pending.zmm_hi.len() {
+                    let at = base + k as u64 * ZMM_HI256_STRIDE;
+                    pending.zmm_hi[k] = [self.read128(at)?, self.read128(at + 16)?];
+                }
+            }
+            _ => {
+                for k in 0..pending.zmm_extra.len() {
+                    let at = base + k as u64 * HI16_ZMM_STRIDE;
+                    for lane in 0..4 {
+                        pending.zmm_extra[k][lane] = self.read128(at + 16 * lane as u64)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The vector registers xrstor can replace, staged so a fault while reading leaves the real
+/// ones alone.
+struct VectorState {
+    ymm_hi: [u128; 16],
+    opmask: [u64; 8],
+    zmm_hi: [[u128; 2]; 16],
+    zmm_extra: [[u128; 4]; 16],
+}
+
+impl VectorState {
+    fn initialize(&mut self, bit: u64) {
+        match bit {
+            XCR0_AVX => self.ymm_hi = [0; 16],
+            XCR0_OPMASK => self.opmask = [0; 8],
+            XCR0_ZMM_HI256 => self.zmm_hi = [[0; 2]; 16],
+            _ => self.zmm_extra = [[0; 4]; 16],
+        }
     }
 }
 
 /// CPUID.0xD.0:EBX: bytes the XSAVE area needs for the components `xcr0` enables.
 pub(super) fn enabled_area_size(xcr0: u64) -> u32 {
-    // The header is always part of the area; each further component extends it.
-    if xcr0 & XCR0_AVX != 0 {
-        XSAVE_AREA_SIZE_WITH_AVX as u32
-    } else {
-        XSAVE_AREA_SIZE as u32
-    }
+    // The header is always part of the area; the highest enabled component ends it.
+    COMPONENTS
+        .iter()
+        .filter(|part| xcr0 & part.bit != 0)
+        .map(|part| part.offset + part.size)
+        .fold(XSAVE_AREA_SIZE, u64::max) as u32
 }
 
 #[cfg(test)]

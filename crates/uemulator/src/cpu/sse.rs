@@ -2034,6 +2034,8 @@ fn put_u64<T: Lane>(r: &mut u128, k: usize, v: u64, width: u32) {
     *r |= ((v & m) as u128) << (k * width as usize);
 }
 
+#[path = "evex.rs"]
+pub(in crate::cpu) mod evex;
 #[path = "sse_ext.rs"]
 pub(in crate::cpu) mod ext;
 #[path = "sse_fma.rs"]

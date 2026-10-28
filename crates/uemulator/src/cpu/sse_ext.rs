@@ -15,7 +15,7 @@
 use super::*;
 
 #[path = "crypto.rs"]
-mod crypto;
+pub(super) mod crypto;
 #[path = "string_compare.rs"]
 mod string_compare;
 
@@ -457,7 +457,7 @@ fn horizontal(fp: &mut FpEnv, format: Format, subtract: bool, dst: u128, src: u1
     result
 }
 
-/// AES-NI and PCLMULQDQ.
+/// AES-NI, PCLMULQDQ and GFNI.
 fn decode_crypto_op(map: u16, opcode: u8) -> Option<Op> {
     Some(match (map, opcode) {
         (OPCODE_MAP_0F38, 0xdb) => Op::Unary(crypto::aes_inverse_mix_columns),
@@ -478,6 +478,14 @@ fn decode_crypto_op(map: u16, opcode: u8) -> Option<Op> {
             Op::WithImm(|_, source, constant| crypto::aes_key_generation_assist(source, constant))
         }
         (OPCODE_MAP_0F3A, 0x44) => Op::WithImm(pclmulqdq),
+        // GFNI: the data is the destination operand, the matrix the source
+        (OPCODE_MAP_0F38, 0xcf) => Op::Binary(crypto::gf_multiply_bytes),
+        (OPCODE_MAP_0F3A, 0xce) => {
+            Op::WithImm(|data, matrix, immediate| crypto::gf_affine(data, matrix, immediate, false))
+        }
+        (OPCODE_MAP_0F3A, 0xcf) => {
+            Op::WithImm(|data, matrix, immediate| crypto::gf_affine(data, matrix, immediate, true))
+        }
         _ => return None,
     })
 }

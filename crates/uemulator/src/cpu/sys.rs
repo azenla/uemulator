@@ -370,8 +370,35 @@ const STRUCTURED_FEATURE_BMI2: u32 = 1 << 8;
 const STRUCTURED_FEATURE_SMEP: u32 = 1 << 7;
 const STRUCTURED_FEATURE_INVPCID: u32 = 1 << 10;
 const STRUCTURED_FEATURE_SMAP: u32 = 1 << 20;
+/// AVX-512 foundation and its sub-extensions (EBX): F, DQ, IFMA, CD, BW, VL. PF and ER (Xeon Phi
+/// only) are absent. The state they need is XCR0 bits 7:5 (leaf 0xd).
+const STRUCTURED_FEATURE_AVX512F: u32 = 1 << 16;
+const STRUCTURED_FEATURE_AVX512DQ: u32 = 1 << 17;
+const STRUCTURED_FEATURE_AVX512IFMA: u32 = 1 << 21;
+const STRUCTURED_FEATURE_AVX512CD: u32 = 1 << 28;
+const STRUCTURED_FEATURE_AVX512BW: u32 = 1 << 30;
+const STRUCTURED_FEATURE_AVX512VL: u32 = 1 << 31;
 /// Leaf 7 ECX bit 2: UMIP.
 const STRUCTURED_ECX_UMIP: u32 = 1 << 2;
+/// Leaf 7 ECX: AVX512_VBMI, AVX512_VBMI2, GFNI, VAES, VPCLMULQDQ, AVX512_VNNI, AVX512_BITALG and
+/// AVX512_VPOPCNTDQ. GFNI, VAES and VPCLMULQDQ also cover the legacy and VEX encodings.
+const STRUCTURED_ECX_AVX512_VBMI: u32 = 1 << 1;
+const STRUCTURED_ECX_AVX512_VBMI2: u32 = 1 << 6;
+const STRUCTURED_ECX_GFNI: u32 = 1 << 8;
+const STRUCTURED_ECX_VAES: u32 = 1 << 9;
+const STRUCTURED_ECX_VPCLMULQDQ: u32 = 1 << 10;
+const STRUCTURED_ECX_AVX512_VNNI: u32 = 1 << 11;
+const STRUCTURED_ECX_AVX512_BITALG: u32 = 1 << 12;
+const STRUCTURED_ECX_AVX512_VPOPCNTDQ: u32 = 1 << 14;
+const STRUCTURED_ECX: u32 = STRUCTURED_ECX_UMIP
+    | STRUCTURED_ECX_AVX512_VBMI
+    | STRUCTURED_ECX_AVX512_VBMI2
+    | STRUCTURED_ECX_GFNI
+    | STRUCTURED_ECX_VAES
+    | STRUCTURED_ECX_VPCLMULQDQ
+    | STRUCTURED_ECX_AVX512_VNNI
+    | STRUCTURED_ECX_AVX512_BITALG
+    | STRUCTURED_ECX_AVX512_VPOPCNTDQ;
 /// ERMS: fast `rep movsb`/`rep stosb`.
 const STRUCTURED_FEATURE_ERMS: u32 = 1 << 9;
 const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE
@@ -382,7 +409,13 @@ const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE
     | STRUCTURED_FEATURE_SMAP
     | STRUCTURED_FEATURE_BMI1
     | STRUCTURED_FEATURE_BMI2
-    | STRUCTURED_FEATURE_RDSEED;
+    | STRUCTURED_FEATURE_RDSEED
+    | STRUCTURED_FEATURE_AVX512F
+    | STRUCTURED_FEATURE_AVX512DQ
+    | STRUCTURED_FEATURE_AVX512IFMA
+    | STRUCTURED_FEATURE_AVX512CD
+    | STRUCTURED_FEATURE_AVX512BW
+    | STRUCTURED_FEATURE_AVX512VL;
 
 // Leaf 7 subleaf 0 EDX: the speculation-control interface. The MSRs behind these bits are
 // implemented as inert storage (see `ARCH_CAPABILITIES`).
@@ -480,7 +513,7 @@ impl Cpu {
             CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES => {
                 // Only subleaf 0 exists; EAX is the highest subleaf.
                 if self.gpr[RCX] as u32 == 0 {
-                    (0, STRUCTURED_EBX, STRUCTURED_ECX_UMIP, STRUCTURED_EDX)
+                    (0, STRUCTURED_EBX, STRUCTURED_ECX, STRUCTURED_EDX)
                 } else {
                     (0, 0, 0, 0)
                 }
@@ -510,7 +543,7 @@ impl Cpu {
                 0 => (
                     xsave::XCR0_SUPPORTED as u32,
                     xsave::enabled_area_size(self.xcr0),
-                    xsave::XSAVE_AREA_SIZE_WITH_AVX as u32,
+                    xsave::enabled_area_size(xsave::XCR0_SUPPORTED),
                     0,
                 ),
                 1 => (
@@ -519,14 +552,11 @@ impl Cpu {
                     0,
                     0,
                 ),
-                // Component 2 (AVX): size and offset in the standard format
-                2 => (
-                    xsave::AVX_STATE_SIZE as u32,
-                    xsave::AVX_STATE_OFFSET as u32,
-                    0,
-                    0,
-                ),
-                _ => (0, 0, 0, 0),
+                // Components 2 (AVX) and 5-7 (AVX-512): size and offset in the standard format
+                subleaf => match xsave::COMPONENTS.iter().find(|part| part.index == subleaf) {
+                    Some(part) => (part.size as u32, part.offset as u32, 0, 0),
+                    None => (0, 0, 0, 0),
+                },
             },
             CPUID_LEAF_EXT_MAX => (CPUID_MAX_EXTENDED_LEAF, VENDOR_EBX, VENDOR_ECX, VENDOR_EDX),
             CPUID_LEAF_EXT_FEATURES => (
@@ -1969,14 +1999,19 @@ mod sys_tests {
             const INVPCID: u32 = 1 << 10;
             const SMAP: u32 = 1 << 20;
             const UMIP: u32 = 1 << 2;
+            // AVX-512 F, DQ, IFMA, CD, BW, VL
+            const AVX512: u32 = 1 << 16 | 1 << 17 | 1 << 21 | 1 << 28 | 1 << 30 | 1 << 31;
+            // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ
+            const ECX_EXTENSIONS: u32 =
+                1 << 1 | 1 << 6 | 1 << 8 | 1 << 9 | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 14;
             let mut h = blank();
             // EAX is the highest subleaf; EDX is the speculation-control set plus FSRM.
             assert_eq!(
                 cpuid(&mut h, 7, 0),
                 [
                     0,
-                    FSGSBASE | BMI1 | BMI2 | RDSEED | ERMS | SMEP | AVX2 | INVPCID | SMAP,
-                    UMIP,
+                    FSGSBASE | BMI1 | BMI2 | RDSEED | ERMS | SMEP | AVX2 | INVPCID | SMAP | AVX512,
+                    UMIP | ECX_EXTENSIONS,
                     STRUCTURED_EDX
                 ]
             );
@@ -2009,15 +2044,24 @@ mod sys_tests {
         #[test]
         fn leaf_0xd_describes_the_xsave_area() {
             let mut h = blank();
-            // supported XCR0 bits (x87, SSE, AVX), size for the enabled set, size for all supported
-            assert_eq!(cpuid(&mut h, 0xd, 0), [7, 576, 832, 0]);
+            // supported XCR0 bits (x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM), size for the
+            // enabled set, size for all supported
+            assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 576, 2688, 0]);
             h.cpu.xcr0 = 7;
-            assert_eq!(cpuid(&mut h, 0xd, 0), [7, 832, 832, 0]);
+            assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 832, 2688, 0]);
+            h.cpu.xcr0 = 0xe7;
+            assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 2688, 2688, 0]);
             // xsaveopt only: no xsavec, xgetbv1 or xsaves
-            assert_eq!(cpuid(&mut h, 0xd, 1), [1, 832, 0, 0]);
+            assert_eq!(cpuid(&mut h, 0xd, 1), [1, 2688, 0, 0]);
             // component 2 (AVX): 256 bytes at offset 576
             assert_eq!(cpuid(&mut h, 0xd, 2), [256, 576, 0, 0]);
             assert_eq!(cpuid(&mut h, 0xd, 3), [0, 0, 0, 0]);
+            assert_eq!(cpuid(&mut h, 0xd, 4), [0, 0, 0, 0]);
+            // opmask: 64 bytes at 1088; ZMM_Hi256: 512 at 1152; Hi16_ZMM: 1024 at 1664
+            assert_eq!(cpuid(&mut h, 0xd, 5), [64, 1088, 0, 0]);
+            assert_eq!(cpuid(&mut h, 0xd, 6), [512, 1152, 0, 0]);
+            assert_eq!(cpuid(&mut h, 0xd, 7), [1024, 1664, 0, 0]);
+            assert_eq!(cpuid(&mut h, 0xd, 8), [0, 0, 0, 0]);
         }
 
         #[test]

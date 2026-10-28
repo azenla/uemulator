@@ -88,12 +88,30 @@ pub(crate) struct Insn {
     pub vex: bool,
     /// VEX.L: 256-bit vector length.
     pub vex_l: bool,
-    /// VEX.vvvv, already un-inverted (0..=15): the extra register operand.
+    /// VEX.vvvv, already un-inverted (0..=15; 0..=31 with EVEX.V'): the extra register operand.
     pub vex_v: u8,
+    /// Encoded with an EVEX prefix (`62`, AVX-512). `op` then carries `EVEX_OP_FLAG`, `vex` stays
+    /// false, and `reg`, `rm` (register form), `vex_v` and a VSIB `index` are 5 bits wide. `p66`,
+    /// `rep` and `opsize` follow the VEX conventions. `disp` holds the raw disp8 for `md == 1`:
+    /// the executor scales it by the tuple size (`evex_disp8`).
+    pub evex: bool,
+    /// EVEX.aaa: opmask register selecting the elements to write (0 = no masking).
+    pub evex_mask: u8,
+    /// EVEX.z: zero the masked-out elements instead of keeping them.
+    pub evex_zeroing: bool,
+    /// EVEX.b: broadcast with a memory operand; embedded rounding / suppress-all-exceptions with a
+    /// register operand (then `evex_ll` is the rounding mode, not a vector length).
+    pub evex_b: bool,
+    /// EVEX.L'L: 0 = 128, 1 = 256, 2 = 512 bits, 3 reserved (rounding mode for `evex_b` forms).
+    pub evex_ll: u8,
+    /// `md == 1`: `disp` is a compressed disp8 (multiplied by the memory tuple size).
+    pub evex_disp8: bool,
 }
 
 /// Set in `Insn::op` for VEX-encoded instructions; see `Insn::vex`.
 pub(crate) const VEX_OP_FLAG: u16 = 0x1000;
+/// Set in `Insn::op` for EVEX-encoded instructions; see `Insn::evex`.
+pub(crate) const EVEX_OP_FLAG: u16 = 0x2000;
 
 /// Marks an absent `base`/`index` register.
 pub(crate) const NO_REG: u8 = 0xff;
@@ -119,6 +137,22 @@ const PREFIX_SEG_GS: u8 = 0x65;
 
 const VEX_THREE_BYTE: u8 = 0xc4;
 const VEX_TWO_BYTE: u8 = 0xc5;
+const EVEX_PREFIX: u8 = 0x62;
+/// EVEX payload bits. P0 is `R X B R' 0 mmm` (R, X, B, R' inverted), P1 is `W vvvv 1 pp` and P2 is
+/// `z L'L b V' aaa` (V' inverted). The fixed bits must hold their value or the encoding is #UD.
+const EVEX_R: u8 = 0x80;
+const EVEX_X: u8 = 0x40;
+const EVEX_B: u8 = 0x20;
+const EVEX_R_PRIME: u8 = 0x10;
+const EVEX_P0_MUST_BE_ZERO: u8 = 0x08;
+const EVEX_MAP_MASK: u8 = 0x07;
+const EVEX_P1_MUST_BE_ONE: u8 = 0x04;
+const EVEX_Z: u8 = 0x80;
+const EVEX_LL_SHIFT: u32 = 5;
+const EVEX_LL_MASK: u8 = 3;
+const EVEX_BROADCAST: u8 = 0x10;
+const EVEX_V_PRIME: u8 = 0x08;
+const EVEX_AAA_MASK: u8 = 7;
 /// VEX payload bits (stored inverted for R, X, B and vvvv).
 const VEX_R: u8 = 0x80;
 const VEX_X: u8 = 0x40;
@@ -290,6 +324,12 @@ fn has_modrm(map: u16, opcode: u8) -> bool {
     }
 }
 
+/// `0F 38` opcodes whose memory operand has a vector index (VSIB): the VEX gathers 90-93, and with
+/// EVEX also the scatters a0-a3.
+fn is_gather_opcode(opcode: u8, evex: bool) -> bool {
+    (0x90..=0x93).contains(&opcode) || (evex && (0xa0..=0xa3).contains(&opcode))
+}
+
 /// One-byte opcodes that are invalid in 64-bit mode, plus EVEX (`62`), which is not supported.
 /// `c4`/`c5` are `les`/`lds` outside 64-bit mode and VEX prefixes here; `decode` consumes them
 /// before this check.
@@ -384,7 +424,54 @@ pub(crate) fn decode_in_mode(bytes: &[u8], mode: CodeMode) -> Result<Insn, Decod
     // encode (they need memory): that is VEX.
     let is_vex = (op == VEX_THREE_BYTE || op == VEX_TWO_BYTE)
         && (long || bytes.get(1).is_some_and(|&b| b >> 6 == MODRM_MOD_REGISTER));
-    if is_vex {
+    // Registers 16-31 (EVEX.R', V' and X on a register operand); added once ModRM is known.
+    let (mut high_reg, mut high_rm, mut high_vvvv) = (0u8, 0u8, 0u8);
+    // Outside 64-bit mode 62 is `bound`.
+    if long && op == EVEX_PREFIX {
+        // Same restriction as VEX: legacy operand-size, repeat, lock and REX prefixes are #UD.
+        if i.p66 || i.rep != 0 || i.lock || rex != 0 {
+            return Err(DecodeErr::Invalid);
+        }
+        let (p0, p1, p2) = (r.u8()?, r.u8()?, r.u8()?);
+        let evex_map = (p0 & EVEX_MAP_MASK) as u16;
+        if p0 & EVEX_P0_MUST_BE_ZERO != 0
+            || p1 & EVEX_P1_MUST_BE_ONE == 0
+            || !(MAP_0F..=MAP_0F3A).contains(&evex_map)
+        {
+            return Err(DecodeErr::Invalid);
+        }
+        let mut synthesized = REX_FIRST;
+        for (bit, rex_bit) in [(EVEX_R, REX_R), (EVEX_X, REX_X), (EVEX_B, REX_B)] {
+            if p0 & bit == 0 {
+                synthesized |= rex_bit;
+            }
+        }
+        let w = p1 & VEX_W != 0;
+        if w {
+            synthesized |= REX_W;
+        }
+        rex = synthesized;
+        high_reg = (p0 & EVEX_R_PRIME == 0) as u8;
+        high_rm = (p0 & EVEX_X == 0) as u8;
+        high_vvvv = (p2 & EVEX_V_PRIME == 0) as u8;
+        i.evex = true;
+        i.vex_v = (!(p1 >> VEX_VVVV_SHIFT) & VEX_VVVV_MASK) | high_vvvv << 4;
+        match p1 & VEX_PP_MASK {
+            VEX_PP_66 => i.p66 = true,
+            VEX_PP_F3 => i.rep = 1,
+            VEX_PP_F2 => i.rep = 2,
+            _ => {}
+        }
+        i.evex_zeroing = p2 & EVEX_Z != 0;
+        i.evex_ll = (p2 >> EVEX_LL_SHIFT) & EVEX_LL_MASK;
+        i.evex_b = p2 & EVEX_BROADCAST != 0;
+        i.evex_mask = p2 & EVEX_AAA_MASK;
+        map = evex_map;
+        opb = r.u8()?;
+        i.rex = rex;
+        i.opsize = if w { 8 } else { 4 };
+        i.op = EVEX_OP_FLAG | (map << 8) | opb as u16;
+    } else if is_vex {
         // A legacy operand-size, repeat, lock or REX prefix before VEX is #UD (SDM 2.3.2).
         if i.p66 || i.rep != 0 || i.lock || rex != 0 {
             return Err(DecodeErr::Invalid);
@@ -468,7 +555,7 @@ pub(crate) fn decode_in_mode(bytes: &[u8], mode: CodeMode) -> Result<Insn, Decod
         return Err(DecodeErr::Invalid);
     }
 
-    if has_modrm(map, opb) {
+    if has_modrm(map, opb) || i.evex {
         let m = r.u8()?;
         i.has_modrm = true;
         i.modrm = m;
@@ -476,7 +563,10 @@ pub(crate) fn decode_in_mode(bytes: &[u8], mode: CodeMode) -> Result<Insn, Decod
         // REX.R/X/B extend the 3-bit fields to 4 bits; shift moves the REX bit to bit 3.
         i.reg = ((m >> 3) & 7) | ((i.rex & REX_R) << 1);
         i.rm = (m & 7) | ((i.rex & REX_B) << 3);
-        if i.md != MODRM_MOD_REGISTER && i.addr16 {
+        i.reg |= high_reg << 4;
+        if i.md == MODRM_MOD_REGISTER {
+            i.rm |= high_rm << 4;
+        } else if i.addr16 {
             let (base, index) = ADDRESS16_REGISTERS[(m & 7) as usize];
             i.base = base;
             i.index = index;
@@ -489,16 +579,17 @@ pub(crate) fn decode_in_mode(bytes: &[u8], mode: CodeMode) -> Result<Insn, Decod
                 MODRM_MOD_DISP32 => i.disp = r.int(2)?,
                 _ => {}
             }
-        } else if i.md != MODRM_MOD_REGISTER {
+        } else {
             let mut base_field = m & 7;
             if base_field == RM_SIB_FOLLOWS {
                 let sib = r.u8()?;
                 i.scale = sib >> 6;
                 let index_field = ((sib >> 3) & 7) | ((i.rex & REX_X) << 2);
                 // VSIB (the VEX gathers, 0F38 90-93) has no "no index" encoding: index 4 is xmm4/ymm4
-                let vsib = i.vex && map == MAP_0F38 && (0x90..=0x93).contains(&opb);
+                let vsib = (i.vex || i.evex) && map == MAP_0F38 && is_gather_opcode(opb, i.evex);
                 if index_field != SIB_INDEX_NONE || vsib {
-                    i.index = index_field;
+                    // EVEX.V' extends a VSIB index to zmm16-31; X already did bit 3.
+                    i.index = index_field | if vsib { high_vvvv << 4 } else { 0 };
                 }
                 base_field = sib & 7;
                 // mod 0 with SIB base 5 means no base register, disp32 follows (index may remain)
@@ -515,7 +606,10 @@ pub(crate) fn decode_in_mode(bytes: &[u8], mode: CodeMode) -> Result<Insn, Decod
                 i.base = base_field | ((i.rex & REX_B) << 3);
             }
             match i.md {
-                MODRM_MOD_DISP8 => i.disp = r.int(1)?,
+                MODRM_MOD_DISP8 => {
+                    i.disp = r.int(1)?;
+                    i.evex_disp8 = i.evex;
+                }
                 MODRM_MOD_DISP32 => i.disp = r.int(4)?,
                 _ => {}
             }
@@ -1836,9 +1930,12 @@ mod decode_tests {
         }
 
         #[test]
-        fn evex_is_rejected() {
+        fn evex_decodes_instead_of_being_bound() {
+            // vmovaps zmm0, zmm1: 62 is EVEX in 64-bit mode, never `bound`
             let evex = [0x62, 0xf1, 0x7c, 0x48, 0x28, 0xc1];
-            assert_eq!(decode(&evex).err(), Some(DecodeErr::Invalid));
+            let i = decode(&evex).unwrap();
+            assert!(i.evex);
+            assert_eq!(i.len, 6);
         }
 
         #[test]

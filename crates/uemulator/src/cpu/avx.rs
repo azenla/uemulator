@@ -153,8 +153,9 @@ pub(super) fn vex_form(map: u16, opcode: u8, prefix: Prefix) -> Option<Form> {
 fn form_for_extension(op: Op, map: u16, opcode: u8) -> Option<Form> {
     Some(match op {
         Op::Movddup | Op::Movsldup | Op::Movshdup | Op::Lddqu | Op::LoadAligned | Op::Unary(_) => {
-            // pabs*, phminposuw (128-bit only), pmovsx/zx are widening and handled elsewhere
-            if map == OPCODE_MAP_0F38 && opcode == 0x41 {
+            // pabs*, phminposuw and aesimc (128-bit only), pmovsx/zx are widening and handled
+            // elsewhere
+            if map == OPCODE_MAP_0F38 && matches!(opcode, 0x41 | 0xdb) {
                 return form(Merge::No, Dest::Reg, Width::Xmm);
             }
             Form {
@@ -164,9 +165,10 @@ fn form_for_extension(op: Op, map: u16, opcode: u8) -> Option<Form> {
             }
         }
         Op::AddSub { .. } | Op::Horizontal { .. } | Op::Binary(_) | Op::WithImm(_) => {
-            // AES and PCLMULQDQ have 256-bit forms only with VAES/VPCLMULQDQ, which are not here.
-            let crypto = (map == OPCODE_MAP_0F38 && matches!(opcode, 0xdb..=0xdf))
-                || (map == OPCODE_MAP_0F3A && matches!(opcode, 0x44 | 0xdf));
+            // aesimc and aeskeygenassist have no 256-bit form; the AES rounds (VAES), PCLMULQDQ
+            // (VPCLMULQDQ) and GFNI do, one 128-bit lane at a time.
+            let crypto = (map == OPCODE_MAP_0F38 && opcode == 0xdb)
+                || (map == OPCODE_MAP_0F3A && opcode == 0xdf);
             Form {
                 merge: Merge::Always,
                 dest: Dest::Reg,
@@ -208,6 +210,17 @@ fn form_for_extension(op: Op, map: u16, opcode: u8) -> Option<Form> {
     })
 }
 
+/// Instructions whose register r/m operand names a general register (the integer source of
+/// cvtsi2ss/sd and of pinsrb/w/d/q), which can share a number with the destination vector register
+/// without being the same operand.
+fn rm_is_general_register(op: u16) -> bool {
+    const CVTSI2SS_SD: u16 = 0x12a;
+    const PINSRW: u16 = 0x1c4;
+    const PINSRB: u16 = 0x320;
+    const PINSRD_Q: u16 = 0x322;
+    matches!(op, CVTSI2SS_SD | PINSRW | PINSRB | PINSRD_Q)
+}
+
 impl Cpu {
     /// #UD unless the OS enabled AVX state (CR4.OSXSAVE and XCR0 bits 2:1), then #NM under CR0.TS.
     pub(super) fn vex_gate(&self) -> ExecResult<()> {
@@ -244,10 +257,14 @@ impl Cpu {
             }
             // vzeroupper clears bits 255:128 of every register; vzeroall also clears the low halves
             self.ymm_hi = [0; REGISTER_COUNT];
+            self.zmm_hi = [[0; 2]; REGISTER_COUNT];
             if i.vex_l {
                 self.xmm = [0; REGISTER_COUNT];
             }
             self.rip = next;
+            return Ok(());
+        }
+        if self.exec_opmask(i, next)? {
             return Ok(());
         }
         let Some(form) = vex_form(map, opcode, prefix) else {
@@ -264,12 +281,12 @@ impl Cpu {
         {
             return Err(Exception::invalid_opcode());
         }
-        let snapshot = (self.xmm, self.ymm_hi);
+        let snapshot = (self.xmm, self.ymm_hi, self.zmm_hi);
         let result = self.run_vex_passes(i, next, form);
         self.vex_active = false;
         if let Err(error) = result {
             // A fault in the second lane must not leave the first one written.
-            (self.xmm, self.ymm_hi) = snapshot;
+            (self.xmm, self.ymm_hi, self.zmm_hi) = snapshot;
             return Err(error);
         }
         self.rip = next;
@@ -324,14 +341,16 @@ impl Cpu {
                 return Err(self.unimplemented_opcode(i));
             }
         }
-        if let Some(register) = destination
-            && !two_lanes
-        {
-            self.ymm_hi[register] = 0;
+        if let Some(register) = destination {
+            if !two_lanes {
+                self.ymm_hi[register] = 0;
+            }
+            self.clear_zmm_upper(register);
         }
         // vpcmpistrm/vpcmpestrm write xmm0 (not a ModRM operand), and zero its upper half too
         if map == OPCODE_MAP_0F3A && matches!(opcode, 0x60 | 0x62) {
             self.ymm_hi[0] = 0;
+            self.clear_zmm_upper(0);
         }
         Ok(())
     }
@@ -357,7 +376,11 @@ impl Cpu {
             // - Dest::Reg: the kernel's source is ModRM.rm (register form);
             // - Dest::Rm (stores): the kernel's source is ModRM.reg.
             let collides = match form.dest {
-                Dest::Reg => legacy.md == MODRM_MOD_REGISTER && legacy.rm as usize == destination,
+                Dest::Reg => {
+                    legacy.md == MODRM_MOD_REGISTER
+                        && legacy.rm as usize == destination
+                        && !rm_is_general_register(legacy.op)
+                }
                 Dest::Rm => legacy.reg as usize == destination,
                 Dest::None => false,
             };
