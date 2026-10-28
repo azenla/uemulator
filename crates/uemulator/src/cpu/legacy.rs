@@ -601,28 +601,28 @@ impl Cpu {
             let destination = self.gpr[GPR_RDI] & amask;
             match op {
                 0xa4 | 0xa5 => {
-                    let from = self.segment_linear(source_segment, source)?;
-                    let to = self.segment_linear(SEG_ES, destination)?;
+                    let from = self.segment_access(source_segment, source, size, false)?;
+                    let to = self.segment_access(SEG_ES, destination, size, true)?;
                     let value = self.read(from, size)?;
                     self.write(to, size, value)?;
                     self.write_address_register(GPR_RSI, source.wrapping_add(step), i);
                     self.write_address_register(GPR_RDI, destination.wrapping_add(step), i);
                 }
                 0xaa | 0xab => {
-                    let to = self.segment_linear(SEG_ES, destination)?;
+                    let to = self.segment_access(SEG_ES, destination, size, true)?;
                     let value = self.read_gpr(0, size, true);
                     self.write(to, size, value)?;
                     self.write_address_register(GPR_RDI, destination.wrapping_add(step), i);
                 }
                 0xac | 0xad => {
-                    let from = self.segment_linear(source_segment, source)?;
+                    let from = self.segment_access(source_segment, source, size, false)?;
                     let value = self.read(from, size)?;
                     self.write_gpr(0, size, true, value);
                     self.write_address_register(GPR_RSI, source.wrapping_add(step), i);
                 }
                 0xa6 | 0xa7 => {
-                    let from = self.segment_linear(source_segment, source)?;
-                    let to = self.segment_linear(SEG_ES, destination)?;
+                    let from = self.segment_access(source_segment, source, size, false)?;
+                    let to = self.segment_access(SEG_ES, destination, size, false)?;
                     let a = self.read(from, size)?;
                     let b = self.read(to, size)?;
                     self.set_lazy_flags(
@@ -636,7 +636,7 @@ impl Cpu {
                     self.write_address_register(GPR_RDI, destination.wrapping_add(step), i);
                 }
                 _ => {
-                    let to = self.segment_linear(SEG_ES, destination)?;
+                    let to = self.segment_access(SEG_ES, destination, size, false)?;
                     let a = self.read_gpr(0, size, true);
                     let b = self.read(to, size)?;
                     self.set_lazy_flags(
@@ -704,13 +704,13 @@ impl Cpu {
             let now = self.now_ns();
             if input {
                 let destination = self.gpr[GPR_RDI] & amask;
-                let to = self.segment_linear(SEG_ES, destination)?;
+                let to = self.segment_access(SEG_ES, destination, size, true)?;
                 let value = self.dev.io_in(port, size, now);
                 self.write(to, size, value as u64)?;
                 self.write_address_register(GPR_RDI, destination.wrapping_add(step), i);
             } else {
                 let source = self.gpr[GPR_RSI] & amask;
-                let from = self.segment_linear(source_segment, source)?;
+                let from = self.segment_access(source_segment, source, size, false)?;
                 let value = self.read(from, size)? as u32;
                 self.dev.io_out(port, size, value, now);
                 self.write_address_register(GPR_RSI, source.wrapping_add(step), i);

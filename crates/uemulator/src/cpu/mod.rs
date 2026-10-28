@@ -330,6 +330,10 @@ pub(crate) struct Cpu {
     /// True while a VEX instruction runs through the legacy SSE kernels (see `avx.rs`): they then
     /// skip the CR4.OSFXSR gate and the 16-byte alignment rule.
     pub vex_active: bool,
+    /// Segment register and offset of the memory operand `linear_address` last formed outside 64-bit
+    /// mode, so `load_operand`/`store_operand` can check its whole extent (see `modes.rs`). Reset at
+    /// the start of every instruction there.
+    pub pending_operand: core::cell::Cell<Option<(u8, u64)>>,
     pub mxcsr: u32,
     pub fcw: u16,
     /// TOP is in bits 11-13.
@@ -488,6 +492,7 @@ impl Cpu {
             zmm_extra: [[0; 4]; 16],
             opmask: [0; 8],
             vex_active: false,
+            pending_operand: core::cell::Cell::new(None),
             mxcsr: MXCSR_RESET,
             fcw: FCW_RESET,
             fsw: 0,

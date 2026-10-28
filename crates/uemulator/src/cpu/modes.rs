@@ -57,11 +57,23 @@ impl Cpu {
         self.cr0 & CR0_PE != 0 && self.eflags & VM == 0
     }
 
-    /// Linear address of `offset` in segment register `index`, checked against the segment limit
-    /// (and, in protected mode, that the segment is usable) for an access that starts at
-    /// `offset`. A violation is #SS(0) through SS and #GP(0) otherwise. 64-bit mode only applies
-    /// the FS and GS bases.
+    /// Linear address of `offset` in segment register `index` for a one-byte read; see
+    /// `segment_access`.
     pub(crate) fn segment_linear(&self, index: usize, offset: u64) -> ExecResult<u64> {
+        self.segment_access(index, offset, 1, false)
+    }
+
+    /// Linear address of `offset` in segment register `index`, checked for an access of `size`
+    /// bytes against the segment limit (expand-down segments included) and, in protected mode, that
+    /// the segment is present, readable (or, for a write, a writable data segment). A violation is
+    /// #SS(0) through SS and #GP(0) otherwise. 64-bit mode only applies the FS and GS bases.
+    pub(crate) fn segment_access(
+        &self,
+        index: usize,
+        offset: u64,
+        size: u8,
+        write: bool,
+    ) -> ExecResult<u64> {
         let seg = &self.seg[index];
         if self.is_long64() {
             return Ok(match index {
@@ -77,26 +89,43 @@ impl Cpu {
             }
         };
         if self.segments_are_protected() {
-            // A null or not-present selector, or code that is not readable, cannot be used.
-            let unreadable_code = seg.is_code() && seg.flags & SEG_TYPE_READ_WRITE == 0;
-            if !seg.present() || unreadable_code {
+            // A null or not-present selector cannot be used; code is never writable and may be
+            // execute-only; data needs its write bit to be stored to.
+            let unusable = !seg.present()
+                || if write {
+                    seg.is_code() || seg.flags & SEG_TYPE_READ_WRITE == 0
+                } else {
+                    seg.is_code() && seg.flags & SEG_TYPE_READ_WRITE == 0
+                };
+            if unusable {
                 return Err(violation());
             }
         }
+        let last = offset.wrapping_add(size.max(1) as u64 - 1);
         let outside = if seg.flags & SEG_TYPE_EXPAND_DOWN != 0 && !seg.is_code() {
             let top = if seg.flags & SEG_DEFAULT_BIG != 0 {
                 OFFSET_MAX_32
             } else {
                 OFFSET_MAX_16
             };
-            offset <= seg.limit as u64 || offset > top
+            offset <= seg.limit as u64 || last > top || last < offset
         } else {
-            offset > seg.limit as u64
+            last > seg.limit as u64 || last < offset
         };
         if outside {
             return Err(violation());
         }
         Ok(seg.base.wrapping_add(offset) & LINEAR_MASK_32)
+    }
+
+    /// Checks the whole extent of the operand `linear_address` last formed (outside 64-bit
+    /// mode): `load_operand` and `store_operand` know the size and direction, `linear_address`
+    /// does not.
+    pub(crate) fn check_operand_extent(&self, size: u8, write: bool) -> ExecResult<()> {
+        if let Some((index, offset)) = self.pending_operand.get() {
+            self.segment_access(index as usize, offset, size, write)?;
+        }
+        Ok(())
     }
 
     /// Linear address of the instruction at `rip`, faulting (#GP(0)) if it lies beyond the CS limit.

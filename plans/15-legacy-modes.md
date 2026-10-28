@@ -22,11 +22,9 @@ The JIT only compiles `Long64`: `Cpu::run` and `run_verify` call `step_block` on
 
 `Cpu::segment_linear(index, offset)` returns the linear address: in `Long64` only FS/GS bases apply (as before); elsewhere `(base + offset) & 0xffff_ffff` after checking the limit (expand-down segments included) and, in protected mode, that the segment is present and readable. A violation is #SS(0) through SS and #GP(0) otherwise. `linear_address(i, a)` picks the override, else SS for `ss_default`, else DS, and is fallible; callers use `?`.
 
-Limits of this model:
+`segment_access(index, offset, size, write)` is the full check: limit for the whole extent of the access, the present and readable/writable rules in protected mode. `modrm_location` cannot know the size, so `linear_address` checks the first byte and remembers the operand (`Cpu::pending_operand`); `load_operand`, `store_operand` and the `moffs` moves then check the whole extent and the direction (`check_operand_extent`). String instructions check each iteration with its size.
 
-- The limit check covers the first byte of an access only (the access size is not threaded through `modrm_location`), so an access that starts inside the limit and runs past it is not faulted. String instructions are the exception: each iteration checks its own address.
-- The write check (writing a read-only data segment or any code segment) is not made; reads of execute-only code are.
-- A20 is always enabled.
+Limits of this model: x87 and SSE/AVX memory operands, `bound`/`les` pairs and descriptor-table accesses take the first-byte check only, and A20 is always enabled.
 
 Real mode builds a segment as `selector << 4` with a 64 KiB limit (`real_mode_segment`); a real-mode load keeps the old limit and attributes, a V86 load installs DPL 3 segments. `Cpu::load_segment_register` does this and falls to the descriptor-validating `load_data_seg` in protected mode. `fetch_decode` adds the CS base and checks the CS limit for the whole instruction. The stack is `stack_pointer()`/`set_stack_pointer()`: SP, ESP or RSP by SS.B (or `Long64`); `push`/`pop` take the mode-aware path (`push_legacy`) whenever `!is_long64()`.
 
@@ -68,5 +66,5 @@ SVM guests may be in any of these modes (see 03, "SVM"); the VMRUN state swap al
 ## Not implemented
 
 - Everything 32-bit runs on the interpreter only; a 32-bit JIT is not planned.
-- Virtual-8086 extensions (CR4.VME/PVI, the interrupt redirection bitmap, VIF/VIP), SMM, and the segment-write and straddling-limit checks listed above.
+- Virtual-8086 extensions (CR4.VME/PVI, the interrupt redirection bitmap, VIF/VIP), SMM, and the whole-extent segment check for x87/SSE operands.
 - 16-bit TSS switching, legacy-mode (non-IA-32e) `syscall`, 64-bit call gates and task switches in IA-32e mode (not architectural), the debug registers' breakpoints.

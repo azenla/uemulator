@@ -350,6 +350,9 @@ impl Cpu {
         } else {
             SEG_DS
         };
+        if !self.is_long64() {
+            self.pending_operand.set(Some((seg as u8, a)));
+        }
         self.segment_linear(seg, a)
     }
 
@@ -366,7 +369,10 @@ impl Cpu {
     pub fn load_operand(&mut self, loc: Loc, size: u8, i: &Insn) -> ExecResult<u64> {
         match loc {
             Loc::Reg(r) => Ok(self.read_gpr(r, size, i.rex_present)),
-            Loc::Mem(a) => self.read(a, size),
+            Loc::Mem(a) => {
+                self.check_operand_extent(size, false)?;
+                self.read(a, size)
+            }
         }
     }
 
@@ -376,7 +382,10 @@ impl Cpu {
                 self.write_gpr(r, size, i.rex_present, v);
                 Ok(())
             }
-            Loc::Mem(a) => self.write(a, size, v),
+            Loc::Mem(a) => {
+                self.check_operand_extent(size, true)?;
+                self.write(a, size, v)
+            }
         }
     }
 
@@ -1122,8 +1131,11 @@ impl Cpu {
         if self.svm.guest.is_some() {
             self.svm_intercept(i, next)?;
         }
-        if i.mode != CodeMode::Long64 && self.exec_legacy(i, next)? {
-            return Ok(());
+        if i.mode != CodeMode::Long64 {
+            self.pending_operand.set(None);
+            if self.exec_legacy(i, next)? {
+                return Ok(());
+            }
         }
         if i.vex {
             return self.exec_vex(i, next);
@@ -1384,6 +1396,7 @@ impl Cpu {
             0xa0..=0xa3 => {
                 let size = if op & 1 == 0 { 1 } else { osz };
                 let a = self.linear_address(i, i.imm as u64 & address_mask(i))?;
+                self.check_operand_extent(size, op >= 0xa2)?;
                 if op < 0xa2 {
                     let v = self.read(a, size)?;
                     self.write_gpr(0, size, true, v);
@@ -13931,10 +13944,12 @@ mod exec_tests {
         assert_ne!(edx & NX, 0);
         assert_ne!(edx & LONG_MODE, 0);
         assert_ne!(ecx & LAHF_SAHF, 0, "lahf/sahf work in 64-bit mode");
+        // prefetch/prefetchw are executed as hints in sys.rs's `prefetchw_is_a_hint_that_never_faults`
+        const PREFETCHW: u64 = 1 << 8;
         assert_eq!(
-            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM),
+            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM | PREFETCHW),
             0,
-            "nothing beyond lahf, svm and abm"
+            "nothing beyond lahf, svm, abm and prefetchw"
         );
     }
 

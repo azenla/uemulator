@@ -914,3 +914,71 @@ fn compatibility_mode_system_calls_enter_at_cstar_and_sysretl_returns() {
     );
     assert_eq!(h.cpu.code_mode(), CodeMode::Long64);
 }
+
+#[test]
+fn an_access_that_straddles_the_segment_limit_faults_but_one_that_fits_does_not() {
+    let code = [
+        0x66, 0xb8, 0x38, 0x00, 0x66, 0x8e, 0xd8, 0x66, 0xa1, 0xfe, 0x0f, 0x00, 0x00, 0x8b, 0x1d,
+        0xfe, 0x0f, 0x00, 0x00, 0xf4,
+    ];
+    let mut h = prot(&code);
+    set_descriptor(
+        &mut h,
+        0x38,
+        super::test_support::descriptor(DATA as u32, 0xfff, 0x92, 0x4),
+    );
+    h.write(DATA + 0xffe, &[0x34, 0x12]);
+    assert_eq!(prot_fault(&mut h), (13, Some(0)));
+    assert_eq!(
+        h.cpu.gpr[RAX] & 0xffff,
+        0x1234,
+        "the 16-bit load at the limit worked"
+    );
+    assert_eq!(h.cpu.gpr[RBX], 0);
+}
+
+#[test]
+fn storing_into_a_read_only_data_segment_is_a_general_protection_fault() {
+    let code = [
+        0x66, 0xb8, 0x38, 0x00, 0x66, 0x8e, 0xd8, 0xa1, 0x10, 0x00, 0x00, 0x00, 0xa3, 0x20, 0x00,
+        0x00, 0x00, 0xf4,
+    ];
+    let mut h = prot(&code);
+    set_descriptor(
+        &mut h,
+        0x38,
+        super::test_support::descriptor(DATA as u32, 0xfffff, 0x90, 0xc),
+    );
+    h.write(DATA + 0x10, &0xabcdu32.to_le_bytes());
+    assert_eq!(prot_fault(&mut h), (13, Some(0)));
+    assert_eq!(h.cpu.gpr[RAX], 0xabcd, "reading it is fine");
+    assert_eq!(dword(&h, DATA + 0x20), 0);
+}
+
+#[test]
+fn writing_through_a_cs_override_is_refused_in_protected_mode() {
+    let code = [0x2e, 0xa3, 0x10, 0x00, 0x00, 0x00, 0xf4];
+    let mut h = prot(&code);
+    assert_eq!(prot_fault(&mut h), (13, Some(0)));
+}
+
+#[test]
+fn an_expand_down_segment_accepts_only_offsets_above_the_limit() {
+    let code = [
+        0x66, 0xb8, 0x38, 0x00, 0x66, 0x8e, 0xd8, 0xa1, 0x00, 0x20, 0x00, 0x00, 0x8b, 0x1d, 0x00,
+        0x10, 0x00, 0x00, 0xf4,
+    ];
+    let mut h = prot(&code);
+    set_descriptor(
+        &mut h,
+        0x38,
+        super::test_support::descriptor(DATA as u32 - 0x2000, 0x1fff, 0x96, 0x4),
+    );
+    h.write(DATA, &0xfeedu32.to_le_bytes());
+    assert_eq!(prot_fault(&mut h), (13, Some(0)));
+    assert_eq!(
+        h.cpu.gpr[RAX], 0xfeed,
+        "[0x2000] is above the limit, so it is valid"
+    );
+    assert_eq!(h.cpu.gpr[RBX], 0, "[0x1000] is not");
+}
