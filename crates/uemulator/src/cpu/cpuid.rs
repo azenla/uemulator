@@ -550,13 +550,13 @@ const EXT_ADDRESS_APIC_ID_SIZE_SHIFT: u32 = 12;
 const APM_INVARIANT_TSC: u32 = 1 << 8;
 
 /// Leaf 0x8000_0021 EAX: LFENCE is always dispatch-serializing (nothing to configure through
-/// DE_CFG; the CPU executes in order), and the "not affected" bits for the transient-execution
-/// bugs Linux keys on family 0x19: Transient Scheduler Attacks (store-queue and L1 variants) and
-/// SRSO (see the module comment).
+/// DE_CFG; the CPU executes in order), and SRSO_NO (see the module comment). ECX: the "not
+/// affected" bits for Transient Scheduler Attacks, which Linux keys on family 0x19 (store-queue
+/// and L1 variants).
 const EXT_FEATURES_2_LFENCE_ALWAYS_SERIALIZING: u32 = 1 << 2;
-const EXT_FEATURES_2_TSA_SQ_NO: u32 = 1 << 27;
-const EXT_FEATURES_2_TSA_L1_NO: u32 = 1 << 28;
 const EXT_FEATURES_2_SRSO_NO: u32 = 1 << 29;
+const EXT_FEATURES_2_TSA_SQ_NO: u32 = 1 << 1;
+const EXT_FEATURES_2_TSA_L1_NO: u32 = 1 << 2;
 
 impl Cpu {
     /// The subleaf (ECX) matters for leaves 7, 0xB, 0xD and 0x8000_001D; unknown leaves return
@@ -712,12 +712,9 @@ impl Cpu {
                 0,
             ),
             LEAF_EXT_FEATURES_2 => (
-                EXT_FEATURES_2_LFENCE_ALWAYS_SERIALIZING
-                    | EXT_FEATURES_2_TSA_SQ_NO
-                    | EXT_FEATURES_2_TSA_L1_NO
-                    | EXT_FEATURES_2_SRSO_NO,
+                EXT_FEATURES_2_LFENCE_ALWAYS_SERIALIZING | EXT_FEATURES_2_SRSO_NO,
                 0,
-                0,
+                EXT_FEATURES_2_TSA_SQ_NO | EXT_FEATURES_2_TSA_L1_NO,
                 0,
             ),
             _ => (0, 0, 0, 0),

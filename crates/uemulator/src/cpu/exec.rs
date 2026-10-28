@@ -267,7 +267,7 @@ impl Cpu {
         }
     }
 
-    fn set_edx_eax(&mut self, v: u64) {
+    pub(super) fn set_edx_eax(&mut self, v: u64) {
         self.gpr[GPR_RAX] = v & DWORD_MASK;
         self.gpr[GPR_RDX] = v >> 32;
     }
@@ -1820,6 +1820,8 @@ impl Cpu {
                 let v = self.rdmsr(self.gpr[GPR_RCX] as u32)?;
                 self.set_edx_eax(v);
             }
+            // rdpmc: the stored value of one of the four legacy AMD counters
+            0x133 => self.rdpmc()?,
             // cmovcc: the source is always read (it can fault); a 32-bit cmov that does not move
             // still zero-extends the destination.
             0x140..=0x14f => {

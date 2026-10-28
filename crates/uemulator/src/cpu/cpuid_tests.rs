@@ -480,7 +480,7 @@ fn leaf_0x80000021_says_lfence_serializes_and_tsa_and_srso_cannot_happen() {
     let mut h = blank();
     assert_eq!(
         cpuid(&mut h, 0x8000_0021, 0),
-        [bits(&[2, 27, 28, 29]), 0, 0, 0]
+        [bits(&[2, 29]), 0, bits(&[1, 2]), 0]
     );
 }
 

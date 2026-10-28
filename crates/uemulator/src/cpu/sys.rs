@@ -23,6 +23,12 @@ pub(crate) const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
 pub(crate) const MSR_TSC_AUX: u32 = 0xc000_0103;
 /// The cache line size CLZERO clears, and leaf 1 EBX reports in units of 8 bytes.
 const CLZERO_LINE_BYTES: u64 = 64;
+/// The legacy AMD performance counters, PERFCTR0-3 (0xC0010004-7), which `rdpmc` reads by index.
+/// They hold whatever was written and never count; see `Cpu::new`.
+pub(crate) const MSR_K7_PERFCTR0: u32 = 0xc001_0004;
+const K7_PERF_COUNTERS: u32 = 4;
+/// The counters are 48 bits wide.
+const PERF_COUNTER_MASK: u64 = (1 << 48) - 1;
 /// IA32_XSS: which supervisor state components xsaves/xrstors handle (none here).
 pub(crate) const MSR_XSS: u32 = 0xda0;
 pub(crate) const MSR_SPEC_CTRL: u32 = 0x48;
@@ -1174,6 +1180,19 @@ impl Cpu {
         Ok(())
     }
 
+    /// 0F 33: ECX selects a counter. Allowed at CPL > 0 only with CR4.PCE; a counter that does not
+    /// exist is #GP(0). Linux's AMD PMU driver reads the counters it has enabled with this (also at
+    /// shutdown, from `perf_reboot`), so it must exist whenever the counter MSRs do.
+    pub(super) fn rdpmc(&mut self) -> ExecResult<()> {
+        let counter = self.gpr[RCX] as u32;
+        if (self.cr4 & CR4_PCE == 0 && self.cpl != 0) || counter >= K7_PERF_COUNTERS {
+            return Err(Exception::general_protection(0));
+        }
+        let value = self.rdmsr(MSR_K7_PERFCTR0 + counter)? & PERF_COUNTER_MASK;
+        self.set_edx_eax(value);
+        Ok(())
+    }
+
     /// F3 0F AE /0../3 with a register operand: rdfsbase, rdgsbase, wrfsbase, wrgsbase. They exist
     /// only while CR4.FSGSBASE is set (#UD otherwise) and work at any CPL. The operand is 32 bits
     /// without REX.W (a read zero-extends, a write zero-extends into the base) and 64 bits with it;
@@ -1309,6 +1328,7 @@ mod sys_tests {
     const TEST_MSR_GS_BASE: u32 = 0xc000_0101;
     const TEST_MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
     const TEST_MSR_TSC_AUX: u32 = 0xc000_0103;
+    const TEST_MSR_K7_PERFCTR0: u32 = 0xc001_0004;
     const TEST_MSR_SYSENTER_CS: u32 = 0x174;
     const TEST_MSR_SYSENTER_ESP: u32 = 0x175;
     const TEST_MSR_SYSENTER_EIP: u32 = 0x176;
@@ -2165,10 +2185,8 @@ mod sys_tests {
         }
 
         #[test]
-        fn rdpmc_sysenter_and_sysexit_are_not_implemented() {
-            let codes: [&[u8]; 3] = [
-                // rdpmc; hlt
-                &[0x0f, 0x33, 0xf4],
+        fn sysenter_and_sysexit_are_not_implemented_in_long_mode() {
+            let codes: [&[u8]; 2] = [
                 // sysenter; hlt
                 &[0x0f, 0x34, 0xf4],
                 // .byte 0x0f, 0x35; hlt
@@ -2177,6 +2195,44 @@ mod sys_tests {
             for code in codes {
                 assert_invalid_opcode(code, |_| {});
             }
+        }
+
+        #[test]
+        fn rdpmc_reads_the_legacy_counters_by_index() {
+            // rdpmc; hlt
+            const RDPMC: &[u8] = &[0x0f, 0x33, 0xf4];
+            for counter in 0..4u32 {
+                let value = 0xffff_aaaa_bbbb_cccc_u64 ^ counter as u64;
+                let h = run_ok(RDPMC, |h| {
+                    h.cpu.wrmsr(TEST_MSR_K7_PERFCTR0 + counter, value).unwrap();
+                    h.cpu.gpr[RCX] = 0xdead_0000_0000_0000 | counter as u64;
+                });
+                assert_eq!(h.cpu.gpr[RAX], value & 0xffff_ffff, "counter {counter}");
+                assert_eq!(
+                    h.cpu.gpr[RDX],
+                    (value >> 32) & 0xffff,
+                    "counter {counter}: 48 bits"
+                );
+            }
+        }
+
+        #[test]
+        fn rdpmc_needs_an_existing_counter_and_cr4_pce_outside_cpl_0() {
+            const RDPMC: &[u8] = &[0x0f, 0x33, 0xf4];
+            assert_general_protection_zero(RDPMC, |h| h.cpu.gpr[RCX] = 4);
+            assert_general_protection_zero(RDPMC, |h| h.cpu.gpr[RCX] = 1 << 31);
+            // at CPL 3 without CR4.PCE it faults on the instruction; with PCE only the hlt does
+            assert_general_protection_zero(RDPMC, user_mode);
+            let (h, stop) = run_with(RDPMC, |h| {
+                user_mode(h);
+                h.cpu.cr4 |= CR4_PCE;
+            });
+            assert_eq!(stop, general_protection(0));
+            assert_eq!(
+                h.cpu.rip,
+                CODE_BASE + 2,
+                "rdpmc ran, the hlt behind it faulted"
+            );
         }
     }
 
