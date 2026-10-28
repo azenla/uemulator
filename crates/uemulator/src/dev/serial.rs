@@ -97,6 +97,13 @@ pub(crate) struct Uart {
     last_level: bool,
     /// Cleared while the virtio console is active so host input goes to hvc0, not the 16550.
     rx_enabled: bool,
+    /// Virtual time between two bytes of host input (0: all at once). A real line carries a byte
+    /// per 87 us at 115200 baud; Xen's 128-byte console input ring overflowed, dropping the end
+    /// of a pasted command line (and its Enter), when the whole line landed in the FIFO faster
+    /// than dom0 could drain it.
+    byte_interval_ns: u64,
+    now_ns: u64,
+    next_byte_ns: u64,
 }
 
 impl Uart {
@@ -117,6 +124,9 @@ impl Uart {
             modem_deltas: 0,
             last_level: false,
             rx_enabled: true,
+            byte_interval_ns: 0,
+            now_ns: 0,
+            next_byte_ns: 0,
         }
     }
 
@@ -168,6 +178,24 @@ impl Uart {
         edge
     }
 
+    /// Paces host input at one byte per `interval_ns` of virtual time.
+    pub fn set_byte_interval(&mut self, interval_ns: u64) {
+        self.byte_interval_ns = interval_ns;
+    }
+
+    pub fn set_time(&mut self, now_ns: u64) {
+        self.now_ns = now_ns;
+    }
+
+    /// When the next waiting host byte may arrive, so an idle guest wakes for it.
+    pub fn next_deadline(&self) -> Option<u64> {
+        (self.byte_interval_ns > 0
+            && self.rx_enabled
+            && self.next_byte_ns > self.now_ns
+            && self.console.has_input())
+        .then_some(self.next_byte_ns)
+    }
+
     pub fn set_rx_enabled(&mut self, on: bool) {
         self.rx_enabled = on;
     }
@@ -193,9 +221,13 @@ impl Uart {
             return false;
         }
         while self.rx.len() < self.fifo_depth() {
+            if self.byte_interval_ns > 0 && self.now_ns < self.next_byte_ns {
+                break;
+            }
             match self.console.guest_rx() {
                 Some(byte) => {
                     self.rx.push_back(byte);
+                    self.next_byte_ns = self.now_ns + self.byte_interval_ns;
                     any = true;
                 }
                 None => break,
@@ -904,6 +936,27 @@ mod tests {
         console.write(b"b");
         uart.poll();
         assert!(uart.irq_edge());
+    }
+
+    #[test]
+    fn paced_host_input_arrives_one_byte_per_interval() {
+        let (mut uart, console) = new_uart();
+        enable_fifo(&mut uart);
+        uart.set_byte_interval(100);
+        console.write(b"abc");
+        uart.set_time(1000);
+        assert!(uart.poll());
+        assert_eq!(uart.rx.len(), 1);
+        assert_eq!(uart.next_deadline(), Some(1100));
+        uart.set_time(1050);
+        assert!(!uart.poll());
+        assert_eq!(uart.next_deadline(), Some(1100));
+        uart.set_time(1100);
+        assert!(uart.poll());
+        assert_eq!(uart.rx.len(), 2);
+        uart.set_time(1200);
+        assert!(uart.poll());
+        assert_eq!(uart.next_deadline(), None, "the console is empty");
     }
 
     #[test]

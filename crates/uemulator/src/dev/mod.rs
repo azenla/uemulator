@@ -41,6 +41,9 @@ use vnet::VirtioNet;
 /// PIC wiring: IRQ lines used by the legacy devices we model.
 const IRQ_PIT: u8 = 0;
 const IRQ_UART: u8 = 4;
+/// One 8N1 character (start, eight data, stop) at 115200 baud, in nanoseconds: how fast host
+/// input reaches the UART.
+const UART_BYTE_INTERVAL_NS: u64 = 10 * 1_000_000_000 / 115_200;
 
 /// I/O ports. Anything not listed reads as all ones and ignores writes.
 const PIC_MASTER_COMMAND: u16 = 0x20;
@@ -276,7 +279,11 @@ impl Devices {
         Devices {
             pic: Pics::default(),
             pit: Pit::new(),
-            uart: Uart::new(console),
+            uart: {
+                let mut uart = Uart::new(console);
+                uart.set_byte_interval(UART_BYTE_INTERVAL_NS);
+                uart
+            },
             cmos_index: 0,
             cmos: [0; CMOS_SIZE],
             boot_unix,
@@ -336,6 +343,7 @@ impl Devices {
     pub fn next_deadline(&self, now: u64) -> Option<u64> {
         [
             self.pit.next_deadline(),
+            self.uart.next_deadline(),
             self.hpet.next_deadline(),
             self.pm.next_deadline(now),
         ]
@@ -730,6 +738,7 @@ impl Devices {
             .uart_peer_console
             .is_some_and(|position| self.pci.console_active(position));
         self.uart.set_rx_enabled(!yielded);
+        self.uart.set_time(now);
         self.uart.poll();
         self.update_uart_irq();
         self.deliver_messages(messages, mem);
@@ -856,6 +865,7 @@ impl Devices {
 
     pub fn io_in(&mut self, port: u16, size: u8, now: u64) -> u32 {
         self.now_ns = now;
+        self.uart.set_time(now);
         let ones = size_mask(size);
         let value: u8 = match port {
             PIC_MASTER_COMMAND | PIC_MASTER_DATA | PIC_SLAVE_COMMAND | PIC_SLAVE_DATA
@@ -893,6 +903,7 @@ impl Devices {
     /// Port devices are byte-wide: only the low byte of `value` is used except for PCI config.
     pub fn io_out(&mut self, port: u16, size: u8, value: u32, now: u64) {
         self.now_ns = now;
+        self.uart.set_time(now);
         let byte = value as u8;
         match port {
             PIC_MASTER_COMMAND | PIC_MASTER_DATA | PIC_SLAVE_COMMAND | PIC_SLAVE_DATA
