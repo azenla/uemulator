@@ -974,23 +974,7 @@ impl Cpu {
                     break;
                 }
             }
-            let same_outcome = match (&main_result, &shadow_result) {
-                (Ok(()), Ok(())) => true,
-                (
-                    Err(Exception::Fault {
-                        vector: main_vec,
-                        error_code: main_err,
-                        ..
-                    }),
-                    Err(Exception::Fault {
-                        vector: shadow_vec,
-                        error_code: shadow_err,
-                        ..
-                    }),
-                ) => main_vec == shadow_vec && main_err == shadow_err,
-                (Err(Exception::Exit(_)), Err(Exception::Exit(_))) => true,
-                _ => false,
-            };
+            let same_outcome = outcomes_agree(&main_result, &shadow_result);
             let mismatch = self.diff(shadow);
             if !same_outcome || mismatch.is_some() {
                 let page_base = self
@@ -2743,9 +2727,42 @@ mod cpu_tests {
     }
 }
 
+/// Whether the JIT block and its interpreter replay ended the same way: both finished, both
+/// raised the same fault, both asked the machine to exit, or both took a #VMEXIT (the state the
+/// exit saved is compared separately).
+fn outcomes_agree(main: &ExecResult<()>, shadow: &ExecResult<()>) -> bool {
+    match (main, shadow) {
+        (Ok(()), Ok(())) => true,
+        (
+            Err(Exception::Fault {
+                vector: main_vector,
+                error_code: main_error,
+                ..
+            }),
+            Err(Exception::Fault {
+                vector: shadow_vector,
+                error_code: shadow_error,
+                ..
+            }),
+        ) => main_vector == shadow_vector && main_error == shadow_error,
+        (Err(Exception::Exit(_)), Err(Exception::Exit(_))) => true,
+        (Err(Exception::Vmexit), Err(Exception::Vmexit)) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_accepts_two_vmexits_and_rejects_a_vmexit_against_success() {
+        assert!(outcomes_agree(
+            &Err(Exception::Vmexit),
+            &Err(Exception::Vmexit)
+        ));
+        assert!(!outcomes_agree(&Err(Exception::Vmexit), &Ok(())));
+    }
 
     #[test]
     fn reset_constants_match_documented_values() {
