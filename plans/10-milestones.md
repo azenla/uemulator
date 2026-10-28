@@ -21,6 +21,8 @@
 
 - AVX, AVX2, FMA and F16C done (see 03): VEX.128/256 through the SSE kernels, YMM upper state in XSAVE, gathers, masked moves, a fused multiply-add on the soft-float engine, half-precision conversion. Found while booting Debian: a register-collision bug in the VEX staging that broke glibc's AVX2 `strcmp`, now covered by tests.
 
+- Non-long-mode paging done (see 04 and 03, "Control-register rules outside long mode"): paging off, 32-bit two-level paging (4 MiB pages, PSE-36 advertised), PAE with latched PDPTEs, and the CR0/CR3/CR4/EFER transition rules; 82 tests in `cpu/paging_tests.rs`. Not yet exercised by a 16/32-bit guest (segmentation and real mode are separate work), and the SVM guest check still requires long mode.
+
 - UMIP, SMEP/SMAP, PCID/INVPCID, MONITOR/MWAIT, RDTSCP done (see 03).
 
 - VEX decoding, BMI1 and BMI2 done (see 03, "VEX and BMI").

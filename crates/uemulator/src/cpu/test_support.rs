@@ -8,6 +8,10 @@ use super::exception::Exception;
 use super::{Cpu, ExecResult, SEG_CS, SEG_SS};
 use crate::testkit::Harness;
 
+#[path = "test_support_paging.rs"]
+mod paging;
+pub(crate) use paging::*;
+
 pub(crate) const PTE_P: u64 = 1 << 0;
 pub(crate) const PTE_W: u64 = 1 << 1;
 pub(crate) const PTE_U: u64 = 1 << 2;

@@ -16,7 +16,7 @@
 
 ## Page walk (`mmu.rs`)
 
-4-level long-mode walk (4 KiB/2 MiB/1 GiB), PAE (3-level, needed by the decompressor transitions if any), 32-bit non-PAE low priority. Honors U/S, R/W, NX (EFER.NXE), CR0.WP, reserved bits (raise `#PF` with RSVD), sets A and D bits in guest memory atomically (single-threaded: plain RMW). No SMEP/SMAP (not advertised). Canonical-address checks (#GP/#SS) in the translator.
+Four formats, chosen by `Cpu::paging_mode()` from EFER.LMA, CR0.PG and CR4.PAE: paging off (identity, 32-bit linear), 32-bit two-level (4-byte entries, 4 MiB pages with CR4.PSE, PSE-36 address bits 39:32 from PDE bits 20:13 with bit 21 reserved, no NX, so `#PF` error codes never carry I/D from EFER.NXE there), PAE (3-level; the four PDPT entries are latched in `Cpu::pdpte` at the CR3 write or at the CR0/CR4 write that selects PAE paging, a present entry with reserved bits 2:1, 8:5, 63 or above the 40-bit width is #GP(0) at that write, a later store to the PDPT is not seen until the next reload; 2 MiB pages, NX with EFER.NXE; PDPTEs contribute no permissions or A/D bits) and the 4-level long-mode walk (4 KiB/2 MiB/1 GiB). PAE and long mode share `walk_wide`; 32-bit paging is `walk_legacy`. Outside long mode `translate` truncates linear addresses to 32 bits instead of the canonical check. Honors U/S, R/W, NX (EFER.NXE), CR0.WP, reserved bits (raise `#PF` with RSVD), sets A and D bits in guest memory atomically (single-threaded: plain RMW). No SMEP/SMAP (not advertised). Canonical-address checks (#GP/#SS) in the translator.
 
 Page fault error code and CR2 are set in `Cpu::page_fault` (`mem.rs`). Walk reads page-table entries through the physical RAM map directly (never the soft TLB).
 

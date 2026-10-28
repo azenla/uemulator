@@ -125,6 +125,11 @@ const CR3_MASK: u64 = 0x000f_ffff_ffff_f018;
 const CR3_NO_FLUSH: u64 = 1 << 63;
 /// CR3 bits kept with CR4.PCIDE: the address plus the whole 12-bit PCID.
 const CR3_MASK_PCID: u64 = 0x000f_ffff_ffff_ffff;
+/// Outside IA-32e mode CR3 is 32 bits wide: 32-bit paging uses bits 31:12 (PWT, PCD in 4:3), PAE
+/// paging the 32-byte-aligned PDPT address in bits 31:5.
+const CR3_NON_LONG_RESERVED: u64 = !0u64 << 32;
+const CR3_MASK_LEGACY: u64 = 0xffff_f018;
+const CR3_MASK_PAE: u64 = 0xffff_ffe0 | 0x18;
 pub(super) const CR3_RESERVED_BITS: u64 = CR3_RESERVED;
 const CR3_RESERVED: u64 = !0u64 << PHYSICAL_ADDRESS_BITS;
 /// CR8 holds the 4-bit task priority; it is stored but no APIC consumes it. Higher bits are
@@ -255,6 +260,7 @@ const FEATURE_CX8: u32 = 1 << 8;
 const FEATURE_PGE: u32 = 1 << 13;
 const FEATURE_CMOV: u32 = 1 << 15;
 const FEATURE_PAT: u32 = 1 << 16;
+const FEATURE_PSE36: u32 = 1 << 17;
 const FEATURE_CLFSH: u32 = 1 << 19;
 const FEATURE_MMX: u32 = 1 << 23;
 const FEATURE_FXSR: u32 = 1 << 24;
@@ -262,7 +268,8 @@ const FEATURE_SSE: u32 = 1 << 25;
 const FEATURE_SSE2: u32 = 1 << 26;
 /// Leaf 1 EDX. MMX is advertised because glibc's x86-64 baseline ISA check (CMOV, CX8, FPU,
 /// FXSR, MMX, SSE, SSE2) needs the bit; without it every Debian binary refuses to start ("CPU ISA
-/// level is lower than required"). APIC, SEP and PSE36 are clear.
+/// level is lower than required"). APIC and SEP are clear. PSE-36 is set together with the 4 MiB
+/// PDE address bits 39:32 (`mem.rs`), which match the 40 physical address bits of leaf 0x8000_0008.
 const CPUID_LEAF1_EDX: u32 = FEATURE_FPU
     | FEATURE_DE
     | FEATURE_PSE
@@ -273,6 +280,7 @@ const CPUID_LEAF1_EDX: u32 = FEATURE_FPU
     | FEATURE_PGE
     | FEATURE_CMOV
     | FEATURE_PAT
+    | FEATURE_PSE36
     | FEATURE_CLFSH
     | FEATURE_MMX
     | FEATURE_FXSR
@@ -610,6 +618,10 @@ impl Cpu {
                 {
                     return Err(Exception::general_protection(0));
                 }
+                // LME can only change while paging is off (SDM 9.8.5).
+                if (v ^ self.efer) & EFER_LME != 0 && self.cr0 & CR0_PG != 0 {
+                    return Err(Exception::general_protection(0));
+                }
                 self.efer = (self.efer & !EFER_WRMSR_STORED) | (v & EFER_WRMSR_STORED);
             }
             MSR_STAR => self.star = v,
@@ -689,35 +701,26 @@ impl Cpu {
                 match register {
                     0 => self.write_cr0(v)?,
                     2 => self.cr2 = v,
-                    3 => {
-                        // With CR4.PCIDE, bits 11:0 are the PCID (not PWT/PCD) and bit 63 asks
-                        // not to flush; the TLB is untagged, so the hint is ignored (flushing
-                        // more than asked is always allowed).
-                        let pcide = self.cr4 & CR4_PCIDE != 0;
-                        let reserved = if pcide {
-                            CR3_RESERVED & !CR3_NO_FLUSH
-                        } else {
-                            CR3_RESERVED
-                        };
-                        if v & reserved != 0 {
-                            return Err(Exception::general_protection(0));
-                        }
-                        self.cr3 = v & if pcide { CR3_MASK_PCID } else { CR3_MASK };
-                        self.flush_tlb();
-                    }
+                    3 => self.write_cr3(v)?,
                     4 => {
-                        // PAE cannot be turned off under IA-32e paging.
-                        // PCIDE may only be set while the PCID field of CR3 is zero.
+                        // PAE cannot be turned off under IA-32e paging. PCIDE needs IA-32e
+                        // mode and may only be set while the PCID field of CR3 is zero.
+                        let long_mode = self.efer & EFER_LMA != 0;
                         if v & !CR4_SUPPORTED != 0
-                            || (self.efer & EFER_LMA != 0 && v & CR4_PAE == 0)
+                            || (long_mode && v & CR4_PAE == 0)
                             || (v & CR4_PCIDE != 0
-                                && self.cr4 & CR4_PCIDE == 0
-                                && self.cr3 & 0xfff != 0)
+                                && (!long_mode
+                                    || (self.cr4 & CR4_PCIDE == 0 && self.cr3 & 0xfff != 0)))
                         {
                             return Err(Exception::general_protection(0));
                         }
+                        let mode_before = self.paging_mode();
+                        let pdpte = self.pdptes_if_pae_paging(self.cr0, v, self.cr3)?;
                         self.cr4 = v;
-                        self.flush_tlb();
+                        if let Some(pdpte) = pdpte {
+                            self.pdpte = pdpte;
+                        }
+                        self.paging_changed(mode_before);
                     }
                     8 => {
                         if v & !CR8_MASK != 0 {
@@ -753,19 +756,95 @@ impl Cpu {
         let leaving_long_mode = self.efer & EFER_LMA != 0 && !paging && self.seg[SEG_CS].long();
         let entering_long_mode_without_pae =
             paging && self.efer & EFER_LME != 0 && self.cr4 & CR4_PAE == 0;
+        // Activating IA-32e mode must happen from compatibility or legacy code: with CS.L set the
+        // CPU would be in 64-bit mode on an unmapped instruction stream (SDM 9.8.5.4).
+        let entering_long_mode_from_64bit_code = paging
+            && self.efer & EFER_LME != 0
+            && self.efer & EFER_LMA == 0
+            && self.seg[SEG_CS].long();
+        // PCIDs only exist in IA-32e mode.
+        let leaving_paging_with_pcid = !paging && self.cr4 & CR4_PCIDE != 0;
         if upper_half_set
             || not_write_through_without_cache_disable
             || paging_without_protection
             || leaving_long_mode
             || entering_long_mode_without_pae
+            || entering_long_mode_from_64bit_code
+            || leaving_paging_with_pcid
         {
             return Err(Exception::general_protection(0));
         }
+        let mode_before = self.paging_mode();
+        let long_mode_after = paging && self.efer & EFER_LME != 0;
+        let pdpte = if long_mode_after {
+            None
+        } else {
+            self.pdptes_if_pae_paging(v, self.cr4, self.cr3)?
+        };
         self.cr0 = v | CR0_ET;
-        if paging && self.efer & EFER_LME != 0 {
+        if long_mode_after {
             self.efer |= EFER_LMA;
         } else {
             self.efer &= !EFER_LMA;
+        }
+        if let Some(pdpte) = pdpte {
+            self.pdpte = pdpte;
+        }
+        self.paging_changed(mode_before);
+        Ok(())
+    }
+
+    /// The PDPT entries to latch when `cr0`/`cr4`/`cr3` select PAE paging (and, as a side
+    /// effect of validating them, the #GP for reserved bits); `None` for any other format.
+    /// Long mode is never PAE paging, whatever CR4.PAE says: callers pass the CR0/CR4 they are
+    /// about to install, and LMA is derived from them only in `write_cr0`.
+    fn pdptes_if_pae_paging(&self, cr0: u64, cr4: u64, cr3: u64) -> ExecResult<Option<[u64; 4]>> {
+        let pae_paging = cr0 & CR0_PG != 0 && cr4 & CR4_PAE != 0 && self.efer & EFER_LMA == 0;
+        if pae_paging {
+            self.read_pdptes(cr3).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Every paging-relevant control register write drops cached translations; a change of
+    /// format also drops decoded instructions, since they were found through the old one.
+    fn paging_changed(&mut self, mode_before: super::mem::PagingMode) {
+        self.flush_tlb();
+        if self.paging_mode() != mode_before {
+            self.flush_decode();
+        }
+    }
+
+    /// MOV to CR3. The register is 32 bits wide outside IA-32e mode, where PAE paging also
+    /// latches the four PDPT entries now (#GP if one is malformed).
+    fn write_cr3(&mut self, v: u64) -> ExecResult<()> {
+        if self.efer & EFER_LMA != 0 {
+            // With CR4.PCIDE, bits 11:0 are the PCID (not PWT/PCD) and bit 63 asks
+            // not to flush; the TLB is untagged, so the hint is ignored (flushing
+            // more than asked is always allowed).
+            let pcide = self.cr4 & CR4_PCIDE != 0;
+            let reserved = if pcide {
+                CR3_RESERVED & !CR3_NO_FLUSH
+            } else {
+                CR3_RESERVED
+            };
+            if v & reserved != 0 {
+                return Err(Exception::general_protection(0));
+            }
+            self.cr3 = v & if pcide { CR3_MASK_PCID } else { CR3_MASK };
+            self.flush_tlb();
+            return Ok(());
+        }
+        if v & CR3_NON_LONG_RESERVED != 0 {
+            return Err(Exception::general_protection(0));
+        }
+        let mode = self.paging_mode();
+        if mode == super::mem::PagingMode::Pae {
+            self.pdpte = self.read_pdptes(v)?;
+            self.cr3 = v & CR3_MASK_PAE;
+        } else {
+            self.cr3 = v & CR3_MASK_LEGACY;
         }
         self.flush_tlb();
         Ok(())
@@ -1562,10 +1641,10 @@ mod sys_tests {
         fn leaf_1_edx_advertises_exactly_the_implemented_features() {
             let mut h = blank();
             let [_, _, _, edx] = cpuid(&mut h, 1, 0);
-            // FPU DE PSE TSC MSR PAE CX8 PGE CMOV PAT CLFSH MMX FXSR SSE SSE2
-            let expected = bits(&[0, 2, 3, 4, 5, 6, 8, 13, 15, 16, 19, 23, 24, 25, 26]);
+            // FPU DE PSE TSC MSR PAE CX8 PGE CMOV PAT PSE-36 CLFSH MMX FXSR SSE SSE2
+            let expected = bits(&[0, 2, 3, 4, 5, 6, 8, 13, 15, 16, 17, 19, 23, 24, 25, 26]);
             assert_eq!(edx, expected, "{edx:#034b}");
-            assert_eq!(edx, 0x0789_a17d);
+            assert_eq!(edx, 0x078b_a17d);
         }
 
         #[test]
@@ -1598,7 +1677,6 @@ mod sys_tests {
                 (11, "SEP"),
                 (12, "MTRR"),
                 (14, "MCA"),
-                (17, "PSE-36"),
                 (18, "PSN"),
                 (21, "DS"),
                 (22, "ACPI"),
@@ -2272,6 +2350,7 @@ mod sys_tests {
         fn efer_stores_sce_lme_and_nxe_only() {
             let mut h = blank();
             h.cpu.efer = 0;
+            h.cpu.cr0 &= !CR0_PG;
             h.cpu
                 .wrmsr(TEST_MSR_EFER, EFER_SCE_BIT | EFER_LME_BIT | EFER_NXE_BIT)
                 .unwrap();
@@ -2752,6 +2831,8 @@ mod sys_tests {
 
     mod control_registers {
         use super::*;
+        use crate::cpu::mem::PagingMode;
+        use crate::cpu::test_support::LegacyTables;
 
         // mov cr0, rax; hlt
         const WRITE_CR0: &[u8] = &[0x0f, 0x22, 0xc0, 0xf4];
@@ -2882,7 +2963,7 @@ mod sys_tests {
         #[test]
         fn clearing_pg_outside_long_mode_is_accepted() {
             let (h, stop) = run_with(WRITE_CR0, |h| {
-                h.cpu.efer = 0;
+                LegacyTables::new(&mut h.cpu).identity_map(&mut h.cpu, 32);
                 h.cpu.gpr[RAX] = CR0_PE_BIT | CR0_ET_BIT | CR0_NE_BIT;
             });
             assert_eq!(stop, Stop::Halted);
@@ -2894,6 +2975,7 @@ mod sys_tests {
         fn enabling_paging_with_lme_and_pae_activates_long_mode() {
             let (h, stop) = run_with(WRITE_CR0, |h| {
                 not_yet_in_long_mode(h);
+                h.cpu.seg[SEG_CS].flags &= !SEG_LONG;
                 h.cpu.cr4 = BOOT_CR4;
                 h.cpu.gpr[RAX] = CR0_PG_BIT | CR0_PE_BIT | CR0_ET_BIT;
             });
@@ -2905,11 +2987,16 @@ mod sys_tests {
         fn enabling_paging_without_lme_leaves_long_mode_inactive() {
             let (h, stop) = run_with(WRITE_CR0, |h| {
                 not_yet_in_long_mode(h);
-                h.cpu.efer = 0;
+                // 32-bit paging with the first 16 MiB identity mapped, so code keeps running.
+                let mut tables = LegacyTables::new(&mut h.cpu);
+                tables.identity_map(&mut h.cpu, 32);
+                h.cpu.cr0 = CR0_PE_BIT | CR0_ET_BIT | CR0_NE_BIT;
+                h.cpu.flush_tlb();
                 h.cpu.gpr[RAX] = CR0_PG_BIT | CR0_PE_BIT | CR0_ET_BIT;
             });
             assert_eq!(stop, Stop::Halted);
             assert_eq!(h.cpu.efer & EFER_LMA_BIT, 0);
+            assert_eq!(h.cpu.paging_mode(), PagingMode::Legacy);
         }
 
         #[test]
@@ -3119,6 +3206,7 @@ mod sys_tests {
         fn clearing_pae_outside_long_mode_is_accepted() {
             let (h, stop) = run_with(WRITE_CR4, |h| {
                 h.cpu.efer = 0;
+                h.cpu.cr0 = CR0_PE_BIT | CR0_ET_BIT | CR0_NE_BIT;
                 h.cpu.gpr[RAX] = 0;
             });
             assert_eq!(stop, Stop::Halted);

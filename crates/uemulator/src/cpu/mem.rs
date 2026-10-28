@@ -1,7 +1,7 @@
 use super::decode::{self, DecodeErr, Insn};
 use super::exception::{Exception, VECTOR_GENERAL_PROTECTION, VECTOR_PAGE_FAULT};
 use super::flags::*;
-use super::sys::{CR4_SMAP, CR4_SMEP};
+use super::sys::{CR4_PSE, CR4_SMAP, CR4_SMEP};
 use super::*;
 use crate::dev::guestmem::GuestMem;
 
@@ -10,6 +10,19 @@ pub(crate) enum AccessKind {
     Read,
     Write,
     Exec,
+}
+
+/// Which page-table format the MMU walks, from CR0.PG, CR4.PAE and EFER.LMA.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum PagingMode {
+    /// CR0.PG clear: linear equals physical (32 bits wide), everything permitted.
+    Off,
+    /// 32-bit paging: two levels of 4-byte entries, 4 MiB pages with CR4.PSE.
+    Legacy,
+    /// PAE paging: three levels of 8-byte entries, 2 MiB pages, NX with EFER.NXE.
+    Pae,
+    /// IA-32e paging (4 levels).
+    Long,
 }
 
 const PTE_PRESENT: u64 = 1 << 0;
@@ -29,8 +42,31 @@ const PTE_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const PTE_BYTES: u64 = 8;
 const LEVEL_INDEX_BITS: u32 = 9;
 const LEVEL_INDEX_MASK: u64 = (1 << LEVEL_INDEX_BITS) - 1;
-/// The PML4 is level 3 and the PT is level 0; only 4-level long-mode paging is walked.
+/// The PML4 is level 3 and the PT is level 0 in long mode. PAE paging starts one level lower, at
+/// the PDPT (level 2), whose four entries come from `Cpu::pdpte` instead of memory.
 const TOP_LEVEL: u32 = 3;
+const PAE_TOP_LEVEL: u32 = 2;
+/// CR3 bits 31:5 of a PAE CR3: the 32-byte-aligned PDPT address.
+const PAE_PDPT_ADDRESS_MASK: u64 = 0xffff_ffe0;
+const PDPT_ENTRIES: usize = 4;
+/// PDPTE bits that must be zero when the entry is present: 2:1 and 8:5 (SDM Vol. 3A 4.4.1) and
+/// bit 63 and the bits above the physical address width.
+const PDPTE_RESERVED_MASK: u64 = 0x1e6 | (1 << 63) | PTE_RESERVED_MASK;
+/// 32-bit paging: 4-byte entries, 10 index bits per level, a 4 MiB leaf at the PDE.
+const LEGACY_PTE_BYTES: u64 = 4;
+const LEGACY_INDEX_BITS: u32 = 10;
+const LEGACY_INDEX_MASK: u64 = (1 << LEGACY_INDEX_BITS) - 1;
+const LEGACY_TABLE_MASK: u64 = 0xffff_f000;
+const LEGACY_LARGE_PAGE_SHIFT: u32 = PAGE_SHIFT + LEGACY_INDEX_BITS;
+/// 4 MiB PDE (PSE-36): address bits 31:22 sit in place, bits 39:32 in PDE bits 20:13, and bit 21
+/// is reserved. PDE bit 12 is the PAT bit, not an address bit.
+const LEGACY_LARGE_ADDRESS_LOW_MASK: u64 = 0xffc0_0000;
+const LEGACY_LARGE_ADDRESS_HIGH_SHIFT: u32 = 13;
+const LEGACY_LARGE_ADDRESS_HIGH_MASK: u64 = 0xff;
+const LEGACY_LARGE_ADDRESS_HIGH_POSITION: u32 = 32;
+const LEGACY_LARGE_RESERVED_BIT: u64 = 1 << 21;
+/// Linear addresses are 32 bits wide outside long mode.
+const LINEAR_32BIT_MASK: u64 = 0xffff_ffff;
 /// Bit 47 and everything above must be equal (48-bit linear addresses, no LA57).
 const CANONICAL_SIGN_BIT: u32 = 47;
 const MAX_INSN_LEN: usize = 15;
@@ -132,8 +168,10 @@ impl Cpu {
         if reserved_bit_violation {
             error_code |= PF_RESERVED;
         }
-        // The fetch bit is only reported when NX or SMEP is enabled.
-        if access == AccessKind::Exec && (self.efer & EFER_NXE != 0 || self.cr4 & CR4_SMEP != 0) {
+        // The fetch bit is only reported when NX (which 32-bit paging does not have) or SMEP is
+        // enabled.
+        let nx_active = self.efer & EFER_NXE != 0 && self.paging_mode() >= PagingMode::Pae;
+        if access == AccessKind::Exec && (nx_active || self.cr4 & CR4_SMEP != 0) {
             error_code |= PF_INSTRUCTION_FETCH;
         }
         Exception::fault(VECTOR_PAGE_FAULT, Some(error_code))
@@ -146,16 +184,95 @@ impl Cpu {
             .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    /// 4-level page walk. Returns the physical address of the 4 KiB page containing `linear`
-    /// (inside a 2 MiB/1 GiB leaf too) and the `TLB_FLAG_*` permissions, or the #PF. Page
-    /// tables are read straight from RAM, never through the TLB; a table outside RAM counts
-    /// as not present. Sets Accessed on every level touched, and Dirty on a write, but only
-    /// after the permission check passed.
+    pub(crate) fn paging_mode(&self) -> PagingMode {
+        if self.efer & EFER_LMA != 0 {
+            PagingMode::Long
+        } else if self.cr0 & CR0_PG == 0 {
+            PagingMode::Off
+        } else if self.cr4 & CR4_PAE != 0 {
+            PagingMode::Pae
+        } else {
+            PagingMode::Legacy
+        }
+    }
+
+    fn read_ram_u32(&self, pa: u64) -> Option<u64> {
+        let start = pa as usize;
+        self.ram
+            .get(start..start + LEGACY_PTE_BYTES as usize)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as u64)
+    }
+
+    /// Whether a leaf with these accumulated permissions refuses the access. Supervisor writes to
+    /// read-only pages only fault with CR0.WP. SMEP/SMAP: a supervisor-mode access to a page that
+    /// is user-accessible at every level; SMAP is waived by EFLAGS.AC for explicit accesses, and
+    /// implicit ones (descriptor tables) are indistinguishable here and get the same waiver.
+    fn leaf_denied(
+        &self,
+        access: AccessKind,
+        user: bool,
+        writable: bool,
+        user_allowed: bool,
+        no_execute: bool,
+    ) -> bool {
+        let supervisor_on_user_page = !user && user_allowed;
+        let smep_smap_denied = supervisor_on_user_page
+            && if access == AccessKind::Exec {
+                self.cr4 & CR4_SMEP != 0
+            } else {
+                self.cr4 & CR4_SMAP != 0 && self.eflags & AC == 0
+            };
+        let nxe = self.efer & EFER_NXE != 0;
+        smep_smap_denied
+            || (user && !user_allowed)
+            || (access == AccessKind::Write && !writable && (user || self.cr0 & CR0_WP != 0))
+            || (access == AccessKind::Exec && no_execute && nxe)
+    }
+
+    fn leaf_tlb_flags(&self, writable: bool, user_allowed: bool, no_execute: bool, pte: u64) -> u8 {
+        let mut tlb_flags = 0;
+        if writable {
+            tlb_flags |= TLB_FLAG_WRITABLE;
+        }
+        if user_allowed {
+            tlb_flags |= TLB_FLAG_USER;
+        }
+        if no_execute && self.efer & EFER_NXE != 0 {
+            tlb_flags |= TLB_FLAG_NO_EXECUTE;
+        }
+        if pte & PTE_DIRTY != 0 {
+            tlb_flags |= TLB_FLAG_DIRTY;
+        }
+        tlb_flags
+    }
+
+    /// Page walk in the current paging format. Returns the physical address of the 4 KiB page
+    /// containing `linear` (inside a large leaf too) and the `TLB_FLAG_*` permissions, or the
+    /// #PF. Page tables are read straight from RAM, never through the TLB; a table outside RAM
+    /// counts as not present. Sets Accessed on every level touched, and Dirty on a write, but
+    /// only after the permission check passed.
     ///
-    /// Only long-mode (4-level) paging exists: CR4.PAE and EFER.LME are assumed set, whatever
-    /// the guest wrote to them, and 32-bit/PAE/5-level formats are not walked. `Cpu::new`
-    /// starts the guest in long mode and nothing in the emulator leaves it.
+    /// Long mode and PAE share one loop (same 8-byte entries; PAE just starts at the PDPT
+    /// latched in `pdpte`); 32-bit paging has its own because everything about its entries is
+    /// narrower.
     fn walk(&mut self, linear: u64, access: AccessKind, user: bool) -> ExecResult<(u64, u8)> {
+        match self.paging_mode() {
+            PagingMode::Off => Ok((
+                linear & !PAGE_OFFSET_MASK,
+                TLB_FLAG_WRITABLE | TLB_FLAG_USER | TLB_FLAG_DIRTY,
+            )),
+            PagingMode::Legacy => self.walk_legacy(linear, access, user),
+            mode => self.walk_wide(linear, access, user, mode == PagingMode::Pae),
+        }
+    }
+
+    fn walk_wide(
+        &mut self,
+        linear: u64,
+        access: AccessKind,
+        user: bool,
+        pae: bool,
+    ) -> ExecResult<(u64, u8)> {
         let write = access == AccessKind::Write;
         let nxe = self.efer & EFER_NXE != 0;
         let mut table = self.cr3 & PTE_ADDRESS_MASK;
@@ -163,9 +280,19 @@ impl Cpu {
         let mut writable = true;
         let mut user_allowed = true;
         let mut no_execute = false;
-        let mut level = TOP_LEVEL;
+        let mut level = if pae { PAE_TOP_LEVEL } else { TOP_LEVEL };
         loop {
             let index = (linear >> (PAGE_SHIFT + LEVEL_INDEX_BITS * level)) & LEVEL_INDEX_MASK;
+            // A PDPTE has no permission or accessed bits and was validated when it was latched.
+            if pae && level == PAE_TOP_LEVEL {
+                let pdpte = self.pdpte[index as usize & (PDPT_ENTRIES - 1)];
+                if pdpte & PTE_PRESENT == 0 {
+                    return Err(self.page_fault(linear, access, user, false, false));
+                }
+                table = pdpte & PTE_ADDRESS_MASK;
+                level -= 1;
+                continue;
+            }
             // With nested paging the guest's page tables are in guest-physical memory too.
             let guest_pte_address = table + index * PTE_BYTES;
             let pte_address = self.nested_translate(guest_pte_address, AccessKind::Read, true)?;
@@ -175,7 +302,8 @@ impl Cpu {
             if pte & PTE_PRESENT == 0 {
                 return Err(self.page_fault(linear, access, user, false, false));
             }
-            let leaf = level == 0 || (pte & PTE_PAGE_SIZE != 0 && level <= 2);
+            let leaf =
+                level == 0 || (pte & PTE_PAGE_SIZE != 0 && (level == 1 || (!pae && level == 2)));
             // The page-size bit must be clear in a PML4 entry, and a large leaf must not have
             // address bits below its alignment (PAT aside).
             let below_leaf_alignment = (1u64 << (PAGE_SHIFT + LEVEL_INDEX_BITS * level)) - 1;
@@ -192,23 +320,7 @@ impl Cpu {
             user_allowed &= pte & PTE_USER != 0;
             no_execute |= pte & PTE_NO_EXECUTE != 0;
             if leaf {
-                let write_protect = self.cr0 & CR0_WP != 0;
-                // Supervisor writes to read-only pages only fault when CR0.WP is set.
-                // SMEP/SMAP: a supervisor-mode access to a page that is user-accessible at every
-                // level. SMAP is waived by EFLAGS.AC for explicit accesses; implicit ones
-                // (descriptor tables) are indistinguishable here and get the same waiver.
-                let supervisor_on_user_page = !user && user_allowed;
-                let smep_smap_denied = supervisor_on_user_page
-                    && if access == AccessKind::Exec {
-                        self.cr4 & CR4_SMEP != 0
-                    } else {
-                        self.cr4 & CR4_SMAP != 0 && self.eflags & AC == 0
-                    };
-                let denied = smep_smap_denied
-                    || (user && !user_allowed)
-                    || (write && !writable && (user || write_protect))
-                    || (access == AccessKind::Exec && no_execute && nxe);
-                if denied {
+                if self.leaf_denied(access, user, writable, user_allowed, no_execute) {
                     return Err(self.page_fault(linear, access, user, true, false));
                 }
                 let mut updated = pte | PTE_ACCESSED;
@@ -228,20 +340,10 @@ impl Cpu {
                 let leaf_base = pte & PTE_ADDRESS_MASK & !leaf_offset_mask;
                 let guest_page = leaf_base | (linear & leaf_offset_mask & !PAGE_OFFSET_MASK);
                 let page_pa = self.nested_translate(guest_page, access, false)?;
-                let mut tlb_flags = 0;
-                if writable {
-                    tlb_flags |= TLB_FLAG_WRITABLE;
-                }
-                if user_allowed {
-                    tlb_flags |= TLB_FLAG_USER;
-                }
-                if no_execute && nxe {
-                    tlb_flags |= TLB_FLAG_NO_EXECUTE;
-                }
-                if pte & PTE_DIRTY != 0 {
-                    tlb_flags |= TLB_FLAG_DIRTY;
-                }
-                return Ok((page_pa, tlb_flags));
+                return Ok((
+                    page_pa,
+                    self.leaf_tlb_flags(writable, user_allowed, no_execute, pte),
+                ));
             }
             if pte & PTE_ACCESSED == 0 {
                 pte |= PTE_ACCESSED;
@@ -253,6 +355,100 @@ impl Cpu {
             table = pte & PTE_ADDRESS_MASK;
             level -= 1;
         }
+    }
+
+    /// 32-bit paging (CR4.PAE clear). Entries are 4 bytes, there is no NX and the only reserved
+    /// bit is bit 21 of a 4 MiB PDE; CR4.PSE decides whether PDE bit 7 means a 4 MiB page.
+    fn walk_legacy(
+        &mut self,
+        linear: u64,
+        access: AccessKind,
+        user: bool,
+    ) -> ExecResult<(u64, u8)> {
+        let write = access == AccessKind::Write;
+        let mut table = self.cr3 & LEGACY_TABLE_MASK;
+        let mut writable = true;
+        let mut user_allowed = true;
+        let mut level = 1;
+        loop {
+            let index = (linear >> (PAGE_SHIFT + LEGACY_INDEX_BITS * level)) & LEGACY_INDEX_MASK;
+            let guest_pte_address = table + index * LEGACY_PTE_BYTES;
+            let pte_address = self.nested_translate(guest_pte_address, AccessKind::Read, true)?;
+            let Some(mut pte) = self.read_ram_u32(pte_address) else {
+                return Err(self.page_fault(linear, access, user, false, false));
+            };
+            if pte & PTE_PRESENT == 0 {
+                return Err(self.page_fault(linear, access, user, false, false));
+            }
+            let large = level == 1 && self.cr4 & CR4_PSE != 0 && pte & PTE_PAGE_SIZE != 0;
+            if large && pte & LEGACY_LARGE_RESERVED_BIT != 0 {
+                return Err(self.page_fault(linear, access, user, true, true));
+            }
+            writable &= pte & PTE_WRITABLE != 0;
+            user_allowed &= pte & PTE_USER != 0;
+            if large || level == 0 {
+                if self.leaf_denied(access, user, writable, user_allowed, false) {
+                    return Err(self.page_fault(linear, access, user, true, false));
+                }
+                let mut updated = pte | PTE_ACCESSED;
+                if write {
+                    updated |= PTE_DIRTY;
+                }
+                if updated != pte {
+                    pte = updated;
+                    let pte_address =
+                        self.nested_translate(guest_pte_address, AccessKind::Write, true)?;
+                    self.ram[pte_address as usize..][..LEGACY_PTE_BYTES as usize]
+                        .copy_from_slice(&(pte as u32).to_le_bytes());
+                }
+                let page_offset_in_leaf = if large {
+                    linear & ((1u64 << LEGACY_LARGE_PAGE_SHIFT) - 1) & !PAGE_OFFSET_MASK
+                } else {
+                    0
+                };
+                let leaf_base = if large {
+                    let high =
+                        (pte >> LEGACY_LARGE_ADDRESS_HIGH_SHIFT) & LEGACY_LARGE_ADDRESS_HIGH_MASK;
+                    (pte & LEGACY_LARGE_ADDRESS_LOW_MASK)
+                        | (high << LEGACY_LARGE_ADDRESS_HIGH_POSITION)
+                } else {
+                    pte & LEGACY_TABLE_MASK
+                };
+                let page_pa =
+                    self.nested_translate(leaf_base | page_offset_in_leaf, access, false)?;
+                return Ok((
+                    page_pa,
+                    self.leaf_tlb_flags(writable, user_allowed, false, pte),
+                ));
+            }
+            if pte & PTE_ACCESSED == 0 {
+                pte |= PTE_ACCESSED;
+                let pte_address =
+                    self.nested_translate(guest_pte_address, AccessKind::Write, true)?;
+                self.ram[pte_address as usize..][..LEGACY_PTE_BYTES as usize]
+                    .copy_from_slice(&(pte as u32).to_le_bytes());
+            }
+            table = pte & LEGACY_TABLE_MASK;
+            level -= 1;
+        }
+    }
+
+    /// Reads and validates the four PDPT entries PAE paging would use for `cr3`. A present entry
+    /// with a reserved bit set is #GP(0), and happens at the CR3/CR0/CR4 write rather than at the
+    /// first access. A PDPT outside RAM reads as not present, like page tables do.
+    pub(crate) fn read_pdptes(&self, cr3: u64) -> ExecResult<[u64; PDPT_ENTRIES]> {
+        let base = cr3 & PAE_PDPT_ADDRESS_MASK;
+        let mut entries = [0u64; PDPT_ENTRIES];
+        for (index, entry) in entries.iter_mut().enumerate() {
+            let Some(value) = self.read_ram_u64(base + index as u64 * PTE_BYTES) else {
+                continue;
+            };
+            if value & PTE_PRESENT != 0 && value & PDPTE_RESERVED_MASK != 0 {
+                return Err(Exception::general_protection(0));
+            }
+            *entry = value;
+        }
+        Ok(entries)
     }
 
     /// Linear to physical address for one access, refilling the TLB on a miss.
@@ -267,10 +463,17 @@ impl Cpu {
         access: AccessKind,
         supervisor: bool,
     ) -> ExecResult<u64> {
-        let sign_extension = (linear as i64) >> CANONICAL_SIGN_BIT;
-        if sign_extension != 0 && sign_extension != -1 {
-            return Err(Exception::general_protection(0));
-        }
+        // Outside long mode linear addresses are 32 bits wide: the upper half is dropped rather
+        // than checked, so callers may pass an unmasked 64-bit register sum.
+        let linear = if self.efer & EFER_LMA == 0 {
+            linear & LINEAR_32BIT_MASK
+        } else {
+            let sign_extension = (linear as i64) >> CANONICAL_SIGN_BIT;
+            if sign_extension != 0 && sign_extension != -1 {
+                return Err(Exception::general_protection(0));
+            }
+            linear
+        };
         let user = self.cpl == USER_CPL && !supervisor;
         let page = linear & !PAGE_OFFSET_MASK;
         let slot = tlb_slot(linear, user);
@@ -289,8 +492,10 @@ impl Cpu {
         // A supervisor access to a user page is never cached while SMEP or SMAP is on: whether it
         // is allowed depends on EFLAGS.AC (SMAP), which changes without any TLB flush (stac,
         // clac, popf), and a cached entry would let a later access skip the check.
-        let uncacheable =
-            !user && walk_flags & TLB_FLAG_USER != 0 && self.cr4 & (CR4_SMEP | CR4_SMAP) != 0;
+        let uncacheable = !user
+            && walk_flags & TLB_FLAG_USER != 0
+            && self.cr4 & (CR4_SMEP | CR4_SMAP) != 0
+            && self.paging_mode() != PagingMode::Off;
         // Only RAM-backed pages are cached; MMIO has no host pointer to put in `addend`.
         if page_pa < self.ram.len() as u64 && !uncacheable {
             let write_protect = self.cr0 & CR0_WP != 0;
@@ -632,6 +837,10 @@ impl Cpu {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "paging_tests.rs"]
+mod paging_tests;
 
 #[cfg(test)]
 mod tests {

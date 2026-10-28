@@ -271,6 +271,10 @@ pub(crate) struct Cpu {
     pub cr2: u64,
     pub cr3: u64,
     pub cr4: u64,
+    /// The four PDPT entries PAE paging walks from, latched when CR3 (or a CR0/CR4 bit that
+    /// changes the paging mode) is written, as hardware does: later stores to the PDPT are not
+    /// seen until the next reload. Meaningful only while PAE paging is active.
+    pub pdpte: [u64; 4],
     /// Stored only; there is no local APIC to apply the task priority to.
     pub cr8: u64,
     pub efer: u64,
@@ -427,6 +431,7 @@ impl Cpu {
             cr2: 0,
             cr3: boot.cr3,
             cr4: CR4_PAE,
+            pdpte: [0; 4],
             cr8: 0,
             efer: EFER_LMA | EFER_LME,
             star: 0,
