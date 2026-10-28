@@ -26,6 +26,8 @@ const GPR_RDX: usize = 2;
 /// Opcode maps of `Insn::op` (the high byte) that this file adds to the `0F` map of `sse.rs`.
 const OPCODE_MAP_0F38: u16 = 2;
 const OPCODE_MAP_0F3A: u16 = 3;
+/// `0F 38 F6`: ADCX with a 66 prefix, ADOX with F3 (VEX-encoded, the same opcode is MULX).
+const OPCODE_ADX: u8 = 0xf6;
 
 /// The operation of an instruction, decoded from (map, opcode, prefix).
 #[derive(Clone, Copy)]
@@ -815,6 +817,40 @@ impl Cpu {
         Ok(())
     }
 
+    /// ADCX (66 0F 38 F6) and ADOX (F3 0F 38 F6): add with carry where the carry chain is CF
+    /// (ADCX) or OF (ADOX) and the other flags stay untouched, so two independent chains can be
+    /// interleaved. 32 bits, or 64 under REX.W; a 32-bit result zero-extends. No SSE enable rules.
+    fn add_with_carry_chain(
+        &mut self,
+        i: &Insn,
+        next: u64,
+        overflow_chain: bool,
+    ) -> ExecResult<()> {
+        let size = if i.opsize == 8 { 8 } else { 4 };
+        let chain_flag = if overflow_chain { OF } else { CF };
+        let source = if i.md == MODRM_MOD_REGISTER {
+            self.read_gpr(i.rm, size, i.rex_present)
+        } else {
+            let addr = self.linear_address(i, self.effective_address(i, next))?;
+            self.read(addr, size)?
+        };
+        let destination = self.read_gpr(i.reg, size, i.rex_present);
+        let flags = self.eflags_full();
+        let carry_in = (flags & chain_flag != 0) as u64;
+        let width_mask = mask(size);
+        let sum = destination.wrapping_add(source).wrapping_add(carry_in) & width_mask;
+        // carry out of the top bit: the sum wrapped, or equals an operand when the carry-in was
+        // absorbed by a full-width operand
+        let carry_out = if carry_in == 0 {
+            sum < destination
+        } else {
+            sum <= destination
+        };
+        self.write_gpr(i.reg, size, i.rex_present, sum);
+        self.set_eflags_arith(flags & !chain_flag | if carry_out { chain_flag } else { 0 });
+        Ok(())
+    }
+
     /// CRC32 (F2 0F 38 F0/F1): accumulates the source operand into the CRC-32C in the low 32 bits
     /// of the destination register. The source is a byte (F0) or 16/32/64 bits by operand size
     /// (F1); the destination is 32 bits, or 64 under REX.W (the upper half is then zero). No SSE
@@ -949,6 +985,14 @@ impl Cpu {
                 Prefix::F2 => self.crc32(i, next).map(|()| true),
                 Prefix::Np | Prefix::P66 => self.movbe(i, next).map(|()| true),
                 Prefix::F3 => Ok(false),
+            };
+        }
+        if map == OPCODE_MAP_0F38 && opcode == OPCODE_ADX {
+            return match prefix {
+                Prefix::P66 | Prefix::F3 => self
+                    .add_with_carry_chain(i, next, prefix == Prefix::F3)
+                    .map(|()| true),
+                _ => Ok(false),
             };
         }
         let Some(op) = decode_op(map, opcode, prefix) else {
@@ -4368,6 +4412,134 @@ mod tests {
         }
     }
 
+    mod adx {
+        use super::*;
+
+        /// 64-bit add with carry in `u128`, so the carry out is read off bit 64 instead of derived.
+        fn reference(destination: u64, source: u64, carry_in: bool, bits: u32) -> (u64, bool) {
+            let wide = (destination as u128 & ((1 << bits) - 1))
+                + (source as u128 & ((1 << bits) - 1))
+                + carry_in as u128;
+            (wide as u64 & (u64::MAX >> (64 - bits)), wide >> bits != 0)
+        }
+
+        const OPERANDS: [u64; 8] = [
+            0,
+            1,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+
+        #[test]
+        fn adcx_and_adox_add_the_carry_of_their_own_flag_and_leave_the_other_alone() {
+            let mut rig = Rig::new();
+            for (asm, bits, chain, other) in [
+                ("adcx rax, rbx", 64, CF, OF),
+                ("adcx eax, ebx", 32, CF, OF),
+                ("adox rax, rbx", 64, OF, CF),
+                ("adox eax, ebx", 32, OF, CF),
+            ] {
+                for &a in &OPERANDS {
+                    for &b in &OPERANDS {
+                        for flags in [0, chain, other, chain | other, ARITH_FLAGS] {
+                            rig.reset();
+                            rig.h.cpu.gpr[RAX] = a;
+                            rig.h.cpu.gpr[RBX] = b;
+                            rig.h.cpu.set_eflags_arith(flags);
+                            assert_eq!(rig.exec(asm), Stop::Halted);
+                            let (sum, carry) = reference(a, b, flags & chain != 0, bits);
+                            assert_eq!(rig.gpr(RAX), sum, "{asm} {a:#x} {b:#x} {flags:#x}");
+                            let want = flags & !chain | if carry { chain } else { 0 };
+                            assert_eq!(rig.flags(), want, "{asm} {a:#x} {b:#x} {flags:#x}");
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn memory_sources_and_zero_extension() {
+            let mut rig = Rig::new();
+            rig.h.write(DATA, &0x1111_2222_3333_4444u64.to_le_bytes());
+            rig.reset();
+            rig.h.cpu.gpr[RAX] = 0xffff_ffff_0000_0001;
+            rig.h.cpu.set_eflags_arith(OF);
+            assert_eq!(rig.exec("adox rax, [rsi]"), Stop::Halted);
+            assert_eq!(
+                rig.gpr(RAX),
+                0xffff_ffff_0000_0001u64.wrapping_add(0x1111_2222_3333_4444) + 1
+            );
+            rig.reset();
+            rig.h.cpu.gpr[RAX] = 0xffff_ffff_ffff_ffff;
+            rig.h.cpu.set_eflags_arith(OF);
+            assert_eq!(rig.exec("adox eax, [rsi]"), Stop::Halted);
+            assert_eq!(
+                rig.gpr(RAX),
+                0x3333_4444,
+                "a 32-bit result clears the upper half"
+            );
+            assert_eq!(rig.flags() & OF, OF, "carry out of bit 31");
+        }
+
+        #[test]
+        fn two_interleaved_chains_do_not_disturb_each_other() {
+            // The point of the instructions: adcx (CF) and adox (OF) alternate without disturbing
+            // each other, each carrying through its own accumulator.
+            let mut rig = Rig::new();
+            rig.reset();
+            rig.h.cpu.set_eflags_arith(0);
+            let (mut low, mut high) = (u64::MAX, u64::MAX);
+            let mut flags = 0u64;
+            for step in 0..3u64 {
+                for (asm, accumulator, flag) in [
+                    ("adcx rax, rbx", &mut low, CF),
+                    ("adox rax, rbx", &mut high, OF),
+                ] {
+                    rig.h.cpu.gpr[RAX] = *accumulator;
+                    rig.h.cpu.gpr[RBX] = step + 1;
+                    rig.h.cpu.set_eflags_arith(flags);
+                    assert_eq!(rig.exec(asm), Stop::Halted);
+                    *accumulator = rig.gpr(RAX);
+                    flags = rig.flags();
+                    let _ = flag;
+                }
+            }
+            // low: MAX + 1 = 0 carry; 0 + 2 + 1 = 3; 3 + 3 + 0 = 6 (CF cleared by then)
+            // high: MAX + 1 = 0 carry, then OF carries into the next adox: 0 + 2 + 1 = 3, 3 + 3 = 6
+            assert_eq!((low, high), (6, 6));
+        }
+
+        #[test]
+        fn the_unprefixed_opcode_is_undefined_and_the_jit_matches() {
+            let mut rig = Rig::new();
+            assert_eq!(rig.run(".byte 0x0f, 0x38, 0xf6, 0xc3"), ud());
+            for asm in ["adcx rax, rbx", "adox eax, ebx"] {
+                assert_jit_matches_interpreter(code(asm), |h| {
+                    h.cpu.gpr[RAX] = u64::MAX;
+                    h.cpu.gpr[RBX] = 1;
+                    h.cpu.set_eflags_arith(CF | OF);
+                });
+            }
+        }
+
+        #[test]
+        fn clwb_and_clflushopt_are_not_xsaveopt() {
+            let mut rig = Rig::new();
+            for asm in ["clwb [rsi]", "clflushopt [rsi]"] {
+                rig.reset();
+                // 16-byte aligned only: xsaveopt would #GP, and it would scribble over the data
+                rig.h.cpu.gpr[RSI] = DATA + 16;
+                rig.h.write(DATA, &[0x5a; 64]);
+                assert_eq!(rig.exec(asm), Stop::Halted, "{asm}");
+                assert_eq!(rig.h.read(DATA, 64), [0x5a; 64], "{asm} modified memory");
+            }
+        }
+    }
+
     mod movbe {
         use super::*;
 
@@ -5168,6 +5340,26 @@ mod tests {
             ".byte 0x66, 0x0f, 0x3a, 0xcc, 0xc1, 0",
             &[0x66, 0x0f, 0x3a, 0xcc, 0xc1, 0x00, 0xf4],
         ),
+        ("adcx rax, rbx", &[0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc3, 0xf4]),
+        ("adcx eax, ebx", &[0x66, 0x0f, 0x38, 0xf6, 0xc3, 0xf4]),
+        ("adox rax, rbx", &[0xf3, 0x48, 0x0f, 0x38, 0xf6, 0xc3, 0xf4]),
+        ("adox eax, ebx", &[0xf3, 0x0f, 0x38, 0xf6, 0xc3, 0xf4]),
+        (
+            "adcx rax, [rsi]",
+            &[0x66, 0x48, 0x0f, 0x38, 0xf6, 0x06, 0xf4],
+        ),
+        (
+            "adox rax, [rsi]",
+            &[0xf3, 0x48, 0x0f, 0x38, 0xf6, 0x06, 0xf4],
+        ),
+        ("adox eax, [rsi]", &[0xf3, 0x0f, 0x38, 0xf6, 0x06, 0xf4]),
+        // no prefix: the opcode is not defined (the VEX form is mulx)
+        (
+            ".byte 0x0f, 0x38, 0xf6, 0xc3",
+            &[0x0f, 0x38, 0xf6, 0xc3, 0xf4],
+        ),
+        ("clwb [rsi]", &[0x66, 0x0f, 0xae, 0x36, 0xf4]),
+        ("clflushopt [rsi]", &[0x66, 0x0f, 0xae, 0x3e, 0xf4]),
         // SNIPPETS-END
     ];
 }

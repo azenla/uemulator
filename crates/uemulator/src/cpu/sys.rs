@@ -21,6 +21,10 @@ pub(crate) const MSR_FS_BASE: u32 = 0xc000_0100;
 pub(crate) const MSR_GS_BASE: u32 = 0xc000_0101;
 pub(crate) const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
 pub(crate) const MSR_TSC_AUX: u32 = 0xc000_0103;
+/// The cache line size CLZERO clears, and leaf 1 EBX reports in units of 8 bytes.
+const CLZERO_LINE_BYTES: u64 = 64;
+/// IA32_XSS: which supervisor state components xsaves/xrstors handle (none here).
+pub(crate) const MSR_XSS: u32 = 0xda0;
 pub(crate) const MSR_SPEC_CTRL: u32 = 0x48;
 pub(crate) const MSR_PRED_CMD: u32 = 0x49;
 pub(crate) const MSR_ARCH_CAPABILITIES: u32 = 0x10a;
@@ -480,6 +484,12 @@ const EXT_ADDRESS_EBX: u32 =
 
 /// Leaf 0xd subleaf 1 EAX bit 0.
 const XSTATE_FEATURE_XSAVEOPT: u32 = 1 << 0;
+/// Leaf 0xd subleaf 1 EAX bit 1: xsavec and the compacted format in xrstor.
+const XSTATE_FEATURE_XSAVEC: u32 = 1 << 1;
+/// Leaf 0xd subleaf 1 EAX bit 2: xgetbv with ECX=1 (XINUSE).
+const XSTATE_FEATURE_XGETBV1: u32 = 1 << 2;
+/// Leaf 0xd subleaf 1 EAX bit 3: xsaves, xrstors and IA32_XSS.
+const XSTATE_FEATURE_XSAVES: u32 = 1 << 3;
 
 /// Leaf 0x8000_0001 EDX repeats this subset of the leaf 1 bits (the AMD aliases); DE and PSE
 /// are not mirrored.
@@ -599,11 +609,16 @@ impl Cpu {
                     xsave::enabled_area_size(xsave::XCR0_SUPPORTED),
                     0,
                 ),
+                // EBX is the compacted size for the enabled components; ECX:EDX are the
+                // IA32_XSS bits the OS may enable
                 1 => (
-                    XSTATE_FEATURE_XSAVEOPT,
-                    xsave::enabled_area_size(self.xcr0),
-                    0,
-                    0,
+                    XSTATE_FEATURE_XSAVEOPT
+                        | XSTATE_FEATURE_XSAVEC
+                        | XSTATE_FEATURE_XGETBV1
+                        | XSTATE_FEATURE_XSAVES,
+                    xsave::compacted_area_size(self.xcr0),
+                    xsave::XSS_SUPPORTED as u32,
+                    (xsave::XSS_SUPPORTED >> 32) as u32,
                 ),
                 // Components 2 (AVX) and 5-7 (AVX-512): size and offset in the standard format
                 subleaf => match xsave::COMPONENTS.iter().find(|part| part.index == subleaf) {
@@ -675,6 +690,7 @@ impl Cpu {
             MSR_GS_BASE => self.seg[SEG_GS].base,
             MSR_KERNEL_GS_BASE => self.kgsbase,
             MSR_TSC_AUX => self.tsc_aux,
+            MSR_XSS => xsave::XSS_SUPPORTED,
             super::svm::MSR_VM_CR => self.svm.vm_cr,
             super::svm::MSR_VM_HSAVE_PA => self.svm.hsave_pa,
             MSR_SPEC_CTRL => self.spec_ctrl,
@@ -765,6 +781,12 @@ impl Cpu {
             MSR_GS_BASE => self.seg[SEG_GS].base = v,
             MSR_KERNEL_GS_BASE => self.kgsbase = v,
             MSR_TSC_AUX => self.tsc_aux = v,
+            // no supervisor state component is implemented, so the only value is "none"
+            MSR_XSS => {
+                if v & !xsave::XSS_SUPPORTED != 0 {
+                    return Err(Exception::general_protection(0));
+                }
+            }
             super::svm::MSR_VM_CR => {
                 if v & !super::svm::VM_CR_WRITABLE != 0 {
                     return Err(Exception::general_protection(0));
@@ -1400,6 +1422,7 @@ impl Cpu {
         const MODRM_MWAIT: u8 = 0xc9;
         const MODRM_CLAC: u8 = 0xca;
         const MODRM_STAC: u8 = 0xcb;
+        const MODRM_CLZERO: u8 = 0xfc;
         let reg = i.reg & 7;
         if i.op == OP_GROUP6 {
             let loc = self.modrm_location(i, next)?;
@@ -1467,6 +1490,7 @@ impl Cpu {
                     }
                 }
                 MODRM_XSETBV => self.xsetbv()?,
+                MODRM_CLZERO => self.clzero(i)?,
                 // Same CR4.TSD rule as rdtsc; ECX = IA32_TSC_AUX (zero-extended), EDX:EAX = TSC.
                 MODRM_RDTSCP => {
                     if self.cr4 & CR4_TSD != 0 && self.cpl != 0 {
@@ -1551,6 +1575,23 @@ impl Cpu {
         Ok(())
     }
 
+    /// 0F 01 FC (AMD): zeroes the cache line holding the address in rAX (DS-relative, truncated to
+    /// the address size). Allowed at any CPL; the line is aligned down, so it never crosses a
+    /// page and one probe covers the whole write.
+    fn clzero(&mut self, i: &Insn) -> ExecResult<()> {
+        let offset = if i.addr32 {
+            self.gpr[RAX] & 0xffff_ffff
+        } else {
+            self.gpr[RAX]
+        };
+        let line = self.linear_address(i, offset & !(CLZERO_LINE_BYTES - 1))?;
+        self.translate(line, mem::AccessKind::Write, false)?;
+        for qword in 0..CLZERO_LINE_BYTES / 8 {
+            self.write(line + 8 * qword, 8, 0)?;
+        }
+        Ok(())
+    }
+
     /// F3 0F AE /0../3 with a register operand: rdfsbase, rdgsbase, wrfsbase, wrgsbase. They exist
     /// only while CR4.FSGSBASE is set (#UD otherwise) and work at any CPL. The operand is 32 bits
     /// without REX.W (a read zero-extends, a write zero-extends into the base) and 64 bits with it;
@@ -1607,6 +1648,11 @@ impl Cpu {
                 // xsave, xrstor, xsaveopt (REX.W selects the 64-bit pointer layout, identical here)
                 4 => self.xsave(addr)?,
                 5 => self.xrstor(addr)?,
+                // 66 0F AE /6 is clwb, not xsaveopt: a cache-line write back, which like clflush
+                // only needs the access check here
+                6 if i.p66 => {
+                    self.read(addr, 1)?;
+                }
                 6 => self.xsave(addr)?,
                 2 => {
                     let v = self.read(addr, 4)? as u32;
@@ -2153,8 +2199,11 @@ mod sys_tests {
             assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 832, 2688, 0]);
             h.cpu.xcr0 = 0xe7;
             assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 2688, 2688, 0]);
-            // xsaveopt only: no xsavec, xgetbv1 or xsaves
-            assert_eq!(cpuid(&mut h, 0xd, 1), [1, 2688, 0, 0]);
+            // xsaveopt, xsavec, xgetbv1, xsaves; EBX is the compacted size for the enabled set
+            assert_eq!(cpuid(&mut h, 0xd, 1), [0xf, 2432, 0, 0]);
+            h.cpu.xcr0 = 7;
+            assert_eq!(cpuid(&mut h, 0xd, 1), [0xf, 832, 0, 0]);
+            h.cpu.xcr0 = 0xe7;
             // component 2 (AVX): 256 bytes at offset 576
             assert_eq!(cpuid(&mut h, 0xd, 2), [256, 576, 0, 0]);
             assert_eq!(cpuid(&mut h, 0xd, 3), [0, 0, 0, 0]);
@@ -5172,6 +5221,62 @@ mod sys_tests {
                 expected.icount = h.cpu.icount;
                 assert_eq!(h.snapshot(), expected);
             }
+        }
+
+        #[test]
+        fn wbnoinvd_is_wbinvd_without_the_invalidate() {
+            // f3 0f 09 (wbnoinvd); hlt: privileged like wbinvd, and nothing else happens
+            run_ok(&[0xf3, 0x0f, 0x09, 0xf4], |_| {});
+            assert_general_protection_zero(&[0xf3, 0x0f, 0x09, 0xf4], user_mode);
+        }
+
+        #[test]
+        fn clzero_zeroes_the_aligned_cache_line_around_rax_at_any_cpl() {
+            // clzero; hlt
+            const CLZERO: &[u8] = &[0x0f, 0x01, 0xfc, 0xf4];
+            const CLZERO_ADDRESS32: &[u8] = &[0x67, 0x0f, 0x01, 0xfc, 0xf4];
+            let fill = |h: &mut Harness| h.write(DATA, &[0xaa; 192]);
+            let h = run_ok(CLZERO, |h| {
+                fill(h);
+                h.cpu.gpr[RAX] = DATA + 64 + 0x25;
+            });
+            let bytes = h.read(DATA, 192);
+            assert_eq!(bytes[..64], [0xaa; 64]);
+            assert_eq!(bytes[64..128], [0; 64], "exactly the line holding rax");
+            assert_eq!(bytes[128..], [0xaa; 64]);
+            // the 0x67 prefix truncates the address to 32 bits
+            let h = run_ok(CLZERO_ADDRESS32, |h| {
+                fill(h);
+                h.cpu.gpr[RAX] = 0xffff_ffff_0000_0000 | (DATA + 128);
+            });
+            assert_eq!(h.read(DATA + 128, 64), [0; 64]);
+            assert_eq!(h.read(DATA + 64, 64), [0xaa; 64]);
+            // unprivileged, unlike wbinvd
+            // (the hlt behind it is what faults at CPL 3)
+            let (h, stop) = run_with(CLZERO, |h| {
+                user_mode(h);
+                fill(h);
+                h.cpu.gpr[RAX] = DATA;
+            });
+            assert_eq!(stop, general_protection(0));
+            assert_eq!(h.cpu.rip, CODE_BASE + 3, "stopped at the hlt, after clzero");
+            assert_eq!(h.read(DATA, 64), [0; 64]);
+        }
+
+        #[test]
+        fn clzero_faults_like_a_store() {
+            const CLZERO: &[u8] = &[0x0f, 0x01, 0xfc, 0xf4];
+            let (_, stop) = run_with(CLZERO, |h| h.cpu.gpr[RAX] = 0x4000_0000_0000);
+            assert!(
+                matches!(
+                    stop,
+                    Stop::Fault {
+                        vector: 14 | 13,
+                        ..
+                    }
+                ),
+                "{stop:?}"
+            );
         }
 
         #[test]

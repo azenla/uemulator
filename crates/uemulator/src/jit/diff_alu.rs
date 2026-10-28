@@ -1172,6 +1172,26 @@ fn xsave_xrstor_round_trip_matches() {
     );
 }
 
+#[test]
+fn xsavec_xrstors_xgetbv1_rdpid_match() {
+    // mov eax,-1; mov edx,-1; xsavec [rdi]; pxor xmm0,xmm0; xrstors [rdi] is privileged but runs at
+    // CPL 0 here; mov ecx,1; xgetbv; rdpid rbx; hlt
+    check_with(
+        &[
+            0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, 0x48, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff,
+            0x0f, 0xc7, 0x27, 0x66, 0x0f, 0xef, 0xc0, 0x0f, 0xc7, 0x1f, 0xb9, 0x01, 0x00, 0x00,
+            0x00, 0x0f, 0x01, 0xd0, 0xf3, 0x0f, 0xc7, 0xfb, 0xf4,
+        ],
+        |h| {
+            h.cpu.cr4 |= (1 << 9) | (1 << 18);
+            h.cpu.xcr0 = 3;
+            h.cpu.gpr[7] = crate::testkit::SCRATCH + 0x1000;
+            h.cpu.xmm[0] = 0x1234_5678_9abc_def0;
+            h.cpu.tsc_aux = 0x77;
+        },
+    );
+}
+
 /// Every BMI1/BMI2 form in one block, with operands that exercise the edge cases (zero source,
 /// count beyond the operand width, all ones). The JIT runs them through the interpreter helper,
 /// so this pins that a VEX instruction is neither mis-decoded as its legacy-opcode neighbour nor

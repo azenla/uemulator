@@ -1959,6 +1959,24 @@ impl Cpu {
                     self.rip = next;
                     return Ok(());
                 }
+                // rdpid (F3 0F C7 /7): IA32_TSC_AUX, 64 bits wide in 64-bit mode
+                if i.md == 3 && i.reg & 7 == 7 && i.rep == REP_REPE {
+                    let size = if self.seg[SEG_CS].long() { 8 } else { 4 };
+                    self.write_gpr(i.rm, size, true, self.tsc_aux & 0xffff_ffff);
+                    self.rip = next;
+                    return Ok(());
+                }
+                // xrstors /3, xsavec /4, xsaves /5
+                if i.md != 3 && matches!(i.reg & 7, 3..=5) && i.rep == 0 {
+                    let a = self.linear_address(i, self.effective_address(i, next))?;
+                    match i.reg & 7 {
+                        3 => self.xrstors(a)?,
+                        4 => self.xsavec(a)?,
+                        _ => self.xsaves(a)?,
+                    }
+                    self.rip = next;
+                    return Ok(());
+                }
                 if i.md == 3 || i.reg & 7 != 1 {
                     return Err(self.unimplemented_opcode(i));
                 }
