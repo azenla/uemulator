@@ -1,4 +1,4 @@
-//! `--net-loop`: a minimal gateway that only answers ARP and ICMP echo for 10.0.2.2. Used by the
+//! `--network-link-loop`: a minimal gateway that only answers ARP and ICMP echo for 10.0.2.2. Used by the
 //! tests and for checking the virtio-net path; it does no DHCP and forwards nothing.
 
 use std::ops::Range;

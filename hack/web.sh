@@ -5,8 +5,9 @@
 #   hack/web.sh          build only
 #   hack/web.sh serve    build, then serve
 #
-# Kernel and initramfs: pick files on the page, or run `uemulator quick alpine` once; its cached
-# netboot files are linked under assets/ and prefilled.
+# Kernel and initramfs: pick files on the page, or run `uemulator quick create alpine --install alpine`
+# once; that machine's netboot files are linked under assets/ and prefilled (UEMULATOR_MACHINE names
+# another Alpine machine).
 set -e
 
 cd "$(dirname "${0}")/.." || exit 1
@@ -19,7 +20,7 @@ mkdir -p "$out"
 cp crates/uemulator-web/www/* "$out/"
 cp target/wasm32-unknown-unknown/release/uemulator_web.wasm "$out/"
 
-cache="${UEMULATOR_CACHE:-${UEMULATOR_HOME:-$HOME/.uemulator}/cache}/quick/alpine/artifacts"
+cache="${UEMULATOR_HOME:-$HOME/.uemulator}/machines/${UEMULATOR_MACHINE:-alpine}/artifacts"
 if [ -f "$cache/vmlinuz-virt" ] && [ -f "$cache/initramfs-virt" ]; then
     mkdir -p "$out/assets"
     ln -s "$cache/vmlinuz-virt" "$out/assets/vmlinuz-virt"

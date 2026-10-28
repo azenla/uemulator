@@ -6,17 +6,18 @@
 # crates/uemulator/src/cpu/svm.rs, the paging code or the 16/32-bit modes.
 #
 # Needs: an `x86_64-linux-musl-gcc` (or a Linux host gcc), `unsquashfs` (brew install squashfs),
-# `bsdtar` or `cpio`, and the Alpine artifacts from `cargo run --release -- quick alpine`.
+# `bsdtar` or `cpio`, and the Alpine artifacts of a machine made with
+# `cargo run --release -- quick create alpine --install alpine` (UEMULATOR_MACHINE names another).
 #   hack/kvm/run.sh            # expects "KVMTEST done failures=0"
 set -e
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-cache=${UEMULATOR_CACHE:-${UEMULATOR_HOME:-$HOME/.uemulator}/cache}/quick/alpine/artifacts
+cache=${UEMULATOR_HOME:-$HOME/.uemulator}/machines/${UEMULATOR_MACHINE:-alpine}/artifacts
 work=${KVM_TEST_DIR:-/tmp/uemulator-kvm-test}
 base=https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/netboot
 
-[ -f "$cache/vmlinuz-virt" ] || { echo "run 'uemulator quick alpine' once to fetch $cache" >&2; exit 1; }
+[ -f "$cache/vmlinuz-virt" ] || { echo "run 'uemulator quick create alpine --install alpine' once to fetch $cache" >&2; exit 1; }
 mkdir -p "$work"
 cd "$work"
 

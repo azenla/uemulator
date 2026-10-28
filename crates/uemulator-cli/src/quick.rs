@@ -3,15 +3,17 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 
 use crate::run::DEFAULT_MEMORY_MIB;
 
 /// The library's upper memory bound: RAM must stay below the 0xC000_0000 PCI/MMIO window.
 const MAX_MEMORY_MIB: usize = 3072;
-const GIB_SHIFT: u32 = 30;
 const DOWNLOAD_CHUNK_LEN: usize = 1 << 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+/// The lowercase name is both the command-line value and what `machine.toml` stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Distro {
     Debian,
     Alpine,
@@ -30,7 +32,7 @@ impl Distro {
 
     /// Kernel arguments that make the netboot image reach its installer over the user-mode network.
     /// `ip=dhcp` configures the NIC in the initramfs; Alpine's `modloop` must come from the same
-    /// release as the cached kernel, so `--update` refreshes both together.
+    /// release as the cached kernel, so `update-artifacts` refreshes both together.
     pub fn cmdline(self) -> &'static str {
         match self {
             Distro::Debian => "",
@@ -53,7 +55,7 @@ pub struct Artifacts {
 }
 
 struct Download {
-    /// Name under the artifacts cache directory.
+    /// Name under the machine's artifacts directory.
     file_name: &'static str,
     url: &'static str,
 }
@@ -70,6 +72,13 @@ impl Distro {
             Distro::Alpine => "alpine",
             Distro::Fedora => "fedora",
         }
+    }
+
+    /// The kernel and initramfs URLs, for tests that check what was fetched.
+    #[cfg(test)]
+    pub fn source_urls(self) -> (&'static str, &'static str) {
+        let source = self.source();
+        (source.kernel.url, source.initramfs.url)
     }
 
     /// Debian and Fedora URLs are pinned to a release (Debian `trixie`, Fedora 44) and must be
@@ -111,86 +120,15 @@ impl Distro {
     }
 }
 
-/// Root of all CLI state: `$UEMULATOR_HOME`, else `~/.uemulator`. Holds `quick/<distro>/disk.img`
-/// and, unless `UEMULATOR_CACHE` overrides it, the download cache in `cache/`. `HOME` is unix
-/// only, so quick mode needs `UEMULATOR_HOME` on Windows.
-fn home() -> Result<PathBuf, String> {
-    home_from(env_var)
-}
-
-fn env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok()
-}
-
-fn home_from(env: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
-    if let Some(dir) = env("UEMULATOR_HOME") {
-        return Ok(dir.into());
-    }
-    let home = env("HOME").ok_or_else(|| "HOME not set".to_string())?;
-    Ok(Path::new(&home).join(".uemulator"))
-}
-
-/// Downloads live at `<cache>/quick/<distro>/artifacts/`.
-fn cache_root() -> Result<PathBuf, String> {
-    cache_root_from(env_var)
-}
-
-fn cache_root_from(env: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
-    match env("UEMULATOR_CACHE") {
-        Some(dir) => Ok(dir.into()),
-        None => Ok(home_from(env)?.join("cache")),
-    }
-}
-
-fn disk_path(home: &Path, distro: Distro) -> PathBuf {
-    home.join("quick").join(distro.name()).join("disk.img")
-}
-
-fn artifacts_dir(cache_root: &Path, distro: Distro) -> PathBuf {
-    cache_root
-        .join("quick")
-        .join(distro.name())
-        .join("artifacts")
-}
-
-/// Creates `path` (and its parent directories) as a sparse file of `gib` GiB.
-fn create_sparse_disk(path: &Path, gib: u64) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    }
-    File::create(path)
-        .and_then(|file| file.set_len(gib << GIB_SHIFT))
-        .map_err(|e| format!("create {}: {e}", path.display()))
-}
-
-/// Per-distro scratch disk, created sparse on first use and never resized afterwards: `gib` only
-/// matters for the call that creates the file.
-pub fn ensure_disk(distro: Distro, gib: u64) -> Result<PathBuf, String> {
-    let path = disk_path(&home()?, distro);
-    if !path.exists() {
-        create_sparse_disk(&path, gib)?;
-        eprintln!("created {gib} GiB disk {}", path.display());
-    }
-    Ok(path)
-}
-
-pub fn ensure(distro: Distro, update: bool) -> Result<Artifacts, String> {
-    ensure_in(
-        &artifacts_dir(&cache_root()?, distro),
-        distro,
-        update,
-        download,
-    )
-}
-
 /// A zero-length file counts as missing: it is what a crash between create and first write leaves.
 fn needs_download(path: &Path, update: bool) -> bool {
     let cached = fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
     update || !cached
 }
 
-/// `ensure` with the transfer injected, so the cache logic runs without a network.
-fn ensure_in(
+/// Puts the distro's kernel and initramfs in `dir`, fetching only what is missing unless `update`.
+/// The transfer is injected so the skip logic runs without a network.
+pub fn ensure_in(
     dir: &Path,
     distro: Distro,
     update: bool,
@@ -213,7 +151,7 @@ fn ensure_in(
 
 /// Streams to a `.part` file and renames it into place, so an interrupted download never leaves a
 /// truncated artifact that `ensure` would trust.
-fn download(url: &str, dest: &Path) -> Result<(), String> {
+pub fn download(url: &str, dest: &Path) -> Result<(), String> {
     eprintln!("downloading {url}");
     let res = ureq::get(url)
         .call()
@@ -228,7 +166,7 @@ fn part_path(dest: &Path) -> PathBuf {
 
 /// Copies `body` to `dest` through `part_path(dest)`. On any failure the partial file is removed
 /// and `dest` is left as it was.
-fn write_atomically(mut body: impl Read, dest: &Path) -> io::Result<()> {
+pub fn write_atomically(mut body: impl Read, dest: &Path) -> io::Result<()> {
     let part = part_path(dest);
     let res = (|| -> io::Result<()> {
         let mut out = File::create(&part)?;
@@ -255,19 +193,9 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::test_support::{EnvGuard, TempDir};
+    use crate::test_support::TempDir;
 
     const ALL_DISTROS: [Distro; 3] = [Distro::Debian, Distro::Alpine, Distro::Fedora];
-    const GIB: u64 = 1 << 30;
-
-    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |name| {
-            pairs
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| value.to_string())
-        }
-    }
 
     /// The release component of `.../releases/<n>/...`.
     fn release_in(url: &str) -> &str {
@@ -303,7 +231,6 @@ mod tests {
         };
         assert!(library(MAX_MEMORY_MIB + 1).contains(&format!("{MAX_MEMORY_MIB}")));
         assert!(library(MAX_MEMORY_MIB + 1).contains("between"));
-        assert_eq!(GIB_SHIFT, 30);
     }
 
     #[test]
@@ -442,205 +369,6 @@ mod tests {
             assert_eq!(cmdline, cmdline.trim());
             assert!(!cmdline.contains("  "));
         }
-    }
-
-    #[test]
-    fn home_prefers_uemulator_home() {
-        let env = [("UEMULATOR_HOME", "/data/emu"), ("HOME", "/home/me")];
-        assert_eq!(home_from(env_of(&env)).unwrap(), PathBuf::from("/data/emu"));
-    }
-
-    #[test]
-    fn home_falls_back_to_dot_uemulator_under_home() {
-        let env = [("HOME", "/home/me")];
-        assert_eq!(
-            home_from(env_of(&env)).unwrap(),
-            PathBuf::from("/home/me/.uemulator")
-        );
-    }
-
-    #[test]
-    fn home_without_any_variable_is_an_error() {
-        assert_eq!(home_from(env_of(&[])).unwrap_err(), "HOME not set");
-    }
-
-    #[test]
-    fn uemulator_home_works_without_home() {
-        let env = [("UEMULATOR_HOME", "C:\\emu")];
-        assert_eq!(home_from(env_of(&env)).unwrap(), PathBuf::from("C:\\emu"));
-    }
-
-    #[test]
-    fn cache_defaults_to_the_cache_directory_inside_home() {
-        let env = [("UEMULATOR_HOME", "/data/emu")];
-        assert_eq!(
-            cache_root_from(env_of(&env)).unwrap(),
-            PathBuf::from("/data/emu/cache")
-        );
-        let env = [("HOME", "/home/me")];
-        assert_eq!(
-            cache_root_from(env_of(&env)).unwrap(),
-            PathBuf::from("/home/me/.uemulator/cache")
-        );
-    }
-
-    #[test]
-    fn uemulator_cache_overrides_only_the_cache() {
-        let env = [
-            ("UEMULATOR_CACHE", "/fast/cache"),
-            ("UEMULATOR_HOME", "/data/emu"),
-        ];
-        assert_eq!(
-            cache_root_from(env_of(&env)).unwrap(),
-            PathBuf::from("/fast/cache")
-        );
-        assert_eq!(home_from(env_of(&env)).unwrap(), PathBuf::from("/data/emu"));
-    }
-
-    #[test]
-    fn uemulator_cache_needs_no_home() {
-        let env = [("UEMULATOR_CACHE", "/fast/cache")];
-        assert_eq!(
-            cache_root_from(env_of(&env)).unwrap(),
-            PathBuf::from("/fast/cache")
-        );
-    }
-
-    #[test]
-    fn cache_root_without_any_variable_is_an_error() {
-        assert_eq!(cache_root_from(env_of(&[])).unwrap_err(), "HOME not set");
-    }
-
-    #[test]
-    fn disk_and_artifact_paths_are_per_distro() {
-        let home = Path::new("/h");
-        assert_eq!(
-            disk_path(home, Distro::Debian),
-            PathBuf::from("/h/quick/debian/disk.img")
-        );
-        assert_eq!(
-            disk_path(home, Distro::Fedora),
-            PathBuf::from("/h/quick/fedora/disk.img")
-        );
-        let cache = Path::new("/c");
-        assert_eq!(
-            artifacts_dir(cache, Distro::Alpine),
-            PathBuf::from("/c/quick/alpine/artifacts")
-        );
-        let all: std::collections::HashSet<_> =
-            ALL_DISTROS.iter().map(|d| disk_path(home, *d)).collect();
-        assert_eq!(all.len(), ALL_DISTROS.len());
-    }
-
-    #[test]
-    fn real_home_reads_the_process_environment() {
-        let _env = EnvGuard::set(&[
-            ("UEMULATOR_HOME", Some("/tmp/uemulator-env-home")),
-            ("UEMULATOR_CACHE", None),
-        ]);
-        assert_eq!(home().unwrap(), PathBuf::from("/tmp/uemulator-env-home"));
-        assert_eq!(
-            cache_root().unwrap(),
-            PathBuf::from("/tmp/uemulator-env-home/cache")
-        );
-    }
-
-    #[test]
-    fn real_cache_root_honours_uemulator_cache() {
-        let _env = EnvGuard::set(&[
-            ("UEMULATOR_HOME", Some("/tmp/uemulator-env-home")),
-            ("UEMULATOR_CACHE", Some("/tmp/uemulator-env-cache")),
-        ]);
-        assert_eq!(
-            cache_root().unwrap(),
-            PathBuf::from("/tmp/uemulator-env-cache")
-        );
-        assert_eq!(home().unwrap(), PathBuf::from("/tmp/uemulator-env-home"));
-    }
-
-    #[test]
-    fn real_home_falls_back_to_home_variable() {
-        let _env = EnvGuard::set(&[
-            ("UEMULATOR_HOME", None),
-            ("UEMULATOR_CACHE", None),
-            ("HOME", Some("/tmp/uemulator-fake-home")),
-        ]);
-        assert_eq!(
-            home().unwrap(),
-            PathBuf::from("/tmp/uemulator-fake-home/.uemulator")
-        );
-    }
-
-    #[test]
-    fn env_guard_restores_previous_values() {
-        {
-            let _outer = EnvGuard::set(&[("UEMULATOR_HOME", Some("/tmp/one"))]);
-            assert_eq!(std::env::var("UEMULATOR_HOME").unwrap(), "/tmp/one");
-        }
-        let _again = EnvGuard::set(&[]);
-        assert_ne!(
-            std::env::var("UEMULATOR_HOME").ok().as_deref(),
-            Some("/tmp/one")
-        );
-    }
-
-    #[test]
-    fn sparse_disk_has_the_requested_length_without_allocating_it() {
-        let dir = TempDir::new("quick-sparse");
-        let path = dir.path().join("nested").join("deeper").join("disk.img");
-        create_sparse_disk(&path, 2).unwrap();
-        let meta = fs::metadata(&path).unwrap();
-        assert_eq!(meta.len(), 2 * GIB);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            const BLOCK_BYTES: u64 = 512;
-            assert!(meta.blocks() * BLOCK_BYTES < GIB, "file is not sparse");
-        }
-    }
-
-    #[test]
-    fn sparse_disk_of_zero_gib_is_empty() {
-        let dir = TempDir::new("quick-sparse0");
-        let path = dir.path().join("disk.img");
-        create_sparse_disk(&path, 0).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
-    }
-
-    #[test]
-    fn sparse_disk_creation_reports_the_path_on_failure() {
-        let dir = TempDir::new("quick-sparse-fail");
-        let blocker = dir.path().join("file");
-        fs::write(&blocker, b"x").unwrap();
-        let err = create_sparse_disk(&blocker.join("disk.img"), 1).unwrap_err();
-        assert!(err.starts_with("create "), "{err}");
-    }
-
-    #[test]
-    fn ensure_disk_creates_it_under_home_and_never_resizes_it() {
-        let dir = TempDir::new("quick-ensure-disk");
-        let home = dir.path().to_string_lossy().into_owned();
-        let _env = EnvGuard::set(&[("UEMULATOR_HOME", Some(&home))]);
-        let path = ensure_disk(Distro::Alpine, 1).unwrap();
-        assert_eq!(path, dir.path().join("quick/alpine/disk.img"));
-        assert_eq!(fs::metadata(&path).unwrap().len(), GIB);
-
-        fs::write(&path, b"guest data").unwrap();
-        let again = ensure_disk(Distro::Alpine, 4).unwrap();
-        assert_eq!(again, path);
-        assert_eq!(fs::read(&path).unwrap(), b"guest data");
-    }
-
-    #[test]
-    fn ensure_disk_keeps_distros_apart() {
-        let dir = TempDir::new("quick-ensure-disk2");
-        let home = dir.path().to_string_lossy().into_owned();
-        let _env = EnvGuard::set(&[("UEMULATOR_HOME", Some(&home))]);
-        let debian = ensure_disk(Distro::Debian, 1).unwrap();
-        let fedora = ensure_disk(Distro::Fedora, 2).unwrap();
-        assert_ne!(debian, fedora);
-        assert_eq!(fs::metadata(&debian).unwrap().len(), GIB);
-        assert_eq!(fs::metadata(&fedora).unwrap().len(), 2 * GIB);
     }
 
     #[test]
@@ -798,20 +526,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_uses_the_cache_override_without_touching_the_network_when_cached() {
-        let cache = TempDir::new("quick-real-ensure");
-        let cache_path = cache.path().to_string_lossy().into_owned();
-        let _env = EnvGuard::set(&[("UEMULATOR_CACHE", Some(&cache_path))]);
-        let dir = cache.path().join("quick/alpine/artifacts");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("vmlinuz-virt"), b"k").unwrap();
-        fs::write(dir.join("initramfs-virt"), b"i").unwrap();
-        let artifacts = ensure(Distro::Alpine, false).unwrap();
-        assert_eq!(artifacts.kernel, dir.join("vmlinuz-virt"));
-        assert_eq!(artifacts.initramfs, dir.join("initramfs-virt"));
-    }
-
-    #[test]
     fn part_file_sits_next_to_the_destination_with_a_part_extension() {
         assert_eq!(
             part_path(Path::new("/c/linux")),
@@ -918,11 +632,5 @@ mod tests {
         let dir = TempDir::new("quick-atomic-nodir");
         let dest = dir.path().join("missing").join("linux");
         assert!(write_atomically(Cursor::new(b"x".to_vec()), &dest).is_err());
-    }
-
-    #[test]
-    fn env_helper_ignores_variables_that_are_not_set() {
-        let _env = EnvGuard::set(&[("UEMULATOR_CACHE", None)]);
-        assert_eq!(env_var("UEMULATOR_CACHE"), None);
     }
 }

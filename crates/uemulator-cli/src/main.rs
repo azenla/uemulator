@@ -1,3 +1,5 @@
+mod args;
+mod machines;
 mod netgw;
 mod quick;
 mod run;
@@ -9,12 +11,12 @@ mod usernet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use uemulator::ExitReason;
 
+use args::{HardwareArgs, LinuxArgs, NewDiskArgs, RemoveArgs, RuntimeArgs, Settings, attach_only};
 use quick::Distro;
 
-const DEFAULT_DISK_GIB: u64 = 8;
 /// The machine ran and ended in a way that is not a failure of the emulator or the guest.
 const EXIT_SUCCESS: i32 = 0;
 /// Setup failed before or while starting the machine: bad arguments, unreadable files, failed
@@ -56,6 +58,90 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Named machines that install a distro from its netboot images, kept in ~/.uemulator/machines
+    Quick {
+        #[command(subcommand)]
+        cmd: QuickCmd,
+    },
+    /// Boot a kernel or a firmware image directly, with every option spelled out
+    Advanced {
+        #[command(subcommand)]
+        cmd: AdvancedCmd,
+    },
+}
+
+/// Options that change a saved machine apply to it for good (`create`, `edit`) or to one run
+/// (`boot`). Lists of devices (`--disk`, `--network`, `--console`) add to the saved ones;
+/// `--remove-*` takes saved ones away first.
+#[derive(Subcommand)]
+enum QuickCmd {
+    /// Create a machine, downloading its kernel and initramfs
+    ///
+    /// Without --disk or --create-disk the machine gets an 8 GiB disk, without --network a
+    /// NIC linked with user-mode NAT, and without --console a virtio console.
+    Create {
+        /// Machine name: letters, digits, '.', '_' and '-'
+        name: String,
+        /// The distro whose netboot installer the machine boots
+        #[arg(long, value_name = "DISTRO")]
+        install: Distro,
+        #[command(flatten)]
+        hardware: HardwareArgs,
+        #[command(flatten)]
+        new_disks: NewDiskArgs,
+        #[command(flatten)]
+        linux: LinuxArgs,
+        /// Boot the machine once it is created
+        #[arg(long)]
+        boot: bool,
+    },
+    /// Change a machine's saved configuration
+    ///
+    /// Removals apply first and their INDEXes refer to the lists as `create` and `edit` print
+    /// them; then the new devices are added after the ones that remain.
+    Edit {
+        /// The machine to change
+        name: String,
+        #[command(flatten)]
+        hardware: HardwareArgs,
+        #[command(flatten)]
+        new_disks: NewDiskArgs,
+        #[command(flatten)]
+        linux: LinuxArgs,
+        #[command(flatten)]
+        remove: RemoveArgs,
+    },
+    /// Boot a machine, optionally with options that apply to this run only
+    Boot {
+        /// The machine to boot
+        name: String,
+        #[command(flatten)]
+        hardware: HardwareArgs,
+        #[command(flatten)]
+        linux: LinuxArgs,
+        #[command(flatten)]
+        remove: RemoveArgs,
+        #[command(flatten)]
+        runtime: RuntimeArgs,
+    },
+    /// Throw away a machine's kernel and initramfs and download fresh ones; the disk and the
+    /// configuration are kept
+    Reinstall {
+        /// The machine to reinstall
+        name: String,
+        /// Switch the machine to another distro [default: the one it has]
+        #[arg(long, value_name = "DISTRO")]
+        install: Option<Distro>,
+    },
+    /// Download the current kernel and initramfs of the machine's distro
+    UpdateArtifacts {
+        /// The machine whose kernel and initramfs to refresh
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdvancedCmd {
     /// Boot a kernel (bzImage) and optional initramfs
     Boot {
         /// Linux bzImage
@@ -65,165 +151,163 @@ enum Cmd {
         #[arg(long)]
         initramfs: Option<PathBuf>,
         #[command(flatten)]
-        machine: MachineArgs,
+        hardware: HardwareArgs,
+        #[command(flatten)]
+        linux: LinuxArgs,
+        #[command(flatten)]
+        runtime: RuntimeArgs,
     },
     /// Boot a firmware image (a BIOS, or a real-mode program) at the reset vector in real mode
-    Firmware {
-        /// Image placed so that it ends at 1 MiB; execution starts at F000:FFF0
-        image: PathBuf,
-        #[command(flatten)]
-        machine: MachineArgs,
-    },
-    /// Boot a distro's netboot kernel and initramfs, downloading them on first use
-    Quick {
-        distro: Distro,
-        /// Re-download the cached artifacts
+    BootFirmware {
+        /// Image placed so that it ends at 1 MiB; execution starts at F000:FFF0. A guest reset
+        /// ends the run
         #[arg(long)]
-        update: bool,
-        /// Size in GiB of the sparse disk created at ~/.uemulator/quick/<distro>/disk.img; ignored
-        /// if the file exists or `--disk` is given
-        #[arg(long, default_value_t = DEFAULT_DISK_GIB, value_name = "GIB")]
-        disk_size: u64,
+        firmware: PathBuf,
         #[command(flatten)]
-        machine: MachineArgs,
+        hardware: HardwareArgs,
+        #[command(flatten)]
+        runtime: RuntimeArgs,
     },
 }
 
-/// clap's flag actions (`SetTrue`, `Count`) record one argument index however often a flag is
-/// repeated, which would lose the interleaving of `--net-user`, `--net-loop` and `--net-udp`. So
-/// those two flags are appending options that take no value on the command line
-/// (`default_missing_value`); every occurrence then has an index of its own.
-const REPEATABLE_FLAG: &str = "on";
-
-/// One `--net-*` flag: what sits on the host side of a NIC.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NetBackend {
-    User,
-    Loop,
-    /// `LOCAL,REMOTE`, unparsed.
-    Udp(String),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum ConsoleArg {
-    /// ttyS0 on the 16550; for kernels without a built-in virtio_console driver
-    Serial,
-    /// hvc0; the host terminal size is forwarded and follows resizes
-    Virtio,
-}
-
-#[derive(Args)]
-pub struct MachineArgs {
-    /// Guest memory in MiB, 64 to 3072 [default: 2048, 3072 for `quick fedora`]
-    #[arg(long, short = 'm')]
-    memory: Option<usize>,
-    /// Kernel command line
-    #[arg(long)]
-    cmdline: Option<String>,
-    /// Raw disk image as a virtio-blk device; append ",ro" for read-only. Repeat for more disks:
-    /// the guest sees them in command-line order (vda, vdb, ...)
-    #[arg(long, value_name = "PATH[,ro]")]
-    disk: Vec<String>,
-    /// Attach a virtio-net device with user-mode NAT to the host network (default for `quick`).
-    /// Repeat for more NICs
-    #[arg(long, action = ArgAction::Append, num_args = 0..=1, require_equals = true,
-        default_missing_value = REPEATABLE_FLAG, value_parser = [REPEATABLE_FLAG],
-        hide_possible_values = true, value_name = "")]
-    net_user: Vec<String>,
-    /// Append to the kernel command line
-    #[arg(long, value_name = "ARGS")]
-    append: Option<String>,
-    /// Attach a virtio-net device answered by a built-in gateway that only replies to ARP and ICMP
-    /// echo for 10.0.2.2: no DHCP, nothing is forwarded. Repeat for more NICs
-    #[arg(long, action = ArgAction::Append, num_args = 0..=1, require_equals = true,
-        default_missing_value = REPEATABLE_FLAG, value_parser = [REPEATABLE_FLAG],
-        hide_possible_values = true, value_name = "")]
-    net_loop: Vec<String>,
-    /// Attach a virtio-net device bridged to a UDP socket pair. Repeat for more NICs
-    #[arg(long, value_name = "LOCAL,REMOTE")]
-    net_udp: Vec<String>,
-    /// The NICs in the order the guest sees them: one entry per --net-user, --net-loop and
-    /// --net-udp, in command-line order. `parse_cli` fills it; clap cannot order across flags.
-    #[arg(skip)]
-    nets: Vec<NetBackend>,
-    /// Guest console device. Repeat to add more: the first is the guest's primary console and
-    /// the one the terminal is attached to; the others have no host side (their output is
-    /// dropped). Serial can be given once
-    #[arg(long, value_enum, default_value = "virtio")]
-    console: Vec<ConsoleArg>,
-    /// End the run with "machine reset" when the guest resets instead of rebooting it in place
-    #[arg(long)]
-    no_reboot: bool,
-    /// Run the interpreter only
-    #[arg(long)]
-    disable_jit: bool,
-    /// Run the JIT in lockstep with the interpreter and stop at the first divergence
-    #[arg(long)]
-    verify: bool,
-    /// Dump CPU state and the guest kernel log on exit
-    #[arg(long)]
-    debug: bool,
-    /// Fix the guest RTC to this Unix time
-    #[arg(long, value_name = "UNIX")]
-    time: Option<u64>,
-    /// Pace guest time to the wall clock even when stdin is not a terminal
-    #[arg(long)]
-    realtime: bool,
-    /// Stop the machine after this many seconds
-    #[arg(long, value_name = "SECS")]
-    timeout: Option<u64>,
+impl Cmd {
+    /// The hardware options of the command, for the parts of them clap cannot order.
+    fn hardware_mut(&mut self) -> Option<&mut HardwareArgs> {
+        match self {
+            Cmd::Quick {
+                cmd:
+                    QuickCmd::Create { hardware, .. }
+                    | QuickCmd::Edit { hardware, .. }
+                    | QuickCmd::Boot { hardware, .. },
+            }
+            | Cmd::Advanced {
+                cmd: AdvancedCmd::Boot { hardware, .. } | AdvancedCmd::BootFirmware { hardware, .. },
+            } => Some(hardware),
+            Cmd::Quick { .. } => None,
+        }
+    }
 }
 
 fn read(path: &PathBuf) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))
 }
 
-/// Quick mode's defaults for everything the user did not choose.
-fn apply_quick_defaults(machine: &mut MachineArgs, distro: Distro) {
-    // The installers fetch packages over the network, so default to NAT unless the user picked
-    // a NIC of their own.
-    if machine.nets.is_empty() {
-        machine.nets.push(NetBackend::User);
-    }
-    let distro_args = distro.cmdline();
-    if !distro_args.is_empty() {
-        let mut append = distro_args.to_string();
-        if let Some(user) = machine.append.take() {
-            append = format!("{append} {user}");
-        }
-        machine.append = Some(append);
-    }
-    machine.memory.get_or_insert(distro.default_memory_mib());
+/// The settings of a machine that has no saved ones: nothing but what the command line says.
+fn settings_of(hardware: &HardwareArgs, linux: &LinuxArgs) -> Result<Settings, String> {
+    let mut settings = Settings::default();
+    settings.add(hardware, linux, attach_only(&hardware.disk_steps)?);
+    Ok(settings)
 }
 
-fn execute(cli: Cli) -> Result<ExitReason, String> {
-    match cli.cmd {
-        Cmd::Boot {
+fn boot_launch(launch: machines::Launch, runtime: &RuntimeArgs) -> Result<ExitReason, String> {
+    let kernel = read(&launch.artifacts.kernel)?;
+    let initramfs = read(&launch.artifacts.initramfs)?;
+    run::run(kernel, Some(initramfs), &launch.settings, runtime)
+}
+
+/// `None` is a command that did not run a machine.
+fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
+    let home = machines::home()?;
+    match cmd {
+        QuickCmd::Create {
+            name,
+            install,
+            hardware,
+            new_disks: _,
+            linux,
+            boot,
+        } => {
+            let machine = machines::create(&home, &name, install, &hardware, &linux)?;
+            machines::fetch_artifacts(&machine, quick::download).map_err(|e| {
+                format!("{e}\nmachine {name} was created; `quick boot {name}` retries the download")
+            })?;
+            eprint!("{}", machines::describe(&machine));
+            if !boot {
+                return Ok(None);
+            }
+            let launch = machines::prepare_boot(
+                &machine,
+                &HardwareArgs::default(),
+                &LinuxArgs::default(),
+                &RemoveArgs::default(),
+                quick::download,
+            )?;
+            boot_launch(launch, &RuntimeArgs::default()).map(Some)
+        }
+        QuickCmd::Edit {
+            name,
+            hardware,
+            new_disks: _,
+            linux,
+            remove,
+        } => {
+            let edited = machines::edit(&home, &name, &hardware, &linux, &remove)?;
+            for disk in &edited.detached {
+                eprintln!(
+                    "detached {} (the image is left in place)",
+                    disk.path.display()
+                );
+            }
+            eprint!("{}", machines::describe(&edited.machine));
+            Ok(None)
+        }
+        QuickCmd::Boot {
+            name,
+            hardware,
+            linux,
+            remove,
+            runtime,
+        } => {
+            let machine = machines::load(&home, &name)?;
+            let launch =
+                machines::prepare_boot(&machine, &hardware, &linux, &remove, quick::download)?;
+            boot_launch(launch, &runtime).map(Some)
+        }
+        QuickCmd::Reinstall { name, install } => {
+            let machine = machines::reinstall(&home, &name, install, quick::download)?;
+            eprintln!(
+                "{name} will install {}; its disks and settings are unchanged",
+                machine.install.name()
+            );
+            Ok(None)
+        }
+        QuickCmd::UpdateArtifacts { name } => {
+            machines::update_artifacts(&home, &name, quick::download)?;
+            Ok(None)
+        }
+    }
+}
+
+fn advanced_command(cmd: AdvancedCmd) -> Result<ExitReason, String> {
+    match cmd {
+        AdvancedCmd::Boot {
             kernel,
             initramfs,
-            machine,
+            hardware,
+            linux,
+            runtime,
         } => {
             let kernel_image = read(&kernel)?;
             let initramfs_image = initramfs.as_ref().map(read).transpose()?;
-            run::run(kernel_image, initramfs_image, machine)
+            let settings = settings_of(&hardware, &linux)?;
+            run::run(kernel_image, initramfs_image, &settings, &runtime)
         }
-        Cmd::Firmware { image, machine } => run::run_firmware(read(&image)?, machine),
-        Cmd::Quick {
-            distro,
-            update,
-            disk_size,
-            mut machine,
+        AdvancedCmd::BootFirmware {
+            firmware,
+            hardware,
+            runtime,
         } => {
-            let artifacts = quick::ensure(distro, update)?;
-            let kernel_image = read(&artifacts.kernel)?;
-            let initramfs_image = read(&artifacts.initramfs)?;
-            apply_quick_defaults(&mut machine, distro);
-            if machine.disk.is_empty() {
-                let disk = quick::ensure_disk(distro, disk_size)?;
-                machine.disk.push(disk.to_string_lossy().into_owned());
-            }
-            run::run(kernel_image, Some(initramfs_image), machine)
+            let image = read(&firmware)?;
+            let settings = settings_of(&hardware, &LinuxArgs::default())?;
+            run::run_firmware(image, &settings, &runtime)
         }
+    }
+}
+
+fn execute(cli: Cli) -> Result<Option<ExitReason>, String> {
+    match cli.cmd {
+        Cmd::Quick { cmd } => quick_command(cmd),
+        Cmd::Advanced { cmd } => advanced_command(cmd).map(Some),
     }
 }
 
@@ -237,43 +321,25 @@ fn usage_exit_code(error: &clap::Error) -> i32 {
     }
 }
 
-/// The NICs of one subcommand in command-line order. clap keeps each flag's occurrences apart, so
-/// the interleaving (`--net-udp a,b --net-user --net-udp c,d`) is recovered from the argument
-/// indices; the n-th NIC the guest sees must be the n-th flag the user typed.
-fn net_backends(sub: &ArgMatches) -> Vec<NetBackend> {
-    let mut ordered: Vec<(usize, NetBackend)> = Vec::new();
-    for (id, backend) in [
-        ("net_user", NetBackend::User),
-        ("net_loop", NetBackend::Loop),
-    ] {
-        for index in sub.indices_of(id).into_iter().flatten() {
-            ordered.push((index, backend.clone()));
-        }
+/// The matches of the command that was actually named, however deep the subcommands nest.
+fn leaf(matches: &ArgMatches) -> &ArgMatches {
+    match matches.subcommand() {
+        Some((_, sub)) => leaf(sub),
+        None => matches,
     }
-    if let (Some(indices), Some(specs)) =
-        (sub.indices_of("net_udp"), sub.get_many::<String>("net_udp"))
-    {
-        for (index, spec) in indices.zip(specs) {
-            ordered.push((index, NetBackend::Udp(spec.clone())));
-        }
-    }
-    ordered.sort_by_key(|(index, _)| *index);
-    ordered.into_iter().map(|(_, backend)| backend).collect()
 }
 
-/// `Cli::try_parse_from` plus the part clap's derive cannot do: ordering the NIC flags.
+/// `Cli::try_parse_from` plus the part clap's derive cannot do: ordering the devices.
 fn parse_cli<I, T>(argv: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let matches = Cli::command().try_get_matches_from(argv)?;
+    let command = Cli::command();
+    let matches = command.clone().try_get_matches_from(argv)?;
     let mut cli = Cli::from_arg_matches(&matches)?;
-    if let Some((_, sub)) = matches.subcommand() {
-        let (Cmd::Boot { machine, .. }
-        | Cmd::Firmware { machine, .. }
-        | Cmd::Quick { machine, .. }) = &mut cli.cmd;
-        machine.nets = net_backends(sub);
+    if let Some(hardware) = cli.cmd.hardware_mut() {
+        hardware.order(&command, leaf(&matches))?;
     }
     Ok(cli)
 }
@@ -287,7 +353,8 @@ fn main() -> ExitCode {
         }
     };
     match execute(cli) {
-        Ok(reason) => ExitCode::from(exit_code(&reason) as u8),
+        Ok(Some(reason)) => ExitCode::from(exit_code(&reason) as u8),
+        Ok(None) => ExitCode::from(EXIT_SUCCESS as u8),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(EXIT_ERROR as u8)
@@ -301,6 +368,7 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::*;
+    use crate::args::{ConsoleArg, DiskSpec, DiskStep, NetLink, NetModel, Nic, parse_disk_spec};
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         let mut argv = vec!["uemulator"];
@@ -312,33 +380,40 @@ mod tests {
         parse(args).err().expect("parse should fail").kind()
     }
 
-    fn boot(args: &[&str]) -> (PathBuf, Option<PathBuf>, MachineArgs) {
+    struct Advanced {
+        kernel: PathBuf,
+        initramfs: Option<PathBuf>,
+        hardware: HardwareArgs,
+        linux: LinuxArgs,
+        runtime: RuntimeArgs,
+    }
+
+    fn advanced_boot(args: &[&str]) -> Advanced {
         match parse(args).unwrap().cmd {
-            Cmd::Boot {
+            Cmd::Advanced {
+                cmd:
+                    AdvancedCmd::Boot {
+                        kernel,
+                        initramfs,
+                        hardware,
+                        linux,
+                        runtime,
+                    },
+            } => Advanced {
                 kernel,
                 initramfs,
-                machine,
-            } => (kernel, initramfs, machine),
-            _ => panic!("expected boot"),
+                hardware,
+                linux,
+                runtime,
+            },
+            _ => panic!("expected advanced boot"),
         }
     }
 
-    fn quick(args: &[&str]) -> (Distro, bool, u64, MachineArgs) {
-        match parse(args).unwrap().cmd {
-            Cmd::Quick {
-                distro,
-                update,
-                disk_size,
-                machine,
-            } => (distro, update, disk_size, machine),
-            _ => panic!("expected quick"),
-        }
-    }
-
-    fn machine_args(extra: &[&str]) -> MachineArgs {
-        let mut args = vec!["boot", "--kernel", "k"];
+    fn hardware(extra: &[&str]) -> HardwareArgs {
+        let mut args = vec!["advanced", "boot", "--kernel", "k"];
         args.extend_from_slice(extra);
-        boot(&args).2
+        advanced_boot(&args).hardware
     }
 
     fn help_of(path: &[&str]) -> String {
@@ -347,6 +422,13 @@ mod tests {
             command = command.find_subcommand(name).unwrap().clone();
         }
         command.render_long_help().to_string()
+    }
+
+    fn nic(link: Option<NetLink>) -> Nic {
+        Nic {
+            model: NetModel::Virtio,
+            link,
+        }
     }
 
     #[test]
@@ -415,10 +497,11 @@ mod tests {
     #[test]
     fn usage_errors_exit_one_not_clap_default_two() {
         for args in [
-            &["boot"][..],
-            &["quick", "ubuntu"],
+            &["advanced", "boot"][..],
+            &["quick", "create", "m"],
+            &["quick", "create", "m", "--install", "ubuntu"],
             &["nope"],
-            &["boot", "--kernel", "k", "--memory", "x"],
+            &["advanced", "boot", "--kernel", "k", "--memory", "x"],
             &[],
         ] {
             let error = parse(args).err().unwrap();
@@ -428,7 +511,12 @@ mod tests {
 
     #[test]
     fn help_requests_exit_zero() {
-        for args in [&["--help"][..], &["boot", "--help"], &["quick", "-h"]] {
+        for args in [
+            &["--help"][..],
+            &["advanced", "boot", "--help"],
+            &["quick", "-h"],
+            &["quick", "create", "--help"],
+        ] {
             let error = parse(args).err().unwrap();
             assert_eq!(usage_exit_code(&error), EXIT_SUCCESS, "{args:?}");
         }
@@ -440,75 +528,106 @@ mod tests {
     }
 
     #[test]
-    fn firmware_takes_an_image_and_the_machine_options() {
-        match parse(&["firmware", "bios.bin", "--memory", "64", "--disable-jit"])
-            .unwrap()
-            .cmd
-        {
-            Cmd::Firmware { image, machine } => {
-                assert_eq!(image, PathBuf::from("bios.bin"));
-                assert_eq!(machine.memory, Some(64));
-                assert!(machine.disable_jit);
-            }
-            _ => panic!("expected firmware"),
-        }
-        assert_eq!(
-            error_kind(&["firmware"]),
-            ErrorKind::MissingRequiredArgument
-        );
-    }
-
-    #[test]
-    fn boot_requires_a_kernel() {
-        assert_eq!(error_kind(&["boot"]), ErrorKind::MissingRequiredArgument);
-        assert_eq!(
-            error_kind(&["boot", "--initramfs", "i"]),
-            ErrorKind::MissingRequiredArgument
-        );
-        assert_eq!(error_kind(&["boot", "--kernel"]), ErrorKind::InvalidValue);
-    }
-
-    #[test]
-    fn boot_with_only_a_kernel_uses_the_defaults() {
-        let (kernel, initramfs, machine) = boot(&["boot", "--kernel", "bz"]);
-        assert_eq!(kernel, PathBuf::from("bz"));
-        assert_eq!(initramfs, None);
-        assert_eq!(machine.memory, None);
-        assert_eq!(machine.cmdline, None);
-        assert!(machine.disk.is_empty());
-        assert_eq!(machine.append, None);
-        assert!(machine.net_udp.is_empty() && machine.nets.is_empty());
-        assert_eq!(machine.time, None);
-        assert_eq!(machine.timeout, None);
-        assert_eq!(machine.console, [ConsoleArg::Virtio]);
-        assert!(machine.net_user.is_empty() && machine.net_loop.is_empty());
-        for flag in [
-            machine.disable_jit,
-            machine.verify,
-            machine.debug,
-            machine.realtime,
-            machine.no_reboot,
+    fn the_old_top_level_commands_are_gone() {
+        for args in [
+            &["boot", "--kernel", "k"][..],
+            &["firmware", "bios.bin"],
+            &["quick", "debian"],
         ] {
-            assert!(!flag);
+            assert_eq!(error_kind(args), ErrorKind::InvalidSubcommand, "{args:?}");
         }
     }
 
     #[test]
-    fn no_reboot_is_a_machine_flag_of_boot_and_quick() {
-        assert!(machine_args(&["--no-reboot"]).no_reboot);
-        let quick = parse(&["quick", "alpine", "--no-reboot"]).unwrap();
-        assert!(matches!(quick.cmd, Cmd::Quick { machine, .. } if machine.no_reboot));
+    fn missing_or_unknown_subcommands_are_errors() {
+        assert_eq!(
+            error_kind(&[]),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert_eq!(
+            error_kind(&["quick"]),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert_eq!(
+            error_kind(&["advanced"]),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert_eq!(error_kind(&["run"]), ErrorKind::InvalidSubcommand);
+        assert_eq!(
+            error_kind(&["advanced", "run"]),
+            ErrorKind::InvalidSubcommand
+        );
+        assert_eq!(error_kind(&["--kernel", "k"]), ErrorKind::UnknownArgument);
     }
 
     #[test]
-    fn boot_takes_an_initramfs() {
-        let (_, initramfs, _) = boot(&["boot", "--kernel", "k", "--initramfs", "rd.gz"]);
-        assert_eq!(initramfs, Some(PathBuf::from("rd.gz")));
+    fn help_is_available_for_every_command() {
+        for args in [
+            &["--help"][..],
+            &["quick", "--help"],
+            &["quick", "create", "--help"],
+            &["quick", "edit", "--help"],
+            &["quick", "boot", "--help"],
+            &["quick", "reinstall", "--help"],
+            &["quick", "update-artifacts", "--help"],
+            &["advanced", "--help"],
+            &["advanced", "boot", "--help"],
+            &["advanced", "boot-firmware", "--help"],
+        ] {
+            assert_eq!(error_kind(args), ErrorKind::DisplayHelp, "{args:?}");
+        }
     }
 
     #[test]
-    fn boot_accepts_every_machine_flag_together() {
-        let (_, _, m) = boot(&[
+    fn there_is_no_version_flag() {
+        assert_eq!(error_kind(&["--version"]), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn advanced_boot_requires_a_kernel() {
+        assert_eq!(
+            error_kind(&["advanced", "boot"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            error_kind(&["advanced", "boot", "--initramfs", "i"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            error_kind(&["advanced", "boot", "--kernel"]),
+            ErrorKind::InvalidValue
+        );
+    }
+
+    #[test]
+    fn advanced_boot_with_only_a_kernel_chooses_nothing() {
+        let boot = advanced_boot(&["advanced", "boot", "--kernel", "bz"]);
+        assert_eq!(boot.kernel, PathBuf::from("bz"));
+        assert_eq!(boot.initramfs, None);
+        let hardware = &boot.hardware;
+        assert_eq!(hardware.memory, None);
+        assert_eq!(hardware.disable_jit, None);
+        assert!(hardware.disk_steps.is_empty());
+        assert!(hardware.nics.is_empty());
+        assert_eq!(boot.linux.cmdline, None);
+        assert_eq!(boot.linux.append, None);
+        assert_eq!(boot.linux.no_reboot, None);
+        let runtime = &boot.runtime;
+        assert_eq!(runtime.time, None);
+        assert_eq!(runtime.timeout, None);
+        assert!(!runtime.verify && !runtime.debug && !runtime.realtime);
+    }
+
+    #[test]
+    fn advanced_boot_takes_an_initramfs() {
+        let boot = advanced_boot(&["advanced", "boot", "--kernel", "k", "--initramfs", "rd.gz"]);
+        assert_eq!(boot.initramfs, Some(PathBuf::from("rd.gz")));
+    }
+
+    #[test]
+    fn advanced_boot_accepts_every_option_together() {
+        let boot = advanced_boot(&[
+            "advanced",
             "boot",
             "--kernel",
             "k",
@@ -518,15 +637,15 @@ mod tests {
             "console=ttyS0 root=/dev/vda",
             "--disk",
             "d.img,ro",
-            "--net-user",
+            "--network",
+            "virtio",
+            "--network-link-user",
             "--append",
             "quiet",
-            "--net-loop",
-            "--net-udp",
-            "127.0.0.1:1,127.0.0.1:2",
             "--console",
             "virtio",
             "--disable-jit",
+            "--no-reboot",
             "--verify",
             "--debug",
             "--time",
@@ -535,35 +654,94 @@ mod tests {
             "--timeout",
             "30",
         ]);
-        assert_eq!(m.memory, Some(256));
-        assert_eq!(m.cmdline.as_deref(), Some("console=ttyS0 root=/dev/vda"));
-        assert_eq!(m.disk, ["d.img,ro"]);
-        assert_eq!(m.append.as_deref(), Some("quiet"));
-        assert_eq!(m.net_udp, ["127.0.0.1:1,127.0.0.1:2"]);
-        assert_eq!(m.console, [ConsoleArg::Virtio]);
-        assert_eq!(m.time, Some(1_700_000_000));
-        assert_eq!(m.timeout, Some(30));
-        assert!(
-            m.net_user.len() == 1
-                && m.net_loop.len() == 1
-                && m.disable_jit
-                && m.verify
-                && m.debug
-                && m.realtime
+        let (hardware, linux, runtime) = (&boot.hardware, &boot.linux, &boot.runtime);
+        assert_eq!(hardware.memory, Some(256));
+        assert_eq!(
+            linux.cmdline.as_deref(),
+            Some("console=ttyS0 root=/dev/vda")
+        );
+        assert_eq!(
+            hardware.disk_steps,
+            vec![DiskStep::Attach(parse_disk_spec("d.img,ro"))]
+        );
+        assert_eq!(hardware.nics, vec![nic(Some(NetLink::User))]);
+        assert_eq!(linux.append.as_deref(), Some("quiet"));
+        assert_eq!(hardware.disable_jit, Some(true));
+        assert_eq!(linux.no_reboot, Some(true));
+        assert_eq!(runtime.time, Some(1_700_000_000));
+        assert_eq!(runtime.timeout, Some(30));
+        assert!(runtime.verify && runtime.debug && runtime.realtime);
+    }
+
+    #[test]
+    fn boot_firmware_takes_an_image_and_the_hardware_options() {
+        match parse(&[
+            "advanced",
+            "boot-firmware",
+            "--firmware",
+            "bios.bin",
+            "--memory",
+            "64",
+            "--disable-jit",
+            "--timeout",
+            "3",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Cmd::Advanced {
+                cmd:
+                    AdvancedCmd::BootFirmware {
+                        firmware,
+                        hardware,
+                        runtime,
+                    },
+            } => {
+                assert_eq!(firmware, PathBuf::from("bios.bin"));
+                assert_eq!(hardware.memory, Some(64));
+                assert_eq!(hardware.disable_jit, Some(true));
+                assert_eq!(runtime.timeout, Some(3));
+            }
+            _ => panic!("expected boot-firmware"),
+        }
+        assert_eq!(
+            error_kind(&["advanced", "boot-firmware"]),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn firmware_boots_have_no_kernel_command_line_options() {
+        for flag in ["--cmdline", "--append"] {
+            assert_eq!(
+                error_kind(&["advanced", "boot-firmware", "--firmware", "f", flag, "x"]),
+                ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+        }
+        assert_eq!(
+            error_kind(&[
+                "advanced",
+                "boot-firmware",
+                "--firmware",
+                "f",
+                "--no-reboot"
+            ]),
+            ErrorKind::UnknownArgument
         );
     }
 
     #[test]
     fn memory_has_a_short_and_a_long_flag() {
-        assert_eq!(machine_args(&["-m", "128"]).memory, Some(128));
-        assert_eq!(machine_args(&["--memory", "128"]).memory, Some(128));
-        assert_eq!(machine_args(&["--memory=128"]).memory, Some(128));
+        assert_eq!(hardware(&["-m", "128"]).memory, Some(128));
+        assert_eq!(hardware(&["--memory", "128"]).memory, Some(128));
+        assert_eq!(hardware(&["--memory=128"]).memory, Some(128));
     }
 
     #[test]
     fn memory_must_be_a_non_negative_integer() {
         for bad in ["abc", "-1", "1.5", "", "0x40"] {
-            let kind = error_kind(&["boot", "--kernel", "k", "--memory", bad]);
+            let kind = error_kind(&["advanced", "boot", "--kernel", "k", "--memory", bad]);
             assert!(
                 matches!(
                     kind,
@@ -573,30 +751,26 @@ mod tests {
             );
         }
         assert_eq!(
-            error_kind(&["boot", "--kernel", "k", "--memory"]),
+            error_kind(&["advanced", "boot", "--kernel", "k", "--memory"]),
             ErrorKind::InvalidValue
         );
     }
 
     #[test]
     fn memory_range_is_enforced_by_the_library_not_the_parser() {
-        assert_eq!(machine_args(&["--memory", "0"]).memory, Some(0));
-        assert_eq!(machine_args(&["--memory", "99999"]).memory, Some(99999));
+        assert_eq!(hardware(&["--memory", "0"]).memory, Some(0));
+        assert_eq!(hardware(&["--memory", "99999"]).memory, Some(99999));
     }
 
     #[test]
-    fn console_accepts_only_serial_and_virtio() {
+    fn console_accepts_only_serial_and_virtio_and_repeats() {
         assert_eq!(
-            machine_args(&["--console", "serial"]).console,
-            [ConsoleArg::Serial]
-        );
-        assert_eq!(
-            machine_args(&["--console", "virtio"]).console,
-            [ConsoleArg::Virtio]
+            hardware(&["--console", "serial", "--console", "virtio"]).console,
+            vec![ConsoleArg::Serial, ConsoleArg::Virtio]
         );
         for bad in ["hvc0", "Serial", "VIRTIO", ""] {
             assert_eq!(
-                error_kind(&["boot", "--kernel", "k", "--console", bad]),
+                error_kind(&["advanced", "boot", "--kernel", "k", "--console", bad]),
                 ErrorKind::InvalidValue,
                 "{bad:?}"
             );
@@ -605,16 +779,21 @@ mod tests {
 
     #[test]
     fn time_and_timeout_must_be_unsigned_integers() {
-        assert_eq!(machine_args(&["--time", "0"]).time, Some(0));
-        assert_eq!(machine_args(&["--timeout", "0"]).timeout, Some(0));
+        let runtime = |extra: &[&str]| {
+            let mut args = vec!["advanced", "boot", "--kernel", "k"];
+            args.extend_from_slice(extra);
+            advanced_boot(&args).runtime
+        };
+        assert_eq!(runtime(&["--time", "0"]).time, Some(0));
+        assert_eq!(runtime(&["--timeout", "0"]).timeout, Some(0));
         assert_eq!(
-            machine_args(&["--time", "18446744073709551615"]).time,
+            runtime(&["--time", "18446744073709551615"]).time,
             Some(u64::MAX)
         );
         for flag in ["--time", "--timeout"] {
             for bad in ["soon", "1.5", "99999999999999999999999"] {
                 assert_eq!(
-                    error_kind(&["boot", "--kernel", "k", flag, bad]),
+                    error_kind(&["advanced", "boot", "--kernel", "k", flag, bad]),
                     ErrorKind::ValueValidation,
                     "{flag} {bad}"
                 );
@@ -623,101 +802,206 @@ mod tests {
     }
 
     #[test]
+    fn boolean_options_take_an_optional_value_only_after_an_equals_sign() {
+        assert_eq!(hardware(&[]).disable_jit, None);
+        assert_eq!(hardware(&["--disable-jit"]).disable_jit, Some(true));
+        assert_eq!(hardware(&["--disable-jit=true"]).disable_jit, Some(true));
+        assert_eq!(hardware(&["--disable-jit=false"]).disable_jit, Some(false));
+        assert_eq!(
+            error_kind(&["advanced", "boot", "--kernel", "k", "--disable-jit=maybe"]),
+            ErrorKind::InvalidValue
+        );
+        assert_eq!(
+            error_kind(&[
+                "advanced",
+                "boot",
+                "--kernel",
+                "k",
+                "--disable-jit",
+                "false"
+            ]),
+            ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
     fn unknown_flags_and_stray_positionals_are_rejected() {
         assert_eq!(
-            error_kind(&["boot", "--kernel", "k", "--nope"]),
+            error_kind(&["advanced", "boot", "--kernel", "k", "--nope"]),
             ErrorKind::UnknownArgument
         );
         assert_eq!(
-            error_kind(&["boot", "--kernel", "k", "extra"]),
+            error_kind(&["advanced", "boot", "--kernel", "k", "extra"]),
             ErrorKind::UnknownArgument
         );
+    }
+
+    #[test]
+    fn the_old_network_flags_are_gone() {
+        for flag in ["--net-user", "--net-loop", "--net-udp"] {
+            assert_eq!(
+                error_kind(&["advanced", "boot", "--kernel", "k", flag]),
+                ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_links_bind_the_preceding_network_in_command_line_order() {
+        let nics = hardware(&[
+            "--network",
+            "virtio",
+            "--network-link-udp",
+            "a,b",
+            "--network",
+            "virtio",
+            "--network",
+            "virtio",
+            "--network-link-loop",
+            "--network",
+            "virtio",
+            "--network-link-user",
+        ])
+        .nics;
         assert_eq!(
-            error_kind(&["boot", "--kernel", "k", "--net-user=yes"]),
+            nics,
+            vec![
+                nic(Some(NetLink::Udp("a,b".into()))),
+                nic(None),
+                nic(Some(NetLink::Loop)),
+                nic(Some(NetLink::User)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_without_a_network_before_it_is_an_error() {
+        for link in [
+            &["--network-link-user"][..],
+            &["--network-link-loop"],
+            &["--network-link-udp", "a,b"],
+        ] {
+            let mut args = vec!["advanced", "boot", "--kernel", "k"];
+            args.extend_from_slice(link);
+            args.extend_from_slice(&["--network", "virtio"]);
+            let error = parse(&args).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{link:?}");
+            assert!(
+                error.to_string().contains("must follow the --network"),
+                "{error}"
+            );
+            assert_eq!(usage_exit_code(&error), EXIT_ERROR);
+        }
+    }
+
+    #[test]
+    fn a_network_takes_one_link() {
+        let error = parse(&[
+            "advanced",
+            "boot",
+            "--kernel",
+            "k",
+            "--network",
+            "virtio",
+            "--network-link-user",
+            "--network-link-loop",
+        ])
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        assert!(error.to_string().contains("already has a link"), "{error}");
+    }
+
+    #[test]
+    fn network_model_must_be_virtio() {
+        assert_eq!(
+            error_kind(&["advanced", "boot", "--kernel", "k", "--network", "e1000"]),
+            ErrorKind::InvalidValue
+        );
+        assert_eq!(
+            error_kind(&["advanced", "boot", "--kernel", "k", "--network"]),
+            ErrorKind::InvalidValue
+        );
+        assert_eq!(
+            error_kind(&[
+                "advanced",
+                "boot",
+                "--kernel",
+                "k",
+                "--network",
+                "virtio",
+                "--network-link-user=yes"
+            ]),
             ErrorKind::InvalidValue
         );
     }
 
     #[test]
-    fn quick_flags_do_not_exist_on_boot() {
+    fn disks_are_listed_in_the_order_they_were_typed() {
+        let steps = hardware(&["--disk", "a.img", "--disk", "b.img,ro"]).disk_steps;
         assert_eq!(
-            error_kind(&["boot", "--kernel", "k", "--update"]),
-            ErrorKind::UnknownArgument
-        );
-        assert_eq!(
-            error_kind(&["boot", "--kernel", "k", "--disk-size", "4"]),
-            ErrorKind::UnknownArgument
-        );
-    }
-
-    #[test]
-    fn boot_flags_do_not_exist_on_quick() {
-        assert_eq!(
-            error_kind(&["quick", "debian", "--kernel", "k"]),
-            ErrorKind::UnknownArgument
-        );
-        assert_eq!(
-            error_kind(&["quick", "debian", "--initramfs", "i"]),
-            ErrorKind::UnknownArgument
+            steps,
+            vec![
+                DiskStep::Attach(DiskSpec {
+                    path: "a.img".into(),
+                    read_only: false
+                }),
+                DiskStep::Attach(DiskSpec {
+                    path: "b.img".into(),
+                    read_only: true
+                }),
+            ]
         );
     }
 
-    #[test]
-    fn quick_requires_a_known_distro() {
-        assert_eq!(error_kind(&["quick"]), ErrorKind::MissingRequiredArgument);
-        for bad in ["ubuntu", "Debian", "DEBIAN", "arch", ""] {
-            assert_eq!(
-                error_kind(&["quick", bad]),
-                ErrorKind::InvalidValue,
-                "{bad:?}"
-            );
-        }
-        assert_eq!(
-            error_kind(&["quick", "debian", "alpine"]),
-            ErrorKind::UnknownArgument
-        );
-    }
-
-    #[test]
-    fn quick_accepts_each_distro_with_defaults() {
-        for (name, want) in [
-            ("debian", Distro::Debian),
-            ("alpine", Distro::Alpine),
-            ("fedora", Distro::Fedora),
-        ] {
-            let (distro, update, disk_size, machine) = quick(&["quick", name]);
-            assert_eq!(distro, want, "{name}");
-            assert!(!update);
-            assert_eq!(disk_size, DEFAULT_DISK_GIB);
-            assert_eq!(machine.memory, None);
+    fn create_hardware(extra: &[&str]) -> HardwareArgs {
+        let mut args = vec!["quick", "create", "m", "--install", "alpine"];
+        args.extend_from_slice(extra);
+        match parse(&args).unwrap().cmd {
+            Cmd::Quick {
+                cmd: QuickCmd::Create { hardware, .. },
+            } => hardware,
+            _ => panic!("expected quick create"),
         }
     }
 
     #[test]
-    fn quick_takes_update_disk_size_and_machine_flags_in_any_order() {
-        let (_, update, disk_size, machine) = quick(&[
-            "quick",
-            "--memory",
-            "512",
-            "alpine",
-            "--update",
-            "--disk-size",
-            "20",
-            "--net-loop",
-            "--timeout",
-            "5",
-        ]);
-        assert!(update);
-        assert_eq!(disk_size, 20);
-        assert_eq!(machine.memory, Some(512));
-        assert_eq!(machine.nets, [NetBackend::Loop]);
-        assert_eq!(machine.timeout, Some(5));
+    fn disk_and_create_disk_interleave_in_command_line_order() {
+        let steps = create_hardware(&[
+            "--create-disk",
+            "100",
+            "--disk",
+            "a.img",
+            "--create-disk",
+            "200",
+            "--disk",
+            "b.img,ro",
+        ])
+        .disk_steps;
+        assert_eq!(
+            steps,
+            vec![
+                DiskStep::Create { mib: 100 },
+                DiskStep::Attach(parse_disk_spec("a.img")),
+                DiskStep::Create { mib: 200 },
+                DiskStep::Attach(parse_disk_spec("b.img,ro")),
+            ]
+        );
     }
 
     #[test]
-    fn quick_disk_size_must_be_an_unsigned_integer() {
-        for bad in ["-1", "big", "1.5"] {
-            let kind = error_kind(&["quick", "debian", "--disk-size", bad]);
+    fn create_disk_takes_a_positive_number_of_mebibytes() {
+        for bad in ["0", "-1", "big", "1.5"] {
+            let kind = error_kind(&[
+                "quick",
+                "create",
+                "m",
+                "--install",
+                "alpine",
+                "--create-disk",
+                bad,
+            ]);
             assert!(
                 matches!(
                     kind,
@@ -726,32 +1010,223 @@ mod tests {
                 "{bad}: {kind:?}"
             );
         }
-        assert_eq!(
-            error_kind(&["quick", "debian", "--disk-size"]),
-            ErrorKind::InvalidValue
-        );
     }
 
     #[test]
-    fn missing_or_unknown_subcommands_are_errors() {
+    fn quick_create_requires_a_name_and_a_known_distro() {
         assert_eq!(
-            error_kind(&[]),
-            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            error_kind(&["quick", "create", "--install", "alpine"]),
+            ErrorKind::MissingRequiredArgument
         );
-        assert_eq!(error_kind(&["run"]), ErrorKind::InvalidSubcommand);
-        assert_eq!(error_kind(&["--kernel", "k"]), ErrorKind::UnknownArgument);
-    }
-
-    #[test]
-    fn help_is_available_for_every_command() {
-        for args in [&["--help"][..], &["boot", "--help"], &["quick", "--help"]] {
-            assert_eq!(error_kind(args), ErrorKind::DisplayHelp, "{args:?}");
+        assert_eq!(
+            error_kind(&["quick", "create", "m"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        for bad in ["ubuntu", "Debian", "DEBIAN", "arch", ""] {
+            assert_eq!(
+                error_kind(&["quick", "create", "m", "--install", bad]),
+                ErrorKind::InvalidValue,
+                "{bad:?}"
+            );
         }
     }
 
     #[test]
-    fn there_is_no_version_flag() {
-        assert_eq!(error_kind(&["--version"]), ErrorKind::UnknownArgument);
+    fn quick_create_accepts_each_distro_and_the_sketched_options() {
+        for (name, want) in [
+            ("debian", Distro::Debian),
+            ("alpine", Distro::Alpine),
+            ("fedora", Distro::Fedora),
+        ] {
+            match parse(&["quick", "create", "m", "--install", name])
+                .unwrap()
+                .cmd
+            {
+                Cmd::Quick {
+                    cmd:
+                        QuickCmd::Create {
+                            install,
+                            boot,
+                            hardware,
+                            ..
+                        },
+                } => {
+                    assert_eq!(install, want, "{name}");
+                    assert!(!boot);
+                    assert_eq!(hardware.memory, None);
+                }
+                _ => panic!("expected quick create"),
+            }
+        }
+        match parse(&[
+            "quick",
+            "create",
+            "test",
+            "--install",
+            "alpine",
+            "--memory",
+            "4096",
+            "--create-disk",
+            "16384",
+            "--console",
+            "virtio",
+            "--network",
+            "virtio",
+            "--network-link-user",
+            "--boot",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Cmd::Quick {
+                cmd:
+                    QuickCmd::Create {
+                        name,
+                        boot,
+                        hardware,
+                        ..
+                    },
+            } => {
+                assert_eq!(name, "test");
+                assert!(boot);
+                assert_eq!(hardware.memory, Some(4096));
+                assert_eq!(hardware.disk_steps, vec![DiskStep::Create { mib: 16384 }]);
+                assert_eq!(hardware.nics, vec![nic(Some(NetLink::User))]);
+            }
+            _ => panic!("expected quick create"),
+        }
+    }
+
+    #[test]
+    fn each_quick_command_takes_the_options_that_mean_something_to_it() {
+        // (command, option, accepted)
+        let cases: &[(&[&str], &str, bool)] = &[
+            (
+                &["quick", "create", "m", "--install", "alpine"],
+                "--create-disk=1",
+                true,
+            ),
+            (
+                &["quick", "create", "m", "--install", "alpine"],
+                "--boot",
+                true,
+            ),
+            (
+                &["quick", "create", "m", "--install", "alpine"],
+                "--remove-disk=0",
+                false,
+            ),
+            (
+                &["quick", "create", "m", "--install", "alpine"],
+                "--timeout=1",
+                false,
+            ),
+            (
+                &["quick", "create", "m", "--install", "alpine"],
+                "--debug",
+                false,
+            ),
+            (&["quick", "edit", "m"], "--create-disk=1", true),
+            (&["quick", "edit", "m"], "--remove-disk=0", true),
+            (&["quick", "edit", "m"], "--remove-network=0", true),
+            (&["quick", "edit", "m"], "--remove-console=0", true),
+            (&["quick", "edit", "m"], "--install=debian", false),
+            (&["quick", "edit", "m"], "--boot", false),
+            (&["quick", "edit", "m"], "--verify", false),
+            (&["quick", "boot", "m"], "--remove-disk=0", true),
+            (&["quick", "boot", "m"], "--timeout=1", true),
+            (&["quick", "boot", "m"], "--verify", true),
+            (&["quick", "boot", "m"], "--memory=8192", true),
+            (&["quick", "boot", "m"], "--create-disk=1", false),
+            (&["quick", "boot", "m"], "--install=debian", false),
+            (&["quick", "reinstall", "m"], "--install=debian", true),
+            (&["quick", "reinstall", "m"], "--memory=1", false),
+            (
+                &["quick", "update-artifacts", "m"],
+                "--install=debian",
+                false,
+            ),
+            (
+                &["advanced", "boot", "--kernel", "k"],
+                "--remove-disk=0",
+                false,
+            ),
+            (
+                &["advanced", "boot", "--kernel", "k"],
+                "--create-disk=1",
+                false,
+            ),
+            (
+                &["advanced", "boot", "--kernel", "k"],
+                "--install=alpine",
+                false,
+            ),
+        ];
+        for (command, option, accepted) in cases {
+            let mut args = command.to_vec();
+            args.push(option);
+            assert_eq!(parse(&args).is_ok(), *accepted, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn quick_boot_overrides_parse_like_the_saved_options() {
+        match parse(&[
+            "quick",
+            "boot",
+            "test",
+            "--memory",
+            "8192",
+            "--timeout",
+            "5",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Cmd::Quick {
+                cmd:
+                    QuickCmd::Boot {
+                        name,
+                        hardware,
+                        runtime,
+                        ..
+                    },
+            } => {
+                assert_eq!(name, "test");
+                assert_eq!(hardware.memory, Some(8192));
+                assert_eq!(runtime.timeout, Some(5));
+            }
+            _ => panic!("expected quick boot"),
+        }
+    }
+
+    #[test]
+    fn quick_edit_removals_take_zero_based_indices() {
+        match parse(&[
+            "quick",
+            "edit",
+            "m",
+            "--remove-disk",
+            "1",
+            "--remove-disk",
+            "0",
+            "--remove-network",
+            "2",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Cmd::Quick {
+                cmd: QuickCmd::Edit { remove, .. },
+            } => {
+                assert_eq!(remove.remove_disk, vec![1, 0]);
+                assert_eq!(remove.remove_network, vec![2]);
+                assert!(remove.remove_console.is_empty());
+            }
+            _ => panic!("expected quick edit"),
+        }
+        assert!(parse(&["quick", "edit", "m", "--remove-disk", "-1"]).is_err());
+        assert!(parse(&["quick", "edit", "m", "--remove-disk", "first"]).is_err());
     }
 
     #[test]
@@ -764,8 +1239,8 @@ mod tests {
     }
 
     #[test]
-    fn net_loop_help_describes_only_what_the_gateway_answers() {
-        let help = help_of(&["boot"]);
+    fn loopback_link_help_describes_only_what_the_gateway_answers() {
+        let help = help_of(&["advanced", "boot"]);
         assert!(help.contains("ARP"), "{help}");
         assert!(help.contains("ICMP echo"), "{help}");
         assert!(help.contains("10.0.2.2"), "{help}");
@@ -776,7 +1251,7 @@ mod tests {
     #[test]
     fn memory_help_states_the_range_the_library_enforces() {
         use crate::run::DEFAULT_MEMORY_MIB;
-        let help = help_of(&["boot"]);
+        let help = help_of(&["advanced", "boot"]);
         assert!(help.contains("64 to 3072"), "{help}");
         assert!(
             help.contains(&format!("default: {DEFAULT_MEMORY_MIB}")),
@@ -784,7 +1259,7 @@ mod tests {
         );
         assert!(
             help.contains(&format!(
-                "{} for `quick fedora`",
+                "{} for a fedora install",
                 Distro::Fedora.default_memory_mib()
             )),
             "{help}"
@@ -806,153 +1281,66 @@ mod tests {
             .collect();
         assert_eq!(numbers.len(), 2, "{message}");
         assert!(
-            help_of(&["boot"]).contains(&format!("{} to {}", numbers[0], numbers[1])),
+            help_of(&["advanced", "boot"]).contains(&format!("{} to {}", numbers[0], numbers[1])),
             "{message}"
         );
     }
 
     #[test]
-    fn quick_help_mentions_the_disk_location() {
-        let help = help_of(&["quick"]);
-        assert!(
-            help.contains("~/.uemulator/quick/<distro>/disk.img"),
-            "{help}"
-        );
-        assert!(help.contains(&format!("{DEFAULT_DISK_GIB}")), "{help}");
+    fn every_option_a_command_takes_is_documented() {
+        for path in [
+            &["quick", "create"][..],
+            &["quick", "edit"],
+            &["quick", "boot"],
+            &["quick", "reinstall"],
+            &["advanced", "boot"],
+            &["advanced", "boot-firmware"],
+        ] {
+            let mut command = Cli::command();
+            for name in path {
+                command = command.find_subcommand(name).unwrap().clone();
+            }
+            for arg in command.get_arguments() {
+                assert!(
+                    arg.get_help().is_some() || arg.get_id() == "help",
+                    "{path:?}: {} has no help",
+                    arg.get_id()
+                );
+            }
+        }
     }
 
     #[test]
-    fn quick_defaults_pick_user_networking_when_no_backend_was_chosen() {
-        let mut machine = machine_args(&[]);
-        apply_quick_defaults(&mut machine, Distro::Debian);
-        assert_eq!(machine.nets, [NetBackend::User]);
+    fn edit_help_explains_how_removals_and_additions_combine() {
+        let help = help_of(&["quick", "edit"]);
+        assert!(help.contains("Removals apply first"), "{help}");
+        assert!(help.contains("--remove-disk"), "{help}");
+        assert!(help.contains("--create-disk"), "{help}");
+        assert!(help.contains("left where it is"), "{help}");
     }
 
     #[test]
-    fn quick_defaults_respect_another_network_backend() {
-        let mut machine = machine_args(&["--net-loop"]);
-        apply_quick_defaults(&mut machine, Distro::Debian);
-        assert_eq!(machine.nets, [NetBackend::Loop]);
-        let mut machine = machine_args(&["--net-udp", "a,b"]);
-        apply_quick_defaults(&mut machine, Distro::Debian);
-        assert_eq!(machine.nets, [NetBackend::Udp("a,b".into())]);
-    }
-
-    #[test]
-    fn quick_defaults_keep_every_explicit_nic() {
-        let mut machine = machine_args(&["--net-user", "--net-loop"]);
-        apply_quick_defaults(&mut machine, Distro::Alpine);
-        assert_eq!(machine.nets, [NetBackend::User, NetBackend::Loop]);
-    }
-
-    #[test]
-    fn console_disk_and_net_flags_repeat() {
-        let m = machine_args(&[
-            "--console",
-            "serial",
-            "--console",
+    fn settings_of_applies_only_what_the_command_line_says() {
+        let boot = advanced_boot(&[
+            "advanced",
+            "boot",
+            "--kernel",
+            "k",
+            "--memory",
+            "300",
+            "--disk",
+            "x.img",
+            "--network",
             "virtio",
-            "--disk",
-            "a.img",
-            "--disk",
-            "b.img,ro",
+            "--append",
+            "quiet",
         ]);
-        assert_eq!(m.console, [ConsoleArg::Serial, ConsoleArg::Virtio]);
-        assert_eq!(m.disk, ["a.img", "b.img,ro"]);
-    }
-
-    #[test]
-    fn nics_come_in_command_line_order_across_different_flags() {
-        let m = machine_args(&[
-            "--net-udp",
-            "a:1,b:2",
-            "--net-user",
-            "--net-loop",
-            "--net-udp",
-            "c:3,d:4",
-            "--net-user",
-        ]);
-        assert_eq!(
-            m.nets,
-            [
-                NetBackend::Udp("a:1,b:2".into()),
-                NetBackend::User,
-                NetBackend::Loop,
-                NetBackend::Udp("c:3,d:4".into()),
-                NetBackend::User,
-            ]
-        );
-    }
-
-    #[test]
-    fn a_repeated_nic_flag_adds_a_nic_each_time() {
-        assert_eq!(
-            machine_args(&["--net-user", "--net-user"]).nets,
-            [NetBackend::User, NetBackend::User]
-        );
-        assert_eq!(
-            machine_args(&["--net-loop", "--net-loop", "--net-loop"]).nets,
-            [NetBackend::Loop, NetBackend::Loop, NetBackend::Loop]
-        );
-    }
-
-    #[test]
-    fn nics_are_ordered_for_quick_and_firmware_too() {
-        let (_, _, _, m) = quick(&["quick", "alpine", "--net-loop", "--net-user"]);
-        assert_eq!(m.nets, [NetBackend::Loop, NetBackend::User]);
-        let Cmd::Firmware { machine, .. } =
-            parse(&["firmware", "bios.bin", "--net-user", "--net-loop"])
-                .unwrap()
-                .cmd
-        else {
-            panic!("expected firmware")
-        };
-        assert_eq!(machine.nets, [NetBackend::User, NetBackend::Loop]);
-    }
-
-    #[test]
-    fn quick_defaults_set_distro_memory_only_when_unset() {
-        let mut machine = machine_args(&[]);
-        apply_quick_defaults(&mut machine, Distro::Fedora);
-        assert_eq!(machine.memory, Some(Distro::Fedora.default_memory_mib()));
-        let mut machine = machine_args(&["-m", "1024"]);
-        apply_quick_defaults(&mut machine, Distro::Fedora);
-        assert_eq!(machine.memory, Some(1024));
-        let mut machine = machine_args(&[]);
-        apply_quick_defaults(&mut machine, Distro::Debian);
-        assert_eq!(machine.memory, Some(Distro::Debian.default_memory_mib()));
-    }
-
-    #[test]
-    fn quick_defaults_leave_the_cmdline_alone_for_debian() {
-        let mut machine = machine_args(&[]);
-        apply_quick_defaults(&mut machine, Distro::Debian);
-        assert_eq!(machine.append, None);
-        let mut machine = machine_args(&["--append", "auto=true"]);
-        apply_quick_defaults(&mut machine, Distro::Debian);
-        assert_eq!(machine.append.as_deref(), Some("auto=true"));
-    }
-
-    #[test]
-    fn quick_defaults_put_distro_arguments_before_the_users() {
-        let mut machine = machine_args(&[]);
-        apply_quick_defaults(&mut machine, Distro::Alpine);
-        assert_eq!(machine.append.as_deref(), Some(Distro::Alpine.cmdline()));
-
-        let mut machine = machine_args(&["--append", "console=ttyS0"]);
-        apply_quick_defaults(&mut machine, Distro::Fedora);
-        assert_eq!(
-            machine.append,
-            Some(format!("{} console=ttyS0", Distro::Fedora.cmdline()))
-        );
-    }
-
-    #[test]
-    fn quick_defaults_do_not_touch_the_explicit_cmdline_or_disk() {
-        let mut machine = machine_args(&["--cmdline", "root=/dev/vda", "--disk", "x.img"]);
-        apply_quick_defaults(&mut machine, Distro::Alpine);
-        assert_eq!(machine.cmdline.as_deref(), Some("root=/dev/vda"));
-        assert_eq!(machine.disk, ["x.img"]);
+        let settings = settings_of(&boot.hardware, &boot.linux).unwrap();
+        assert_eq!(settings.memory, Some(300));
+        assert_eq!(settings.disks.len(), 1);
+        assert_eq!(settings.networks, vec![nic(None)]);
+        assert_eq!(settings.append.as_deref(), Some("quiet"));
+        assert!(settings.consoles.is_empty());
     }
 
     #[test]

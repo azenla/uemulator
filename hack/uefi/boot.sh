@@ -7,7 +7,7 @@
 # The guest is always an x86_64 Linux kernel. Only a same-architecture QEMU can use KVM or HVF,
 # so on an Apple Silicon Mac the aarch64 build is the accelerated one.
 #
-# Environment: UEFI_ACCEL (auto, hv or emu: hardware virtualization or the emulator), KERNEL, INITRD (default: the `quick alpine` artifacts), GUEST_MEM (MiB, the
+# Environment: UEFI_ACCEL (auto, hv or emu: hardware virtualization or the emulator), KERNEL, INITRD (default: the artifacts of the `alpine` machine, or the one UEMULATOR_MACHINE names), GUEST_MEM (MiB, the
 # emulated machine's RAM), QEMU_ACCEL (kvm, hvf, tcg), QEMU_FIRMWARE, QEMU_MEMORY (MiB, the
 # QEMU VM's RAM), QEMU_EXTRA_ARGS, SKIP_BUILD=1.
 set -e
@@ -28,15 +28,15 @@ esac
 [ "${1}" = "--" ] && shift
 
 RUST_TARGET="${TARGET_ARCH}-unknown-uefi"
-CACHE="${UEMULATOR_CACHE:-${UEMULATOR_HOME:-${HOME}/.uemulator}/cache}"
-KERNEL="${KERNEL:-${CACHE}/quick/alpine/artifacts/vmlinuz-virt}"
-INITRD="${INITRD:-${CACHE}/quick/alpine/artifacts/initramfs-virt}"
+ARTIFACTS="${UEMULATOR_HOME:-${HOME}/.uemulator}/machines/${UEMULATOR_MACHINE:-alpine}/artifacts"
+KERNEL="${KERNEL:-${ARTIFACTS}/vmlinuz-virt}"
+INITRD="${INITRD:-${ARTIFACTS}/initramfs-virt}"
 GUEST_MEM="${GUEST_MEM:-1024}"
 QEMU_MEMORY="${QEMU_MEMORY:-4096}"
 
 for f in "${KERNEL}" "${INITRD}"; do
 	if [ ! -f "${f}" ]; then
-		echo "missing ${f}: run 'cargo run --release -- quick alpine' once, or set KERNEL and INITRD" >&2
+		echo "missing ${f}: run 'cargo run --release -- quick create alpine --install alpine' once, or set KERNEL and INITRD" >&2
 		exit 1
 	fi
 done

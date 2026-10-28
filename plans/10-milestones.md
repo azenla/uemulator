@@ -9,7 +9,7 @@
 
 - Machine lifecycle done: a guest reset reboots the machine in place by default (`MachineConfig::reboot`, CLI `--no-reboot` to end with `ExitReason::Reset`; checked on the real Alpine kernel with `busybox reboot -f`, interpreter and JIT), `hlt` with IF=0 is `ExitReason::Shutdown` (checked with `busybox poweroff -f`; the UEFI hardware-virtualization loop applies the same rule, but has no in-process reboot). `ConsoleKind::Virtio` (hvc0) is the default everywhere except the UEFI hardware-virtualization path (no virtio in `Platform`). The M2 criterion "VFS panic then clean Reset" now needs `--no-reboot`; by default `panic=-1` reboots forever.
 
-- Workspace split done: `crates/uemulator` (library) + `crates/uemulator-cli` (`uemulator boot|quick`, clap). 
+- Workspace split done: `crates/uemulator` (library) + `crates/uemulator-cli` (`uemulator quick create|edit|boot|reinstall|update-artifacts` for named machines and `uemulator advanced boot|boot-firmware`, clap). 
 - `jit` feature (default on) gates `libc`/`windows-sys`; `--no-default-features` is dependency-free and interpreter-only.
 - x86_64 host JIT done (see 06): same inlined subset as aarch64, verified in lockstep. Exercised on macOS x86_64 under Rosetta; Linux and Windows x86_64 hosts compile but are untested.
 
@@ -21,7 +21,7 @@
 
 - AVX, AVX2, FMA and F16C done (see 03): VEX.128/256 through the SSE kernels, YMM upper state in XSAVE, gathers, masked moves, a fused multiply-add on the soft-float engine, half-precision conversion. Found while booting Debian: a register-collision bug in the VEX staging that broke glibc's AVX2 `strcmp`, now covered by tests.
 
-- Real mode, 16/32-bit protected mode, compatibility mode and virtual-8086 mode done (see 15): mode derived from CS, a mode-aware decoder, segment bases and limits, 16/32-bit interrupt and call-gate delivery, hardware task switching, sysenter/sysexit, and `MachineConfig::firmware` / `uemulator firmware` to boot a real-mode image. 49 tests in `cpu/legacy_tests.rs`. The JIT stays 64-bit-only.
+- Real mode, 16/32-bit protected mode, compatibility mode and virtual-8086 mode done (see 15): mode derived from CS, a mode-aware decoder, segment bases and limits, 16/32-bit interrupt and call-gate delivery, hardware task switching, sysenter/sysexit, and `MachineConfig::firmware` / `uemulator advanced boot-firmware` to boot a real-mode image. 49 tests in `cpu/legacy_tests.rs`. The JIT stays 64-bit-only.
 
 - Non-long-mode paging done (see 04 and 03, "Control-register rules outside long mode"): paging off, 32-bit two-level paging (4 MiB pages, PSE-36 advertised), PAE with latched PDPTEs, and the CR0/CR3/CR4/EFER transition rules; 82 tests in `cpu/paging_tests.rs`.
 
@@ -47,7 +47,7 @@ Each has an observable serial-output exit criterion. Interpreter first.
 
 | # | deliverable | exit criterion |
 |---|-------------|----------------|
-| M0 | API skeleton, config, bzImage parse + loader, example downloads/caches kernel, clock + console + UART | `uemulator quick debian` downloads (once), loads, and reports the parsed header; `cargo test` passes |
+| M0 | API skeleton, config, bzImage parse + loader, example downloads/caches kernel, clock + console + UART | `uemulator quick create` downloads (once), loads, and reports the parsed header; `cargo test` passes |
 | M1 | 64-bit decoder + interpreter for the integer subset, exceptions, paging, soft TLB, PIC/PIT/CMOS | console prints `Linux version 6.12.107...` (decompressor finished, kernel `start_kernel` running) |
 | M2 | Rest of integer ISA, SSE2 basics, x87 basics, TSC calibration, SMC invalidation, reset/triple-fault exit | no initrd: `Kernel panic - not syncing: VFS: Unable to mount root fs` then clean `ExitReason::Reset`; ≥50 MIPS release |
 | M3 | Full initrd boot | `Run /init as init process`, then installer userspace output (SSE2 libc paths, syscalls, signals, fork/exec) |

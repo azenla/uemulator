@@ -5,9 +5,9 @@ use uemulator::{
     ClockMode, ConsoleKind, Disk, EmulatedMachine, ExitReason, JitMode, MachineConfig, NetHandle,
 };
 
+use crate::args::{ConsoleArg, NetLink, RuntimeArgs, Settings};
 use crate::netgw;
 use crate::term::{stty, term_size};
-use crate::{ConsoleArg, MachineArgs, NetBackend};
 
 /// QEMU's conventional default NIC MAC (52:54:00 is its locally administered prefix).
 pub(crate) const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -23,10 +23,10 @@ const UDP_MAX_DATAGRAM: usize = 65536;
 const UDP_RECV_TIMEOUT: Duration = Duration::from_millis(2);
 const GATEWAY_RECV_TIMEOUT: Duration = Duration::from_millis(5);
 
-/// Splits `--net-udp LOCAL,REMOTE` at the first comma.
+/// Splits `--network-link-udp LOCAL,REMOTE` at the first comma.
 fn parse_udp_spec(spec: &str) -> Result<(&str, &str), String> {
     spec.split_once(',')
-        .ok_or_else(|| "--net-udp takes LOCAL,REMOTE".to_string())
+        .ok_or_else(|| "--network-link-udp takes LOCAL,REMOTE".to_string())
 }
 
 fn open_udp_socket(spec: &str) -> Result<std::net::UdpSocket, String> {
@@ -39,11 +39,11 @@ fn open_udp_socket(spec: &str) -> Result<std::net::UdpSocket, String> {
     Ok(sock)
 }
 
-/// Splits `--disk PATH[,ro]` into the path and whether the disk is read-only.
-fn parse_disk_spec(spec: &str) -> (&str, bool) {
-    match spec.strip_suffix(",ro") {
-        Some(path) => (path, true),
-        None => (spec, false),
+/// The consoles to configure: a machine that chose none gets the virtio console, like the library.
+fn console_list(settings: &Settings) -> Vec<ConsoleArg> {
+    match settings.consoles.is_empty() {
+        true => vec![ConsoleArg::Virtio],
+        false => settings.consoles.clone(),
     }
 }
 
@@ -119,47 +119,50 @@ fn spawn_gateway(net: NetHandle) {
 fn build_config(
     kernel: Vec<u8>,
     initramfs: Option<Vec<u8>>,
-    args: &MachineArgs,
+    settings: &Settings,
+    runtime: &RuntimeArgs,
     stdin_is_terminal: bool,
 ) -> Result<MachineConfig, String> {
     let mut cfg = MachineConfig::new()
         .kernel(kernel)
-        .debug(args.debug)
-        .verify_jit(args.verify);
-    if args.debug {
+        .debug(runtime.debug)
+        .verify_jit(runtime.verify);
+    if runtime.debug {
         cfg = cfg.log(|line| eprintln!("{line}"));
     }
     if let Some(initramfs) = initramfs {
         cfg = cfg.initrd(initramfs);
     }
-    cfg = cfg.memory_mib(args.memory.unwrap_or(DEFAULT_MEMORY_MIB));
-    if let Some(cmdline) = &args.cmdline {
+    cfg = cfg.memory_mib(settings.memory.unwrap_or(DEFAULT_MEMORY_MIB));
+    if let Some(cmdline) = &settings.cmdline {
         cfg = cfg.cmdline(cmdline.clone());
     }
-    if let Some(extra) = &args.append {
+    if let Some(extra) = &settings.append {
         cfg = cfg.cmdline_append(extra.clone());
     }
-    for spec in &args.disk {
-        let (path, read_only) = parse_disk_spec(spec);
-        cfg = cfg.disk(Disk::open(path, read_only).map_err(|e| format!("open disk {path}: {e}"))?);
+    for disk in &settings.disks {
+        let path = disk.path.display();
+        cfg = cfg.disk(
+            Disk::open(&disk.path, disk.read_only).map_err(|e| format!("open disk {path}: {e}"))?,
+        );
     }
-    for index in 0..args.nets.len() {
+    for index in 0..settings.networks.len() {
         cfg = cfg.net(guest_mac(index));
     }
-    for console in &args.console {
-        cfg = cfg.console(console_kind(*console));
+    for console in console_list(settings) {
+        cfg = cfg.console(console_kind(console));
     }
-    if let Some(t) = args.time {
+    if let Some(t) = runtime.time {
         cfg = cfg.unix_time(t);
     }
     cfg = cfg.random_seed(host_random_seed());
-    if wants_realtime_clock(stdin_is_terminal, args.realtime) {
+    if wants_realtime_clock(stdin_is_terminal, runtime.realtime) {
         cfg = cfg.clock(ClockMode::Realtime);
     }
-    if args.disable_jit {
+    if settings.disable_jit {
         cfg = cfg.jit(JitMode::Off);
     }
-    cfg = cfg.reboot(!args.no_reboot);
+    cfg = cfg.reboot(!settings.no_reboot);
     Ok(cfg)
 }
 
@@ -180,35 +183,46 @@ pub(crate) fn exit_message(reason: &ExitReason) -> String {
 pub fn run(
     kernel: Vec<u8>,
     initramfs: Option<Vec<u8>>,
-    args: MachineArgs,
+    settings: &Settings,
+    runtime: &RuntimeArgs,
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
-    let cfg = build_config(kernel, initramfs, &args, tty)?;
-    run_config(cfg, args, tty)
+    let cfg = build_config(kernel, initramfs, settings, runtime, tty)?;
+    run_config(cfg, settings, runtime, tty)
 }
 
 /// Like `run`, for a firmware image started in real mode at the reset vector.
-pub fn run_firmware(image: Vec<u8>, args: MachineArgs) -> Result<ExitReason, String> {
+pub fn run_firmware(
+    image: Vec<u8>,
+    settings: &Settings,
+    runtime: &RuntimeArgs,
+) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
-    let cfg = build_config(Vec::new(), None, &args, tty)?.firmware(image);
-    run_config(cfg, args, tty)
+    let cfg = build_config(Vec::new(), None, settings, runtime, tty)?.firmware(image);
+    run_config(cfg, settings, runtime, tty)
 }
 
-fn run_config(cfg: MachineConfig, args: MachineArgs, tty: bool) -> Result<ExitReason, String> {
+fn run_config(
+    cfg: MachineConfig,
+    settings: &Settings,
+    runtime: &RuntimeArgs,
+    tty: bool,
+) -> Result<ExitReason, String> {
     let mut machine = EmulatedMachine::new(cfg).map_err(|e| e.to_string())?;
     let console = machine.console();
     if machine.consoles().len() > 1 {
         eprintln!(
-            "note: the terminal is attached to the first --console; the other {} have no host side",
+            "note: the terminal is attached to the first console; the other {} have no host side",
             machine.consoles().len() - 1
         );
     }
-    // `build_config` made one NIC per backend, in this order.
-    for (net, backend) in machine.nets().into_iter().zip(&args.nets) {
-        match backend {
-            NetBackend::Udp(spec) => spawn_udp(net, spec)?,
-            NetBackend::Loop => spawn_gateway(net),
-            NetBackend::User => crate::usernet::spawn(net),
+    // `build_config` made one NIC per entry, in this order.
+    for (net, nic) in machine.nets().into_iter().zip(&settings.networks) {
+        match &nic.link {
+            Some(NetLink::Udp(spec)) => spawn_udp(net, spec)?,
+            Some(NetLink::Loop) => spawn_gateway(net),
+            Some(NetLink::User) => crate::usernet::spawn(net),
+            None => {}
         }
     }
     if let Some((cols, rows)) = term_size() {
@@ -245,7 +259,7 @@ fn run_config(cfg: MachineConfig, args: MachineArgs, tty: bool) -> Result<ExitRe
             input.write(&buf[..n]);
         }
     });
-    if let Some(secs) = args.timeout {
+    if let Some(secs) = runtime.timeout {
         let stop = machine.stop_handle();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(secs));
@@ -282,20 +296,38 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
-    use crate::Cmd;
     use crate::test_support::TempDir;
+    use crate::{AdvancedCmd, Cmd};
 
     const SAVED_SETTINGS: &str = "4500:5:bf:8a3b:3:1c:7f:15:4:0:1:0:11:13:1a:0:12:f:17:16:0:0";
     const MIN_MEMORY_MIB: usize = 64;
     const MAX_MEMORY_MIB: usize = 3072;
 
-    fn boot_args(extra: &[&str]) -> MachineArgs {
-        let mut argv = vec!["uemulator", "boot", "--kernel", "k"];
+    /// The settings and runtime options `advanced boot --kernel k <extra>` parses to.
+    fn boot_args(extra: &[&str]) -> (Settings, RuntimeArgs) {
+        let mut argv = vec!["uemulator", "advanced", "boot", "--kernel", "k"];
         argv.extend_from_slice(extra);
         match crate::parse_cli(argv).unwrap().cmd {
-            Cmd::Boot { machine, .. } => machine,
-            Cmd::Quick { .. } | Cmd::Firmware { .. } => unreachable!(),
+            Cmd::Advanced {
+                cmd:
+                    AdvancedCmd::Boot {
+                        hardware,
+                        linux,
+                        runtime,
+                        ..
+                    },
+            } => (crate::settings_of(&hardware, &linux).unwrap(), runtime),
+            _ => unreachable!(),
         }
+    }
+
+    fn build(
+        extra: &[&str],
+        initramfs: Option<Vec<u8>>,
+        tty: bool,
+    ) -> Result<MachineConfig, String> {
+        let (settings, runtime) = boot_args(extra);
+        build_config(Vec::new(), initramfs, &settings, &runtime, tty)
     }
 
     /// What the library says about `cfg` before it looks at the kernel. The kernel is empty, so
@@ -369,36 +401,6 @@ mod tests {
     }
 
     #[test]
-    fn disk_spec_without_suffix_is_read_write() {
-        assert_eq!(parse_disk_spec("disk.img"), ("disk.img", false));
-    }
-
-    #[test]
-    fn disk_spec_with_ro_suffix_is_read_only() {
-        assert_eq!(parse_disk_spec("disk.img,ro"), ("disk.img", true));
-    }
-
-    #[test]
-    fn disk_spec_only_strips_one_ro_suffix() {
-        assert_eq!(parse_disk_spec("a,ro,ro"), ("a,ro", true));
-    }
-
-    #[test]
-    fn disk_spec_other_suffixes_stay_part_of_the_path() {
-        assert_eq!(parse_disk_spec("disk.img,rw"), ("disk.img,rw", false));
-        assert_eq!(parse_disk_spec("ro"), ("ro", false));
-        assert_eq!(parse_disk_spec("disk.img,RO"), ("disk.img,RO", false));
-        assert_eq!(parse_disk_spec("a,roo"), ("a,roo", false));
-    }
-
-    #[test]
-    fn disk_spec_edge_cases() {
-        assert_eq!(parse_disk_spec(",ro"), ("", true));
-        assert_eq!(parse_disk_spec(""), ("", false));
-        assert_eq!(parse_disk_spec("/a b/c d.img,ro"), ("/a b/c d.img", true));
-    }
-
-    #[test]
     fn udp_spec_splits_at_the_first_comma() {
         assert_eq!(
             parse_udp_spec("127.0.0.1:1234,127.0.0.1:5678"),
@@ -412,7 +414,7 @@ mod tests {
     fn udp_spec_without_comma_is_rejected_with_usage() {
         assert_eq!(
             parse_udp_spec("127.0.0.1:1234"),
-            Err("--net-udp takes LOCAL,REMOTE".to_string())
+            Err("--network-link-udp takes LOCAL,REMOTE".to_string())
         );
         assert!(parse_udp_spec("").is_err());
     }
@@ -461,22 +463,56 @@ mod tests {
     fn udp_socket_without_comma_reports_usage() {
         assert_eq!(
             open_udp_socket("127.0.0.1:0").unwrap_err(),
-            "--net-udp takes LOCAL,REMOTE"
+            "--network-link-udp takes LOCAL,REMOTE"
         );
     }
 
     #[test]
-    fn every_backend_flag_adds_a_nic() {
+    fn every_network_adds_a_nic_whether_or_not_it_is_linked() {
         for (flags, count) in [
             (&[][..], 0),
-            (&["--net-loop"], 1),
-            (&["--net-user"], 1),
-            (&["--net-udp", "a,b"], 1),
-            (&["--net-loop", "--net-user"], 2),
-            (&["--net-user", "--net-user", "--net-udp", "a,b"], 3),
+            (&["--network", "virtio"], 1),
+            (&["--network", "virtio", "--network-link-loop"], 1),
+            (
+                &[
+                    "--network",
+                    "virtio",
+                    "--network-link-user",
+                    "--network",
+                    "virtio",
+                ],
+                2,
+            ),
+            (
+                &[
+                    "--network",
+                    "virtio",
+                    "--network-link-user",
+                    "--network",
+                    "virtio",
+                    "--network-link-udp",
+                    "a,b",
+                    "--network",
+                    "virtio",
+                ],
+                3,
+            ),
         ] {
-            assert_eq!(boot_args(flags).nets.len(), count, "{flags:?}");
+            assert_eq!(boot_args(flags).0.networks.len(), count, "{flags:?}");
         }
+    }
+
+    #[test]
+    fn a_machine_that_chose_no_console_gets_the_virtio_one() {
+        assert_eq!(console_list(&Settings::default()), vec![ConsoleArg::Virtio]);
+        let serial = Settings {
+            consoles: vec![ConsoleArg::Serial, ConsoleArg::Virtio],
+            ..Settings::default()
+        };
+        assert_eq!(
+            console_list(&serial),
+            vec![ConsoleArg::Serial, ConsoleArg::Virtio]
+        );
     }
 
     #[test]
@@ -501,21 +537,24 @@ mod tests {
         std::fs::write(&first, vec![0u8; 4096]).unwrap();
         std::fs::write(&second, vec![0u8; 4096]).unwrap();
         let (first, second) = (first.to_str().unwrap(), second.to_str().unwrap());
-        let cfg = build_config(
-            vec![],
-            None,
-            &boot_args(&[
+        let cfg = build(
+            &[
                 "--disk",
                 first,
                 "--disk",
                 &format!("{second},ro"),
-                "--net-loop",
-                "--net-user",
+                "--network",
+                "virtio",
+                "--network-link-loop",
+                "--network",
+                "virtio",
+                "--network-link-user",
                 "--console",
                 "serial",
                 "--console",
                 "virtio",
-            ]),
+            ],
+            None,
             false,
         )
         .unwrap();
@@ -526,13 +565,7 @@ mod tests {
 
     #[test]
     fn two_serial_consoles_are_rejected_by_the_library() {
-        let cfg = build_config(
-            vec![],
-            None,
-            &boot_args(&["--console", "serial", "--console", "serial"]),
-            false,
-        )
-        .unwrap();
+        let cfg = build(&["--console", "serial", "--console", "serial"], None, false).unwrap();
         assert!(machine_error(cfg).contains("only once"));
     }
 
@@ -626,26 +659,14 @@ mod tests {
     #[test]
     fn memory_below_the_library_minimum_is_rejected_by_the_library() {
         let memory = (MIN_MEMORY_MIB - 1).to_string();
-        let cfg = build_config(
-            vec![],
-            None,
-            &boot_args(&["-m", &memory, "--disable-jit"]),
-            false,
-        )
-        .unwrap();
+        let cfg = build(&["-m", &memory, "--disable-jit"], None, false).unwrap();
         assert!(machine_error(cfg).contains("between 64 and 3072"));
     }
 
     #[test]
     fn memory_above_the_library_maximum_is_rejected_by_the_library() {
         let memory = (MAX_MEMORY_MIB + 1).to_string();
-        let cfg = build_config(
-            vec![],
-            None,
-            &boot_args(&["--memory", &memory, "--disable-jit"]),
-            false,
-        )
-        .unwrap();
+        let cfg = build(&["--memory", &memory, "--disable-jit"], None, false).unwrap();
         assert!(machine_error(cfg).contains("between 64 and 3072"));
     }
 
@@ -653,13 +674,7 @@ mod tests {
     fn the_minimum_memory_is_accepted_by_the_library() {
         // Only the minimum is probed: acceptance at the maximum would allocate 3 GiB of guest RAM.
         let memory = MIN_MEMORY_MIB.to_string();
-        let cfg = build_config(
-            vec![],
-            None,
-            &boot_args(&["-m", &memory, "--disable-jit"]),
-            false,
-        )
-        .unwrap();
+        let cfg = build(&["-m", &memory, "--disable-jit"], None, false).unwrap();
         assert!(machine_error(cfg).contains("kernel"));
     }
 
@@ -668,9 +683,7 @@ mod tests {
         let dir = TempDir::new("run-disk");
         let missing = dir.path().join("missing.img");
         let spec = missing.to_string_lossy().into_owned();
-        let err = build_config(vec![], None, &boot_args(&["--disk", &spec]), false)
-            .err()
-            .unwrap();
+        let err = build(&["--disk", &spec], None, false).err().unwrap();
         assert!(err.starts_with(&format!("open disk {spec}: ")), "{err}");
     }
 
@@ -680,9 +693,7 @@ mod tests {
         let missing = dir.path().join("missing.img");
         let path = missing.to_string_lossy().into_owned();
         let spec = format!("{path},ro");
-        let err = build_config(vec![], None, &boot_args(&["--disk", &spec]), false)
-            .err()
-            .unwrap();
+        let err = build(&["--disk", &spec], None, false).err().unwrap();
         assert!(err.starts_with(&format!("open disk {path}: ")), "{err}");
     }
 
@@ -693,29 +704,24 @@ mod tests {
         std::fs::write(&image, vec![0u8; 4096]).unwrap();
         let path = image.to_string_lossy().into_owned();
         for spec in [path.clone(), format!("{path},ro")] {
-            assert!(
-                build_config(vec![], None, &boot_args(&["--disk", &spec]), false).is_ok(),
-                "{spec}"
-            );
+            assert!(build(&["--disk", &spec], None, false).is_ok(), "{spec}");
         }
     }
 
     #[test]
     fn every_backend_and_console_combination_builds_a_config() {
         for flags in [
-            &["--net-loop"][..],
-            &["--net-user"],
-            &["--net-udp", "a,b"],
+            &["--network", "virtio", "--network-link-loop"][..],
+            &["--network", "virtio", "--network-link-user"],
+            &["--network", "virtio", "--network-link-udp", "a,b"],
+            &["--network", "virtio"],
             &["--console", "virtio"],
             &["--console", "serial"],
             &["--time", "1700000000", "--realtime"],
             &["--debug", "--verify", "--disable-jit"],
             &["--cmdline", "console=ttyS0", "--append", "quiet"],
         ] {
-            assert!(
-                build_config(vec![], Some(vec![1, 2, 3]), &boot_args(flags), true).is_ok(),
-                "{flags:?}"
-            );
+            assert!(build(flags, Some(vec![1, 2, 3]), true).is_ok(), "{flags:?}");
         }
     }
 }

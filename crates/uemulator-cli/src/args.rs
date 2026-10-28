@@ -1,0 +1,623 @@
+//! The options every way of booting shares. They come in groups so each command takes exactly the
+//! ones that mean something to it:
+//!
+//! - `HardwareArgs`: memory, disks, NICs, consoles, JIT. Every command that describes a machine.
+//! - `LinuxArgs`: command line and reboot behaviour. Not on firmware boots, which have neither.
+//! - `RemoveArgs`: `--remove-<device> INDEX`, for commands that start from an existing device list.
+//! - `NewDiskArgs`: `--create-disk`, for commands that own a directory to put the image in.
+//! - `RuntimeArgs`: debugging and pacing for one run; never persisted.
+//!
+//! `Settings` is what a named machine persists and what `run` consumes: a command line is a patch
+//! on it (`remove_devices`, then `add`), and `advanced boot` patches an empty one.
+
+use std::path::PathBuf;
+
+use clap::error::ErrorKind;
+use clap::{ArgAction, ArgMatches, Args, Command};
+use serde::{Deserialize, Serialize};
+
+/// clap's flag actions (`SetTrue`, `Count`) record one argument index however often a flag is
+/// repeated, which would lose the interleaving of `--network` with its `--network-link-*` flags.
+/// So the link flags are appending options that take no value on the command line
+/// (`default_missing_value`); every occurrence then has an index of its own.
+const REPEATABLE_FLAG: &str = "on";
+
+/// What a boolean option written without a value means.
+const BOOL_FLAG_DEFAULT: &str = "true";
+
+/// The NIC models `--network` accepts. Virtio is the only one the library has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetModel {
+    Virtio,
+}
+
+/// What sits on the host side of a NIC (`--network-link-*`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetLink {
+    /// NAT to the host network.
+    User,
+    /// A built-in gateway that answers ARP and ICMP echo.
+    Loop,
+    /// `LOCAL,REMOTE`, unparsed.
+    Udp(String),
+}
+
+/// One NIC. Without a link nothing is attached on the host side and the guest's frames go nowhere.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Nic {
+    pub model: NetModel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<NetLink>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConsoleArg {
+    /// ttyS0 on the 16550; for kernels without a built-in virtio_console driver
+    Serial,
+    /// hvc0; the host terminal size is forwarded and follows resizes
+    Virtio,
+}
+
+/// `--disk PATH[,ro]`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskSpec {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Splits `--disk PATH[,ro]` into the path and whether the disk is read-only.
+pub fn parse_disk_spec(spec: &str) -> DiskSpec {
+    match spec.strip_suffix(",ro") {
+        Some(path) => DiskSpec {
+            path: path.into(),
+            read_only: true,
+        },
+        None => DiskSpec {
+            path: spec.into(),
+            read_only: false,
+        },
+    }
+}
+
+/// One entry of the disk list a command line builds, in command-line order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiskStep {
+    Attach(DiskSpec),
+    /// A new sparse image of this many MiB.
+    Create {
+        mib: u64,
+    },
+}
+
+#[derive(Args, Default)]
+pub struct HardwareArgs {
+    /// Guest memory in MiB, 64 to 3072 [default: 2048, 3072 for a fedora install]
+    #[arg(long, short = 'm')]
+    pub memory: Option<usize>,
+    /// Attach a raw disk image as a virtio-blk device; append ",ro" for read-only. Repeat for more
+    /// disks: the guest sees them in order (vda, vdb, ...)
+    #[arg(long, value_name = "PATH[,ro]")]
+    disk: Vec<String>,
+    /// Add a NIC. Repeat for more. Give it a host side with the `--network-link-*` option that
+    /// follows it
+    #[arg(long, value_enum, value_name = "MODEL")]
+    network: Vec<NetModel>,
+    /// Link the preceding --network to the host network with user-mode NAT (DHCP, DNS, ICMP echo,
+    /// UDP and TCP; the guest is 10.0.2.15 and the gateway 10.0.2.2)
+    #[arg(long, action = ArgAction::Append, num_args = 0..=1, require_equals = true,
+        default_missing_value = REPEATABLE_FLAG, value_parser = [REPEATABLE_FLAG],
+        hide_possible_values = true, value_name = "")]
+    network_link_user: Vec<String>,
+    /// Link the preceding --network to a built-in gateway that only replies to ARP and ICMP echo
+    /// for 10.0.2.2: no DHCP, nothing is forwarded
+    #[arg(long, action = ArgAction::Append, num_args = 0..=1, require_equals = true,
+        default_missing_value = REPEATABLE_FLAG, value_parser = [REPEATABLE_FLAG],
+        hide_possible_values = true, value_name = "")]
+    network_link_loop: Vec<String>,
+    /// Link the preceding --network to a UDP socket pair
+    #[arg(long, value_name = "LOCAL,REMOTE")]
+    network_link_udp: Vec<String>,
+    /// Add a console. Repeat for more: the first is the guest's primary console and the one the
+    /// terminal is attached to; the others have no host side (their output is dropped). Serial can
+    /// be given once [default: virtio]
+    #[arg(long, value_enum, value_name = "KIND")]
+    pub console: Vec<ConsoleArg>,
+    /// Run the interpreter only; `--disable-jit=false` turns it back on
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
+        value_name = "BOOL")]
+    pub disable_jit: Option<bool>,
+    /// The disks in command-line order, `--disk` and `--create-disk` interleaved. `order` fills it.
+    #[arg(skip)]
+    pub disk_steps: Vec<DiskStep>,
+    /// The NICs with their links, in command-line order. `order` fills it.
+    #[arg(skip)]
+    pub nics: Vec<Nic>,
+}
+
+#[derive(Args, Default)]
+pub struct LinuxArgs {
+    /// Kernel command line; an empty value clears a saved one
+    #[arg(long)]
+    pub cmdline: Option<String>,
+    /// Append to the kernel command line; an empty value clears a saved one
+    #[arg(long, value_name = "ARGS")]
+    pub append: Option<String>,
+    /// End the run with "machine reset" when the guest resets instead of rebooting it in place;
+    /// `--no-reboot=false` turns it back off
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
+        value_name = "BOOL")]
+    pub no_reboot: Option<bool>,
+}
+
+/// Indices count from 0 in the order the guest sees the devices, and refer to the list as it is
+/// before this command line changes anything.
+#[derive(Args, Default)]
+pub struct RemoveArgs {
+    /// Detach the disk at INDEX. The image file is left where it is
+    #[arg(long, value_name = "INDEX")]
+    pub remove_disk: Vec<usize>,
+    /// Remove the NIC at INDEX
+    #[arg(long, value_name = "INDEX")]
+    pub remove_network: Vec<usize>,
+    /// Remove the console at INDEX
+    #[arg(long, value_name = "INDEX")]
+    pub remove_console: Vec<usize>,
+}
+
+#[derive(Args, Default)]
+pub struct NewDiskArgs {
+    /// Create a sparse disk image of MIB MiB in the machine's directory and attach it after the
+    /// disks already there. Repeat for more
+    #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
+    create_disk: Vec<u64>,
+}
+
+#[derive(Args, Default)]
+pub struct RuntimeArgs {
+    /// Run the JIT in lockstep with the interpreter and stop at the first divergence
+    #[arg(long)]
+    pub verify: bool,
+    /// Dump CPU state and the guest kernel log on exit
+    #[arg(long)]
+    pub debug: bool,
+    /// Fix the guest RTC to this Unix time
+    #[arg(long, value_name = "UNIX")]
+    pub time: Option<u64>,
+    /// Pace guest time to the wall clock even when stdin is not a terminal
+    #[arg(long)]
+    pub realtime: bool,
+    /// Stop the machine after this many seconds
+    #[arg(long, value_name = "SECS")]
+    pub timeout: Option<u64>,
+}
+
+/// Everything about a machine that outlives one run, and what `run` needs to build it. `None` and
+/// empty lists mean "not chosen": the defaults (2048 MiB, one virtio console, the distro's command
+/// line) are applied when the machine starts, so changing a machine's distro changes them too.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub append: Option<String>,
+    pub no_reboot: bool,
+    pub disable_jit: bool,
+    // The arrays come last: TOML wants every plain value before the first table.
+    pub consoles: Vec<ConsoleArg>,
+    pub disks: Vec<DiskSpec>,
+    pub networks: Vec<Nic>,
+}
+
+/// `Some("")` is how a command line clears a saved string.
+fn set_or_clear(slot: &mut Option<String>, value: &Option<String>) {
+    match value.as_deref() {
+        Some("") => *slot = None,
+        Some(text) => *slot = Some(text.to_string()),
+        None => {}
+    }
+}
+
+/// Indices to drop from a list of `len` entries, validated and deduplicated.
+fn removal_set(flag: &str, noun: &str, len: usize, indices: &[usize]) -> Result<Vec<bool>, String> {
+    let mut drop = vec![false; len];
+    for &index in indices {
+        if index >= len {
+            return Err(match len {
+                0 => format!("{flag} {index}: there are no {noun}s"),
+                1 => format!("{flag} {index}: there is 1 {noun}, numbered 0"),
+                _ => format!(
+                    "{flag} {index}: there are {len} {noun}s, numbered 0 to {}",
+                    len - 1
+                ),
+            });
+        }
+        drop[index] = true;
+    }
+    Ok(drop)
+}
+
+fn retain_unmarked<T>(list: &mut Vec<T>, drop: &[bool]) {
+    let mut index = 0;
+    list.retain(|_| {
+        index += 1;
+        !drop[index - 1]
+    });
+}
+
+impl Settings {
+    /// Applies the `--remove-*` options and returns the disks that were detached. Run it before
+    /// `add`: indices refer to the list as it was, and nothing changes if any index is wrong.
+    pub fn remove_devices(&mut self, remove: &RemoveArgs) -> Result<Vec<DiskSpec>, String> {
+        let disks = removal_set(
+            "--remove-disk",
+            "disk",
+            self.disks.len(),
+            &remove.remove_disk,
+        )?;
+        let networks = removal_set(
+            "--remove-network",
+            "network",
+            self.networks.len(),
+            &remove.remove_network,
+        )?;
+        let consoles = removal_set(
+            "--remove-console",
+            "console",
+            self.consoles.len(),
+            &remove.remove_console,
+        )?;
+        let detached = self
+            .disks
+            .iter()
+            .zip(&disks)
+            .filter(|(_, dropped)| **dropped)
+            .map(|(disk, _)| disk.clone())
+            .collect();
+        retain_unmarked(&mut self.disks, &disks);
+        retain_unmarked(&mut self.networks, &networks);
+        retain_unmarked(&mut self.consoles, &consoles);
+        Ok(detached)
+    }
+
+    /// Applies what the command line chose: scalars replace, devices are appended in command-line
+    /// order. `new_disks` is `hardware.disk_steps` with the images made and the paths settled,
+    /// which only the caller can do (it knows where a created image goes).
+    pub fn add(&mut self, hardware: &HardwareArgs, linux: &LinuxArgs, new_disks: Vec<DiskSpec>) {
+        if hardware.memory.is_some() {
+            self.memory = hardware.memory;
+        }
+        if let Some(disable_jit) = hardware.disable_jit {
+            self.disable_jit = disable_jit;
+        }
+        set_or_clear(&mut self.cmdline, &linux.cmdline);
+        set_or_clear(&mut self.append, &linux.append);
+        if let Some(no_reboot) = linux.no_reboot {
+            self.no_reboot = no_reboot;
+        }
+        self.disks.extend(new_disks);
+        self.networks.extend(hardware.nics.iter().cloned());
+        self.consoles.extend(hardware.console.iter().copied());
+    }
+}
+
+/// The disks of a command that cannot create images (`advanced boot`, `quick boot`).
+pub fn attach_only(steps: &[DiskStep]) -> Result<Vec<DiskSpec>, String> {
+    steps
+        .iter()
+        .map(|step| match step {
+            DiskStep::Attach(disk) => Ok(disk.clone()),
+            DiskStep::Create { .. } => {
+                Err("--create-disk needs a machine to keep the image in".into())
+            }
+        })
+        .collect()
+}
+
+/// Whether the leaf command defines `id`: querying one it does not is a debug-build assertion in
+/// clap, and the shared groups are not on every command.
+fn defines(leaf: &ArgMatches, id: &str) -> bool {
+    leaf.try_contains_id(id).unwrap_or(false)
+}
+
+/// The disk list in command-line order. `--disk` and `--create-disk` are separate options, so
+/// their interleaving is recovered from the argument indices: the n-th disk the guest sees must be
+/// the n-th flag the user typed.
+fn disk_steps(leaf: &ArgMatches) -> Vec<DiskStep> {
+    let mut ordered: Vec<(usize, DiskStep)> = Vec::new();
+    if let (Some(indices), Some(specs)) = (leaf.indices_of("disk"), leaf.get_many::<String>("disk"))
+    {
+        for (index, spec) in indices.zip(specs) {
+            ordered.push((index, DiskStep::Attach(parse_disk_spec(spec))));
+        }
+    }
+    if defines(leaf, "create_disk")
+        && let (Some(indices), Some(sizes)) = (
+            leaf.indices_of("create_disk"),
+            leaf.get_many::<u64>("create_disk"),
+        )
+    {
+        for (index, mib) in indices.zip(sizes) {
+            ordered.push((index, DiskStep::Create { mib: *mib }));
+        }
+    }
+    ordered.sort_by_key(|(index, _)| *index);
+    ordered.into_iter().map(|(_, step)| step).collect()
+}
+
+/// The NICs in command-line order: `--network` declares one and every `--network-link-*` binds the
+/// one declared most recently, so a link before any `--network` or a second link on one NIC is an
+/// error rather than a guess.
+fn nics(leaf: &ArgMatches) -> Result<Vec<Nic>, String> {
+    enum Event {
+        Declare(NetModel),
+        Link(&'static str, NetLink),
+    }
+    let mut events: Vec<(usize, Event)> = Vec::new();
+    if let (Some(indices), Some(models)) = (
+        leaf.indices_of("network"),
+        leaf.get_many::<NetModel>("network"),
+    ) {
+        for (index, model) in indices.zip(models) {
+            events.push((index, Event::Declare(*model)));
+        }
+    }
+    for (id, flag, link) in [
+        ("network_link_user", "--network-link-user", NetLink::User),
+        ("network_link_loop", "--network-link-loop", NetLink::Loop),
+    ] {
+        for index in leaf.indices_of(id).into_iter().flatten() {
+            events.push((index, Event::Link(flag, link.clone())));
+        }
+    }
+    if let (Some(indices), Some(specs)) = (
+        leaf.indices_of("network_link_udp"),
+        leaf.get_many::<String>("network_link_udp"),
+    ) {
+        for (index, spec) in indices.zip(specs) {
+            events.push((
+                index,
+                Event::Link("--network-link-udp", NetLink::Udp(spec.clone())),
+            ));
+        }
+    }
+    events.sort_by_key(|(index, _)| *index);
+    let mut nics: Vec<Nic> = Vec::new();
+    for (_, event) in events {
+        match event {
+            Event::Declare(model) => nics.push(Nic { model, link: None }),
+            Event::Link(flag, link) => {
+                let nic = nics
+                    .last_mut()
+                    .ok_or_else(|| format!("{flag} must follow the --network it links"))?;
+                if nic.link.is_some() {
+                    return Err(format!("{flag}: that --network already has a link"));
+                }
+                nic.link = Some(link);
+            }
+        }
+    }
+    Ok(nics)
+}
+
+impl HardwareArgs {
+    /// Fills `disk_steps` and `nics`, the parts clap's derive cannot do: it keeps each option's
+    /// occurrences apart and loses how they interleave.
+    pub fn order(&mut self, command: &Command, leaf: &ArgMatches) -> Result<(), clap::Error> {
+        self.disk_steps = disk_steps(leaf);
+        self.nics = nics(leaf)
+            .map_err(|message| command.clone().error(ErrorKind::ArgumentConflict, message))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disk(path: &str, read_only: bool) -> DiskSpec {
+        DiskSpec {
+            path: path.into(),
+            read_only,
+        }
+    }
+
+    #[test]
+    fn disk_spec_without_suffix_is_read_write() {
+        assert_eq!(parse_disk_spec("disk.img"), disk("disk.img", false));
+    }
+
+    #[test]
+    fn disk_spec_with_ro_suffix_is_read_only() {
+        assert_eq!(parse_disk_spec("disk.img,ro"), disk("disk.img", true));
+    }
+
+    #[test]
+    fn disk_spec_only_strips_one_ro_suffix() {
+        assert_eq!(parse_disk_spec("a,ro,ro"), disk("a,ro", true));
+    }
+
+    #[test]
+    fn disk_spec_other_suffixes_stay_part_of_the_path() {
+        assert_eq!(parse_disk_spec("disk.img,rw"), disk("disk.img,rw", false));
+        assert_eq!(parse_disk_spec("ro"), disk("ro", false));
+        assert_eq!(parse_disk_spec("disk.img,RO"), disk("disk.img,RO", false));
+        assert_eq!(parse_disk_spec("a,roo"), disk("a,roo", false));
+    }
+
+    #[test]
+    fn disk_spec_edge_cases() {
+        assert_eq!(parse_disk_spec(",ro"), disk("", true));
+        assert_eq!(parse_disk_spec(""), disk("", false));
+        assert_eq!(
+            parse_disk_spec("/a b/c d.img,ro"),
+            disk("/a b/c d.img", true)
+        );
+    }
+
+    fn settings_with_devices() -> Settings {
+        Settings {
+            disks: vec![disk("a", false), disk("b", true), disk("c", false)],
+            networks: vec![
+                Nic {
+                    model: NetModel::Virtio,
+                    link: Some(NetLink::User),
+                },
+                Nic {
+                    model: NetModel::Virtio,
+                    link: None,
+                },
+            ],
+            consoles: vec![ConsoleArg::Virtio, ConsoleArg::Serial],
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn removals_refer_to_the_list_before_any_of_them_apply() {
+        let mut settings = settings_with_devices();
+        let detached = settings
+            .remove_devices(&RemoveArgs {
+                remove_disk: vec![2, 0],
+                remove_network: vec![0],
+                remove_console: vec![1],
+            })
+            .unwrap();
+        assert_eq!(detached, vec![disk("a", false), disk("c", false)]);
+        assert_eq!(settings.disks, vec![disk("b", true)]);
+        assert_eq!(settings.networks.len(), 1);
+        assert_eq!(settings.networks[0].link, None);
+        assert_eq!(settings.consoles, vec![ConsoleArg::Virtio]);
+    }
+
+    #[test]
+    fn removing_the_same_index_twice_removes_it_once() {
+        let mut settings = settings_with_devices();
+        settings
+            .remove_devices(&RemoveArgs {
+                remove_disk: vec![1, 1],
+                ..RemoveArgs::default()
+            })
+            .unwrap();
+        assert_eq!(settings.disks, vec![disk("a", false), disk("c", false)]);
+    }
+
+    #[test]
+    fn an_out_of_range_removal_names_the_valid_range_and_changes_nothing() {
+        let mut settings = settings_with_devices();
+        let before = settings.clone();
+        let error = settings
+            .remove_devices(&RemoveArgs {
+                remove_disk: vec![0],
+                remove_console: vec![2],
+                ..RemoveArgs::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "--remove-console 2: there are 2 consoles, numbered 0 to 1"
+        );
+        assert_eq!(settings, before);
+
+        let error = Settings::default()
+            .remove_devices(&RemoveArgs {
+                remove_network: vec![0],
+                ..RemoveArgs::default()
+            })
+            .unwrap_err();
+        assert_eq!(error, "--remove-network 0: there are no networks");
+    }
+
+    #[test]
+    fn add_replaces_scalars_appends_devices_and_leaves_the_rest() {
+        let mut settings = settings_with_devices();
+        settings.memory = Some(1024);
+        settings.cmdline = Some("quiet".into());
+        let hardware = HardwareArgs {
+            disable_jit: Some(true),
+            console: vec![ConsoleArg::Serial],
+            nics: vec![Nic {
+                model: NetModel::Virtio,
+                link: Some(NetLink::Loop),
+            }],
+            ..HardwareArgs::default()
+        };
+        settings.add(&hardware, &LinuxArgs::default(), vec![disk("d", false)]);
+        assert_eq!(settings.memory, Some(1024));
+        assert_eq!(settings.cmdline.as_deref(), Some("quiet"));
+        assert!(settings.disable_jit);
+        assert_eq!(settings.disks.len(), 4);
+        assert_eq!(settings.disks[3], disk("d", false));
+        assert_eq!(settings.networks.len(), 3);
+        assert_eq!(settings.consoles.len(), 3);
+    }
+
+    #[test]
+    fn an_empty_string_clears_a_saved_command_line() {
+        let mut settings = Settings {
+            cmdline: Some("root=/dev/vda".into()),
+            append: Some("quiet".into()),
+            no_reboot: true,
+            ..Settings::default()
+        };
+        let linux = LinuxArgs {
+            cmdline: Some(String::new()),
+            append: Some("debug".into()),
+            no_reboot: Some(false),
+        };
+        settings.add(&HardwareArgs::default(), &linux, Vec::new());
+        assert_eq!(settings.cmdline, None);
+        assert_eq!(settings.append.as_deref(), Some("debug"));
+        assert!(!settings.no_reboot);
+    }
+
+    #[test]
+    fn attach_only_rejects_a_created_disk() {
+        let steps = [
+            DiskStep::Attach(disk("a", false)),
+            DiskStep::Create { mib: 1 },
+        ];
+        assert!(attach_only(&steps).unwrap_err().contains("--create-disk"));
+        assert_eq!(attach_only(&steps[..1]).unwrap(), vec![disk("a", false)]);
+    }
+
+    #[test]
+    fn settings_survive_a_round_trip_through_toml() {
+        let settings = Settings {
+            memory: Some(4096),
+            cmdline: Some("console=hvc0".into()),
+            append: None,
+            no_reboot: true,
+            disable_jit: false,
+            consoles: vec![ConsoleArg::Virtio, ConsoleArg::Serial],
+            disks: vec![disk("/x/disk-0.img", false), disk("/y.iso", true)],
+            networks: vec![
+                Nic {
+                    model: NetModel::Virtio,
+                    link: Some(NetLink::User),
+                },
+                Nic {
+                    model: NetModel::Virtio,
+                    link: Some(NetLink::Udp("127.0.0.1:1,127.0.0.1:2".into())),
+                },
+                Nic {
+                    model: NetModel::Virtio,
+                    link: None,
+                },
+            ],
+        };
+        let text = toml::to_string(&settings).unwrap();
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
+    }
+
+    #[test]
+    fn an_empty_settings_file_means_every_default() {
+        assert_eq!(toml::from_str::<Settings>("").unwrap(), Settings::default());
+    }
+}
