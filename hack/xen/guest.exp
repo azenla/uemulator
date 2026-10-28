@@ -1,0 +1,25 @@
+#!/usr/bin/expect -f
+# usage: guest.exp MACHINE LOG SCRIPTFILE [timeout] [boot args...]
+# Boots MACHINE (installer or disk, whatever `quick boot` picks), logs in as root
+# and types each line of SCRIPTFILE, waiting for the shell prompt after each.
+# A line starting with "#!wait N" sets the per-line timeout to N seconds.
+set machine [lindex $argv 0]
+log_file -a [lindex $argv 1]
+set fh [open [lindex $argv 2]]
+set lines [split [read $fh] "\n"]
+close $fh
+set timeout [expr {[llength $argv] > 3 ? [lindex $argv 3] : 900}]
+set extra [lrange $argv 4 end]
+set prompt "localhost:.*# $"
+eval spawn ./target/release/uemulator quick boot $machine $extra
+expect "login:"
+send "root\r"
+expect -re $prompt
+foreach line $lines {
+    if {[regexp {^#!wait (\d+)} $line -> secs]} { set timeout $secs; continue }
+    if {$line eq ""} continue
+    send "$line\r"
+    expect -re $prompt
+}
+send "poweroff\r"
+expect eof

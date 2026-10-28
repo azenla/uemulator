@@ -1022,11 +1022,20 @@ impl Cpu {
                 Some(selector_error_code(cs)),
             ));
         }
-        // Compatibility mode is not implemented, so a code segment without CS.L cannot be entered.
-        if !s.long() {
+        // CS.L clear returns to compatibility mode (SDM 6.14.3: iretq and far return may target
+        // it; GRUB's multiboot2 handoff to Xen does). CS.L with CS.D is reserved.
+        if s.long() && s.flags & SEG_DEFAULT_BIG != 0 {
             return Err(privilege_violation);
         }
         Ok(s)
+    }
+
+    /// A return into compatibility mode is limit-checked like any 32-bit target.
+    fn check_compatibility_target(code: &Seg, rip: u64) -> ExecResult<()> {
+        if !code.long() && rip > code.limit as u64 {
+            return Err(Exception::general_protection(0));
+        }
+        Ok(())
     }
 
     /// After a return to an outer ring, DS/ES/FS/GS that hold a data or non-conforming code
@@ -1059,6 +1068,7 @@ impl Cpu {
         let cs = self.read_stack(sp.wrapping_add(FRAME_CS), 8)? as u16;
         let new_rflags = self.read_stack(sp.wrapping_add(FRAME_RFLAGS), 8)?;
         let new_cs = self.checked_return_code_seg(cs)?;
+        Self::check_compatibility_target(&new_cs, rip)?;
         let new_rsp = self.read_stack(sp.wrapping_add(FRAME_RSP), 8)?;
         let ss = self.read_stack(sp.wrapping_add(FRAME_SS), 8)? as u16;
         let new_cpl = (cs & SELECTOR_RPL_MASK) as u8;
@@ -1098,6 +1108,7 @@ impl Cpu {
         let rip = self.read_stack(sp, 8)?;
         let cs = self.read_stack(sp.wrapping_add(FRAME_CS), 8)? as u16;
         let new_cs = self.checked_return_code_seg(cs)?;
+        Self::check_compatibility_target(&new_cs, rip)?;
         let new_cpl = (cs & SELECTOR_RPL_MASK) as u8;
         if new_cpl == self.cpl {
             self.seg[SEG_CS] = new_cs;
@@ -10414,6 +10425,18 @@ mod exec_tests {
     }
 
     #[test]
+    fn return_to_a_32_bit_code_segment_enters_compatibility_mode() {
+        for kind in BOTH_RETURNS {
+            let pair = run_return(kind, 0, SEL_CODE32, SEL_KDATA, |_| {});
+            let cpu = pair.cpu();
+            assert_eq!(cpu.rip, LANDING, "{kind:?}");
+            assert_eq!(cpu.seg[SEG_CS].sel, SEL_CODE32, "{kind:?}");
+            assert_ne!(cpu.efer & EFER_LMA, 0, "{kind:?}");
+            assert_eq!(cpu.code_mode(), CodeMode::Bits32, "{kind:?}");
+        }
+    }
+
+    #[test]
     fn iretq_in_64_bit_mode_always_reloads_ss() {
         // Even without a privilege change the five-word frame is popped and SS is loaded from it.
         let pair = run_return(ReturnKind::Iretq, 0, SEL_KCODE, SEL_KDATA, |h| {
@@ -10608,7 +10631,6 @@ mod exec_tests {
                     SEL_CODE_NOT_PRESENT,
                     np(selector_code(SEL_CODE_NOT_PRESENT)),
                 ),
-                (0, SEL_CODE32, gp(selector_code(SEL_CODE32))),
                 (1, SEL_KCODE, gp(selector_code(SEL_KCODE))),
                 (1, SEL_CODE_DPL1, gp(selector_code(SEL_CODE_DPL1))),
                 (2, SEL_CODE_DPL1 | 1, gp(selector_code(SEL_CODE_DPL1))),

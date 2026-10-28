@@ -1,0 +1,10 @@
+#!/usr/bin/expect -f
+# usage: probe.exp MACHINE LOG [timeout]; boots the installer and logs until the login prompt
+set timeout [expr {[llength $argv] > 2 ? [lindex $argv 2] : 600}]
+log_file -a [lindex $argv 1]
+spawn ./target/release/uemulator quick boot [lindex $argv 0]
+expect "login:"
+send "root\r"
+expect "# "
+send "uname -a; ip a; exit\r"
+expect eof

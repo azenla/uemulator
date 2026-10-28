@@ -108,6 +108,9 @@ struct ExceptionFrame {
     ss: u64,
 }
 
+/// Bytes printed from the faulting instruction's address.
+const CODE_DUMP_BYTES: usize = 16;
+
 const REGISTER_NAMES: [&str; 15] = [
     "r15", "r14", "r13", "r12", "r11", "r10", "r9", "r8", "rbp", "rdi", "rsi", "rdx", "rcx", "rbx",
     "rax",
@@ -179,6 +182,13 @@ extern "C" fn exception_handler(frame: *const ExceptionFrame) -> ! {
     );
     for (name, value) in REGISTER_NAMES.iter().zip(frame.registers.iter()) {
         serial::print!("{name}={value:#018x} ");
+    }
+    serial::println!();
+    // Identity-mapped RAM; a bad rip that faults here ends in a triple fault, which is no worse.
+    let code = unsafe { core::slice::from_raw_parts(frame.rip as *const u8, CODE_DUMP_BYTES) };
+    serial::print!("code at rip:");
+    for byte in code {
+        serial::print!(" {byte:02x}");
     }
     serial::println!();
     halt_forever()
