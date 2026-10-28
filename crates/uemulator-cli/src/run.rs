@@ -210,6 +210,29 @@ pub fn run_firmware(
     run_config(cfg, settings, runtime, tty)
 }
 
+/// Like `run`, for the machine's disks booted through the built-in UEFI firmware. `nvram` keeps
+/// the firmware's variables in a file; `boot_entry` (loader path, load options) is written into
+/// it first so that a boot goes where the caller asked.
+pub fn run_uefi(
+    settings: &Settings,
+    runtime: &RuntimeArgs,
+    nvram: Option<&std::path::Path>,
+    boot_entry: Option<(&str, &str)>,
+) -> Result<ExitReason, String> {
+    let tty = std::io::stdin().is_terminal();
+    let mut cfg =
+        build_config(Vec::new(), None, settings, runtime, tty)?.uefi_firmware(crate::firmware::IMAGE);
+    if let Some(path) = nvram {
+        let mut store = uemulator::FileKeyValueStore::open(path).map_err(|e| e.to_string())?;
+        if let Some((loader, options)) = boot_entry {
+            crate::firmware::set_boot_entry(&mut store, loader, options)
+                .map_err(|e| e.to_string())?;
+        }
+        cfg = cfg.key_value_store(store);
+    }
+    run_config(cfg, settings, runtime, tty)
+}
+
 fn run_config(
     cfg: MachineConfig,
     settings: &Settings,

@@ -574,6 +574,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "uemulator-firmware"
+version = "0.1.0"
+
+[[package]]
 name = "uemulator-uefi"
 version = "0.1.0"
 dependencies = [

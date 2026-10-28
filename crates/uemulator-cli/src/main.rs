@@ -1,4 +1,5 @@
 mod args;
+mod firmware;
 mod machines;
 mod netgw;
 mod quick;
@@ -194,6 +195,28 @@ enum AdvancedCmd {
         #[command(flatten)]
         runtime: RuntimeArgs,
     },
+    /// Boot the machine's disks through the built-in UEFI firmware
+    ///
+    /// The firmware runs the boot entries in the nvram file's BootOrder, else
+    /// EFI/BOOT/BOOTX64.EFI from the first file system that has it.
+    BootUefi {
+        /// Persist UEFI variables (BootOrder, Boot####, anything the guest writes) in this file,
+        /// created if missing. Without it variables last until the guest resets
+        #[arg(long, value_name = "FILE")]
+        nvram: Option<PathBuf>,
+        /// Make Boot0000 run this path on the first file system that has it, and put it first in
+        /// BootOrder. Needs --nvram
+        #[arg(long, value_name = "PATH", requires = "nvram")]
+        boot_loader: Option<String>,
+        /// Load options of --boot-loader: for a Linux EFI stub the kernel command line, with
+        /// initrd=PATH naming the initramfs
+        #[arg(long, value_name = "OPTIONS", requires = "boot_loader")]
+        boot_options: Option<String>,
+        #[command(flatten)]
+        hardware: HardwareArgs,
+        #[command(flatten)]
+        runtime: RuntimeArgs,
+    },
 }
 
 impl Cmd {
@@ -207,7 +230,10 @@ impl Cmd {
                     | QuickCmd::Boot { hardware, .. },
             }
             | Cmd::Advanced {
-                cmd: AdvancedCmd::Boot { hardware, .. } | AdvancedCmd::BootFirmware { hardware, .. },
+                cmd:
+                    AdvancedCmd::Boot { hardware, .. }
+                    | AdvancedCmd::BootFirmware { hardware, .. }
+                    | AdvancedCmd::BootUefi { hardware, .. },
             } => Some(hardware),
             Cmd::Quick { .. } => None,
         }
@@ -373,6 +399,23 @@ fn advanced_command(cmd: AdvancedCmd) -> Result<ExitReason, String> {
             let image = read(&firmware)?;
             let settings = settings_of(&hardware, &LinuxArgs::default())?;
             run::run_firmware(image, &settings, &runtime)
+        }
+        AdvancedCmd::BootUefi {
+            nvram,
+            boot_loader,
+            boot_options,
+            hardware,
+            runtime,
+        } => {
+            let settings = settings_of(&hardware, &LinuxArgs::default())?;
+            run::run_uefi(
+                &settings,
+                &runtime,
+                nvram.as_deref(),
+                boot_loader
+                    .as_deref()
+                    .map(|loader| (loader, boot_options.as_deref().unwrap_or(""))),
+            )
         }
     }
 }

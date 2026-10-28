@@ -27,7 +27,7 @@ const MAX_FOOTPRINT: u64 = 64 << 20;
 
 const HANDOFF_MAGIC: &[u8; 8] = b"UEMUHAND";
 const HANDOFF_VERSION: u32 = 1;
-pub(crate) const HANDOFF_SIZE: usize = 0x300;
+pub(crate) const HANDOFF_SIZE: usize = 0x308;
 
 const HANDOFF_VERSION_OFFSET: usize = 0x08;
 const HANDOFF_SIZE_OFFSET: usize = 0x0c;
@@ -55,6 +55,9 @@ const HANDOFF_MMIO_REGIONS: usize = 0x200;
 /// base u64, size u64.
 const MMIO_REGION_BYTES: usize = 16;
 const MAX_MMIO_REGIONS: usize = 16;
+const HANDOFF_TSC_HZ: usize = 0x300;
+/// `rdtsc` ticks per second: the guest clock is in nanoseconds (`Cpu::tsc`).
+const TSC_HZ: u64 = 1_000_000_000;
 
 const SERIAL_PORT: u16 = 0x3f8;
 const PCI_CONFIG_ADDRESS_PORT: u16 = 0xcf8;
@@ -161,6 +164,7 @@ pub(crate) fn load_uefi_firmware(
     handoff.put_u64(HANDOFF_ACPI_SIZE, params.acpi_region.1);
     handoff.put_u64(HANDOFF_UNIX_TIME, params.unix_time);
     handoff.put_u64(HANDOFF_PCI_ECAM_BASE, 0);
+    handoff.put_u64(HANDOFF_TSC_HZ, TSC_HZ);
     let mut seed_state = params.random_seed;
     for chunk in 0..RANDOM_SEED_BYTES / 8 {
         handoff.put_u64(HANDOFF_RANDOM_SEED + chunk * 8, splitmix64(&mut seed_state));
