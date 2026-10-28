@@ -7,13 +7,15 @@ use std::thread::JoinHandle;
 
 use crate::boot::{self, BootState};
 use crate::console::ConsoleHandle;
-use crate::cpu::Cpu;
+use crate::cpu::{Cpu, DEFAULT_RANDOM_SEED};
+use crate::dev::kv::SharedKeyValueStore;
 use crate::dev::{DevConfig, MAX_VIRTIO_FUNCTIONS};
 #[cfg(not(freestanding))]
 use crate::disk::Disk;
+use crate::kv::{KeyValueStore, MemoryKeyValueStore};
 use crate::netdev::NetHandle;
 use crate::platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE};
-use crate::sync::Arc;
+use crate::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub enum Error {
@@ -112,6 +114,8 @@ type HostPollFn = Arc<dyn Fn(&ConsoleHandle, bool) + Send + Sync>;
 pub struct MachineConfig {
     kernel: Vec<u8>,
     firmware: Option<Vec<u8>>,
+    uefi_firmware: Option<Vec<u8>>,
+    key_value_store: Option<SharedKeyValueStore>,
     boot_disk: bool,
     initrd: Option<Vec<u8>>,
     cmdline: Option<String>,
@@ -138,6 +142,8 @@ impl Default for MachineConfig {
         Self {
             kernel: Vec::new(),
             firmware: None,
+            uefi_firmware: None,
+            key_value_store: None,
             boot_disk: false,
             initrd: None,
             cmdline: None,
@@ -176,6 +182,27 @@ impl MachineConfig {
     /// No BIOS services exist beyond what the image brings, and a guest reset ends the run.
     pub fn firmware(mut self, image: impl Into<Vec<u8>>) -> Self {
         self.firmware = Some(image.into());
+        self
+    }
+
+    /// Boots a UEFI firmware image (`crates/uemulator-firmware`) instead of a Linux kernel. The
+    /// CPU starts at the image's entry in 64-bit mode with the low 4 GiB identity-mapped,
+    /// interrupts off and `rdi` pointing at a handoff page that describes the machine
+    /// (`plans/19-uefi-firmware.md`); the firmware finds the disks and boots from them. A guest
+    /// reset runs the firmware again. Needs a disk to be useful, replaces the kernel, and cannot
+    /// be combined with `firmware` or `boot_disk`.
+    pub fn uefi_firmware(mut self, image: impl Into<Vec<u8>>) -> Self {
+        self.uefi_firmware = Some(image.into());
+        self
+    }
+
+    /// The persistent store behind the guest's key-value device, which the UEFI firmware keeps
+    /// its variables in (`BootOrder`, `Boot0000`, anything a guest writes with `efivar`).
+    /// Without one the device is absent and variables last until the guest resets. The store
+    /// outlives guest resets.
+    pub fn key_value_store(mut self, store: impl KeyValueStore + 'static) -> Self {
+        let store: Box<dyn KeyValueStore> = Box::new(store);
+        self.key_value_store = Some(Arc::new(Mutex::new(store)));
         self
     }
 
@@ -373,6 +400,9 @@ struct RebootImage {
     nets: Vec<([u8; 6], NetHandle)>,
     virtio_consoles: Vec<ConsoleHandle>,
     iommu: bool,
+    key_value_store: Option<SharedKeyValueStore>,
+    /// Set when the machine boots UEFI firmware: that image and handoff replace the kernel.
+    uefi: Option<(Vec<u8>, boot::FirmwareParams)>,
 }
 
 /// Wall-clock seconds, or 0 where there is no clock (UEFI keeps its own, see `unix_time`).
@@ -456,6 +486,12 @@ fn mirrored_devices(main: &DevConfig, main_uart: &ConsoleHandle) -> (DevConfig, 
             })
             .collect(),
         iommu: main.iommu,
+        // The twin gets an empty store of its own, like its disks: it cannot share the real
+        // one, and a guest that reads variables diverges legitimately.
+        key_value_store: main.key_value_store.as_ref().map(|_| {
+            let store: Box<dyn KeyValueStore> = Box::new(MemoryKeyValueStore::new());
+            Arc::new(Mutex::new(store))
+        }),
     };
     (devices, twin_uart)
 }
@@ -500,12 +536,16 @@ impl Vcpu {
             // Fresh zeroed RAM, not a `fill(0)` of the old one: `boot::load` relies on zeroes,
             // and filling would commit every page the host had lazily left untouched.
             let mut ram = vec![0u8; finished.ram_bytes];
-            match boot::load(
-                &mut ram,
-                &image.kernel,
-                image.initrd.as_deref(),
-                &image.cmdline,
-            ) {
+            let loaded = match &image.uefi {
+                Some((firmware, params)) => boot::load_uefi_firmware(&mut ram, firmware, params),
+                None => boot::load(
+                    &mut ram,
+                    &image.kernel,
+                    image.initrd.as_deref(),
+                    &image.cmdline,
+                ),
+            };
+            match loaded {
                 Ok(boot) => self.boot = boot,
                 Err(e) => return ExitReason::Internal(format!("reboot: {e}")),
             }
@@ -516,6 +556,7 @@ impl Vcpu {
                 nets: image.nets.clone(),
                 virtio_consoles: image.virtio_consoles.clone(),
                 iommu: image.iommu,
+                key_value_store: image.key_value_store.clone(),
             };
         }
     }
@@ -675,6 +716,15 @@ impl EmulatedMachine {
             cmdline.push(' ');
             cmdline.push_str(extra);
         }
+        if cfg.uefi_firmware.is_some()
+            && (cfg.firmware.is_some() || cfg.boot_disk || !cfg.kernel.is_empty())
+        {
+            return Err(Error::BadConfig(
+                "uefi_firmware boots its own firmware: it cannot be combined with a kernel, a \
+                 firmware image or boot_disk"
+                    .into(),
+            ));
+        }
         if cfg.boot_disk {
             if cfg.firmware.is_some() || !cfg.kernel.is_empty() {
                 return Err(Error::BadConfig(
@@ -692,8 +742,22 @@ impl EmulatedMachine {
                 ));
             }
         }
+        let uefi = cfg.uefi_firmware.as_ref().map(|image| {
+            let params = boot::FirmwareParams {
+                key_value_store: cfg.key_value_store.is_some(),
+                unix_time: cfg.unix_time.unwrap_or_else(host_unix_time),
+                random_seed: cfg.random_seed.unwrap_or(DEFAULT_RANDOM_SEED),
+                rsdp: 0,
+                acpi_region: (0, 0),
+            };
+            (image.clone(), params)
+        });
         let boot = match &cfg.firmware {
             _ if cfg.boot_disk => boot::load_bios(),
+            _ if uefi.is_some() => {
+                let (image, params) = uefi.as_ref().unwrap();
+                boot::load_uefi_firmware(&mut ram, image, params)?
+            }
             Some(image) => boot::load_firmware(&mut ram, image)?,
             None => boot::load(&mut ram, &cfg.kernel, cfg.initrd.as_deref(), &cmdline)?,
         };
@@ -720,6 +784,7 @@ impl EmulatedMachine {
             nets,
             virtio_consoles,
             iommu: cfg.iommu,
+            key_value_store: cfg.key_value_store.clone(),
         };
         let boot_ram = cfg.verify.then(|| ram.clone());
         // Verification cannot restart (the twin's devices cannot be rebuilt in step), so it keeps
@@ -733,6 +798,8 @@ impl EmulatedMachine {
                     nets: devcfg.nets.clone(),
                     virtio_consoles: devcfg.virtio_consoles.clone(),
                     iommu: cfg.iommu,
+                    key_value_store: cfg.key_value_store,
+                    uefi,
                 }
             });
         let stop = Arc::new(AtomicBool::new(false));

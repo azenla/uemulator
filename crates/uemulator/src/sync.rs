@@ -35,6 +35,13 @@ mod uefi_stubs {
     pub(crate) struct Guard<'a, T>(&'a Mutex<T>);
 
     impl<T> Mutex<T> {
+        pub fn new(value: T) -> Self {
+            Self {
+                locked: AtomicBool::new(false),
+                value: UnsafeCell::new(value),
+            }
+        }
+
         pub fn lock(&self) -> Result<Guard<'_, T>, Infallible> {
             while self.locked.swap(true, Ordering::Acquire) {
                 core::hint::spin_loop();

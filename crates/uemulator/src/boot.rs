@@ -192,6 +192,8 @@ pub struct BootState {
     pub rip: u64,
     /// Physical address of `boot_params`; the 64-bit boot protocol passes it in `rsi`.
     pub rsi: u64,
+    /// First argument of the UEFI firmware entry (`FirmwareHandoff`); zero otherwise.
+    pub rdi: u64,
     pub cr3: u64,
     pub gdt_base: u64,
     pub gdt_limit: u16,
@@ -208,6 +210,37 @@ fn put(ram: &mut [u8], addr: u64, data: &[u8]) -> Result<(), Error> {
         .ok_or_else(too_small)?
         .copy_from_slice(data);
     Ok(())
+}
+
+/// Writes the boot GDT (null, null, `code_descriptor`, flat data) and the 4 GiB identity map
+/// where `BootState` says they are; returns the GDT limit.
+fn write_gdt_and_page_tables(ram: &mut [u8], code_descriptor: u64) -> Result<u16, Error> {
+    // Entries 0 and 1 stay null so the code and data descriptors land on the selectors
+    // `BOOT_CS` and `BOOT_DS`.
+    let gdt: [u64; 4] = [0, 0, code_descriptor, BOOT_DATA_DESCRIPTOR];
+    let gdt_bytes: Vec<u8> = gdt.iter().flat_map(|entry| entry.to_le_bytes()).collect();
+    put(ram, GDT_ADDR, &gdt_bytes)?;
+
+    let pdpt = PML4 + PAGE_SIZE;
+    let first_page_directory = pdpt + PAGE_SIZE;
+    let mut tables = vec![0u8; PAGE_TABLE_PAGES * PAGE_SIZE as usize];
+    let entry_bytes = |value: u64| value.to_le_bytes();
+    tables[0..TABLE_ENTRY_SIZE].copy_from_slice(&entry_bytes(pdpt | PTE_PRESENT | PTE_WRITABLE));
+    for gib in 0..IDENTITY_MAP_GIB {
+        let page_directory = first_page_directory + gib * PAGE_SIZE;
+        let pdpt_entry = (pdpt - PML4) as usize + gib as usize * TABLE_ENTRY_SIZE;
+        tables[pdpt_entry..pdpt_entry + TABLE_ENTRY_SIZE]
+            .copy_from_slice(&entry_bytes(page_directory | PTE_PRESENT | PTE_WRITABLE));
+        for slot in 0..ENTRIES_PER_TABLE {
+            let entry = (page_directory - PML4) as usize + slot as usize * TABLE_ENTRY_SIZE;
+            let physical = (gib * ENTRIES_PER_TABLE + slot) << HUGE_PAGE_SHIFT;
+            tables[entry..entry + TABLE_ENTRY_SIZE].copy_from_slice(&entry_bytes(
+                physical | PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE,
+            ));
+        }
+    }
+    put(ram, PML4, &tables)?;
+    Ok((gdt_bytes.len() - 1) as u16)
 }
 
 /// Places the kernel, initrd, command line, `boot_params`, GDT and page tables in `ram` and
@@ -294,45 +327,22 @@ pub(crate) fn load(
     }
     put(ram, BOOT_PARAMS, &boot_params)?;
 
-    // Entries 0 and 1 stay null so the code and data descriptors land on the selectors
-    // `BOOT_CS` and `BOOT_DS`.
     let kernel_is_64_bit = header.xloadflags & XLF_KERNEL_64 != 0;
     let code_descriptor = if kernel_is_64_bit {
         BOOT_CODE_DESCRIPTOR
     } else {
         BOOT_CODE32_DESCRIPTOR
     };
-    let gdt: [u64; 4] = [0, 0, code_descriptor, BOOT_DATA_DESCRIPTOR];
-    let gdt_bytes: Vec<u8> = gdt.iter().flat_map(|entry| entry.to_le_bytes()).collect();
-    put(ram, GDT_ADDR, &gdt_bytes)?;
-
-    let pdpt = PML4 + PAGE_SIZE;
-    let first_page_directory = pdpt + PAGE_SIZE;
-    let mut tables = vec![0u8; PAGE_TABLE_PAGES * PAGE_SIZE as usize];
-    let entry_bytes = |value: u64| value.to_le_bytes();
-    tables[0..TABLE_ENTRY_SIZE].copy_from_slice(&entry_bytes(pdpt | PTE_PRESENT | PTE_WRITABLE));
-    for gib in 0..IDENTITY_MAP_GIB {
-        let page_directory = first_page_directory + gib * PAGE_SIZE;
-        let pdpt_entry = (pdpt - PML4) as usize + gib as usize * TABLE_ENTRY_SIZE;
-        tables[pdpt_entry..pdpt_entry + TABLE_ENTRY_SIZE]
-            .copy_from_slice(&entry_bytes(page_directory | PTE_PRESENT | PTE_WRITABLE));
-        for slot in 0..ENTRIES_PER_TABLE {
-            let entry = (page_directory - PML4) as usize + slot as usize * TABLE_ENTRY_SIZE;
-            let physical = (gib * ENTRIES_PER_TABLE + slot) << HUGE_PAGE_SHIFT;
-            tables[entry..entry + TABLE_ENTRY_SIZE].copy_from_slice(&entry_bytes(
-                physical | PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE,
-            ));
-        }
-    }
-    put(ram, PML4, &tables)?;
+    let gdt_limit = write_gdt_and_page_tables(ram, code_descriptor)?;
 
     Ok(BootState {
         // A 32-bit kernel starts at the first byte of its protected-mode image (`startup_32`).
         rip: load_addr + if kernel_is_64_bit { ENTRY_64_OFFSET } else { 0 },
         rsi: BOOT_PARAMS,
+        rdi: 0,
         cr3: PML4,
         gdt_base: GDT_ADDR,
-        gdt_limit: (gdt_bytes.len() - 1) as u16,
+        gdt_limit,
         cs: BOOT_CS,
         ds: BOOT_DS,
         mode: if header.xloadflags & XLF_KERNEL_64 != 0 {
@@ -373,6 +383,9 @@ pub(crate) fn load_firmware(ram: &mut [u8], image: &[u8]) -> Result<BootState, E
         ..Default::default()
     })
 }
+
+pub(crate) mod uefi;
+pub(crate) use uefi::{FirmwareParams, load_uefi_firmware};
 
 #[cfg(test)]
 mod tests;

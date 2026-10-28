@@ -13,7 +13,7 @@ use crate::prelude::*;
 pub(crate) const MMIO_BASE: u64 = 0xc000_0000;
 /// Each virtio function gets one BAR0 of this size, laid out back to back from `MMIO_BASE`.
 /// Four `REGION_SIZE` regions: common cfg, ISR, device cfg, notify.
-const BAR_SIZE: u64 = 4 * REGION_SIZE;
+pub(crate) const BAR_SIZE: u64 = 4 * REGION_SIZE;
 /// Legacy PIC lines handed out to functions in order, wrapping around (functions past the fourth
 /// share a line; `line_asserted` ORs them). There is no IOAPIC or ACPI, so the kernel takes
 /// `int_line` as the IRQ. Never 0, `mmio_write` uses 0 for "no interrupt". 9-11 are the lines
