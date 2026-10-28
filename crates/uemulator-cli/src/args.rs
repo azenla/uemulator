@@ -98,6 +98,9 @@ pub struct HardwareArgs {
     /// Guest memory in MiB, 64 to 3072 [default: 2048, 3072 for a fedora install]
     #[arg(long, short = 'm')]
     pub memory: Option<usize>,
+    /// Guest vCPUs, 1 to 64 (they take turns on one host thread) [default: 1]
+    #[arg(long)]
+    pub cpus: Option<usize>,
     /// Attach a raw disk image as a virtio-blk device; append ",ro" for read-only. Repeat for more
     /// disks: the guest sees them in order (vda, vdb, ...)
     #[arg(long, value_name = "PATH[,ro]")]
@@ -233,6 +236,8 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cmdline: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub append: Option<String>,
@@ -322,6 +327,9 @@ impl Settings {
     pub fn add(&mut self, hardware: &HardwareArgs, linux: &LinuxArgs, new_disks: Vec<DiskSpec>) {
         if hardware.memory.is_some() {
             self.memory = hardware.memory;
+        }
+        if hardware.cpus.is_some() {
+            self.cpus = hardware.cpus;
         }
         if let Some(disable_jit) = hardware.disable_jit {
             self.disable_jit = disable_jit;
@@ -624,6 +632,7 @@ mod tests {
     fn settings_survive_a_round_trip_through_toml() {
         let settings = Settings {
             memory: Some(4096),
+            cpus: Some(4),
             cmdline: Some("console=hvc0".into()),
             append: None,
             no_reboot: true,

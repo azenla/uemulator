@@ -462,6 +462,84 @@ pub(crate) fn run_machine(
     }
 }
 
+/// A finished multi-vCPU run: the scheduler (inspect RAM and vCPU state through it) and why it
+/// ended.
+pub(crate) struct SmpRun {
+    pub smp: crate::cpu::smp::Smp,
+    pub exit: ExitReason,
+    /// Declared last, like `Harness::_jit_turn`: it must outlive the JIT.
+    _jit_turn: Option<crate::jit::JitTestGuard>,
+}
+
+impl SmpRun {
+    pub fn read(&self, addr: u64, len: usize) -> Vec<u8> {
+        self.smp.active().ram[addr as usize..addr as usize + len].to_vec()
+    }
+
+    pub fn read_u16(&self, addr: u64) -> u16 {
+        u16::from_le_bytes(self.read(addr, 2).try_into().unwrap())
+    }
+
+    pub fn read_u32(&self, addr: u64) -> u32 {
+        u32::from_le_bytes(self.read(addr, 4).try_into().unwrap())
+    }
+}
+
+/// How long a multi-vCPU test may run before a watchdog stops it (a hang then shows up as
+/// `ExitReason::Stopped`).
+const SMP_WATCHDOG: Duration = Duration::from_secs(30);
+
+/// Runs `code` (as the bootstrap processor's 64-bit snippet, like `Harness`) on a machine with
+/// `cpus` vCPUs until it exits. `setup` may place more code and data in RAM first, typically a
+/// real-mode trampoline for the others. With `jit` the vCPUs run the host JIT where they can
+/// (64-bit code); a host without one runs the interpreter either way.
+pub(crate) fn run_smp(code: &[u8], cpus: usize, jit: bool, setup: impl FnOnce(&mut Cpu)) -> SmpRun {
+    let mut ram = vec![0u8; HARNESS_RAM_BYTES];
+    let state: BootState =
+        boot::load(&mut ram, &fake_bzimage(code), None, "").expect("fake kernel must load");
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut cpu = Cpu::new(
+        ram,
+        state,
+        ConsoleHandle::default(),
+        stop.clone(),
+        None,
+        DevConfig {
+            cpus,
+            ..Default::default()
+        },
+    );
+    cpu.gpr[RSP] = STACK_TOP;
+    let jit_turn = jit.then(crate::jit::serialize_jit_tests);
+    if jit {
+        cpu.jit = crate::jit::Jit::new(true).map(Box::new);
+    }
+    setup(&mut cpu);
+    let mut smp = crate::cpu::smp::Smp::new(cpu);
+    let finished = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let finished = finished.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + SMP_WATCHDOG;
+            while std::time::Instant::now() < deadline {
+                if finished.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let exit = smp.run();
+    finished.store(true, std::sync::atomic::Ordering::Relaxed);
+    watchdog.join().unwrap();
+    SmpRun {
+        smp,
+        exit,
+        _jit_turn: jit_turn,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

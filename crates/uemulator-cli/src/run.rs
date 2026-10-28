@@ -163,6 +163,9 @@ fn build_config(
         cfg = cfg.jit(JitMode::Off);
     }
     cfg = cfg.reboot(!settings.no_reboot).iommu(settings.iommu);
+    if let Some(cpus) = settings.cpus {
+        cfg = cfg.cpus(cpus);
+    }
     Ok(cfg)
 }
 

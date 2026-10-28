@@ -878,6 +878,16 @@ mod tests {
     }
 
     #[test]
+    fn cpus_is_a_count_that_is_unset_by_default() {
+        assert_eq!(hardware(&[]).cpus, None);
+        assert_eq!(hardware(&["--cpus", "4"]).cpus, Some(4));
+        assert_eq!(
+            error_kind(&["advanced", "boot", "--kernel", "k", "--cpus", "x"]),
+            ErrorKind::ValueValidation
+        );
+    }
+
+    #[test]
     fn boolean_options_take_an_optional_value_only_after_an_equals_sign() {
         assert_eq!(hardware(&[]).disable_jit, None);
         assert_eq!(hardware(&["--disable-jit"]).disable_jit, Some(true));

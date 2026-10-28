@@ -246,6 +246,22 @@ fn madt_lists_one_cpu_the_ioapic_and_the_interrupt_wiring() {
 }
 
 #[test]
+fn madt_lists_every_cpu_with_the_apic_id_the_vcpu_starts_with() {
+    // vCPU n's local APIC starts with id n (`Devices::new`), and its ACPI processor id matches.
+    let ram = ram_with_tables(&config(4, 0, false));
+    let entries = madt_entries(find(&ram, "APIC"));
+    let cpus: Vec<(u8, u8, bool)> = entries
+        .iter()
+        .filter(|(kind, _)| *kind == 0)
+        .map(|(_, entry)| (entry[2], entry[3], u32_at(entry, 4) & 1 == 1))
+        .collect();
+    assert_eq!(
+        cpus,
+        [(0, 0, true), (1, 1, true), (2, 2, true), (3, 3, true)]
+    );
+}
+
+#[test]
 fn madt_switches_to_x2apic_entries_for_ids_that_do_not_fit_in_a_byte() {
     let ram = ram_with_tables(&config(300, 0, false));
     let entries = madt_entries(find(&ram, "APIC"));

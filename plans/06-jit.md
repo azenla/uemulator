@@ -57,6 +57,10 @@ Translation cost scales with emitted host instructions and dominates a cold boot
 
 ALU add/or/and/sub/xor/cmp/test at 8/16/32/64 bits including read-modify-write memory forms (flags are recorded only after the store succeeded; x0/x1 are parked in callee-saved registers across the store's slow path), mov at every size including ah/ch/dh/bh, movzx/movsx, lea, inc/dec (CF carried in through `lazy_src`), neg/not, shl/shr/sar and rol/ror by imm/1/cl at 32/64 bits (shifts record `LazyFlagsOp::SzpCfOf`, rotates merge CF/OF with a helper because they keep SF/ZF/PF/AF), imul r,r/m and imm forms, setcc, cmovcc, cdq/cqo/cdqe/cwde, push/pop, push/call/jmp r/m64, near jcc/jmp/call/ret, lfence/mfence/sfence. adc/sbb, bt*, xchg/cmpxchg/xadd, division, lock-prefixed forms, SSE/x87 and string instructions go through `helper_exec` (forward `rep movs`/`rep stos` are bulk inside the interpreter, `Cpu::rep_bulk`). Byte and word ALU ops run in W registers on operands shifted to the top of the word, so the host NZCV flags are exact for the narrow operation and jcc can use them.
 
+## Several vCPUs
+
+The JIT, its block cache and the code buffer are machine-wide: `Cpu::swap_shared` moves the `Box<Jit>` to the vCPU that runs next, and generated code only addresses state through the `Cpu` pointer in its pinned register, so nothing is duplicated or retagged. Blocks are keyed by (rip, physical address) as before. Two things keep the sharing correct: a store by any vCPU to a code page runs `code_written` on the shared cache (and a vCPU's private TLB loses stale write tags when it is switched in), and a quantum ends through the same `next_event` / `block_exit_requested` checks chained blocks already make (`pause` sets both, so the running block stops at the instruction after it). Generated code needs no change for SMP; only 64-bit code is compiled, so real-mode start-up code of the other vCPUs runs on the interpreter.
+
 ## Exceptions and state sync
 
 - Guest RIP is stored by `InsnStart` before any faulting uop; icount for the partial TB is recovered from a per-TB table `(host_pc_offset → insns_retired)` or, in v1, from a store of the retired-count alongside RIP.

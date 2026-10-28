@@ -62,7 +62,7 @@ src/dev/{mod,serial,pic,pit,cmos,misc}.rs
 8. Decoder is parameterized by mode (16/32/64-bit code size) even though only 64-bit is tested in v1; decompressor stubs and far returns may touch compat mode.
 9. 0F 18–1F hint space is NOP, including ENDBR64 (F3 0F 1E FA).
 10. The library never touches stdio, never calls `process::exit`, holds no global mutable state, and never panics on guest behavior (guest faults are guest exceptions; unimplemented opcodes raise #UD and are logged through an optional hook).
-11. Single-threaded guest (one vCPU). Memory ordering concerns (x-tso in the fork) are moot until SMP.
+11. One host thread. The guest has one vCPU by default, or up to 64 that take turns on that thread (`plans/03-cpu.md`, "SMP"), so memory ordering concerns (x-tso in the fork) stay moot: only one vCPU runs at a time.
 
 ## Risks
 

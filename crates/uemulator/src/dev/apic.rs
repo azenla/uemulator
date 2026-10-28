@@ -1,6 +1,6 @@
 //! Local APIC: xAPIC MMIO window, x2APIC MSR interface, the timer (one-shot, periodic,
-//! TSC-deadline), the interrupt request/service registers and the LVT. One CPU, so IPIs only
-//! ever reach the sender.
+//! TSC-deadline), the interrupt request/service registers and the LVT. One `Lapic` per vCPU;
+//! an ICR write only describes the IPI (`Ipi`), `Devices` routes it to the other APICs.
 //!
 //! SDM vol. 3 chapter 12 (Intel) and AMD APM vol. 2 chapter 16 describe the same register
 //! file; QEMU's `hw/intc/apic.c` is the behavioral reference for what guests actually rely on.
@@ -72,7 +72,6 @@ const LVT_RESET: u32 = LVT_MASKED;
 
 pub(crate) const DELIVERY_FIXED: u32 = 0;
 pub(crate) const DELIVERY_LOWEST_PRIORITY: u32 = 1;
-pub(crate) const DELIVERY_SMI: u32 = 2;
 pub(crate) const DELIVERY_NMI: u32 = 4;
 pub(crate) const DELIVERY_INIT: u32 = 5;
 pub(crate) const DELIVERY_STARTUP: u32 = 6;
@@ -96,14 +95,16 @@ const MAX_TIMER_CATCH_UP: u32 = 4;
 const ICR_VECTOR_MASK: u32 = 0xff;
 const ICR_DELIVERY_SHIFT: u32 = 8;
 const ICR_LOGICAL_DESTINATION: u32 = 1 << 11;
+/// Level-assert bit. Only INIT looks at it: INIT with level trigger and this bit clear is the
+/// "de-assert" that old IPI sequences send, and does nothing (SDM 12.6.1).
+const ICR_LEVEL_ASSERT: u32 = 1 << 14;
 const ICR_LEVEL_TRIGGER: u32 = 1 << 15;
 const ICR_SHORTHAND_SHIFT: u32 = 18;
 const ICR_SHORTHAND_MASK: u32 = 0b11;
-const SHORTHAND_NONE: u32 = 0;
-const SHORTHAND_SELF: u32 = 1;
-const SHORTHAND_ALL_INCLUDING_SELF: u32 = 2;
-#[cfg(test)]
-const SHORTHAND_ALL_EXCLUDING_SELF: u32 = 3;
+pub(crate) const SHORTHAND_NONE: u32 = 0;
+pub(crate) const SHORTHAND_SELF: u32 = 1;
+pub(crate) const SHORTHAND_ALL_INCLUDING_SELF: u32 = 2;
+pub(crate) const SHORTHAND_ALL_EXCLUDING_SELF: u32 = 3;
 const ICR_WRITABLE_XAPIC: u32 = 0x000c_cfff;
 
 /// Error status bits.
@@ -137,9 +138,19 @@ pub(crate) struct Interrupt {
     pub logical: bool,
 }
 
+/// What an ICR write asks `Devices` to send: the message and which processors it goes to when
+/// the shorthand is not `SHORTHAND_NONE` (then `interrupt.destination` is the target).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Ipi {
+    pub interrupt: Interrupt,
+    pub shorthand: u32,
+}
+
 pub(crate) struct Lapic {
     /// IA32_APIC_BASE.
     base: u64,
+    /// The APIC id the processor was created with, which a software reset must keep.
+    reset_id: u32,
     id: u32,
     tpr: u8,
     ldr: u32,
@@ -167,6 +178,10 @@ pub(crate) struct Lapic {
     tsc_deadline: u64,
     /// An NMI the CPU has not taken yet.
     nmi_pending: bool,
+    /// INIT and start-up IPIs wait here for the processor itself to act on them
+    /// (`Smp::apply_start_signals`), because resetting a vCPU needs the vCPU.
+    init_pending: bool,
+    startup_vector: Option<u8>,
 }
 
 fn bit(regs: &[u32; 8], vector: u8) -> bool {
@@ -192,10 +207,13 @@ fn highest(regs: &[u32; 8]) -> Option<u8> {
 }
 
 impl Lapic {
-    pub fn new() -> Self {
+    /// Power-on state of the APIC of processor `id`; only the bootstrap processor (id 0) has the
+    /// BSP bit.
+    pub fn new(id: u32) -> Self {
         Lapic {
-            base: APIC_DEFAULT_BASE | APIC_BASE_BSP | APIC_BASE_ENABLE,
-            id: 0,
+            base: APIC_DEFAULT_BASE | APIC_BASE_ENABLE | if id == 0 { APIC_BASE_BSP } else { 0 },
+            reset_id: id,
+            id,
             tpr: 0,
             ldr: 0,
             dfr: DFR_FLAT,
@@ -221,6 +239,8 @@ impl Lapic {
             timer_deadline_ns: None,
             tsc_deadline: 0,
             nmi_pending: false,
+            init_pending: false,
+            startup_vector: None,
         }
     }
 
@@ -264,8 +284,34 @@ impl Lapic {
     /// Guest disabled the APIC: it drops everything it had. Re-enabling starts from reset values.
     fn software_reset(&mut self) {
         let base = self.base;
-        *self = Lapic::new();
+        let id = self.id;
+        *self = Lapic::new(self.reset_id);
         self.base = base;
+        self.id = id;
+    }
+
+    /// INIT: every register goes back to its reset value except the APIC id and the base MSR
+    /// (SDM 9.1.1, table 9-1; the APIC stays enabled in whatever mode it was).
+    pub fn init_reset(&mut self) {
+        self.software_reset();
+    }
+
+    #[cfg(test)]
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// An INIT or start-up IPI is waiting for the processor.
+    pub fn start_signal_pending(&self) -> bool {
+        self.init_pending || self.startup_vector.is_some()
+    }
+
+    pub fn take_init(&mut self) -> bool {
+        core::mem::take(&mut self.init_pending)
+    }
+
+    pub fn take_startup(&mut self) -> Option<u8> {
+        self.startup_vector.take()
     }
 
     pub fn hardware_enabled(&self) -> bool {
@@ -304,6 +350,13 @@ impl Lapic {
     fn processor_priority(&self) -> u8 {
         let in_service = highest(&self.isr).unwrap_or(0) & 0xf0;
         (self.tpr & 0xf0).max(in_service)
+    }
+
+    /// What a lowest-priority interrupt compares: the processor priority raised by the highest
+    /// request still waiting (the arbitration priority, SDM 12.9.7), smaller wins.
+    pub fn arbitration_priority(&self) -> u8 {
+        let requested = highest(&self.irr).unwrap_or(0) & 0xf0;
+        self.processor_priority().max(requested)
     }
 
     /// The vector the CPU would take now, if interrupts were enabled. A request is deliverable
@@ -350,7 +403,7 @@ impl Lapic {
         self.nmi_pending
     }
 
-    fn matches_destination(&self, interrupt: &Interrupt) -> bool {
+    pub fn matches_destination(&self, interrupt: &Interrupt) -> bool {
         let broadcast = if self.x2apic() {
             BROADCAST_X2APIC
         } else {
@@ -379,6 +432,14 @@ impl Lapic {
         if !self.hardware_enabled() || !self.matches_destination(interrupt) {
             return Delivered::Nothing;
         }
+        self.accept_addressed(interrupt)
+    }
+
+    /// `accept` for a message that is already known to be for this APIC (a shorthand IPI).
+    pub fn accept_addressed(&mut self, interrupt: &Interrupt) -> Delivered {
+        if !self.hardware_enabled() {
+            return Delivered::Nothing;
+        }
         match interrupt.delivery_mode {
             DELIVERY_FIXED | DELIVERY_LOWEST_PRIORITY => {
                 if interrupt.vector < FIRST_VALID_VECTOR {
@@ -401,8 +462,16 @@ impl Lapic {
                 self.nmi_pending = true;
                 Delivered::Nmi
             }
-            // No SMM, and the only CPU is never the target of an INIT/SIPI sequence.
-            DELIVERY_SMI | DELIVERY_INIT | DELIVERY_STARTUP => Delivered::Nothing,
+            DELIVERY_INIT => {
+                self.init_pending = true;
+                Delivered::Nothing
+            }
+            // The vector field is the start page (address = vector << 12).
+            DELIVERY_STARTUP => {
+                self.startup_vector = Some(interrupt.vector);
+                Delivered::Nothing
+            }
+            // SMI: there is no SMM.
             _ => Delivered::Nothing,
         }
     }
@@ -645,7 +714,7 @@ impl Lapic {
             }
             REG_TIMER_DIVIDE => self.divide_config = value & DIVIDE_WRITABLE,
             REG_ICR_HIGH => self.icr_high = value,
-            REG_ICR_LOW => self.write_icr(value, self.icr_destination_xapic()),
+            REG_ICR_LOW => effect.ipi = self.write_icr(value, self.icr_destination_xapic()),
             REG_SELF_IPI if self.x2apic() => {
                 let interrupt = Interrupt {
                     vector: value as u8,
@@ -666,9 +735,9 @@ impl Lapic {
         self.icr_high >> 24
     }
 
-    /// Sends an IPI. With one CPU only the self and all-including-self shorthands and explicit
-    /// destinations that match this APIC arrive anywhere.
-    fn write_icr(&mut self, low: u32, destination: u32) {
+    /// Describes the IPI an ICR write sends; `Devices::send_ipi` delivers it. `None` when nothing
+    /// is sent: an illegal vector (recorded in the ESR) or an INIT de-assert.
+    fn write_icr(&mut self, low: u32, destination: u32) -> Option<Ipi> {
         let low = low & ICR_WRITABLE_XAPIC;
         let vector = (low & ICR_VECTOR_MASK) as u8;
         let delivery_mode = (low >> ICR_DELIVERY_SHIFT) & 0b111;
@@ -677,36 +746,28 @@ impl Lapic {
             && vector < FIRST_VALID_VECTOR
         {
             self.esr_pending |= ESR_SEND_ILLEGAL_VECTOR;
-            return;
+            return None;
         }
-        let interrupt = Interrupt {
-            vector,
-            delivery_mode,
-            level_triggered: low & ICR_LEVEL_TRIGGER != 0,
-            destination,
-            logical: low & ICR_LOGICAL_DESTINATION != 0,
-        };
-        match shorthand {
-            SHORTHAND_NONE => {
-                self.accept(&interrupt);
-            }
-            SHORTHAND_SELF | SHORTHAND_ALL_INCLUDING_SELF => {
-                let to_self = Interrupt {
-                    destination: self.id,
-                    logical: false,
-                    ..interrupt
-                };
-                self.accept(&to_self);
-            }
-            // The only CPU is the sender.
-            _ => {}
+        let level_triggered = low & ICR_LEVEL_TRIGGER != 0;
+        if delivery_mode == DELIVERY_INIT && level_triggered && low & ICR_LEVEL_ASSERT == 0 {
+            return None;
         }
+        Some(Ipi {
+            interrupt: Interrupt {
+                vector,
+                delivery_mode,
+                level_triggered,
+                destination,
+                logical: low & ICR_LOGICAL_DESTINATION != 0,
+            },
+            shorthand,
+        })
     }
 
     /// x2APIC writes carry the 32-bit destination in the upper half of the 64-bit ICR value.
-    pub fn write_icr_x2apic(&mut self, value: u64) {
+    pub fn write_icr_x2apic(&mut self, value: u64) -> Option<Ipi> {
         self.icr_high = (value >> 32) as u32;
-        self.write_icr(value as u32, (value >> 32) as u32);
+        self.write_icr(value as u32, (value >> 32) as u32)
     }
 
     pub fn read_icr_x2apic(&self) -> u64 {
@@ -723,6 +784,8 @@ impl Lapic {
 pub(crate) struct WriteEffect {
     /// A level-triggered interrupt finished: tell the I/O APIC.
     pub eoi_vector: Option<u8>,
+    /// The guest wrote the ICR: send this.
+    pub ipi: Option<Ipi>,
 }
 
 #[cfg(test)]
@@ -730,7 +793,7 @@ mod tests {
     use super::*;
 
     fn enabled() -> Lapic {
-        let mut apic = Lapic::new();
+        let mut apic = Lapic::new(0);
         apic.write_register(REG_SVR, SVR_SOFTWARE_ENABLE | 0xff, 0)
             .unwrap();
         apic
@@ -748,7 +811,7 @@ mod tests {
 
     #[test]
     fn reset_state_matches_the_sdm() {
-        let mut apic = Lapic::new();
+        let mut apic = Lapic::new(0);
         assert!(apic.hardware_enabled());
         assert!(!apic.software_enabled());
         assert_eq!(apic.read_register(REG_SVR, 0), Some(0xff));
@@ -759,7 +822,7 @@ mod tests {
 
     #[test]
     fn pending_interrupt_waits_for_software_enable() {
-        let mut apic = Lapic::new();
+        let mut apic = Lapic::new(0);
         apic.accept(&fixed(0x41));
         assert_eq!(apic.pending_vector(), None);
     }
@@ -839,7 +902,7 @@ mod tests {
 
     #[test]
     fn divide_configuration_encoding() {
-        let mut apic = Lapic::new();
+        let mut apic = Lapic::new(0);
         for (config, divider) in [
             (0b0000, 2),
             (0b0001, 4),
@@ -902,35 +965,115 @@ mod tests {
     }
 
     #[test]
-    fn self_ipi_through_the_icr_shorthand() {
+    fn an_icr_write_describes_the_ipi_and_delivers_nothing_itself() {
         let mut apic = enabled();
-        apic.write_register(
-            REG_ICR_LOW,
-            0x55 | (SHORTHAND_SELF << ICR_SHORTHAND_SHIFT),
-            0,
-        )
-        .unwrap();
-        assert_eq!(apic.pending_vector(), Some(0x55));
+        apic.write_register(REG_ICR_HIGH, 3 << 24, 0).unwrap();
+        let effect = apic.write_register(REG_ICR_LOW, 0x55, 0).unwrap();
+        let ipi = effect.ipi.expect("an IPI");
+        assert_eq!(ipi.shorthand, SHORTHAND_NONE);
+        assert_eq!(ipi.interrupt.vector, 0x55);
+        assert_eq!(ipi.interrupt.destination, 3);
+        assert_eq!(apic.pending_vector(), None);
     }
 
     #[test]
-    fn ipi_to_another_cpu_goes_nowhere() {
+    fn the_icr_shorthand_is_reported() {
         let mut apic = enabled();
-        apic.write_register(REG_ICR_HIGH, 1 << 24, 0).unwrap();
-        apic.write_register(REG_ICR_LOW, 0x55, 0).unwrap();
-        assert_eq!(apic.pending_vector(), None);
-        apic.write_register(
-            REG_ICR_LOW,
-            0x55 | (SHORTHAND_ALL_EXCLUDING_SELF << ICR_SHORTHAND_SHIFT),
-            0,
-        )
-        .unwrap();
-        assert_eq!(apic.pending_vector(), None);
+        let low = 0x55 | (SHORTHAND_ALL_EXCLUDING_SELF << ICR_SHORTHAND_SHIFT);
+        let effect = apic.write_register(REG_ICR_LOW, low, 0).unwrap();
+        assert_eq!(effect.ipi.unwrap().shorthand, SHORTHAND_ALL_EXCLUDING_SELF);
+    }
+
+    #[test]
+    fn an_x2apic_icr_write_carries_a_32_bit_destination() {
+        let mut apic = enabled();
+        let ipi = apic.write_icr_x2apic((0x1_0002u64 << 32) | 0x55).unwrap();
+        assert_eq!(ipi.interrupt.destination, 0x1_0002);
+    }
+
+    #[test]
+    fn an_init_deassert_sends_nothing_but_an_init_assert_does() {
+        let mut apic = enabled();
+        let init = DELIVERY_INIT << ICR_DELIVERY_SHIFT;
+        let deassert = init | ICR_LEVEL_TRIGGER;
+        assert!(
+            apic.write_register(REG_ICR_LOW, deassert, 0)
+                .unwrap()
+                .ipi
+                .is_none()
+        );
+        let assert_init = deassert | ICR_LEVEL_ASSERT;
+        assert!(
+            apic.write_register(REG_ICR_LOW, assert_init, 0)
+                .unwrap()
+                .ipi
+                .is_some()
+        );
+        assert!(
+            apic.write_register(REG_ICR_LOW, init, 0)
+                .unwrap()
+                .ipi
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_illegal_ipi_vector_is_an_error_and_sends_nothing() {
+        let mut apic = enabled();
+        let effect = apic.write_register(REG_ICR_LOW, 0x05, 0).unwrap();
+        assert!(effect.ipi.is_none());
+        apic.write_register(REG_ESR, 0, 0).unwrap();
+        assert_eq!(
+            apic.read_register(REG_ESR, 0),
+            Some(ESR_SEND_ILLEGAL_VECTOR)
+        );
+    }
+
+    #[test]
+    fn init_and_startup_wait_for_the_processor_even_with_the_apic_software_disabled() {
+        let mut apic = Lapic::new(1);
+        let init = Interrupt {
+            delivery_mode: DELIVERY_INIT,
+            destination: 1,
+            ..fixed(0)
+        };
+        let startup = Interrupt {
+            delivery_mode: DELIVERY_STARTUP,
+            destination: 1,
+            ..fixed(0x08)
+        };
+        assert!(!apic.start_signal_pending());
+        apic.accept(&init);
+        apic.accept(&startup);
+        assert!(apic.take_init());
+        assert!(!apic.take_init());
+        assert_eq!(apic.take_startup(), Some(0x08));
+        assert!(!apic.start_signal_pending());
+    }
+
+    #[test]
+    fn only_processor_zero_is_the_bsp_and_a_reset_keeps_the_id() {
+        assert_ne!(Lapic::new(0).base_msr() & APIC_BASE_BSP, 0);
+        let mut other = Lapic::new(2);
+        assert_eq!(other.base_msr() & APIC_BASE_BSP, 0);
+        assert_eq!(other.read_register(REG_ID, 0), Some(2 << 24));
+        other.write_register(REG_TPR, 0x40, 0).unwrap();
+        other.init_reset();
+        assert_eq!(other.tpr(), 0);
+        assert_eq!(other.id(), 2);
+    }
+
+    #[test]
+    fn the_arbitration_priority_counts_pending_requests() {
+        let mut apic = enabled();
+        assert_eq!(apic.arbitration_priority(), 0);
+        apic.accept(&fixed(0x61));
+        assert_eq!(apic.arbitration_priority(), 0x60);
     }
 
     #[test]
     fn nmi_ignores_the_software_enable_bit() {
-        let mut apic = Lapic::new();
+        let mut apic = Lapic::new(0);
         let nmi = Interrupt {
             delivery_mode: DELIVERY_NMI,
             ..fixed(0)
@@ -953,7 +1096,7 @@ mod tests {
 
     #[test]
     fn extint_is_connected_until_lint0_is_masked() {
-        let mut apic = Lapic::new();
+        let mut apic = Lapic::new(0);
         assert!(apic.extint_connected());
         apic.write_register(REG_LVT_LINT0, LVT_MASKED | (DELIVERY_EXTINT << 8), 0)
             .unwrap();
@@ -970,14 +1113,14 @@ mod tests {
 
     #[test]
     fn hardware_disabled_apic_wires_the_pic_straight_in() {
-        let mut apic = Lapic::new();
+        let mut apic = Lapic::new(0);
         assert!(apic.set_base_msr(0));
         assert!(apic.extint_connected());
     }
 
     #[test]
     fn apic_base_transitions() {
-        let mut apic = Lapic::new();
+        let mut apic = Lapic::new(0);
         let enable = APIC_DEFAULT_BASE | APIC_BASE_ENABLE;
         // x2APIC without enable is invalid.
         assert!(!apic.set_base_msr(APIC_BASE_X2APIC));
@@ -993,14 +1136,14 @@ mod tests {
 
     #[test]
     fn bsp_bit_is_read_only() {
-        let mut apic = Lapic::new();
+        let mut apic = Lapic::new(0);
         assert!(apic.set_base_msr(APIC_DEFAULT_BASE | APIC_BASE_ENABLE));
         assert_ne!(apic.base_msr() & APIC_BASE_BSP, 0);
     }
 
     #[test]
     fn x2apic_id_is_not_shifted_and_logical_id_is_derived() {
-        let mut apic = Lapic::new();
+        let mut apic = Lapic::new(0);
         assert!(apic.set_base_msr(APIC_DEFAULT_BASE | APIC_BASE_ENABLE | APIC_BASE_X2APIC));
         assert_eq!(apic.read_register(REG_ID, 0), Some(0));
         assert_eq!(apic.read_register(REG_LDR, 0), Some(1));
@@ -1008,7 +1151,7 @@ mod tests {
 
     #[test]
     fn x2apic_self_ipi_register() {
-        let mut apic = Lapic::new();
+        let mut apic = Lapic::new(0);
         apic.set_base_msr(APIC_DEFAULT_BASE | APIC_BASE_ENABLE | APIC_BASE_X2APIC);
         apic.write_register(REG_SVR, SVR_SOFTWARE_ENABLE | 0xff, 0)
             .unwrap();

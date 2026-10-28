@@ -21,7 +21,7 @@ use crate::console::ConsoleHandle;
 use crate::disk::Disk;
 use crate::netdev::NetHandle;
 use acpi_pm::AcpiPm;
-use apic::{Interrupt, Lapic};
+use apic::{Interrupt, Ipi, Lapic};
 use guestmem::GuestMem;
 use hpet::{Hpet, HpetOutput};
 use ioapic::IoApic;
@@ -149,6 +149,8 @@ pub(crate) struct DevConfig {
     pub virtio_consoles: Vec<ConsoleHandle>,
     /// Adds the AMD IOMMU function (00:00.2) and translates every PCI function's DMA by it.
     pub iommu: bool,
+    /// How many vCPUs, so how many local APICs; 0 is taken as 1 (the default).
+    pub cpus: usize,
 }
 
 /// Most virtio functions one machine can hold (PCI slots 1..=31).
@@ -168,7 +170,13 @@ pub(crate) struct Devices {
     system_control_port_a: u8,
     reset_control: u8,
     pci: PciHost,
-    pub lapic: Lapic,
+    /// One local APIC per vCPU, indexed by vCPU number (which is also the APIC id it starts with).
+    lapics: Vec<Lapic>,
+    /// The vCPU that is executing; the CPU-facing APIC accesses (MMIO window, MSRs, CR8,
+    /// interrupt acknowledge) go to its APIC. Set by the scheduler on every switch.
+    current_cpu: usize,
+    /// Where the previous lowest-priority interrupt went, so equal priorities take turns.
+    lowest_priority_cursor: usize,
     ioapic: IoApic,
     pm: AcpiPm,
     hpet: Hpet,
@@ -266,7 +274,9 @@ impl Devices {
             system_control_port_a: 0,
             reset_control: 0,
             pci: PciHost::new(virtio_devices).with_iommu(cfg.iommu),
-            lapic: Lapic::new(),
+            lapics: (0..cfg.cpus.max(1) as u32).map(Lapic::new).collect(),
+            current_cpu: 0,
+            lowest_priority_cursor: 0,
             ioapic: IoApic::new(),
             pm: AcpiPm::new(),
             hpet: Hpet::new(),
@@ -315,13 +325,109 @@ impl Devices {
     pub fn next_deadline(&self, now: u64) -> Option<u64> {
         [
             self.pit.next_deadline(),
-            self.lapic.next_deadline(),
             self.hpet.next_deadline(),
             self.pm.next_deadline(now),
         ]
         .into_iter()
+        .chain(self.lapics.iter().map(Lapic::next_deadline))
         .flatten()
         .min()
+    }
+
+    /// The local APIC of the vCPU that is executing.
+    pub fn lapic(&self) -> &Lapic {
+        &self.lapics[self.current_cpu]
+    }
+
+    pub fn lapic_mut(&mut self) -> &mut Lapic {
+        &mut self.lapics[self.current_cpu]
+    }
+
+    #[cfg(test)]
+    pub fn cpu_count(&self) -> usize {
+        self.lapics.len()
+    }
+
+    pub fn set_current_cpu(&mut self, cpu: usize) {
+        self.current_cpu = cpu;
+    }
+
+    /// A vCPU's local APIC, for the scheduler's INIT and start-up handling.
+    pub fn lapic_of(&mut self, cpu: usize) -> &mut Lapic {
+        &mut self.lapics[cpu]
+    }
+
+    /// Whether a halted vCPU has something to wake it: an INIT or start-up IPI, an NMI, or (with
+    /// interrupts enabled) a deliverable interrupt. The PIC's output goes to the bootstrap
+    /// processor only.
+    pub fn wake_pending(&mut self, cpu: usize, interrupts_enabled: bool) -> bool {
+        self.route_line_events();
+        let lapic = &self.lapics[cpu];
+        lapic.start_signal_pending()
+            || lapic.nmi_pending()
+            || (interrupts_enabled
+                && (lapic.pending_vector().is_some()
+                    || (cpu == 0 && lapic.extint_connected() && self.pic.has_pending())))
+    }
+
+    /// Delivers an interrupt message to the local APICs it addresses (SDM 12.6): every APIC
+    /// whose id or logical id matches, or for lowest-priority delivery the one of them that is
+    /// least busy.
+    fn route_interrupt(&mut self, interrupt: &Interrupt) {
+        if let [only] = self.lapics.as_mut_slice() {
+            only.accept(interrupt);
+            return;
+        }
+        let mut targets = 0u64;
+        for (index, lapic) in self.lapics.iter().enumerate() {
+            if lapic.hardware_enabled() && lapic.matches_destination(interrupt) {
+                targets |= 1 << index;
+            }
+        }
+        if interrupt.delivery_mode == apic::DELIVERY_LOWEST_PRIORITY && targets.count_ones() > 1 {
+            let count = self.lapics.len();
+            let mut best: Option<(u8, usize)> = None;
+            for step in 0..count {
+                let index = (self.lowest_priority_cursor + step) % count;
+                if targets >> index & 1 == 0 {
+                    continue;
+                }
+                let priority = self.lapics[index].arbitration_priority();
+                if best.is_none_or(|(lowest, _)| priority < lowest) {
+                    best = Some((priority, index));
+                }
+            }
+            if let Some((_, chosen)) = best {
+                self.lowest_priority_cursor = chosen + 1;
+                targets = 1 << chosen;
+            }
+        }
+        for (index, lapic) in self.lapics.iter_mut().enumerate() {
+            if targets >> index & 1 != 0 {
+                lapic.accept_addressed(interrupt);
+            }
+        }
+    }
+
+    /// An IPI written to the ICR of the executing vCPU's APIC.
+    fn send_ipi(&mut self, ipi: Ipi) {
+        let sender = self.current_cpu;
+        match ipi.shorthand {
+            apic::SHORTHAND_NONE => self.route_interrupt(&ipi.interrupt),
+            apic::SHORTHAND_SELF => {
+                self.lapics[sender].accept_addressed(&ipi.interrupt);
+            }
+            apic::SHORTHAND_ALL_INCLUDING_SELF | apic::SHORTHAND_ALL_EXCLUDING_SELF => {
+                let include_sender = ipi.shorthand == apic::SHORTHAND_ALL_INCLUDING_SELF;
+                for (index, lapic) in self.lapics.iter_mut().enumerate() {
+                    if include_sender || index != sender {
+                        lapic.accept_addressed(&ipi.interrupt);
+                    }
+                }
+            }
+            // The field is two bits wide, so the four shorthands above are all there is.
+            _ => {}
+        }
     }
 
     /// The ISA line a device raised on the PIC, as an I/O APIC pin: the PIT's IRQ 0 is wired to
@@ -355,7 +461,7 @@ impl Devices {
                     .map(|message| message.into_interrupt()),
             };
             if let Some(interrupt) = interrupt {
-                self.lapic.accept(&interrupt);
+                self.route_interrupt(&interrupt);
             }
             return;
         }
@@ -388,7 +494,7 @@ impl Devices {
         if let Some(pin) = pin {
             self.ioapic.note_delivered(pin, interrupt.vector);
         }
-        self.lapic.accept(&interrupt);
+        self.route_interrupt(&interrupt);
     }
 
     fn drain_deferred(&mut self, mem: &dyn PhysRead) {
@@ -456,9 +562,7 @@ impl Devices {
                 }),
                 Some(mem),
             ),
-            Some(IommuInterrupt::Direct(interrupt)) => {
-                self.lapic.accept(&interrupt);
-            }
+            Some(IommuInterrupt::Direct(interrupt)) => self.route_interrupt(&interrupt),
             None => {}
         }
     }
@@ -486,17 +590,19 @@ impl Devices {
     /// shadow). Local APIC vectors win over the PIC's ExtINT.
     pub fn interrupt_pending(&mut self) -> bool {
         self.route_line_events();
-        self.lapic.pending_vector().is_some()
-            || (self.lapic.extint_connected() && self.pic.has_pending())
+        let lapic = &self.lapics[self.current_cpu];
+        lapic.pending_vector().is_some()
+            || (self.current_cpu == 0 && lapic.extint_connected() && self.pic.has_pending())
     }
 
     /// Interrupt acknowledge: the vector the CPU takes, if any.
     pub fn interrupt_ack(&mut self) -> Option<u8> {
         self.route_line_events();
-        if let Some(vector) = self.lapic.ack() {
+        let lapic = &mut self.lapics[self.current_cpu];
+        if let Some(vector) = lapic.ack() {
             return Some(vector);
         }
-        if self.lapic.extint_connected() {
+        if self.current_cpu == 0 && lapic.extint_connected() {
             return self.pic.ack();
         }
         None
@@ -504,34 +610,41 @@ impl Devices {
 
     /// An NMI the CPU should take at the next instruction boundary.
     pub fn take_nmi(&mut self) -> bool {
-        self.lapic.take_nmi()
+        self.lapic_mut().take_nmi()
     }
 
     pub fn nmi_pending(&self) -> bool {
-        self.lapic.nmi_pending()
+        self.lapic().nmi_pending()
+    }
+
+    /// Whether any vCPU has an NMI waiting (the all-halted idle path asks).
+    pub fn any_nmi_pending(&self) -> bool {
+        self.lapics.iter().any(Lapic::nmi_pending)
     }
 
     /// Reads an x2APIC register MSR; `None` is #GP (not in x2APIC mode, or a reserved register).
     pub fn apic_msr_read(&mut self, msr: u32, now: u64) -> Option<u64> {
-        if !self.lapic.x2apic() {
+        if !self.lapic().x2apic() {
             return None;
         }
         let offset = (msr - apic::X2APIC_MSR_FIRST) << 4;
         if offset == 0x300 {
             // The ICR is one 64-bit register in x2APIC mode.
-            return Some(self.lapic.read_icr_x2apic());
+            return Some(self.lapic().read_icr_x2apic());
         }
-        self.lapic.read_register(offset, now).map(u64::from)
+        self.lapic_mut().read_register(offset, now).map(u64::from)
     }
 
     /// Writes an x2APIC register MSR; `false` is #GP.
     pub fn apic_msr_write(&mut self, msr: u32, value: u64, now: u64) -> bool {
-        if !self.lapic.x2apic() {
+        if !self.lapic().x2apic() {
             return false;
         }
         let offset = (msr - apic::X2APIC_MSR_FIRST) << 4;
         if offset == 0x300 {
-            self.lapic.write_icr_x2apic(value);
+            if let Some(ipi) = self.lapic_mut().write_icr_x2apic(value) {
+                self.send_ipi(ipi);
+            }
             return true;
         }
         if value >> 32 != 0 {
@@ -544,11 +657,14 @@ impl Devices {
         // Line changes the devices made before this access must be visible to the I/O APIC first:
         // an EOI re-sends a level interrupt only if the line is still high *now*.
         self.route_line_events();
-        let effect = self.lapic.write_register(offset, value, now)?;
+        let effect = self.lapic_mut().write_register(offset, value, now)?;
         if let Some(vector) = effect.eoi_vector {
             let mut messages = Vec::new();
             self.ioapic.eoi(vector, &mut messages);
             self.deliver_ioapic(messages, None);
+        }
+        if let Some(ipi) = effect.ipi {
+            self.send_ipi(ipi);
         }
         Ok(())
     }
@@ -581,7 +697,9 @@ impl Devices {
     /// `Cpu::code_written` afterwards (see `GuestMem`).
     pub fn tick(&mut self, now: u64, mem: &mut GuestMem) {
         self.now_ns = now;
-        self.lapic.tick(now);
+        for lapic in &mut self.lapics {
+            lapic.tick(now);
+        }
         if self.pit.tick(now) {
             self.pic.raise(IRQ_PIT);
         }
@@ -621,9 +739,10 @@ impl Devices {
         if let Some(value) = self.pci.iommu_mmio_read(phys_addr, size) {
             return Some(value);
         }
-        if self.lapic.mmio_decodes(phys_addr) {
+        if self.lapic().mmio_decodes(phys_addr) {
             let offset = (phys_addr & APIC_REGISTER_MASK) as u32;
-            return Some(self.lapic.read_register(offset, self.now_ns).unwrap_or(0) as u64);
+            let now = self.now_ns;
+            return Some(self.lapic_mut().read_register(offset, now).unwrap_or(0) as u64);
         }
         if self.ioapic.decodes(phys_addr) {
             self.route_line_events();
@@ -648,13 +767,13 @@ impl Devices {
             self.drain_deferred(mem);
             return true;
         }
-        if self.lapic.mmio_decodes(phys_addr) {
+        if self.lapic().mmio_decodes(phys_addr) {
             let offset = (phys_addr & APIC_REGISTER_MASK) as u32;
             if self
                 .apic_register_write(offset, val as u32, self.now_ns)
                 .is_err()
             {
-                self.lapic.record_illegal_register();
+                self.lapic_mut().record_illegal_register();
             }
             return true;
         }
@@ -800,6 +919,9 @@ impl Devices {
         }
     }
 }
+
+#[cfg(test)]
+mod smp_tests;
 
 #[cfg(test)]
 mod tests {

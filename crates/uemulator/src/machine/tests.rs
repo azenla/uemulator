@@ -2389,3 +2389,157 @@ mod boot_disk {
         assert_eq!(exit, ExitReason::Reset);
     }
 }
+
+mod cpus {
+    use super::*;
+
+    const AP_CODE_ADDRESS: u64 = 0x8000;
+    // mov ecx, 0x1b; mov eax, 0xfee00d00; xor edx, edx; wrmsr; mov ecx, 0x830: x2APIC on, ecx is
+    // the ICR for the writes that follow
+    const ENABLE_X2APIC: [u8; 19] = [
+        0xb9, 0x1b, 0x00, 0x00, 0x00, 0xb8, 0x00, 0x0d, 0xe0, 0xfe, 0x31, 0xd2, 0x0f, 0x30, 0xb9,
+        0x30, 0x08, 0x00, 0x00,
+    ];
+    // mov byte [0x1000], 0x42; hlt, in real mode; padded with hlt to whole dwords
+    const AP_CODE: [u8; 8] = [0xc6, 0x06, 0x00, 0x10, 0x42, 0xf4, 0xf4, 0xf4];
+    // wait: pause; cmp byte [0x1000], 0x42; jne wait
+    const WAIT_FOR_AP: [u8; 12] = [
+        0xf3, 0x90, 0x80, 0x3c, 0x25, 0x00, 0x10, 0x00, 0x00, 0x42, 0x75, 0xf4,
+    ];
+    // mov dx, 0x3f8; mov al, 'o'; out dx, al; mov al, 'k'; out dx, al; mov al, 0xfe; out 0x64, al; hlt
+    const SAY_OK_AND_RESET: [u8; 17] = [
+        0x66, 0xba, 0xf8, 0x03, 0xb0, 0x6f, 0xee, 0xb0, 0x6b, 0xee, 0xb0, 0xfe, 0xe6, 0x64, 0xf4,
+        0xf4, 0xf4,
+    ];
+    const ICR_INIT_LOW: u32 = 0x4500;
+    const ICR_STARTUP_LOW: u32 = 0x4608;
+
+    fn store_dword(address: u32, value: u32) -> Vec<u8> {
+        let mut code = vec![0xc7, 0x04, 0x25];
+        code.extend_from_slice(&address.to_le_bytes());
+        code.extend_from_slice(&value.to_le_bytes());
+        code
+    }
+
+    fn send_icr(destination: u32, low: u32) -> Vec<u8> {
+        let mut code = vec![0xba];
+        code.extend_from_slice(&destination.to_le_bytes());
+        code.push(0xb8);
+        code.extend_from_slice(&low.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x30]);
+        code
+    }
+
+    /// A kernel whose first processor starts the second at `AP_CODE`, waits for its note and
+    /// says "ok".
+    fn start_the_second_cpu() -> Vec<u8> {
+        let mut code = ENABLE_X2APIC.to_vec();
+        for (index, chunk) in AP_CODE.chunks(4).enumerate() {
+            code.extend(store_dword(
+                AP_CODE_ADDRESS as u32 + 4 * index as u32,
+                u32::from_le_bytes(chunk.try_into().unwrap()),
+            ));
+        }
+        code.extend(send_icr(1, ICR_INIT_LOW));
+        code.extend(send_icr(1, ICR_STARTUP_LOW));
+        code.extend(WAIT_FOR_AP);
+        code.extend(SAY_OK_AND_RESET);
+        code
+    }
+
+    #[test]
+    fn the_count_must_be_between_1_and_64() {
+        for cpus in [0, 65] {
+            let message = expect_config_error(EmulatedMachine::new(
+                MachineConfig::new()
+                    .kernel(fake_bzimage(&[0xf4]))
+                    .memory_mib(MIN_MEMORY_MIB)
+                    .cpus(cpus),
+            ));
+            assert!(message.contains("cpus"), "{message}");
+        }
+        for cpus in [1, 64] {
+            assert!(
+                EmulatedMachine::new(
+                    MachineConfig::new()
+                        .kernel(fake_bzimage(&[0xf4]))
+                        .memory_mib(MIN_MEMORY_MIB)
+                        .cpus(cpus),
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn several_cpus_need_acpi_and_exclude_verification_and_firmware() {
+        let base = || {
+            MachineConfig::new()
+                .kernel(fake_bzimage(&[0xf4]))
+                .memory_mib(MIN_MEMORY_MIB)
+                .cpus(2)
+        };
+        expect_config_error(EmulatedMachine::new(base().acpi(false)));
+        expect_config_error(EmulatedMachine::new(base().verify_jit(true)));
+        expect_config_error(EmulatedMachine::new(
+            MachineConfig::new()
+                .firmware(vec![0xf4; 16])
+                .memory_mib(MIN_MEMORY_MIB)
+                .cpus(2),
+        ));
+    }
+
+    #[test]
+    fn a_second_cpu_started_by_the_first_runs_on_a_full_machine() {
+        for jit in auto_and_off() {
+            let run = run_machine(
+                fake_bzimage(&start_the_second_cpu()),
+                jit,
+                GENEROUS_LIMIT,
+                |config| config.cpus(2),
+            );
+            assert_eq!(run.text(), "ok", "{:?}", run.exit);
+            assert_eq!(run.exit, ExitReason::Reset);
+        }
+    }
+
+    #[test]
+    fn the_same_kernel_waits_forever_for_a_cpu_that_does_not_exist() {
+        // With one CPU the INIT/SIPI go nowhere, so the note never appears.
+        let run = run_machine(
+            fake_bzimage(&start_the_second_cpu()),
+            JitMode::Off,
+            WATCHDOG_LIMIT,
+            |config| config,
+        );
+        assert_eq!(run.text(), "");
+        assert_eq!(run.exit, ExitReason::Stopped);
+    }
+
+    #[test]
+    fn a_reboot_brings_every_cpu_back_to_power_on() {
+        // The guest resets after the second CPU ran; a restart must park it again so the same
+        // kernel can start it the same way (and say "ok" twice).
+        let reboots = Arc::new(AtomicUsize::new(0));
+        let counter = reboots.clone();
+        let run = run_machine(
+            fake_bzimage(&start_the_second_cpu()),
+            JitMode::Off,
+            Duration::from_secs(1),
+            |config| {
+                config.cpus(2).reboot(true).log(move |line| {
+                    if line.contains("rebooting") {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            },
+        );
+        assert!(
+            run.text().starts_with("okok"),
+            "{:?} {:?}",
+            run.text(),
+            run.exit
+        );
+        assert!(reboots.load(Ordering::SeqCst) >= 1);
+    }
+}
