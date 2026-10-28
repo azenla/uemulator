@@ -402,6 +402,9 @@ impl Cpu {
         // Stored-only MSRs; names follow Linux's msr-index.h.
         const MSR_UCODE_REV: u32 = 0x8b;
         const MSR_K7_HWCR: u32 = 0xc001_0015;
+        /// IA32_DEBUGCTL: a KVM host saves and restores it around every guest run. Stored only (no
+        /// branch recording).
+        const MSR_IA32_DEBUGCTL: u32 = 0x1d9;
         const MSR_AMD64_NB_CFG: u32 = 0xc001_001f;
         const MSR_AMD64_LS_CFG: u32 = 0xc001_1020;
         const MSR_AMD64_DE_CFG: u32 = 0xc001_1029;
@@ -463,6 +466,7 @@ impl Cpu {
             dr: [0, 0, 0, 0, 0, 0, DR6_RESET, DR7_RESET],
             msr_misc: [
                 (MSR_UCODE_REV, 0),
+                (MSR_IA32_DEBUGCTL, 0),
                 (MSR_K7_HWCR, HWCR_INITIAL),
                 (MSR_AMD64_NB_CFG, 0),
                 (MSR_AMD64_LS_CFG, 0),
