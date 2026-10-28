@@ -15,6 +15,7 @@ for n, m, b in [("VSQRTPS", "vsqrtps", 32), ("VSQRTPD", "vsqrtpd", 64), ("VPABSD
 form("VSHUFPS", "vshufps", "bin", 32, 0x1b)
 form("VPSHUFD", "vpshufd", "un", 32, 0x1b)
 form("VPALIGNR", "vpalignr", "bin", 0, 5)
+form("VDBPSADBW", "vdbpsadbw", "bin", 0, 0x93)
 for n, m in [("VMOVDQA32", "vmovdqa32"), ("VMOVDQU32", "vmovdqu32"), ("VMOVDQU64", "vmovdqu64"),
              ("VMOVDQU8", "vmovdqu8"), ("VMOVDQU16", "vmovdqu16"), ("VMOVUPS", "vmovups"),
              ("VMOVAPD", "vmovapd")]:
@@ -101,7 +102,7 @@ for n, m, b in [("VPMINSQ", "vpminsq", 64), ("VPMAXSQ", "vpmaxsq", 64), ("VPMINU
                 ("VPMAXUB", "vpmaxub", 0), ("VPMINSW", "vpminsw", 0), ("VPMULHUW", "vpmulhuw", 0),
                 ("VPMULLW", "vpmullw", 0), ("VPSHUFB_", "vpshufb", 0), ("VPANDND", "vpandnd", 32),
                 ("VPXORD", "vpxord", 32), ("VPORQ", "vporq", 64), ("VPADDUSB", "vpaddusb", 0),
-                ("VPSUBSB", "vpsubsb", 0), ("VPMINUW", "vpminuw", 0), ("VPMAXSB", "vpmaxsb", 0)]:
+                ("VPSUBSB", "vpsubsb", 0), ("VPSUBSW", "vpsubsw", 0), ("VPADDSW", "vpaddsw", 0), ("VPMINUW", "vpminuw", 0), ("VPMAXSB", "vpmaxsb", 0)]:
     form(n, m, "bin", b)
 for n, m, b in [("VPABSQ", "vpabsq", 64), ("VPLZCNTD", "vplzcntd", 32), ("VPLZCNTQ", "vplzcntq", 64),
                 ("VPOPCNTD", "vpopcntd", 32), ("VPOPCNTQ", "vpopcntq", 64), ("VPOPCNTB", "vpopcntb", 0),
