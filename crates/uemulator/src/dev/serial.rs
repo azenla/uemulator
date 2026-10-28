@@ -247,6 +247,25 @@ impl Uart {
     }
 
     pub fn read(&mut self, reg: u16) -> u8 {
+        let value = self.read_register(reg);
+        self.remember_falling_edge();
+        value
+    }
+
+    pub fn write(&mut self, reg: u16, value: u8) {
+        self.write_register(reg, value);
+        self.remember_falling_edge();
+    }
+
+    /// The line dropped because of a register access: forget that it was high, so the next time
+    /// it rises `irq_edge` reports a new edge even if no sample saw it low in between.
+    fn remember_falling_edge(&mut self) {
+        if !self.level() {
+            self.last_level = false;
+        }
+    }
+
+    fn read_register(&mut self, reg: u16) -> u8 {
         let dlab = self.lcr & LCR_DLAB != 0;
         match reg {
             REG_DATA if dlab => self.dll,
@@ -286,7 +305,7 @@ impl Uart {
         }
     }
 
-    pub fn write(&mut self, reg: u16, value: u8) {
+    fn write_register(&mut self, reg: u16, value: u8) {
         let dlab = self.lcr & LCR_DLAB != 0;
         match reg {
             REG_DATA if dlab => self.dll = value,
@@ -882,6 +901,22 @@ mod tests {
         assert!(!uart.irq_edge());
         uart.read(REG_DATA);
         assert!(!uart.irq_edge());
+        console.write(b"b");
+        uart.poll();
+        assert!(uart.irq_edge());
+    }
+
+    #[test]
+    fn irq_edge_sees_a_dip_the_guest_caused_between_two_samples() {
+        // Xen drains the receive FIFO in its handler and the next byte can arrive before the
+        // device tick samples the line low: that is still a new rising edge on an edge-triggered
+        // I/O APIC pin, and missing it strands the rest of a long pasted line.
+        let (mut uart, console) = new_uart();
+        uart.write(REG_IER, IER_RX_AVAILABLE);
+        console.write(b"a");
+        uart.poll();
+        assert!(uart.irq_edge());
+        uart.read(REG_DATA);
         console.write(b"b");
         uart.poll();
         assert!(uart.irq_edge());

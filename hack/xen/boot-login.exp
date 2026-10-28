@@ -1,0 +1,29 @@
+#!/usr/bin/expect -f
+# usage: boot-login.exp MACHINE LOG SCRIPTFILE [quick boot args...]
+# Boots the installed machine (GRUB, Xen, dom0), logs in as root (password "xen", set by
+# install.sh) and runs the lines of SCRIPTFILE. A line "#!wait N" sets the per-line timeout.
+set machine [lindex $argv 0]
+log_file -a [lindex $argv 1]
+set fh [open [lindex $argv 2]]
+set lines [split [read $fh] "\n"]
+close $fh
+set extra [lrange $argv 3 end]
+set prompt "localhost:.*# $"
+set timeout 1800
+set start [clock seconds]
+eval spawn ./target/release/uemulator quick boot $machine $extra
+expect "login:"
+puts "\nboot-login.exp: login prompt after [expr {[clock seconds] - $start}] s"
+send "root\r"
+expect "assword:"
+send "xen\r"
+expect -re $prompt
+foreach line $lines {
+    if {[regexp {^#!wait (\d+)} $line -> secs]} { set timeout $secs; continue }
+    if {$line eq ""} continue
+    send "$line\r"
+    expect -re $prompt
+    puts "\nboot-login.exp: command done at [expr {[clock seconds] - $start}] s"
+}
+send "poweroff\r"
+expect eof
