@@ -407,3 +407,23 @@ mod translation_counts {
         });
     }
 }
+
+#[test]
+fn a_store_still_invalidates_translated_blocks_after_the_decode_cache_was_flushed() {
+    // An SVM #VMEXIT or VMRUN, a paging-format change or a mode switch flushes the decode cache.
+    // The blocks stay valid (they are keyed by physical address), so the pages they came from
+    // must stay watched, or a later store leaves a stale block that runs the old bytes.
+    // mov eax, 1; hlt
+    let mut h = Harness::new(&[0xb8, 1, 0, 0, 0, 0xf4]);
+    if !h.enable_jit() {
+        return;
+    }
+    assert_eq!(h.run(100), Stop::Halted);
+    assert_eq!(h.cpu.gpr[RAX], 1);
+    h.cpu.flush_decode();
+    h.cpu.write(CODE_BASE + 1, 1, 2).unwrap();
+    h.cpu.rip = CODE_BASE;
+    h.cpu.halted = false;
+    assert_eq!(h.run(100), Stop::Halted);
+    assert_eq!(h.cpu.gpr[RAX], 2);
+}

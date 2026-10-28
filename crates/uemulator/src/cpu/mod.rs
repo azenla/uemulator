@@ -1001,13 +1001,14 @@ impl Cpu {
                 };
                 let main_bytes = code_bytes(&self.ram);
                 let shadow_bytes = code_bytes(&shadow.ram);
+                let page_diffs = format!(
+                    "page diffs at {differing_offsets:x?}; main bytes {main_bytes:02x?}; shadow bytes {shadow_bytes:02x?}"
+                );
                 if let Some(l) = &self.log {
-                    l(&format!(
-                        "page diffs at {differing_offsets:x?}; main bytes {main_bytes:02x?}; shadow bytes {shadow_bytes:02x?}"
-                    ));
+                    l(&page_diffs);
                 }
                 let msg = format!(
-                    "verify: divergence after block at {start:#x} ({retired} insns, attempts {attempts}, shadow start {shadow_before:x?}): exc main={:?} shadow={:?} diff={:?} icount main {:#x} shadow {:#x} now_ns main {} shadow {}\n--- before {main_before:x?}\n--- main\n{}--- shadow\n{}",
+                    "verify: divergence after block at {start:#x} ({retired} insns, attempts {attempts}, shadow start {shadow_before:x?}): exc main={:?} shadow={:?} diff={:?} icount main {:#x} shadow {:#x} now_ns main {} shadow {}\n{page_diffs}\n--- before {main_before:x?}\n--- main\n{}--- shadow\n{}",
                     main_result.as_ref().err(),
                     shadow_result.as_ref().err(),
                     mismatch,

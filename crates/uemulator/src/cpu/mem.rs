@@ -621,6 +621,13 @@ impl Cpu {
     pub fn flush_decode(&mut self) {
         self.flushes += 1;
         self.decode_cache_generation = self.decode_cache_generation.wrapping_add(1);
+        // Translated blocks survive this (they are keyed by physical address and the JIT only
+        // runs 64-bit code), and the page flags are what makes a store to their pages call
+        // `code_written`. Clearing them here left stale blocks after every SVM #VMEXIT or VMRUN
+        // (both flush): Linux's alternatives patching ran old `jmp` targets under Xen.
+        if self.jit.is_some() {
+            return;
+        }
         for page in self.pages_with_code.drain(..) {
             self.page_has_code[page as usize] = 0;
         }
