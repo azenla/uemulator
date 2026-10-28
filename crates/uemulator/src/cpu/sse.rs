@@ -9692,7 +9692,7 @@ mod tests {
         ] {
             for k in 0..16 {
                 rig.h.cpu.xmm[k] = A + k as u128;
-                rig.h.cpu.gpr[k] = 0x1111_1111_1111_1111 * (k as u64 + 1);
+                rig.h.cpu.gpr[k] = 0x1111_1111_1111_1111u64.wrapping_mul(k as u64 + 1);
             }
             rig.reset();
             rig.h.cpu.set_eflags_arith(CF | ZF);

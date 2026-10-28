@@ -2134,7 +2134,13 @@ mod tests {
         }
 
         fn lane_values<const N: usize>(v: u128, lane_bits: usize) -> [u128; N] {
-            std::array::from_fn(|k| (v >> (k * lane_bits)) & ((1u128 << lane_bits) - 1))
+            std::array::from_fn(|k| {
+                // Lanes past the top of the register read as zero.
+                let lane = v.checked_shr((k * lane_bits) as u32).unwrap_or(0);
+                lane & 1u128
+                    .checked_shl(lane_bits as u32)
+                    .map_or(u128::MAX, |bit| bit - 1)
+            })
         }
 
         fn from_lane_values(values: &[u128], lane_bits: usize) -> u128 {

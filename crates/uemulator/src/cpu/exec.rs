@@ -6436,7 +6436,8 @@ mod exec_tests {
     fn idiv_signed_cases_every_size() {
         for (size, code) in IDIV_BY_SIZE {
             let half = 1i128 << (size as u32 * 8 - 1);
-            let wide_max = (half << (size as u32 * 8)) - 1;
+            // For size 8 this is 2^127 - 1: the shift lands on i128::MIN and the subtraction must wrap.
+            let wide_max = (half << (size as u32 * 8)).wrapping_sub(1);
             let mut cases = vec![
                 (7, 2),
                 (-7, 2),
@@ -6495,9 +6496,10 @@ mod exec_tests {
                 (max * 7 + 6, 7),
                 (max * 7 + 7, 7),
                 (wide_max, max),
-                (max * max, max),
-                (max * max + max - 1, max),
-                (max * max + max, max),
+                // At size 8 these dividends pass 2^127; check_divide reads the i128 bits as u128.
+                (max.wrapping_mul(max), max),
+                (max.wrapping_mul(max).wrapping_add(max - 1), max),
+                (max.wrapping_mul(max).wrapping_add(max), max),
                 (5, 0),
                 (0, 0),
                 (wide_max, 0),
