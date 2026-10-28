@@ -39,6 +39,7 @@ const RIP: i32 = offset_of!(Cpu, rip) as i32;
 const ICOUNT: i32 = offset_of!(Cpu, icount) as i32;
 const BLOCK_EXIT_REQUESTED: i32 = offset_of!(Cpu, block_exit_requested) as i32;
 const PREPAID_ICOUNT: i32 = offset_of!(Cpu, prepaid_icount) as i32;
+const SLOW_ACCESS_INSN: i32 = offset_of!(Cpu, slow_access_insn) as i32;
 const LAZY_OP: i32 = offset_of!(Cpu, lazy_op) as i32;
 const LAZY_SIZE_SHIFT: u32 = 8;
 const LAZY_DST: i32 = offset_of!(Cpu, lazy_dst) as i32;
@@ -305,7 +306,7 @@ impl<'a> Gen<'a> {
     /// instructions done. With chaining that is a jump through the chain stub, which wants rax =
     /// `icount` as just stored and already including the successor's first instruction (see
     /// `arch_x64::chain_stub`): the block pays for its own instructions except those paid ahead
-    /// of an rdtsc, plus that one. Without chaining it stores rip and returns to the run loop.
+    /// of a helper, plus that one. Without chaining it stores rip and returns to the run loop.
     /// Clobbers the host flags, so conditional exits call it only after the branch.
     fn chain_exit(&mut self, retired: u32) {
         if self.addrs.chain == 0 {
@@ -341,10 +342,11 @@ impl<'a> Gen<'a> {
     /// Run instruction `insn_index` through the interpreter. `terminal` ends the block after it.
     fn helper(&mut self, insn_index: usize, rip: u64, terminal: bool) {
         let insn = &self.insns[insn_index] as *const Insn as u64;
-        // The run loop already counted one instruction for the block. These instructions see guest
-        // time, which derives from `icount`, so add the ones before this now and tell
-        // `step_block` through `prepaid_icount` not to count them again.
-        if reads_guest_clock(self.insns[insn_index].op) && insn_index as u32 > self.prepaid_insns {
+        // The run loop already counted one instruction for the block. The interpreter may read
+        // guest time (rdtsc, port I/O, a device load), which derives from `icount`, so add the
+        // ones before this now and tell `step_block` through `prepaid_icount` not to count them
+        // again.
+        if insn_index as u32 > self.prepaid_insns {
             // Pay only for the instructions executed since the last payment and record the
             // running total in `prepaid_icount`; see the same code in `emit.rs`.
             let owed = insn_index as u32 - self.prepaid_insns;
@@ -541,6 +543,10 @@ impl<'a> Gen<'a> {
             }
             self.a.mov_rr(SAVED_ADDR, ADDR, true);
             self.set_rip(slow.rip);
+            // Where in the block the access is, for the device clock (`Cpu::slow_access_insn`,
+            // index + 1); the helper clears it.
+            self.a.mov_imm(SCRATCH_D, slow.insn_index as u64 + 1);
+            self.a.st(mem(CPU, SLOW_ACCESS_INSN), SCRATCH_D, 8);
             self.a.mov_rr(ARGS[0], CPU, true);
             self.a.mov_rr(ARGS[1], SAVED_ADDR, true);
             let fail = self.a.label();

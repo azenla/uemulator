@@ -83,6 +83,14 @@ pub(crate) extern "C" fn helper_set_rotate_flags(cpu: &mut Cpu, packed: u64) {
     cpu.set_eflags_arith(flags);
 }
 
+/// Runs a slow-path memory access with `Cpu::slow_access_insn` set by the thunk, and clears it
+/// afterwards so no later clock read sees it (`Cpu::now_ns`).
+fn slow_access<T>(cpu: &mut Cpu, access: impl FnOnce(&mut Cpu) -> T) -> T {
+    let result = access(cpu);
+    cpu.slow_access_insn = 0;
+    result
+}
+
 /// Slow-path load, called when the inline TLB probe misses. Generated code does not keep
 /// `cpu.rip` current, so the faulting instruction's `rip` is passed in and stored here.
 #[cfg(target_arch = "aarch64")]
@@ -93,7 +101,7 @@ pub(crate) extern "C" fn helper_load(
     rip: u64,
 ) -> LoadResult {
     cpu.rip = rip;
-    match cpu.read(linear_addr, size as u8) {
+    match slow_access(cpu, |cpu| cpu.read(linear_addr, size as u8)) {
         Ok(value) => LoadResult {
             val: value,
             status: STATUS_OK,
@@ -118,7 +126,7 @@ pub(crate) extern "C" fn helper_load_stack(
     rip: u64,
 ) -> LoadResult {
     cpu.rip = rip;
-    match cpu.read_stack(linear_addr, size as u8) {
+    match slow_access(cpu, |cpu| cpu.read_stack(linear_addr, size as u8)) {
         Ok(value) => LoadResult {
             val: value,
             status: STATUS_OK,
@@ -142,7 +150,7 @@ pub(crate) extern "C" fn helper_store_stack(
     rip: u64,
 ) -> u64 {
     cpu.rip = rip;
-    match cpu.write_stack(linear_addr, size as u8, value) {
+    match slow_access(cpu, |cpu| cpu.write_stack(linear_addr, size as u8, value)) {
         Ok(()) => STATUS_OK,
         Err(exception) => {
             cpu.pending = Some(exception);
@@ -163,7 +171,7 @@ pub(crate) extern "C" fn helper_store(
     rip: u64,
 ) -> u64 {
     cpu.rip = rip;
-    match cpu.write(linear_addr, size as u8, value) {
+    match slow_access(cpu, |cpu| cpu.write(linear_addr, size as u8, value)) {
         Ok(()) => STATUS_OK,
         Err(exception) => {
             cpu.pending = Some(exception);
@@ -182,7 +190,7 @@ pub(crate) extern "C" fn helper_load_via_out(
     size: u64,
     out: *mut u64,
 ) -> u64 {
-    match cpu.read(linear_addr, size as u8) {
+    match slow_access(cpu, |cpu| cpu.read(linear_addr, size as u8)) {
         Ok(value) => {
             unsafe { *out = value };
             STATUS_OK
@@ -202,7 +210,7 @@ pub(crate) extern "C" fn helper_load_stack_via_out(
     size: u64,
     out: *mut u64,
 ) -> u64 {
-    match cpu.read_stack(linear_addr, size as u8) {
+    match slow_access(cpu, |cpu| cpu.read_stack(linear_addr, size as u8)) {
         Ok(value) => {
             unsafe { *out = value };
             STATUS_OK
@@ -221,7 +229,7 @@ pub(crate) extern "C" fn helper_store_stack_x64(
     size: u64,
     value: u64,
 ) -> u64 {
-    match cpu.write_stack(linear_addr, size as u8, value) {
+    match slow_access(cpu, |cpu| cpu.write_stack(linear_addr, size as u8, value)) {
         Ok(()) => STATUS_OK,
         Err(exception) => {
             cpu.pending = Some(exception);
@@ -237,7 +245,7 @@ pub(crate) extern "C" fn helper_store_x64(
     size: u64,
     value: u64,
 ) -> u64 {
-    match cpu.write(linear_addr, size as u8, value) {
+    match slow_access(cpu, |cpu| cpu.write(linear_addr, size as u8, value)) {
         Ok(()) => STATUS_OK,
         Err(exception) => {
             cpu.pending = Some(exception);
@@ -250,22 +258,6 @@ pub(crate) extern "C" fn helper_store_x64(
 /// guest flags. Used when the emitter cannot test host flags directly.
 pub(crate) extern "C" fn helper_cond(cpu: &mut Cpu, cc: u64) -> u64 {
     cpu.condition_holds(cc as u8) as u64
-}
-
-/// `Insn::op` of `rdtsc` and `rdmsr` (`0f 31`, `0f 32`; `decode` puts the `0f` map in bits 8+).
-const OP_RDTSC: u16 = 0x131;
-const OP_RDMSR: u16 = 0x132;
-/// Group 7 (`0f 01`). It holds rdtscp (`0f 01 f9`), which reads the clock; `op` alone cannot tell
-/// the members apart here, and the group ends the block anyway, so every member pays the sync.
-const OP_GROUP7: u16 = 0x101;
-
-/// Instructions whose result depends on guest time, which `Cpu::now_ns` derives from `icount`:
-/// rdtsc, rdtscp, rdmsr (the TSC MSR), and in/out (which pass the time to the device). `icount` is only
-/// brought up to date when a block exits, so both emitters pay for the instructions ahead of
-/// one of these before calling the helper (see `Gen::helper`).
-pub(crate) fn reads_guest_clock(op: u16) -> bool {
-    // e4..e7 in/out with an imm8 port; ec..ef in/out with the port in dx
-    matches!(op, OP_RDTSC | OP_RDMSR | OP_GROUP7 | 0xe4..=0xe7 | 0xec..=0xef)
 }
 
 /// The instructions an emitter may lower with its own exit sequence (`try_inline` returns true
@@ -450,21 +442,6 @@ mod tests {
             0x6b, 0x80, 0xa3, 0xa8, 0xa9, 0xb0, 0xdf, 0xea, 0xf0, 0xf3, 0xf5,
         ] {
             assert!(!ends(op), "opcode {op:#x}");
-        }
-    }
-
-    #[test]
-    fn the_clock_reading_instructions_are_exactly_rdtsc_rdtscp_rdmsr_and_port_io() {
-        for op in [
-            0x131, 0x132, 0x101, 0xe4, 0xe5, 0xe6, 0xe7, 0xec, 0xed, 0xee, 0xef,
-        ] {
-            assert!(reads_guest_clock(op), "opcode {op:#x}");
-        }
-        for op in [
-            0x130, 0x133, 0xe3, 0xe8, 0xeb, 0xf0, 0x6c, 0x6d, 0x6e, 0x6f, 0x31, 0x32, 0x90, 0xa2,
-            0x1a2,
-        ] {
-            assert!(!reads_guest_clock(op), "opcode {op:#x}");
         }
     }
 

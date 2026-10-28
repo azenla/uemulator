@@ -369,7 +369,7 @@ pub(crate) struct Gen<'a> {
     /// storing instruction, rip after it).
     smc_exits: Vec<(Label, u32, u64)>,
     live: Option<LiveFlags>,
-    /// Instructions of this block already added to `Cpu::icount` ahead of an rdtsc-like helper
+    /// Instructions of this block already added to `Cpu::icount` ahead of an interpreter helper
     /// (the block index of the last one). Exact at translation time because a block is
     /// straight-line code: every instruction before a reachable one has executed.
     prepaid_insns: u32,
@@ -418,7 +418,7 @@ impl<'a> Gen<'a> {
     /// Ends the block by continuing at the guest address in `x1`, with `retired` instructions
     /// done. With chaining that is a jump through the chain stub, which needs `icount` to
     /// already include the successor's first instruction (see `chain_stub`): the block pays
-    /// for its own instructions except those paid ahead of an rdtsc, plus that one. Without
+    /// for its own instructions except those paid ahead of a helper, plus that one. Without
     /// chaining it stores rip and returns to the run loop.
     fn chain_exit(&mut self, retired: u32) {
         if self.addrs.chain == 0 {
@@ -463,12 +463,14 @@ impl<'a> Gen<'a> {
         // Address of the decoded instruction, baked into the code: `Jit::translate` keeps the
         // owning slice alive in the `Block` for as long as this code can run.
         let insn = &self.insns[index] as *const Insn as u64;
-        if reads_guest_clock(self.insns[index].op) && index as u32 > self.prepaid_insns {
-            // `Cpu::icount` is only advanced when the block exits, but these instructions read
-            // the clock now. Pay for the instructions executed since the last payment (the
-            // first one of the block was counted by `run`) and record the running total in
-            // `prepaid_icount`, which `step_block` subtracts from the block's count. Paying the
-            // full `index` again for a second rdtsc would double-count the first payment.
+        if index as u32 > self.prepaid_insns {
+            // `Cpu::icount` is only advanced when the block exits, but the interpreter may read
+            // the clock now (rdtsc, port I/O, a load from a device such as the HPET counter, which
+            // is how Xen reads it with a moffs `mov`). Pay for the instructions executed since
+            // the last payment (the first one of the block was counted by `run`) and record the
+            // running total in `prepaid_icount`, which `step_block` subtracts from the block's
+            // count. Paying the full `index` again for a second helper would double-count the
+            // first payment.
             let owed = index as u32 - self.prepaid_insns;
             self.asm.ldr(SCRATCH_B, CPU, ICOUNT_OFFSET);
             self.asm.add_imm(SCRATCH_B, SCRATCH_B, owed, true);

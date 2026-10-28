@@ -350,7 +350,10 @@ mod twin_devices {
 
     #[test]
     fn mirror_of_an_empty_config_is_empty() {
-        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&mut DevConfig::default()));
+        let mut mirror = Devices::new(
+            ConsoleHandle::default(),
+            mirrored(&mut DevConfig::default()),
+        );
         assert_eq!(id_of(&mut mirror, 1), u32::MAX);
     }
 

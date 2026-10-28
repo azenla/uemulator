@@ -304,6 +304,11 @@ pub(crate) struct Cpu {
     /// rdtsc/port I/O, so those read an up-to-date clock. `step_block` subtracts it from the
     /// block's total.
     pub prepaid_icount: u64,
+    /// One plus the block index of the instruction whose slow-path memory access is in progress
+    /// (0: none). The access may reach a device, which reads the clock, and the instructions of
+    /// the block before this one are not in `icount` yet (`now_ns` adds them). Written by the
+    /// emitted slow path, cleared by the helper (`jit/helpers.rs`).
+    pub slow_access_insn: u64,
     /// Indexed by `SEG_*`.
     pub seg: [Seg; 6],
     pub gdtr: DescriptorTable,
@@ -699,6 +704,7 @@ impl Cpu {
             tlb_active_base: 0,
             block_exit_requested: false,
             prepaid_icount: 0,
+            slow_access_insn: 0,
             trace: None,
             cpu_index: 0,
             cpu_count,
@@ -743,7 +749,13 @@ impl Cpu {
     }
 
     pub fn now_ns(&self) -> u64 {
-        let busy = self.icount - self.slice_base_icount + self.time_carry;
+        // A slow-path access from the middle of a JIT block: count the block's earlier
+        // instructions that `icount` has not been charged for yet.
+        let unpaid = self
+            .slow_access_insn
+            .saturating_sub(1)
+            .saturating_sub(self.prepaid_icount);
+        let busy = self.icount - self.slice_base_icount + self.time_carry + unpaid;
         self.time_base_ns + busy / self.time_divisor * NS_PER_INSN + self.idle_skipped_ns
     }
 
@@ -1011,10 +1023,14 @@ impl Cpu {
                     ));
                 }
                 let msg = format!(
-                    "verify: divergence after block at {start:#x} ({retired} insns, attempts {attempts}, shadow start {shadow_before:x?}): exc main={:?} shadow={:?} diff={:?}\n--- before {main_before:x?}\n--- main\n{}--- shadow\n{}",
+                    "verify: divergence after block at {start:#x} ({retired} insns, attempts {attempts}, shadow start {shadow_before:x?}): exc main={:?} shadow={:?} diff={:?} icount main {:#x} shadow {:#x} now_ns main {} shadow {}\n--- before {main_before:x?}\n--- main\n{}--- shadow\n{}",
                     main_result.as_ref().err(),
                     shadow_result.as_ref().err(),
                     mismatch,
+                    self.icount,
+                    shadow.icount,
+                    self.now_ns(),
+                    shadow.now_ns(),
                     self.dump_regs(),
                     shadow.dump_regs()
                 );

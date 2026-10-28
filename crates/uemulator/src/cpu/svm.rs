@@ -1058,8 +1058,8 @@ mod tests {
     use super::*;
     use crate::cpu::BeforeStep;
     use crate::cpu::mem::AccessKind;
-    use crate::testkit::RBX;
     use crate::cpu::test_support::{LegacyTables, PTE_P, PaeTables};
+    use crate::testkit::RBX;
     use crate::testkit::{CODE_BASE, Harness, SCRATCH};
 
     /// Far from the start of the table pool (0x20_0000), which the guest page-table helpers fill.

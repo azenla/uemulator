@@ -512,7 +512,9 @@ impl crate::disk::BlockBackend for ShadowDisk {
     }
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
         match self.replay.lock().unwrap().pop_front() {
-            Some((recorded_offset, data)) if recorded_offset == offset && data.len() == buf.len() => {
+            Some((recorded_offset, data))
+                if recorded_offset == offset && data.len() == buf.len() =>
+            {
                 buf.copy_from_slice(&data);
             }
             _ => buf.fill(0),

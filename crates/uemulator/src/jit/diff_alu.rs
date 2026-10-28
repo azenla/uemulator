@@ -1246,3 +1246,38 @@ fn rdtscp_after_other_instructions_sees_the_same_time() {
         0xb8, 1, 0, 0, 0, 0x83, 0xc0, 2, 0x90, 0x0f, 0x01, 0xf9, 0xf4,
     ]);
 }
+
+#[test]
+fn pm_timer_read_after_other_instructions_sees_the_same_tick_at_every_phase() {
+    // The PM timer ticks every 279.4 ns of guest time (one instruction is 1 ns): sweep the
+    // starting icount over more than a tick so a read one instruction early or late shows up.
+    // mov edx, 0x608; nop; nop; in eax, dx; hlt
+    const PM_TIMER_TICK_NS: u64 = 280;
+    for start in 0..PM_TIMER_TICK_NS * 2 {
+        check_with(&[0xba, 0x08, 0x06, 0, 0, 0x90, 0x90, 0xed, 0xf4], |h| {
+            h.cpu.icount = start
+        });
+    }
+}
+
+#[test]
+fn hpet_counter_read_after_other_instructions_sees_the_same_tick() {
+    // An instruction the JIT hands to the interpreter (here the moffs load, Xen's HPET read) can
+    // reach a device with the clock as `icount` stood at the last payment, so the instructions
+    // ahead of it in the block must still be counted, and so must they for a load or store that
+    // misses the inline TLB probe (the device write that starts the counter is one). The counter
+    // ticks every 70 ns and one instruction is 1 ns: after `nops` instructions it reads
+    // `nops / 70`. mov ebx, 0xfed00000; mov dword [rbx + 0x10], 1 (start the counter); nop * N;
+    // mov eax, [0xfed000f0]; hlt
+    const HPET_TICK_NS: usize = 70;
+    for nops in 0..HPET_TICK_NS * 3 {
+        let mut code = vec![0xbb, 0x00, 0x00, 0xd0, 0xfe, 0xc7, 0x43, 0x10, 1, 0, 0, 0];
+        code.extend(core::iter::repeat_n(0x90, nops));
+        let mut through_the_slow_path = code.clone();
+        code.extend([0xa1, 0xf0, 0, 0xd0, 0xfe, 0, 0, 0, 0, 0xf4]);
+        crate::testkit::assert_jit_matches_interpreter(&code, |_| {});
+        // The same read as an ordinary load, which the JIT compiles with a slow path.
+        through_the_slow_path.extend([0x8b, 0x83, 0xf0, 0, 0, 0, 0xf4]);
+        crate::testkit::assert_jit_matches_interpreter(&through_the_slow_path, |_| {});
+    }
+}

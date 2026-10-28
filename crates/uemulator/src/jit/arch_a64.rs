@@ -153,6 +153,11 @@ fn thunk(asm: &mut Asm, access: Access, exit_fail: u64) -> u64 {
     asm.mov(SAVED_ADDRESS, ADDRESS);
     asm.mov(SAVED_INFO, INFO);
     asm.mov(SAVED_LR, LINK_REGISTER);
+    // Tell the clock where in the block this access is (`Cpu::slow_access_insn`, index + 1);
+    // the helper clears it. CALL_TARGET is a scratch until the call below.
+    asm.ldr(CALL_TARGET, INFO, 8);
+    asm.add_imm(CALL_TARGET, CALL_TARGET, 1, true);
+    asm.str(CALL_TARGET, CPU, offset_of!(Cpu, slow_access_insn) as u32);
     let fail = asm.label();
     let (helper, size, is_load, keep) = match access {
         Access::Load { size, .. } => (
