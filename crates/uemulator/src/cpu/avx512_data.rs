@@ -20,7 +20,7 @@ impl Cpu {
     ) -> ExecResult<bool> {
         use Prefix::*;
         if map != OPCODE_MAP_0F {
-            return Ok(false);
+            return self.exec_evex_shuffle_data(i, next, map, opcode, prefix, wide);
         }
         let packed_element = if wide { 8 } else { 4 };
         match (opcode, prefix) {
@@ -58,12 +58,15 @@ impl Cpu {
             (0x7e, P66) => self.move_to_general(i, next, wide)?,
             (0x7e, F3) => self.move_quad_load(i, next)?,
             (0xd6, P66) => self.move_quad_store(i, next)?,
+            (0x12 | 0x13 | 0x16 | 0x17, Np | P66) => self.move_half_lanes(i, next, opcode)?,
+            (0xc4, P66) => self.insert_general(i, next, 2, i.imm as usize & 7)?,
+            (0xc5, P66) => self.extract_word_to_register(i)?,
             _ => return Ok(false),
         }
         Ok(true)
     }
 
-    fn check_move_alignment(&self, i: &Insn, next: u64, bytes: usize) -> ExecResult<()> {
+    pub(super) fn check_move_alignment(&self, i: &Insn, next: u64, bytes: usize) -> ExecResult<()> {
         if i.md != 3 {
             let address = self.evex_address(i, next, bytes);
             if address & (bytes as u64 - 1) != 0 {
@@ -200,7 +203,7 @@ impl Cpu {
     }
 
     /// vmovd/vmovq take no mask, no vvvv and a 128-bit length.
-    fn check_general_move(&self, i: &Insn) -> ExecResult<()> {
+    pub(super) fn check_general_move(&self, i: &Insn) -> ExecResult<()> {
         if i.vex_v != 0 || i.evex_mask != 0 || i.evex_zeroing || i.evex_b || i.evex_ll != LENGTH_128
         {
             return Err(Exception::invalid_opcode());

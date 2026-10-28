@@ -208,6 +208,17 @@ fn form_for_extension(op: Op, map: u16, opcode: u8) -> Option<Form> {
     })
 }
 
+/// Instructions whose register r/m operand names a general register (the integer source of
+/// cvtsi2ss/sd and of pinsrb/w/d/q), which can share a number with the destination vector register
+/// without being the same operand.
+fn rm_is_general_register(op: u16) -> bool {
+    const CVTSI2SS_SD: u16 = 0x12a;
+    const PINSRW: u16 = 0x1c4;
+    const PINSRB: u16 = 0x320;
+    const PINSRD_Q: u16 = 0x322;
+    matches!(op, CVTSI2SS_SD | PINSRW | PINSRB | PINSRD_Q)
+}
+
 impl Cpu {
     /// #UD unless the OS enabled AVX state (CR4.OSXSAVE and XCR0 bits 2:1), then #NM under CR0.TS.
     pub(super) fn vex_gate(&self) -> ExecResult<()> {
@@ -363,7 +374,11 @@ impl Cpu {
             // - Dest::Reg: the kernel's source is ModRM.rm (register form);
             // - Dest::Rm (stores): the kernel's source is ModRM.reg.
             let collides = match form.dest {
-                Dest::Reg => legacy.md == MODRM_MOD_REGISTER && legacy.rm as usize == destination,
+                Dest::Reg => {
+                    legacy.md == MODRM_MOD_REGISTER
+                        && legacy.rm as usize == destination
+                        && !rm_is_general_register(legacy.op)
+                }
                 Dest::Rm => legacy.reg as usize == destination,
                 Dest::None => false,
             };

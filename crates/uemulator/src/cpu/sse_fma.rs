@@ -10,7 +10,7 @@ use crate::cpu::decode::Insn;
 /// operand 2 is VEX.vvvv and operand 3 is ModRM.rm; the digits of the mnemonic name the order of
 /// the multiplicands and the addend.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum FmaForm {
+pub(super) enum FmaForm {
     /// `op1 * op3 + op2`
     Form132,
     /// `op2 * op1 + op3`
@@ -20,7 +20,7 @@ enum FmaForm {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum FmaSign {
+pub(super) enum FmaSign {
     /// Add the addend.
     Add,
     /// Subtract the addend (fmsub).
@@ -30,7 +30,7 @@ enum FmaSign {
 /// One fused lane. `sources` are the raw operands in instruction order (op1, op2, op3); NaN
 /// selection follows that order: the first NaN operand wins, quieted, and any signaling NaN raises
 /// invalid. `negate_product` is the fnm* variants, `sign` the msub ones.
-fn fused_lane(
+pub(super) fn fused_lane(
     env: &mut FpEnv,
     format: Format,
     sources: [u64; 3],
@@ -105,7 +105,7 @@ const SINGLE_QUIET_BIT: u32 = 1 << 22;
 const HALF_QUIET_BIT: u32 = 1 << 9;
 
 /// Exact half to single. Returns the single and whether the input was a signaling NaN.
-fn half_to_single(half: u16) -> (u32, bool) {
+pub(super) fn half_to_single(half: u16) -> (u32, bool) {
     let sign = ((half as u32) >> 15) << 31;
     let exponent = (half as u32 >> HALF_FRACTION_BITS) & HALF_EXPONENT_MAX;
     let fraction = half as u32 & ((1 << HALF_FRACTION_BITS) - 1);
@@ -144,7 +144,7 @@ fn half_to_single(half: u16) -> (u32, bool) {
 
 /// Single to half under `rounding` (an MXCSR.RC value). Returns the half and the exception flags.
 /// Denormal inputs are not flushed (DAZ and FTZ do not apply to F16C).
-fn single_to_half(single: u32, rounding: u32) -> (u16, u32) {
+pub(super) fn single_to_half(single: u32, rounding: u32) -> (u16, u32) {
     let sign = ((single >> 31) as u16) << 15;
     let negative = single >> 31 != 0;
     let exponent_field = (single >> SINGLE_FRACTION_BITS) & 0xff;

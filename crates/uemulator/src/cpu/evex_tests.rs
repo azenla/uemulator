@@ -3,6 +3,14 @@
 //! (`hack/gen_avx512.py` -> `avx512_encodings.rs`); the expectations are plain loops over elements
 //! written from the SDM, independent of the implementation.
 
+// The reference models index several parallel arrays by element number, spell out the SDM's
+// range checks and write float constants with every digit the reference defines.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::manual_range_contains,
+    clippy::excessive_precision
+)]
+
 use super::*;
 use crate::cpu::decode::decode;
 use crate::cpu::test_support::unmap_boot_identity_2m;
@@ -212,6 +220,15 @@ pub(in crate::cpu) fn unary_spec(element: usize, broadcast: usize) -> Spec {
     }
 }
 
+#[path = "evex_fp_tests.rs"]
+mod floating;
+#[path = "evex_int_tests.rs"]
+mod integer;
+#[path = "evex_lane_tests.rs"]
+mod lanes;
+#[path = "evex_perm_tests.rs"]
+mod permutation;
+
 mod decoding {
     use super::*;
 
@@ -419,6 +436,38 @@ mod state {
         assert_eq!(h.cpu.zmm(0), [0; 4]);
         assert_eq!(h.cpu.zmm(15), [0; 4]);
         assert_eq!(h.cpu.zmm(16), [u128::MAX; 4]);
+    }
+
+    #[test]
+    fn vex_instructions_with_a_general_register_source_do_not_treat_it_as_a_vector_register() {
+        // rax is general register 0 and the destination is xmm0: the staging code must not take
+        // the r/m operand for a colliding vector register and redirect it to a scratch copy
+        let a = [0x1111_2222_3333_4444_5555_6666_7777_8888u128, 0, 0, 0];
+        let h = run(VEX_PINSRD_EAX, |h| {
+            h.cpu.set_zmm(1, a);
+            h.cpu.gpr[0] = 0xcafe_f00d;
+        });
+        assert_eq!(h.cpu.zmm(0)[0], 0x1111_2222_3333_4444_cafe_f00d_7777_8888);
+        let h = run(VEX_PINSRQ_RAX, |h| {
+            h.cpu.set_zmm(1, a);
+            h.cpu.gpr[0] = 0x0123_4567_89ab_cdef;
+        });
+        assert_eq!(h.cpu.zmm(0)[0], 0x0123_4567_89ab_cdef_5555_6666_7777_8888);
+        let h = run(VEX_PINSRW_EAX, |h| {
+            h.cpu.set_zmm(1, a);
+            h.cpu.gpr[0] = 0xbeef;
+        });
+        assert_eq!(h.cpu.zmm(0)[0], 0x1111_2222_3333_4444_5555_beef_7777_8888);
+        let h = run(VEX_PINSRB_EAX, |h| {
+            h.cpu.set_zmm(1, a);
+            h.cpu.gpr[0] = 0xab;
+        });
+        assert_eq!(h.cpu.zmm(0)[0], 0x1111_2222_3333_4444_5555_6666_ab77_8888);
+        let h = run(VEX_CVTSI2SD_RAX, |h| {
+            h.cpu.set_zmm(1, [7 << 64, 0, 0, 0]);
+            h.cpu.gpr[0] = (-3i64) as u64;
+        });
+        assert_eq!(h.cpu.zmm(0)[0], 7 << 64 | (-3.0f64).to_bits() as u128);
     }
 
     #[test]
@@ -1684,6 +1733,34 @@ mod jit_matches_interpreter {
             KUNPCKBW,
             KMOVQ_RK,
             VPSLLD_COUNT_Z,
+            VPERMD.p[2],
+            VPERMI2Q.k[2],
+            VPTERNLOGD.kz[2],
+            VPMOVDB.mk[2],
+            VPMOVZXBW.k[1],
+            VCVTPS2UDQ.k[2],
+            VCVTPD2PS.p[2],
+            VFMADD231PS.kz[2],
+            VRNDSCALEPS.k[2],
+            VGETEXPPS.p[2],
+            VSCALEFPD.p[2],
+            VCMPPS_1.k[2],
+            VPCMPD_4.m[2],
+            VPCOMPRESSD_M,
+            VPEXPANDD_MZ,
+            VPMOVM2D,
+            VBROADCASTF32X4,
+            VINSERTI64X2_ZM,
+            VEXTRACTI64X4_ZMEM,
+            VPEXTRQ_RAX,
+            VPGATHERDD_Z,
+            VPSCATTERDQ_Z,
+            VCVTSI2SS_Q,
+            VCVTTSD2SI_Q,
+            VFIXUPIMMSS,
+            VGF2P8AFFINEQB,
+            VPDPBUSD,
+            VPSHUFBITQMB,
         ];
         for code in codes {
             assert_jit_matches_interpreter(code, setup);

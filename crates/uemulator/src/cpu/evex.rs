@@ -21,8 +21,18 @@ use crate::cpu::xsave::{XCR0_AVX, XCR0_AVX512, XCR0_SSE};
 
 #[path = "avx512_data.rs"]
 mod data;
+#[path = "avx512_fp.rs"]
+mod fp;
+#[path = "avx512_gather.rs"]
+mod gather;
+#[path = "avx512_int.rs"]
+mod int;
+#[path = "avx512_lanes.rs"]
+mod lanes;
 #[path = "avx512_mask.rs"]
 pub(in crate::cpu) mod mask;
+#[path = "avx512_misc.rs"]
+mod misc;
 
 /// A vector register as four 128-bit lanes, lane 0 least significant.
 pub(in crate::cpu) type Vector = [u128; 4];
@@ -54,6 +64,24 @@ pub(in crate::cpu) fn set_element(v: &mut Vector, size: usize, index: usize, val
     let shift = bit % 128;
     let keep = !((size_mask(size) as u128) << shift);
     v[bit / 128] = v[bit / 128] & keep | ((value & size_mask(size)) as u128) << shift;
+}
+
+pub(in crate::cpu) fn signed(value: u64, size: usize) -> i64 {
+    let unused = 64 - size as u32 * 8;
+    ((value << unused) as i64) >> unused
+}
+
+/// Builds a vector of `bytes` bytes element by element.
+pub(in crate::cpu) fn build(
+    bytes: usize,
+    element_bytes: usize,
+    mut f: impl FnMut(usize) -> u64,
+) -> Vector {
+    let mut out = [0u128; LANES];
+    for k in 0..bytes / element_bytes {
+        set_element(&mut out, element_bytes, k, f(k));
+    }
+    out
 }
 
 /// The legacy opcode space as the SSE decoder keys it.
@@ -97,6 +125,57 @@ impl RmShape {
             element,
             broadcast: true,
             suppress: None,
+        }
+    }
+}
+
+/// How `exec_vector_op` handles the operands of one instruction.
+#[derive(Clone, Copy)]
+pub(in crate::cpu) struct OpShape {
+    /// Element size of the result, which the write mask applies to.
+    pub element: usize,
+    /// Element size of a broadcast memory operand when it differs from `element`.
+    pub rm_element: Option<usize>,
+    /// The r/m operand is `vector bytes / n` bytes (half, quarter, eighth sources).
+    pub rm_bytes: Option<usize>,
+    pub broadcast: bool,
+    /// Masked-out elements of a memory operand are not read. Only right when source element `k`
+    /// feeds result element `k`.
+    pub suppress: bool,
+    /// No vvvv operand (it must encode 1111).
+    pub unary: bool,
+    pub rounding: Rounding,
+    /// Destination register when it is not ModRM.reg (the shift-by-immediate groups use vvvv).
+    pub dest: Option<usize>,
+}
+
+impl OpShape {
+    /// Element-wise operation: result element `k` comes from source elements `k`.
+    pub(in crate::cpu) fn elementwise(element: usize) -> Self {
+        OpShape {
+            element,
+            rm_element: None,
+            rm_bytes: None,
+            broadcast: true,
+            suppress: true,
+            unary: false,
+            rounding: Rounding::None,
+            dest: None,
+        }
+    }
+
+    pub(in crate::cpu) fn unary(self) -> Self {
+        OpShape {
+            unary: true,
+            ..self
+        }
+    }
+
+    /// Any source element can reach any result element (permutes), so nothing is suppressed.
+    pub(in crate::cpu) fn crossing(self) -> Self {
+        OpShape {
+            suppress: false,
+            ..self
         }
     }
 }
@@ -189,6 +268,9 @@ fn lane_spec(map: u16, opcode: u8, prefix: Prefix, wide: bool) -> Option<LaneSpe
         (2, 0x39 | 0x3b | 0x3d | 0x3f, P66) if !wide => binary(4, NoRounding),
         (2, 0x40, P66) if !wide => binary(4, NoRounding),
         (3, 0x0f, P66) => binary(1, NoRounding),
+        // psadbw, AES rounds and carry-less multiply have no write mask in EVEX; the element size
+        // only keeps the generic commit in range
+        (1, 0xf6, P66) | (2, 0xdc..=0xdf, P66) | (3, 0x44, P66) => binary(8, NoRounding),
         _ => None,
     }
 }
@@ -474,11 +556,49 @@ impl Cpu {
             true
         } else {
             self.exec_evex_data(i, next, map, opcode, prefix, wide)?
+                || (prefix == Prefix::P66 && self.exec_evex_gather(i, next, map, opcode, wide)?)
+                || self.exec_evex_int(i, next, map, opcode, prefix, wide)?
         };
         if !handled {
             return Err(self.unimplemented_opcode(i));
         }
         self.rip = next;
+        Ok(())
+    }
+
+    /// The generic vector instruction: fetches vvvv and r/m (register, memory or broadcast, fault
+    /// suppression per `shape`), runs `body(old destination, first source, second source, vector
+    /// bytes)` and commits the result under the write mask.
+    pub(in crate::cpu) fn exec_vector_op(
+        &mut self,
+        i: &Insn,
+        next: u64,
+        shape: OpShape,
+        body: impl FnOnce(&mut Cpu, &Vector, &Vector, &Vector, usize) -> ExecResult<Vector>,
+    ) -> ExecResult<()> {
+        if shape.unary && i.vex_v != 0 {
+            return Err(Exception::invalid_opcode());
+        }
+        let bytes = self.vector_bytes(i, shape.rounding)?;
+        let mask = self.write_mask(i);
+        let rm_shape = RmShape {
+            bytes: shape.rm_bytes.map_or(bytes, |divide| bytes / divide),
+            element: shape.rm_element.unwrap_or(shape.element),
+            broadcast: shape.broadcast,
+            suppress: (i.evex_mask != 0 && shape.suppress).then_some(mask),
+        };
+        let second = self.fetch_rm(i, next, rm_shape)?;
+        let first = if shape.unary {
+            [0; LANES]
+        } else {
+            self.zmm(i.vex_v as usize)
+        };
+        let dest = shape.dest.unwrap_or(i.reg as usize);
+        let old = self.zmm(dest);
+        let rounding = shape.rounding;
+        let result =
+            self.with_static_rounding(i, rounding, |cpu| body(cpu, &old, &first, &second, bytes))?;
+        self.commit_masked(i, dest, shape.element, bytes, &result);
         Ok(())
     }
 
