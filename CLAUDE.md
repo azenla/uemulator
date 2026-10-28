@@ -40,6 +40,6 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 ## Debugging
 
 - `--debug` on the CLI dumps CPU state and scans guest RAM for the kernel log ring buffer on exit.
-- `--verify` runs the JIT in lockstep with the interpreter and stops at the first diverging block; use it after any change under `crates/uemulator/src/jit/`.
+- `--verify` runs the JIT in lockstep with the interpreter and stops at the first diverging block; use it after any change under `crates/uemulator/src/jit/`. Do not type into it: host input reaches only the JIT side's console, so the first keystroke shows up as a bogus divergence at an interrupt entry (boot to the shell prompt and stop instead).
 - `--time <unix>` fixes the RTC; guest behavior must not depend on it, so a time-dependent failure is an emulator bug.
 - On an Apple Silicon Mac the x86_64 JIT runs under Rosetta: `cargo test --release -p uemulator --target x86_64-apple-darwin` (`rustup target add x86_64-apple-darwin`).
