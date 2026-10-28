@@ -178,7 +178,7 @@ pub fn load(
         memory::free_pages(base, pages);
         return Err(LOAD_ERROR);
     }
-    let path_pointer = path.map_or(ptr::null_mut(), leak_path);
+    let path_pointer = path.map_or(ptr::null_mut(), |path| leak_path(&path.file_part()));
     let loaded = Box::new(LoadedImage {
         revision: LOADED_IMAGE_REVISION,
         parent_handle: parent,
@@ -209,8 +209,12 @@ pub fn load(
     });
     let interface = (&mut *record.loaded as *mut LoadedImage).cast();
     let handle = protocols::install(ptr::null_mut(), guids::LOADED_IMAGE, interface)?;
-    if !path_pointer.is_null() {
-        let _ = protocols::install(handle, guids::LOADED_IMAGE_DEVICE_PATH, path_pointer.cast());
+    if let Some(path) = path {
+        let _ = protocols::install(
+            handle,
+            guids::LOADED_IMAGE_DEVICE_PATH,
+            leak_path(path).cast(),
+        );
     }
     record.handle = handle;
     IMAGES.get().push(record);

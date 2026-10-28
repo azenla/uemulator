@@ -159,6 +159,20 @@ impl DevicePath {
             })
     }
 
+    /// The path from its first file-path node on, or the whole path when it has none. This is what
+    /// `LoadedImage.FilePath` holds: shim prints it and opens `\\EFI\\BOOT\\grubx64.efi` next to
+    /// itself by text, which fails if the device nodes are in it.
+    pub fn file_part(&self) -> DevicePath {
+        let mut at = 0;
+        for node in self.nodes() {
+            if node.kind == TYPE_MEDIA && node.subtype == SUBTYPE_FILE_PATH {
+                return Self(self.0[at..].to_vec());
+            }
+            at += NODE_HEADER_BYTES + node.payload.len();
+        }
+        self.clone()
+    }
+
     /// The text of the final file-path node, if the path ends in one.
     pub fn file_name(&self) -> Option<String> {
         self.nodes()
@@ -449,6 +463,15 @@ mod tests {
             Some("\\EFI\\BOOT\\BOOTX64.EFI")
         );
         assert_eq!(&path.as_bytes()[path.as_bytes().len() - 4..], &END_NODE);
+    }
+
+    #[test]
+    fn the_file_part_drops_the_device_nodes() {
+        let file = DevicePath::new().file_path("\\EFI\\BOOT\\BOOTX64.EFI");
+        let full = disk_path().append(&file);
+        assert_eq!(full.file_part(), file);
+        assert_eq!(file.file_part(), file);
+        assert_eq!(disk_path().file_part(), disk_path());
     }
 
     #[test]
