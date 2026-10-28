@@ -1,0 +1,24 @@
+#!/usr/bin/expect -f
+# usage: stages.exp MACHINE [quick boot args...]
+# Prints the wall-clock seconds at which the boot reaches each stage of the Xen + dom0 boot.
+set machine [lindex $argv 0]
+set extra [lrange $argv 1 end]
+set timeout 900
+set start [clock seconds]
+log_user 0
+eval spawn ./target/release/uemulator quick boot $machine $extra
+foreach {pattern label} {
+    "Booting `Xen'" "GRUB menu entry started"
+    "(XEN) Xen version" "Xen banner"
+    "Brought up" "Xen brought up the CPUs"
+    "Building a PVH Dom0" "Xen builds the PVH dom0"
+    "Linux version" "dom0 Linux starts"
+    "Run /init" "dom0 initramfs starts"
+    "xenstored daemon" "dom0 starts xenstored"
+    "login:" "dom0 login prompt"
+} {
+    expect {
+        -exact $pattern { puts "[expr {[clock seconds] - $start}] s  $label" }
+        timeout { puts "timeout waiting for $label"; exit 1 }
+    }
+}

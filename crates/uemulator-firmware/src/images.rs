@@ -135,6 +135,21 @@ fn locate_file_system(path: &mut *mut DevicePathNode, device: &mut Handle) -> St
     (boot.locate_device_path)(&guids::SIMPLE_FILE_SYSTEM, path, device)
 }
 
+/// The handle a loader-supplied path starts with (the partition, for a file path), which is the
+/// loaded image's `DeviceHandle` when the caller passed the file's bytes itself, as GRUB's
+/// `chainloader` does. xen.efi asks that handle for the file system to find its config and
+/// kernel next to itself.
+fn device_of(path: &DevicePath) -> Handle {
+    let mut bytes = path.as_bytes().to_vec();
+    let mut cursor: *mut DevicePathNode = bytes.as_mut_ptr().cast();
+    let mut device: Handle = ptr::null_mut();
+    let boot = unsafe { tables::BOOT_SERVICES.get().assume_init_ref() };
+    match (boot.locate_device_path)(&guids::DEVICE_PATH, &mut cursor, &mut device) {
+        SUCCESS => device,
+        _ => ptr::null_mut(),
+    }
+}
+
 /// Loads an image from `file` (the bytes) into memory and publishes its handle.
 pub fn load(
     file: &[u8],
@@ -231,7 +246,8 @@ extern "efiapi" fn load_image(
         read_file_of(path).and_then(|(bytes, device)| load(&bytes, parent, device, Some(path)))
     } else {
         let bytes = unsafe { core::slice::from_raw_parts(source.cast::<u8>(), source_size) };
-        load(bytes, parent, ptr::null_mut(), path.as_ref())
+        let device = path.as_ref().map_or(ptr::null_mut(), device_of);
+        load(bytes, parent, device, path.as_ref())
     };
     match result {
         Ok(handle) => {

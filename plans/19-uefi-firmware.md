@@ -43,7 +43,7 @@ Variables: key `var/<guid>/<name utf8>`, value = attributes u32 + data. Non-vola
 - Tables: ACPI 2.0/1.0 (when the handoff has an RSDP), SMBIOS 3.0 (BIOS and system information). Memory types: runtime code (the image), BS data, ACPI reclaim, MMIO for BARs/IOAPIC/LAPIC.
 - Boot manager: `BootNext`, then `BootOrder`/`Boot####` (device path to a file, partial paths searched on every volume, optional data = load options), then `\EFI\BOOT\BOOTX64.EFI` on every file system; `BootCurrent` is set.
 
-Not implemented: Graphics Output, USB/network/PCI I/O protocols, file writes, Secure Boot and authenticated variables, EFI_MEMORY_ATTRIBUTES_TABLE, SetTime, multi-instance device paths, key-notify callbacks. For Xen/Fedora shim: no known blocker, but only the Linux EFI stub and Debian GRUB 2.12 are verified; shim's `ShimLock`/MOK paths and Xen's `xen.efi` are untested.
+Not implemented: Graphics Output, USB/network/PCI I/O protocols, file writes, Secure Boot and authenticated variables, EFI_MEMORY_ATTRIBUTES_TABLE, SetTime, multi-instance device paths, key-notify callbacks. Verified: the Linux EFI stub, Debian GRUB 2.12, Alpine GRUB 2.14 booting Xen 4.21 through `multiboot2` (see 18) and Xen's `xen.efi` started by the boot manager (it reads its `xen.cfg`, kernel and initramfs from the ESP). Known failing: `xen.efi` started by GRUB's `chainloader` (`Couldn't obtain the File System Protocol Interface`, the `DeviceHandle` GRUB sets). Untested: shim's `ShimLock`/MOK paths.
 
 ## Tools
 

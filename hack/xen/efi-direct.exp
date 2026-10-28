@@ -1,0 +1,13 @@
+#!/usr/bin/expect -f
+# usage: efi-direct.exp DISK NVRAM LOG [timeout]
+# Boots xen.efi (EFI/xen/xen.efi on the disk's ESP, see efi-files.sh) straight from the firmware's
+# boot manager, without GRUB, and stops at the dom0 login prompt.
+set timeout [expr {[llength $argv] > 3 ? [lindex $argv 3] : 300}]
+log_file -a [lindex $argv 2]
+set start [clock seconds]
+spawn ./target/release/uemulator advanced boot-uefi --disk [lindex $argv 0] --nvram [lindex $argv 1] --boot-loader {\EFI\xen\xen.efi} --memory 3072 --cpus 2 --iommu --console serial
+expect {
+    "login:" { puts "\nefi-direct.exp: login after [expr {[clock seconds] - $start}] s" }
+    timeout { puts "\nefi-direct.exp: timeout" }
+    eof { puts "\nefi-direct.exp: eof" }
+}
