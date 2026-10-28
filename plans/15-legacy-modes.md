@@ -55,8 +55,9 @@ Other places that changed: `mov cr/dr` is 32 bits wide outside IA-32e mode; `lgd
 
 `cpu/legacy_tests.rs` holds 49 tests, generated from assembly snippets (`BITS=16 hack/asm.sh`, `BITS=32 hack/asm.sh`) and run on real-mode and flat 32-bit harnesses (`Harness::real`, `legacy_support::protected32`): 16-bit addressing and wrap, segment bases and limits, stack widths, real-mode interrupts, far jumps/calls, string ops, BCD, 32-bit gates, error codes, ring 3 to ring 0 and back through the TSS, V86 entry and exit, sysenter/sysexit, call gates with parameters, task switch and nested-task return, LDT, 16-bit code in protected mode, real mode to protected mode to long mode with the boot code a real loader runs, compatibility mode and the far jump back to 64-bit mode. `machine/tests.rs` boots a real-mode firmware image on the full machine under both JIT modes.
 
+SVM guests may be in any of these modes (see 03, "SVM"); the VMRUN state swap also flushes the decode cache, since the same bytes decode differently per mode.
+
 ## Not implemented
 
 - Virtual-8086 extensions (CR4.VME/PVI, the interrupt redirection bitmap, VIF/VIP), SMM, and the segment-write and straddling-limit checks listed above.
 - 16-bit TSS switching, `syscall`/`sysret` from compatibility mode, 64-bit call gates and task switches in IA-32e mode (not architectural), the debug registers' breakpoints.
-- SVM guests in real or protected mode: the VMRUN consistency checks still require a long-mode guest (see 03, "SVM").

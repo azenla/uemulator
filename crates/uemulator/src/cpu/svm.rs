@@ -8,11 +8,10 @@
 //! host back. Layout and exit codes follow the AMD APM vol. 2 ch. 15 and are cross-checked against
 //! the hardware driver in `uemulator-uefi/src/hv/svm.rs`, which runs on real SVM.
 //!
-//! Scope: the guest must be in 64-bit long mode (EFER.LME, CR0.PG/PE, CR4.PAE), because the
-//! emulator has no real-mode, protected-mode or 32-bit-paging MMU; anything else fails the
-//! VMRUN consistency checks (#VMEXIT with VMEXIT_INVALID), which is also what an L1 hypervisor
-//! that starts a vCPU in real mode sees. A guest that itself executes `vmrun` is not supported
-//! (it is intercepted like any other VMRUN, and without that intercept the instruction is #UD).
+//! Scope: the guest may be in any mode the CPU runs (real, virtual-8086, 16/32-bit protected, 32-bit
+//! and PAE paging, compatibility and 64-bit mode); the checks are the APM's. A guest that itself
+//! executes `vmrun` is not supported (it is intercepted like any other VMRUN, and without that
+//! intercept the instruction is #UD).
 
 use super::decode::Insn;
 use super::exception::Exception;
@@ -244,6 +243,7 @@ struct Host {
     idtr: DescriptorTable,
     dr6: u64,
     dr7: u64,
+    pdpte: [u64; 4],
 }
 
 /// The guest being run: the intercepts read from its VMCB at `vmrun` time (the hypervisor cannot
@@ -442,7 +442,7 @@ impl Cpu {
         let asid = self.vmcb_read(vmcb, VMCB_ASID, 4);
         let cs = self.vmcb_segment(vmcb, SAVE_CS);
         let long_mode_paging = guest_efer & EFER_LME != 0 && guest_cr0 & CR0_PG_BIT != 0;
-        // Consistency checks (APM 15.5.1), plus this emulator's long-mode-only restriction.
+        // Consistency checks (APM 15.5.1).
         let invalid = guest_efer & EFER_SVME == 0
             || guest_efer & !EFER_KNOWN != 0
             || (guest_cr0 & CR0_CD_BIT == 0 && guest_cr0 & CR0_NW_BIT != 0)
@@ -453,10 +453,10 @@ impl Cpu {
             || guest_dr7 & DR_HIGH_BITS != 0
             || intercept4 & INTERCEPT_VMRUN == 0
             || asid == 0
-            || !long_mode_paging
-            || guest_cr0 & CR0_PE_BIT == 0
-            || guest_cr4 & CR4_PAE == 0
-            || (cs.long() && cs.flags & SEG_DEFAULT_BIG != 0);
+            || (long_mode_paging
+                && (guest_cr0 & CR0_PE_BIT == 0
+                    || guest_cr4 & CR4_PAE == 0
+                    || (cs.long() && cs.flags & SEG_DEFAULT_BIG != 0)));
         if invalid {
             self.vmcb_write(vmcb, VMCB_EXITCODE, 8, VMEXIT_INVALID);
             self.rip = next;
@@ -481,6 +481,7 @@ impl Cpu {
             idtr: self.idtr,
             dr6: self.dr[6],
             dr7: self.dr[7],
+            pdpte: self.pdpte,
         };
         let v_intr = self.vmcb_read(vmcb, VMCB_V_INTR, 8);
         let nested = self.vmcb_read(vmcb, VMCB_NP_ENABLE, 8) & NP_ENABLE != 0;
@@ -511,7 +512,12 @@ impl Cpu {
         self.idtr = self.vmcb_table(vmcb, SAVE_IDTR);
         let cpl = self.vmcb_read(vmcb, SAVE_CPL, 1) as u8 & 3;
         self.set_cpl(cpl);
-        self.efer = guest_efer | EFER_LMA;
+        // Long mode is active exactly when paging is on with LME set.
+        self.efer = if long_mode_paging {
+            guest_efer | EFER_LMA
+        } else {
+            guest_efer & !EFER_LMA
+        };
         self.cr0 = guest_cr0;
         self.cr3 = guest_cr3;
         self.cr4 = guest_cr4;
@@ -533,6 +539,14 @@ impl Cpu {
         self.svm.gif = true;
         self.svm.guest = Some(Box::new(guest));
         self.flush_tlb();
+        self.flush_decode();
+        // PAE paging latches the guest's four PDPT entries now (through nested paging, if on).
+        if self.paging_mode() == super::mem::PagingMode::Pae {
+            match self.read_pdptes(guest_cr3) {
+                Ok(entries) => self.pdpte = entries,
+                Err(_) => return Err(self.vmexit(VMEXIT_INVALID, 0, 0, next)),
+            }
+        }
         // Event injection happens after the state is loaded, as if the event arrived just before
         // the guest's first instruction.
         let event = self.vmcb_read(vmcb, VMCB_EVENTINJ, 4) as u32;
@@ -629,6 +643,7 @@ impl Cpu {
         self.cr4 = host.cr4;
         self.dr[6] = host.dr6;
         self.dr[7] = host.dr7;
+        self.pdpte = host.pdpte;
         self.eflags = (host.eflags & !(VM | RF)) | RESERVED_ONE;
         self.lazy_op = LazyFlagsOp::Eflags;
         self.rip = host.rip;
@@ -638,6 +653,7 @@ impl Cpu {
         self.halted = false;
         self.svm.gif = false;
         self.flush_tlb();
+        self.flush_decode();
         Exception::Vmexit
     }
 
@@ -1001,9 +1017,11 @@ mod tests {
     use super::*;
     use crate::cpu::BeforeStep;
     use crate::cpu::mem::AccessKind;
+    use crate::cpu::test_support::{LegacyTables, PTE_P, PaeTables};
     use crate::testkit::{CODE_BASE, Harness, SCRATCH};
 
-    const VMCB: u64 = 0x20_0000;
+    /// Far from the start of the table pool (0x20_0000), which the guest page-table helpers fill.
+    const VMCB: u64 = 0x3f_0000;
     const IOPM: u64 = 0x21_0000;
     const MSRPM: u64 = 0x25_0000;
     const NPT: u64 = 0x28_0000;
@@ -1052,7 +1070,15 @@ mod tests {
 
     /// A host that is about to `vmrun` a guest that executes `guest_code`.
     fn rig(guest_code: &[u8]) -> Harness {
+        rig_prepared(guest_code, |_| ()).0
+    }
+
+    /// `rig` with a step that runs on the fresh harness before the VMCB is written: guest page
+    /// tables built by the paging test helpers live in the pool that holds the VMCB, so they must
+    /// go in first.
+    fn rig_prepared<T>(guest_code: &[u8], prepare: impl FnOnce(&mut Harness) -> T) -> (Harness, T) {
         let mut h = Harness::new(HOST_CODE);
+        let prepared = prepare(&mut h);
         h.cpu.efer |= EFER_SVME;
         h.write(GUEST_CODE, guest_code);
         let segments = [SEG_ES, SEG_CS, SEG_SS, SEG_DS].map(|index| h.cpu.seg[index]);
@@ -1090,7 +1116,7 @@ mod tests {
         if USE_JIT.with(|flag| flag.get()) {
             h.enable_jit();
         }
-        h
+        (h, prepared)
     }
 
     /// Runs the real loop until the host halts (or the budget ends).
@@ -1107,7 +1133,7 @@ mod tests {
             // as in `Cpu::run`: the shadow of `sti`/`mov ss` covers exactly one instruction
             h.cpu.interrupt_shadow = false;
             h.cpu.icount += 1;
-            let result = if h.cpu.jit.is_some() {
+            let result = if h.cpu.jit.is_some() && h.cpu.is_long64() {
                 h.cpu.step_block()
             } else {
                 h.cpu.step()
@@ -1463,19 +1489,145 @@ mod tests {
             let cr4 = h.cpu.cr4;
             put(h, SAVE_CR4, 8, cr4 | (1 << 63));
         });
-        // outside long mode (the emulator has no other MMU)
-        consistency_failure(|h| {
-            let cr0 = h.cpu.cr0;
-            put(h, SAVE_CR0, 8, cr0 & !CR0_PG_BIT);
-        });
-        consistency_failure(|h| {
-            let efer = h.cpu.efer;
-            put(h, SAVE_EFER, 8, efer & !EFER_LME);
-        });
+        // long mode needs PAE and protection
         consistency_failure(|h| {
             let cr4 = h.cpu.cr4;
             put(h, SAVE_CR4, 8, cr4 & !CR4_PAE);
         });
+        consistency_failure(|h| {
+            let cr0 = h.cpu.cr0;
+            put(h, SAVE_CR0, 8, cr0 & !CR0_PE_BIT);
+        });
+    }
+
+    /// Replaces the guest's mode: control registers, EFER and flat segments for `bits`-bit code.
+    fn set_guest_mode(h: &mut Harness, efer: u64, cr0: u64, cr3: u64, cr4: u64, code_flags: u32) {
+        put(h, SAVE_EFER, 8, efer | EFER_SVME);
+        put(h, SAVE_CR0, 8, cr0);
+        put(h, SAVE_CR3, 8, cr3);
+        put(h, SAVE_CR4, 8, cr4);
+        let code = Seg {
+            sel: 8,
+            base: 0,
+            limit: SEG_LIMIT_4GIB,
+            flags: code_flags,
+        };
+        put_segment(h, SAVE_CS, code);
+        let data = Seg {
+            sel: 16,
+            base: 0,
+            limit: SEG_LIMIT_4GIB,
+            flags: SEG_FLAGS_FLAT_DATA,
+        };
+        for offset in [SAVE_ES, SAVE_SS, SAVE_DS] {
+            put_segment(h, offset, data);
+        }
+    }
+
+    const FLAT_CODE32: u32 = super::super::sys::SEG_FLAGS_CODE32;
+    /// mov eax, 0x5aa5; cpuid
+    const GUEST_MOV_CPUID_32: &[u8] = &[0xb8, 0xa5, 0x5a, 0, 0, 0x0f, 0xa2];
+
+    fn assert_guest_exited_on_cpuid(h: &Harness, rip: u64) {
+        assert_eq!(get(h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(
+            get(h, SAVE_RAX, 8),
+            0x5aa5,
+            "the guest ran its first instruction"
+        );
+        assert_eq!(get(h, SAVE_RIP, 8), rip, "stopped on the cpuid");
+        assert!(h.cpu.svm.guest.is_none());
+        assert!(h.cpu.is_long64(), "the host is back in 64-bit mode");
+    }
+
+    #[test]
+    fn a_protected_mode_guest_without_paging_runs() {
+        let mut h = rig(GUEST_MOV_CPUID_32);
+        set_guest_mode(&mut h, 0, CR0_PE_BIT, 0, 0, FLAT_CODE32);
+        run(&mut h);
+        assert_guest_exited_on_cpuid(&h, GUEST_CODE + 5);
+    }
+
+    #[test]
+    fn a_real_mode_guest_runs_with_sixteen_bit_decoding() {
+        // mov eax, 0x5aa5 (operand-size prefix); cpuid
+        let mut h = rig(&[0x66, 0xb8, 0xa5, 0x5a, 0, 0, 0x0f, 0xa2]);
+        h.write(0x7c00, &[0x66, 0xb8, 0xa5, 0x5a, 0, 0, 0x0f, 0xa2]);
+        set_guest_mode(&mut h, 0, 0, 0, 0, 0);
+        let code = crate::cpu::modes::real_mode_segment(0, 0);
+        put_segment(
+            &mut h,
+            SAVE_CS,
+            Seg {
+                flags: code.flags | SEG_TYPE_EXECUTABLE,
+                ..code
+            },
+        );
+        for offset in [SAVE_ES, SAVE_SS, SAVE_DS] {
+            put_segment(&mut h, offset, code);
+        }
+        put(&mut h, SAVE_RIP, 8, 0x7c00);
+        put(&mut h, SAVE_RSP, 8, 0x7000);
+        run(&mut h);
+        assert_guest_exited_on_cpuid(&h, 0x7c06);
+    }
+
+    /// Builds guest tables with `build` and hands back the control registers they imply, leaving
+    /// the CPU as it was.
+    fn guest_registers(h: &mut Harness, build: impl FnOnce(&mut Cpu)) -> (u64, u64, u64, u64) {
+        let host = (h.cpu.efer, h.cpu.cr0, h.cpu.cr3, h.cpu.cr4, h.cpu.pdpte);
+        build(&mut h.cpu);
+        let guest = (h.cpu.efer, h.cpu.cr0, h.cpu.cr3, h.cpu.cr4);
+        (h.cpu.efer, h.cpu.cr0, h.cpu.cr3, h.cpu.cr4, h.cpu.pdpte) = host;
+        h.cpu.flush_tlb();
+        guest
+    }
+
+    #[test]
+    fn a_guest_with_thirty_two_bit_paging_runs() {
+        let (mut h, guest) = rig_prepared(GUEST_MOV_CPUID_32, |h| {
+            guest_registers(h, |cpu| LegacyTables::new(cpu).identity_map(cpu, 32))
+        });
+        set_guest_mode(&mut h, guest.0, guest.1, guest.2, guest.3, FLAT_CODE32);
+        run(&mut h);
+        assert_guest_exited_on_cpuid(&h, GUEST_CODE + 5);
+    }
+
+    #[test]
+    fn a_pae_guest_latches_its_pdptes_and_the_host_gets_its_own_back() {
+        let (mut h, guest) = rig_prepared(GUEST_MOV_CPUID_32, |h| {
+            guest_registers(h, |cpu| PaeTables::new(cpu).identity_map(cpu, 32))
+        });
+        let host_pdpte = h.cpu.pdpte;
+        set_guest_mode(&mut h, guest.0, guest.1, guest.2, guest.3, FLAT_CODE32);
+        run(&mut h);
+        assert_guest_exited_on_cpuid(&h, GUEST_CODE + 5);
+        assert_eq!(h.cpu.pdpte, host_pdpte);
+    }
+
+    #[test]
+    fn a_pae_guest_with_a_reserved_pdpte_bit_is_vmexit_invalid() {
+        let (mut h, guest) = rig_prepared(GUEST_MOV_CPUID_32, |h| {
+            guest_registers(h, |cpu| {
+                let tables = PaeTables::new(cpu);
+                cpu.ram[tables.pdpt as usize..][..8]
+                    .copy_from_slice(&(PTE_P | 1 << 63).to_le_bytes());
+            })
+        });
+        set_guest_mode(&mut h, guest.0, guest.1, guest.2, guest.3, FLAT_CODE32);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_INVALID);
+        assert!(h.cpu.svm.guest.is_none());
+        assert!(h.cpu.is_long64());
+    }
+
+    #[test]
+    fn a_compatibility_mode_guest_runs_under_long_mode_paging() {
+        let mut h = rig(GUEST_MOV_CPUID_32);
+        let (efer, cr0, cr3, cr4) = (h.cpu.efer, h.cpu.cr0, h.cpu.cr3, h.cpu.cr4);
+        set_guest_mode(&mut h, efer, cr0, cr3, cr4, FLAT_CODE32);
+        run(&mut h);
+        assert_guest_exited_on_cpuid(&h, GUEST_CODE + 5);
     }
 
     #[test]

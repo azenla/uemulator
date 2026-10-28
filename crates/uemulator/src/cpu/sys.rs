@@ -823,7 +823,12 @@ impl Cpu {
     /// effect of validating them, the #GP for reserved bits); `None` for any other format.
     /// Long mode is never PAE paging, whatever CR4.PAE says: callers pass the CR0/CR4 they are
     /// about to install, and LMA is derived from them only in `write_cr0`.
-    fn pdptes_if_pae_paging(&self, cr0: u64, cr4: u64, cr3: u64) -> ExecResult<Option<[u64; 4]>> {
+    fn pdptes_if_pae_paging(
+        &mut self,
+        cr0: u64,
+        cr4: u64,
+        cr3: u64,
+    ) -> ExecResult<Option<[u64; 4]>> {
         let pae_paging = cr0 & CR0_PG != 0 && cr4 & CR4_PAE != 0 && self.efer & EFER_LMA == 0;
         if pae_paging {
             self.read_pdptes(cr3).map(Some)

@@ -436,11 +436,14 @@ impl Cpu {
     /// Reads and validates the four PDPT entries PAE paging would use for `cr3`. A present entry
     /// with a reserved bit set is #GP(0), and happens at the CR3/CR0/CR4 write rather than at the
     /// first access. A PDPT outside RAM reads as not present, like page tables do.
-    pub(crate) fn read_pdptes(&self, cr3: u64) -> ExecResult<[u64; PDPT_ENTRIES]> {
+    pub(crate) fn read_pdptes(&mut self, cr3: u64) -> ExecResult<[u64; PDPT_ENTRIES]> {
         let base = cr3 & PAE_PDPT_ADDRESS_MASK;
         let mut entries = [0u64; PDPT_ENTRIES];
         for (index, entry) in entries.iter_mut().enumerate() {
-            let Some(value) = self.read_ram_u64(base + index as u64 * PTE_BYTES) else {
+            // With nested paging the PDPT is at a guest-physical address.
+            let address =
+                self.nested_translate(base + index as u64 * PTE_BYTES, AccessKind::Read, true)?;
+            let Some(value) = self.read_ram_u64(address) else {
                 continue;
             };
             if value & PTE_PRESENT != 0 && value & PDPTE_RESERVED_MASK != 0 {

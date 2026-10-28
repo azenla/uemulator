@@ -23,7 +23,7 @@
 
 - Real mode, 16/32-bit protected mode, compatibility mode and virtual-8086 mode done (see 15): mode derived from CS, a mode-aware decoder, segment bases and limits, 16/32-bit interrupt and call-gate delivery, hardware task switching, sysenter/sysexit, and `MachineConfig::firmware` / `uemulator firmware` to boot a real-mode image. 49 tests in `cpu/legacy_tests.rs`. The JIT stays 64-bit-only.
 
-- Non-long-mode paging done (see 04 and 03, "Control-register rules outside long mode"): paging off, 32-bit two-level paging (4 MiB pages, PSE-36 advertised), PAE with latched PDPTEs, and the CR0/CR3/CR4/EFER transition rules; 82 tests in `cpu/paging_tests.rs`. The SVM guest check still requires long mode.
+- Non-long-mode paging done (see 04 and 03, "Control-register rules outside long mode"): paging off, 32-bit two-level paging (4 MiB pages, PSE-36 advertised), PAE with latched PDPTEs, and the CR0/CR3/CR4/EFER transition rules; 82 tests in `cpu/paging_tests.rs`.
 
 - UMIP, SMEP/SMAP, PCID/INVPCID, MONITOR/MWAIT, RDTSCP done (see 03).
 

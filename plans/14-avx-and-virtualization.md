@@ -1,6 +1,6 @@
 # AVX and nested virtualization (not implemented)
 
-Status: AVX, AVX2, FMA, F16C and SVM (long-mode guests) are implemented (03). VMX below is a design only and is not advertised.
+Status: AVX, AVX2, FMA, F16C and SVM are implemented (03). VMX below is a design only and is not advertised.
 
 ## AVX, AVX2, FMA, F16C
 
@@ -8,7 +8,7 @@ Done: see 03, "AVX, AVX2, FMA, F16C". Not done: AVX-512 (EVEX), VAES, VPCLMULQDQ
 
 ## SVM (AMD-V) for nested guests
 
-Done for 64-bit long-mode guests: see 03, "SVM (AMD-V)", including the limits. What remains: real-mode/protected-mode/32-bit-paging MMUs (needed for a vCPU that starts at the reset vector), a guest-side `vmrun` (nested virtualization), AVIC, decode assists, and above all a run against a real nested hypervisor.
+Done, for guests in any CPU mode: see 03, "SVM (AMD-V)", including the limits. What remains: a guest-side `vmrun` (nested virtualization), AVIC, decode assists, and above all a run against a real nested hypervisor.
 
 ## VMX (Intel VT-x)
 
