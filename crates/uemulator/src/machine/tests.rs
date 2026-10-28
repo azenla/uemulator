@@ -283,6 +283,7 @@ mod twin_devices {
             disk: Some(Disk::from_backend(ReadOnlyFlagDisk(DISK_BYTES, read_only))),
             net: Some((MAC, NetHandle::default())),
             virtio_console: true,
+            ..Default::default()
         }
     }
 

@@ -1,6 +1,7 @@
 #[cfg(freestanding)]
 use crate::prelude::*;
 pub(crate) mod guestmem;
+pub(crate) mod iommu;
 mod pci;
 mod pic;
 mod pit;
@@ -114,6 +115,8 @@ pub(crate) struct DevConfig {
     /// MAC address and the host side of the frame channel.
     pub net: Option<([u8; 6], NetHandle)>,
     pub virtio_console: bool,
+    /// Adds the AMD IOMMU function (00:00.2) and translates every PCI function's DMA by it.
+    pub iommu: bool,
 }
 
 /// The whole device bus: legacy port-I/O devices plus the virtio-pci host. Port I/O goes
@@ -211,7 +214,7 @@ impl Devices {
             system_control_port_b: 0,
             system_control_port_a: 0,
             reset_control: 0,
-            pci: PciHost::new(virtio_devices),
+            pci: PciHost::new(virtio_devices).with_iommu(cfg.iommu),
             reset_requested: false,
         }
     }
@@ -280,6 +283,9 @@ impl Devices {
 
     /// None means no device decodes `phys_addr` and the caller treats it as unmapped.
     pub fn mmio_read(&mut self, phys_addr: u64, size: u8) -> Option<u64> {
+        if let Some(value) = self.pci.iommu_mmio_read(phys_addr, size) {
+            return Some(value);
+        }
         let value = self.pci.mmio_read(phys_addr, size);
         // Reading the ISR register acknowledges the interrupt.
         self.update_pci_irqs();
@@ -288,6 +294,9 @@ impl Devices {
 
     /// Returns false if no device decodes `phys_addr`.
     pub fn mmio_write(&mut self, phys_addr: u64, size: u8, val: u64, mem: &mut GuestMem) -> bool {
+        if self.pci.iommu_mmio_write(phys_addr, size, val, mem) {
+            return true;
+        }
         let result = self.pci.mmio_write(phys_addr, size, val as u32, mem);
         match result {
             Some(irq) => {
@@ -1246,6 +1255,7 @@ mod tests {
                 disk: Some(Disk::memory(vec![0; 4096])),
                 net: Some(([2, 0, 0, 0, 0, 1], NetHandle::default())),
                 virtio_console: true,
+                ..Default::default()
             },
         );
         let mut device_ids = Vec::new();
@@ -1636,6 +1646,7 @@ mod tests {
                 disk: Some(Disk::memory(vec![0; 4096])),
                 net: Some(([2, 0, 0, 0, 0, 1], NetHandle::default())),
                 virtio_console: true,
+                ..Default::default()
             },
         );
         let mut disk = dev.into_disk().expect("a disk was attached");
