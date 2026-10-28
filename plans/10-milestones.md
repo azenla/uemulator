@@ -27,9 +27,11 @@
 
 - Non-long-mode paging done (see 04 and 03, "Control-register rules outside long mode"): paging off, 32-bit two-level paging (4 MiB pages, PSE-36 advertised), PAE with latched PDPTEs, and the CR0/CR3/CR4/EFER transition rules; 82 tests in `cpu/paging_tests.rs`.
 
-- AVX-512 done (see 03, "AVX-512"): EVEX decoding, 32 ZMM registers, opmasks and XSAVE components 5-7, AVX512F/VL/BW/DQ/CD/IFMA/VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ, GFNI, VAES and VPCLMULQDQ, with masking, broadcast, embedded rounding and fault suppression; advertised in CPUID. Alpine and the Debian installer boot with it on.
+- AVX-512 done (see 03, "AVX-512"): EVEX decoding, 32 ZMM registers, opmasks and XSAVE components 5-7, AVX512F/VL/BW/DQ/CD/IFMA/VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ, GFNI, VAES and VPCLMULQDQ, with masking, broadcast, embedded rounding and fault suppression; advertised in CPUID. Alpine and the Debian installer boot with it on. **Correction:** this entry (and the AVX one above) claimed more than was true. Unit tests covered the instructions that existed, but `vpsubsw` (EVEX) and `vdbpsadbw` were #UD while AVX512BW was advertised, which only a real guest running one of every intrinsic showed; both are fixed, as are AVX512_BF16 and SHA-NI (added), and 03 ("Real-guest check") records how AVX was verified in a guest against QEMU TCG, under signals and context switches, and JIT versus interpreter.
 
 - SVM validated against Linux KVM (see 03, "SVM", and `hack/kvm/run.sh`): the emulated Alpine guest loads `kvm_amd` and runs vCPUs in real, protected, long, PAE and 32-bit-paging mode on the emulator's SVM and nested paging. A 32-bit Alpine i686 kernel also boots to a shell (see 15).
+
+- Zen 4 CPU model done (see 03, "CPUID/MSR contract"; `cpu/cpuid.rs`): family 19h model 11h (EPYC 9004 Genoa), cache, TLB and topology leaves (0xB, 0x8000001D/1E) consistent with a configurable processor count and x2APIC id, SHA-NI, ADX, CLWB/CLFLUSHOPT, RDPID, CLZERO, WBNOINVD, AVX512_BF16, XSAVEC/XSAVES/XGETBV1 with the compacted format, 1 GiB pages, and the AMD configuration MSRs Linux and Xen touch. Linux reports "AMD EPYC-Genoa Processor", `sha_ni avx512_bf16 xsavec xsaves clzero rdpid ...` and the compacted XSAVE format.
 
 - UMIP, SMEP/SMAP, PCID/INVPCID, MONITOR/MWAIT, RDTSCP done (see 03).
 
