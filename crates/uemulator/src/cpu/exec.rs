@@ -1321,7 +1321,8 @@ impl Cpu {
                     return Err(e);
                 }
             }
-            // nop, or xchg r8, rax with REX.B. pause (f3 90) is a plain nop.
+            // nop, or xchg r8, rax with REX.B. pause (f3 90) is a nop to this vCPU, but a spin
+            // loop is waiting for another one, so it gives up the rest of its quantum.
             0x90 => {
                 if i.rex & REX_B != 0 {
                     let r = 8;
@@ -1329,6 +1330,8 @@ impl Cpu {
                     let b = self.read_gpr(r, osz, true);
                     self.write_gpr(0, osz, true, b);
                     self.write_gpr(r, osz, true, a);
+                } else if i.rep != 0 && self.multi {
+                    self.request_yield();
                 }
             }
             // xchg r, rax
@@ -1575,6 +1578,7 @@ impl Cpu {
                     return Err(Exception::general_protection(0));
                 }
                 self.halted = true;
+                self.mwait_watch = None;
             }
             // cmc
             0xf5 => {

@@ -8,6 +8,7 @@ use std::thread::JoinHandle;
 use crate::acpi::AcpiConfig;
 use crate::boot::{self, BootState};
 use crate::console::ConsoleHandle;
+use crate::cpu::smp::Smp;
 use crate::cpu::{Cpu, DEFAULT_RANDOM_SEED};
 use crate::dev::kv::SharedKeyValueStore;
 use crate::dev::{DevConfig, MAX_VIRTIO_FUNCTIONS};
@@ -100,6 +101,10 @@ pub enum ConsoleKind {
     Virtio,
 }
 
+pub const MIN_CPUS: usize = 1;
+/// The APIC id fits one byte in xAPIC mode, and the I/O APIC and IPI routing keep one bit per
+/// vCPU in a `u64`.
+pub const MAX_CPUS: usize = 64;
 pub const MIN_MEMORY_MIB: usize = 64;
 /// RAM must stay below the 0xc000_0000 MMIO window (3 GiB) where the virtio devices' BARs live.
 pub const MAX_MEMORY_MIB: usize = 3072;
@@ -125,6 +130,7 @@ pub struct MachineConfig {
     cmdline: Option<String>,
     cmdline_extra: Vec<String>,
     memory_mib: usize,
+    cpus: usize,
     #[cfg(not(freestanding))]
     disks: Vec<Disk>,
     net_macs: Vec<[u8; 6]>,
@@ -154,6 +160,7 @@ impl Default for MachineConfig {
             cmdline: None,
             cmdline_extra: Vec::new(),
             memory_mib: DEFAULT_MEMORY_MIB,
+            cpus: MIN_CPUS,
             #[cfg(not(freestanding))]
             disks: Vec::new(),
             net_macs: Vec::new(),
@@ -288,6 +295,17 @@ impl MachineConfig {
         self
     }
 
+    /// How many vCPUs the guest sees, `MIN_CPUS` to `MAX_CPUS` (default 1). They run in turns on
+    /// the one host thread (a few thousand instructions each, or until one halts or spins), so
+    /// more vCPUs do not make the guest faster in host time, only let it use its SMP code paths;
+    /// guest time advances by the instructions of whichever vCPU runs. Needs ACPI (the MADT is
+    /// how the guest finds the others) and cannot be combined with `verify_jit`, a firmware image
+    /// or `boot_disk`'s BIOS shim.
+    pub fn cpus(mut self, n: usize) -> Self {
+        self.cpus = n;
+        self
+    }
+
     pub fn jit(mut self, mode: JitMode) -> Self {
         self.jit = mode;
         self
@@ -417,6 +435,7 @@ struct RebootImage {
     nets: Vec<([u8; 6], NetHandle)>,
     virtio_consoles: Vec<ConsoleHandle>,
     iommu: bool,
+    cpus: usize,
     acpi: Option<AcpiConfig>,
     key_value_store: Option<SharedKeyValueStore>,
     /// Set when the machine boots UEFI firmware: that image and handoff replace the kernel.
@@ -510,6 +529,7 @@ fn mirrored_devices(main: &DevConfig, main_uart: &ConsoleHandle) -> (DevConfig, 
             let store: Box<dyn KeyValueStore> = Box::new(MemoryKeyValueStore::new());
             Arc::new(Mutex::new(store))
         }),
+        cpus: main.cpus,
     };
     (devices, twin_uart)
 }
@@ -578,6 +598,7 @@ impl Vcpu {
                 virtio_consoles: image.virtio_consoles.clone(),
                 iommu: image.iommu,
                 key_value_store: image.key_value_store.clone(),
+                cpus: image.cpus,
             };
         }
     }
@@ -637,6 +658,7 @@ impl Vcpu {
         cpu.realtime = self.clock == ClockMode::Realtime && !lockstep;
         // Lockstep needs generated code to compare; without any (`JitMode::Off`, a host without
         // a backend) `step_block` has nothing to run, so just interpret.
+        let mut vcpu_summary = String::new();
         let reason = match verify_twin {
             Some((devices, uart_console, boot_unix)) if lockstep => {
                 let mut twin = interpreter_twin(
@@ -650,13 +672,20 @@ impl Vcpu {
                 twin.rng_state = cpu.rng_state;
                 cpu.run_verify(&mut twin)
             }
+            _ if cpu.cpu_count > 1 => {
+                let mut smp = Smp::new(cpu);
+                let reason = smp.run();
+                vcpu_summary = smp.summary();
+                cpu = smp.into_active();
+                reason
+            }
             _ => cpu.run(),
         };
         if let (Some(l), true) = (
             &self.log,
             self.debug || matches!(reason, ExitReason::TripleFault | ExitReason::Internal(_)),
         ) {
-            l(&cpu.dump());
+            l(&format!("{vcpu_summary}{}", cpu.dump()));
         }
         let finished = Finished {
             ram_bytes,
@@ -692,6 +721,25 @@ impl EmulatedMachine {
         }
         if cfg.jit == JitMode::On && !crate::jit::probe() {
             return Err(Error::JitUnavailable);
+        }
+        if !(MIN_CPUS..=MAX_CPUS).contains(&cfg.cpus) {
+            return Err(Error::BadConfig(format!(
+                "cpus must be between {MIN_CPUS} and {MAX_CPUS}"
+            )));
+        }
+        if cfg.cpus > 1 {
+            if !cfg.acpi {
+                return Err(Error::BadConfig(
+                    "more than one cpu needs ACPI: the MADT is how the guest finds them".into(),
+                ));
+            }
+            if cfg.verify || cfg.firmware.is_some() || cfg.boot_disk {
+                return Err(Error::BadConfig(
+                    "more than one cpu cannot be combined with verify_jit, a firmware image or \
+                     a BIOS disk boot"
+                        .into(),
+                ));
+            }
         }
         let mut ram = vec![0u8; cfg.memory_mib << BYTES_PER_MIB_SHIFT];
         let kinds = if cfg.consoles.is_empty() {
@@ -771,7 +819,7 @@ impl EmulatedMachine {
         let acpi = cfg.acpi.then_some(AcpiConfig {
             pci_functions: functions,
             iommu: cfg.iommu,
-            ..Default::default()
+            cpus: cfg.cpus as u32,
         });
         let uefi = cfg.uefi_firmware.as_ref().map(|image| {
             let params = boot::FirmwareParams {
@@ -822,6 +870,7 @@ impl EmulatedMachine {
             virtio_consoles,
             iommu: cfg.iommu,
             key_value_store: cfg.key_value_store.clone(),
+            cpus: cfg.cpus,
         };
         let boot_ram = cfg.verify.then(|| ram.clone());
         // Verification cannot restart (the twin's devices cannot be rebuilt in step), so it keeps
@@ -835,6 +884,7 @@ impl EmulatedMachine {
                     nets: devcfg.nets.clone(),
                     virtio_consoles: devcfg.virtio_consoles.clone(),
                     iommu: cfg.iommu,
+                    cpus: cfg.cpus,
                     acpi,
                     key_value_store: cfg.key_value_store,
                     uefi,

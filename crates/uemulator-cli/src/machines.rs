@@ -555,6 +555,9 @@ pub fn describe(machine: &Machine) -> String {
         .memory
         .unwrap_or(machine.install.default_memory_mib());
     out.push_str(&format!("  memory    {memory} MiB\n"));
+    if let Some(cpus) = settings.cpus {
+        out.push_str(&format!("  cpus      {cpus}\n"));
+    }
     let boot = match machine.boot_from {
         BootSource::Auto => "auto (the disk once an install is on it, else the installer)",
         BootSource::Installer => "installer",

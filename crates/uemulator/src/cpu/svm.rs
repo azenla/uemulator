@@ -1169,6 +1169,7 @@ mod tests {
                 BeforeStep::Exit(reason) => panic!("machine exit: {reason:?}"),
                 BeforeStep::Idled => continue,
                 BeforeStep::Execute => {}
+                BeforeStep::Yield | BeforeStep::Halted => unreachable!("one vCPU"),
             }
             // as in `Cpu::run`: the shadow of `sti`/`mov ss` covers exactly one instruction
             h.cpu.interrupt_shadow = false;

@@ -172,6 +172,15 @@ impl Cpu {
     /// paging and long mode off, every data segment 0 with a 64 KiB limit, the interrupt vector
     /// table at 0 with its 256 four-byte entries.
     pub(crate) fn reset_to_real_mode(&mut self) {
+        self.reset_real_mode_registers();
+        self.flush_tlb();
+        self.flush_decode();
+    }
+
+    /// `reset_to_real_mode` without the TLB and decode-cache flushes, for an INIT that arrives
+    /// while the machine runs: `flush_decode` also forgets which pages hold translated code,
+    /// which the shared JIT cache cannot afford.
+    pub(crate) fn reset_real_mode_registers(&mut self) {
         const RESET_CODE_SELECTOR: u16 = 0xf000;
         const RESET_CODE_BASE: u64 = 0xffff_0000;
         const RESET_IP: u64 = 0xfff0;
@@ -202,8 +211,6 @@ impl Cpu {
         self.rip = RESET_IP;
         self.halted = false;
         self.set_cpl(0);
-        self.flush_tlb();
-        self.flush_decode();
     }
 
     /// The 32-bit Linux boot protocol's CPU state (Documentation/arch/x86/boot.rst): protected

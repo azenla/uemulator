@@ -24,6 +24,9 @@ pub(crate) mod mem;
 pub(crate) mod modes;
 pub(crate) mod mtrr;
 mod protection;
+pub(crate) mod smp;
+#[cfg(test)]
+mod smp_tests;
 mod sse;
 mod svm;
 mod sys;
@@ -60,6 +63,18 @@ enum BeforeStep {
     Idled,
     /// Execute the next instruction or block.
     Execute,
+    /// Several vCPUs: this one used up its quantum (or executed `pause`); let the others run.
+    Yield,
+    /// Several vCPUs: this one is halted with nothing to wake it. The scheduler idles the whole
+    /// machine once every vCPU is in this state.
+    Halted,
+}
+
+/// Why `Cpu::run_slice` returned.
+pub(crate) enum Slice {
+    Exit(ExitReason),
+    Yield,
+    Halted,
 }
 
 /// Virtual time per retired instruction. `now_ns`/`tsc` are derived from `icount`, which makes
@@ -246,7 +261,14 @@ const TRACE_DUMP_ENTRIES: usize = 16;
 /// Registers per line in the register dumps.
 const GPRS_PER_DUMP_LINE: usize = 4;
 
-/// All architectural and emulator state of the single vCPU.
+/// All architectural and emulator state of one vCPU, plus (in the vCPU that is executing) the
+/// machine it runs in.
+///
+/// With several vCPUs there is one `Cpu` per vCPU. The ones that are not executing keep only
+/// their architectural state: the machine-wide fields (the second group at the end, listed in
+/// `Cpu::swap_shared`) live in whichever `Cpu` the scheduler ran last and move with the
+/// execution, so the JIT, which finds everything relative to a `Cpu` pointer, needs no
+/// per-vCPU copies of code or caches.
 ///
 /// `#[repr(C)]` keeps declaration order: the JIT writes `lazy_op` and `lazy_size` with one
 /// 16-bit store, so `lazy_size` must directly follow `lazy_op`. Every other field the JIT
@@ -381,7 +403,7 @@ pub(crate) struct Cpu {
     /// Pages whose `page_has_code` byte is set, so `flush_decode` can clear them without
     /// scanning the whole array. May list pages already cleared by `code_written`.
     pub pages_with_code: Vec<u32>,
-    pub dev: Devices,
+    pub dev: Box<Devices>,
     /// Present when the machine boots a disk's boot sector: the BIOS services run as host code
     /// (`bios.rs`).
     #[cfg(not(freestanding))]
@@ -392,6 +414,15 @@ pub(crate) struct Cpu {
     /// Virtual time added while halted: the clock jumps (or sleeps, when realtime) to the next
     /// device deadline instead of executing instructions.
     pub idle_skipped_ns: u64,
+    /// With several vCPUs the clock is not the raw `icount` (see `smp.rs`): guest time is
+    /// `time_base_ns` plus the instructions retired since `slice_base_icount` divided by
+    /// `time_divisor`, the number of vCPUs that were running when the slice began. With one vCPU
+    /// the divisor is 1 and the base 0, which is `icount * NS_PER_INSN`. `time_carry` is the
+    /// instructions that did not make a whole nanosecond yet, kept while the divisor stays put.
+    pub time_base_ns: u64,
+    pub slice_base_icount: u64,
+    pub time_divisor: u64,
+    pub time_carry: u64,
     /// `icount` at which `service_events` runs next.
     pub next_event: u64,
     pub stop: Arc<AtomicBool>,
@@ -414,13 +445,79 @@ pub(crate) struct Cpu {
     pub jit: Option<Box<crate::jit::Jit>>,
     /// Most recent instruction addresses, recorded only when debugging.
     pub trace: Option<alloc::collections::VecDeque<u64>>,
+    /// This vCPU's number, which is also the APIC id it starts with, and how many there are.
+    pub cpu_index: u32,
+    pub cpu_count: u32,
+    /// More than one vCPU: the run loop hands control back to the scheduler (`smp.rs`) at every
+    /// event tick, at `pause` and while halted.
+    pub multi: bool,
+    /// Halted since power-on or INIT until a start-up IPI arrives (the "wait-for-SIPI" state).
+    pub wait_for_sipi: bool,
+    /// While a `pause` has pulled `next_event` forward to force a yield, the deadline it
+    /// displaced; 0 otherwise. `before_step` puts it back.
+    pub pause_resume_event: u64,
+    /// The cache line an MWAIT is waiting on (physical address) and its contents when the wait
+    /// began; the scheduler wakes the vCPU when another vCPU or a device changes them.
+    pub mwait_watch: Option<(u64, [u8; MONITOR_WATCH_BYTES])>,
+    /// Counts pages that gained translated code. A vCPU that has not run since the count last
+    /// moved may hold write tags for such a page in its private TLB; `Smp::switch_to` revokes
+    /// them (machine-wide, so it moves with `dev`).
+    pub code_mark_epoch: u64,
+    /// The `code_mark_epoch` this vCPU's TLB is up to date with.
+    pub code_mark_seen: u64,
 }
+
+/// Size of the line MONITOR arms and the unit of the wait-on-store check.
+pub(crate) const MONITOR_WATCH_BYTES: usize = 64;
 
 impl Cpu {
     /// Starts in 64-bit long mode with paging already on, as the Linux 64-bit boot protocol
     /// leaves it (`plans/02-boot.md`): there is no firmware to set any of this up.
     pub fn new(
         ram: Vec<u8>,
+        boot: BootState,
+        console: ConsoleHandle,
+        stop: Arc<AtomicBool>,
+        log: Option<LogFn>,
+        dev_config: DevConfig,
+    ) -> Self {
+        let ram_bytes = ram.len();
+        Self::build(ram, ram_bytes, boot, console, stop, log, dev_config)
+    }
+
+    /// A vCPU that is not the bootstrap processor: waiting for a start-up IPI, with none of the
+    /// machine-wide state (that arrives when the scheduler first switches to it). It copies what
+    /// the machine-wide fields' consumers need from `bsp`, which must still own them.
+    pub fn new_secondary(index: u32, bsp: &Cpu) -> Self {
+        let boot = BootState {
+            mode: crate::boot::BootMode::Real16,
+            ..Default::default()
+        };
+        let mut cpu = Self::build(
+            Vec::new(),
+            bsp.ram.len(),
+            boot,
+            ConsoleHandle::default(),
+            bsp.stop.clone(),
+            bsp.log.clone(),
+            DevConfig::default(),
+        );
+        cpu.ram_base = bsp.ram_base;
+        cpu.cpu_index = index;
+        // The local APIC id is the vCPU number, and one thread per core keeps it equal to the
+        // x2APIC id CPUID reports.
+        cpu.topology.x2apic_id = index;
+        cpu.cpu_count = bsp.cpu_count;
+        cpu.multi = true;
+        cpu.realtime = bsp.realtime;
+        cpu.halted = true;
+        cpu.wait_for_sipi = true;
+        cpu
+    }
+
+    fn build(
+        ram: Vec<u8>,
+        ram_bytes: usize,
         boot: BootState,
         console: ConsoleHandle,
         stop: Arc<AtomicBool>,
@@ -464,7 +561,10 @@ impl Cpu {
 
         let pages = ram.len() >> PAGE_SHIFT;
         // RAM never reaches 4 GiB (the PCI window starts at 3 GiB), so TOP_MEM2 stays zero.
-        let top_of_memory = ram.len() as u64;
+        let top_of_memory = ram_bytes as u64;
+        let cpu_count = dev_config.cpus.max(1) as u32;
+        // A secondary vCPU is built without RAM and gets its decode cache from the scheduler.
+        let has_machine_state = !ram.is_empty();
         let flat = |sel: u16, flags: u32| Seg {
             sel,
             base: 0,
@@ -512,7 +612,10 @@ impl Cpu {
             sfmask: 0,
             kgsbase: 0,
             tsc_aux: 0,
-            topology: cpuid::CpuTopology::SINGLE_PROCESSOR,
+            topology: cpuid::CpuTopology {
+                logical_processors: cpu_count,
+                ..cpuid::CpuTopology::SINGLE_PROCESSOR
+            },
             spec_ctrl: 0,
             xcr0: xsave::XCR0_X87,
             svm: svm::Svm::new(),
@@ -559,22 +662,30 @@ impl Cpu {
             ram,
             tlb: vec![TLB_EMPTY; 2 * TLB_ENTRIES_PER_MODE],
             ram_base: 0,
-            decode_cache: vec![
-                DecodeCacheEntry {
-                    gpa: 0,
-                    generation: 0,
-                    insn: Insn::default()
-                };
-                DECODE_CACHE_ENTRIES
-            ],
+            decode_cache: if has_machine_state {
+                vec![
+                    DecodeCacheEntry {
+                        gpa: 0,
+                        generation: 0,
+                        insn: Insn::default()
+                    };
+                    DECODE_CACHE_ENTRIES
+                ]
+            } else {
+                Vec::new()
+            },
             decode_cache_generation: 1,
             page_has_code: vec![0; pages],
             pages_with_code: Vec::new(),
-            dev: Devices::new(console, dev_config),
+            dev: Box::new(Devices::new(console, dev_config)),
             #[cfg(not(freestanding))]
             bios: None,
             icount: 0,
             idle_skipped_ns: 0,
+            time_base_ns: 0,
+            slice_base_icount: 0,
+            time_divisor: 1,
+            time_carry: 0,
             next_event: 0,
             stop,
             log,
@@ -589,6 +700,14 @@ impl Cpu {
             block_exit_requested: false,
             prepaid_icount: 0,
             trace: None,
+            cpu_index: 0,
+            cpu_count,
+            multi: cpu_count > 1,
+            wait_for_sipi: false,
+            pause_resume_event: 0,
+            mwait_watch: None,
+            code_mark_epoch: 0,
+            code_mark_seen: 0,
         };
         cpu.ram_base = cpu.ram.as_ptr() as u64;
         cpu.set_cpl(0);
@@ -624,7 +743,8 @@ impl Cpu {
     }
 
     pub fn now_ns(&self) -> u64 {
-        self.icount * NS_PER_INSN + self.idle_skipped_ns
+        let busy = self.icount - self.slice_base_icount + self.time_carry;
+        self.time_base_ns + busy / self.time_divisor * NS_PER_INSN + self.idle_skipped_ns
     }
 
     /// The TSC is just guest time in nanoseconds.
@@ -694,10 +814,18 @@ impl Cpu {
     /// Runs the per-step housekeeping: device/stop polling, interrupt delivery, halt handling.
     /// Interrupts are only taken here, i.e. at instruction (or JIT block) boundaries.
     fn before_step(&mut self) -> BeforeStep {
-        if self.icount >= self.next_event
-            && let Some(reason) = self.service_events()
-        {
-            return BeforeStep::Exit(reason);
+        if self.icount >= self.next_event {
+            // `pause` pulled the deadline forward only to get here: no device work is due.
+            if self.pause_resume_event != 0 {
+                self.next_event = core::mem::take(&mut self.pause_resume_event);
+                return BeforeStep::Yield;
+            }
+            if let Some(reason) = self.service_events() {
+                return BeforeStep::Exit(reason);
+            }
+            if self.multi {
+                return BeforeStep::Yield;
+            }
         }
         // has_pending() is a cheap pre-check; pending_interrupt() does the acknowledge.
         // A guest may intercept physical interrupts (and takes its virtual ones) before the host does.
@@ -720,7 +848,11 @@ impl Cpu {
             }
         }
         if self.halted {
-            return match self.idle() {
+            if self.multi {
+                return BeforeStep::Halted;
+            }
+            let may_wake = self.eflags & flags::IF != 0 || self.dev.nmi_pending();
+            return match self.idle(may_wake) {
                 Some(reason) => BeforeStep::Exit(reason),
                 None => BeforeStep::Idled,
             };
@@ -750,11 +882,24 @@ impl Cpu {
         }
     }
 
+    /// Single vCPU: runs until the machine exits.
     pub fn run(&mut self) -> ExitReason {
+        match self.run_slice() {
+            Slice::Exit(reason) => reason,
+            Slice::Yield | Slice::Halted => {
+                ExitReason::Internal("a lone vCPU asked for a scheduler".into())
+            }
+        }
+    }
+
+    /// Runs until the machine exits or, with several vCPUs, until this one should give way.
+    pub fn run_slice(&mut self) -> Slice {
         loop {
             match self.before_step() {
-                BeforeStep::Exit(reason) => return reason,
+                BeforeStep::Exit(reason) => return Slice::Exit(reason),
                 BeforeStep::Idled => continue,
+                BeforeStep::Yield => return Slice::Yield,
+                BeforeStep::Halted => return Slice::Halted,
                 BeforeStep::Execute => {}
             }
             self.interrupt_shadow = false;
@@ -765,7 +910,7 @@ impl Cpu {
                 self.step()
             };
             if let Some(reason) = self.after_step(result) {
-                return reason;
+                return Slice::Exit(reason);
             }
         }
     }
@@ -943,9 +1088,11 @@ impl Cpu {
         }
     }
 
-    /// Handles a halted CPU: skips (or sleeps) to the next device deadline so timers can raise
-    /// the interrupt that wakes it. Returns `Some` for stop, reset and power-off.
-    fn idle(&mut self) -> Option<ExitReason> {
+    /// Handles a halted machine: skips (or sleeps) to the next device deadline so timers can
+    /// raise the interrupt that wakes a vCPU. Returns `Some` for stop, reset and power-off.
+    /// `may_wake` is whether any vCPU could still be woken by an interrupt (interrupts enabled)
+    /// or an NMI.
+    fn idle(&mut self, may_wake: bool) -> Option<ExitReason> {
         if self.stop.load(Ordering::Relaxed) {
             return Some(ExitReason::Stopped);
         }
@@ -962,7 +1109,7 @@ impl Cpu {
         // poweroff and halt end without ACPI (`stop_this_cpu`: `cli; hlt` in a loop). Only IF is
         // tested, not `interrupt_shadow` or a queued event: `sti; hlt` has IF=1 by the time
         // `hlt` runs, and a PIC line pending behind IF=0 never wakes the CPU either.
-        if self.eflags & flags::IF == 0 && !self.dev.nmi_pending() {
+        if !may_wake {
             return Some(ExitReason::Shutdown);
         }
         let now = self.now_ns();
@@ -1195,7 +1342,7 @@ mod cpu_tests {
             assert_eq!(h.cpu.cr4, 0x20);
             assert_eq!(h.cpu.efer, 0x500);
             assert_eq!(h.cpu.cr2, 0);
-            assert_eq!(h.cpu.dev.lapic.tpr(), 0);
+            assert_eq!(h.cpu.dev.lapic().tpr(), 0);
             assert_eq!(h.cpu.cr3 & PTE_ADDRESS_BITS, 0x9000);
         }
 
@@ -2005,10 +2152,10 @@ mod cpu_tests {
         fn task_priority_holds_back_lower_priority_vectors() {
             let mut h = enabled_apic();
             apic_write(&mut h, APIC_ICR_LOW, 0x41 | ICR_SHORTHAND_SELF);
-            h.cpu.dev.lapic.set_tpr(0x40);
+            h.cpu.dev.lapic_mut().set_tpr(0x40);
             h.cpu.before_step();
             assert_eq!(h.cpu.rip, OLD_RIP);
-            h.cpu.dev.lapic.set_tpr(0x30);
+            h.cpu.dev.lapic_mut().set_tpr(0x30);
             h.cpu.before_step();
             assert_eq!(h.cpu.rip, handler_for(0x41));
         }
@@ -2073,9 +2220,9 @@ mod cpu_tests {
         #[test]
         fn cr8_reads_and_writes_the_apic_task_priority() {
             let mut h = enabled_apic();
-            h.cpu.dev.lapic.set_tpr(0x70);
+            h.cpu.dev.lapic_mut().set_tpr(0x70);
             // mov rax, cr8
-            let value = (h.cpu.dev.lapic.tpr() >> 4) as u64;
+            let value = (h.cpu.dev.lapic().tpr() >> 4) as u64;
             assert_eq!(value, 7);
         }
     }

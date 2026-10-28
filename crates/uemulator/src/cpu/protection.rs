@@ -6,7 +6,7 @@ use super::decode::Insn;
 use super::exception::Exception;
 use super::exec::Loc;
 use super::sys::{CR4_UMIP, RAX, RCX};
-use super::{Cpu, ExecResult};
+use super::{Cpu, ExecResult, MONITOR_WATCH_BYTES};
 
 /// INVPCID descriptor: PCID in bits 11:0 (the rest of the first quadword is reserved) followed by
 /// a linear address.
@@ -72,6 +72,24 @@ impl Cpu {
         Ok(())
     }
 
+    /// Remembers the monitored line so a store to it by another vCPU (or a device) wakes this
+    /// one, which is how a remote CPU hands work to an idle one without an IPI (the kernel's
+    /// idle loop polls a flag with MONITOR/MWAIT). An address that does not translate is not
+    /// watched: only interrupts wake it.
+    fn watch_monitored_line(&mut self) {
+        let Ok(physical) = self.translate(self.monitor_address, super::mem::AccessKind::Read, true)
+        else {
+            return;
+        };
+        let line = physical & !(MONITOR_WATCH_BYTES as u64 - 1);
+        if let Some(contents) = self
+            .ram
+            .get(line as usize..line as usize + MONITOR_WATCH_BYTES)
+        {
+            self.mwait_watch = Some((line, contents.try_into().unwrap()));
+        }
+    }
+
     /// 0F 01 C9. CPL 0 only, #GP on reserved ECX bits. Waits like `hlt` while interrupts are
     /// enabled; with IF=0 and no break-on-masked-interrupt it returns immediately, because a
     /// `hlt`-style stop there would be the machine-shutdown case in the run loop and MWAIT may
@@ -88,6 +106,9 @@ impl Cpu {
         self.monitor_armed = false;
         if self.eflags_full() & super::flags::IF != 0 {
             self.halted = true;
+            if self.multi {
+                self.watch_monitored_line();
+            }
         }
         Ok(())
     }

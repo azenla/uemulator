@@ -642,6 +642,10 @@ impl Cpu {
                 self.pages_with_code.dedup();
             }
             self.pages_with_code.push(page as u32);
+            // The other vCPUs' TLBs are revoked when they next run (`Smp::switch_to`); this one
+            // is done below.
+            self.code_mark_epoch += 1;
+            self.code_mark_seen = self.code_mark_epoch;
             let ram_base = self.ram_base;
             for entry in self.tlb.iter_mut() {
                 // tag + addend is the page's host address, minus ram_base its physical address.
