@@ -122,6 +122,9 @@ fn build_config(
         .kernel(kernel)
         .debug(args.debug)
         .verify_jit(args.verify);
+    if args.debug {
+        cfg = cfg.log(|line| eprintln!("{line}"));
+    }
     if let Some(initramfs) = initramfs {
         cfg = cfg.initrd(initramfs);
     }

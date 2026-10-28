@@ -508,6 +508,15 @@ impl Cpu {
             ignore_tpr: v_intr & V_IGNORE_TPR != 0,
             virtual_tpr: v_intr as u8,
         };
+        if self.trace.is_some() {
+            let guest_rip = self.vmcb_read(vmcb, SAVE_RIP, 8);
+            if let Some(log) = &self.log {
+                log(&format!(
+                    "svm: vmrun vmcb={vmcb:#x} rip={guest_rip:#x} cr0={guest_cr0:#x} efer={guest_efer:#x} npt={nested} cs={:#x}:{:#x} limit={:#x} flags={:#x}",
+                    cs.sel, cs.base, cs.limit, cs.flags
+                ));
+            }
+        }
         // Load the guest.
         self.seg[SEG_ES] = self.vmcb_segment(vmcb, SAVE_ES);
         self.seg[SEG_CS] = cs;
@@ -581,6 +590,18 @@ impl Cpu {
         let guest = self.svm.guest.take().expect("vmexit outside a guest");
         let vmcb = guest.vmcb;
         self.svm.last_vmcb = vmcb;
+        if let (Some(log), Some(_)) = (&self.log, &self.trace) {
+            log(&format!(
+                "svm: #VMEXIT {code:#x} info1={info1:#x} info2={info2:#x} rip={:#x} nrip={next_rip:#x} cs={:#x}:{:#x} flags={:#x} rax={:#x} cr0={:#x} cpl={}",
+                self.rip,
+                self.seg[SEG_CS].sel,
+                self.seg[SEG_CS].base,
+                self.seg[SEG_CS].flags,
+                self.gpr[0],
+                self.cr0,
+                self.cpl
+            ));
+        }
         for (offset, segment) in [
             (SAVE_ES, self.seg[SEG_ES]),
             (SAVE_CS, self.seg[SEG_CS]),
@@ -1968,6 +1989,33 @@ mod tests {
         run(&mut h);
         assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
         assert_eq!(get(&h, SAVE_RAX, 8), 0xfeed_face_cafe_beef);
+    }
+
+    #[test]
+    fn a_guest_without_paging_still_goes_through_the_nested_tables() {
+        // Real mode, CS.base = the remapped guest-physical page; the code exists only at the
+        // host-physical page behind it, so the fetch must go through nCR3.
+        let mut h = nested_rig(ASM_HLT);
+        h.write(
+            NESTED_REMAPPED_HPA,
+            &[0x66, 0xb8, 0xa5, 0x5a, 0, 0, 0x0f, 0xa2],
+        );
+        set_guest_mode(&mut h, 0, 0, 0, 0, 0);
+        let code = crate::cpu::modes::real_mode_segment(0, 0);
+        let code_segment = Seg {
+            sel: (NESTED_REMAPPED_GPA >> 4) as u16,
+            base: NESTED_REMAPPED_GPA,
+            flags: code.flags | SEG_TYPE_EXECUTABLE,
+            ..code
+        };
+        put_segment(&mut h, SAVE_CS, code_segment);
+        for offset in [SAVE_ES, SAVE_SS, SAVE_DS] {
+            put_segment(&mut h, offset, code);
+        }
+        put(&mut h, SAVE_RIP, 8, 0);
+        put(&mut h, SAVE_RSP, 8, 0x7000);
+        run(&mut h);
+        assert_guest_exited_on_cpuid(&h, 6);
     }
 
     #[test]

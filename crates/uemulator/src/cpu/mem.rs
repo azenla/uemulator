@@ -257,8 +257,9 @@ impl Cpu {
     /// narrower.
     fn walk(&mut self, linear: u64, access: AccessKind, user: bool) -> ExecResult<(u64, u8)> {
         match self.paging_mode() {
+            // Linear is guest-physical; a nested-paging guest's addresses still go through nCR3.
             PagingMode::Off => Ok((
-                linear & !PAGE_OFFSET_MASK,
+                self.nested_translate(linear & !PAGE_OFFSET_MASK, access, false)?,
                 TLB_FLAG_WRITABLE | TLB_FLAG_USER | TLB_FLAG_DIRTY,
             )),
             PagingMode::Legacy => self.walk_legacy(linear, access, user),

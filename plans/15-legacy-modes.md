@@ -55,6 +55,10 @@ Other places that changed: `mov cr/dr` is 32 bits wide outside IA-32e mode; `lgd
 
 A bzImage without `XLF_KERNEL_64` is no longer rejected: `boot::load` places it exactly like a 64-bit one but returns `BootMode::Protected32` with `rip` at the first byte of the protected-mode image (`startup_32`), a boot GDT whose `__BOOT_CS` (0x10) is a 32-bit code descriptor, and `Cpu::enter_boot_protected_mode` (CR0.PE only, flat segments, paging and long mode off, ESI = `boot_params`). Verified end to end with Alpine's x86 `vmlinuz-lts` (6.18, non-PAE i686): the kernel enables 32-bit paging itself, takes timer and device interrupts through 32-bit gates, runs busybox in ring 3 via `int 0x80`/`sysenter`, and reaches a shell on the serial console (`uemulator boot --kernel vmlinuz-lts --initramfs initramfs-lts --console serial -m 512 --cmdline "console=ttyS0 rdinit=/bin/sh"`). Everything runs on the interpreter (the JIT is 64-bit-only), so expect it to be several times slower than a 64-bit guest.
 
+## Validation by KVM
+
+`hack/kvm/run.sh` (see 03, "SVM") runs Linux KVM inside the emulated guest and starts vCPUs in each mode this document covers, over SVM and nested paging; all pass. That is the check that the segment, paging and interrupt rules agree with what a hypervisor sets up from `KVM_SET_SREGS`.
+
 ## Tests
 
 `cpu/legacy_tests.rs` holds 49 tests, generated from assembly snippets (`BITS=16 hack/asm.sh`, `BITS=32 hack/asm.sh`) and run on real-mode and flat 32-bit harnesses (`Harness::real`, `legacy_support::protected32`): 16-bit addressing and wrap, segment bases and limits, stack widths, real-mode interrupts, far jumps/calls, string ops, BCD, 32-bit gates, error codes, ring 3 to ring 0 and back through the TSS, V86 entry and exit, sysenter/sysexit, call gates with parameters, task switch and nested-task return, LDT, 16-bit code in protected mode, real mode to protected mode to long mode with the boot code a real loader runs, compatibility mode and the far jump back to 64-bit mode. `machine/tests.rs` boots a real-mode firmware image on the full machine under both JIT modes.

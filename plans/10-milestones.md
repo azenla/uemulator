@@ -27,6 +27,8 @@
 
 - AVX-512 done (see 03, "AVX-512"): EVEX decoding, 32 ZMM registers, opmasks and XSAVE components 5-7, AVX512F/VL/BW/DQ/CD/IFMA/VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ, GFNI, VAES and VPCLMULQDQ, with masking, broadcast, embedded rounding and fault suppression; advertised in CPUID. Alpine and the Debian installer boot with it on.
 
+- SVM validated against Linux KVM (see 03, "SVM", and `hack/kvm/run.sh`): the emulated Alpine guest loads `kvm_amd` and runs vCPUs in real, protected, long, PAE and 32-bit-paging mode on the emulator's SVM and nested paging. A 32-bit Alpine i686 kernel also boots to a shell (see 15).
+
 - UMIP, SMEP/SMAP, PCID/INVPCID, MONITOR/MWAIT, RDTSCP done (see 03).
 
 - VEX decoding, BMI1 and BMI2 done (see 03, "VEX and BMI").
