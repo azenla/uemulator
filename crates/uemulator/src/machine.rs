@@ -67,10 +67,11 @@ pub enum ClockMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitReason {
-    /// The guest executed `hlt` with interrupts disabled (IF=0), which nothing can wake: with
-    /// `acpi=off` that is how Linux's poweroff and halt end (`cli; hlt` in a loop). There is no
-    /// ACPI or power-off device, so this is the only power-off signal. A reset request made just
-    /// before the `hlt` wins and is reported as `Reset`.
+    /// The guest powered the machine off: it wrote the ACPI sleep register (PM1a_CNT) with
+    /// SLP_EN and the S5 type, or it executed `hlt` with interrupts disabled (IF=0), which
+    /// nothing can wake. Without ACPI tables (`MachineConfig::acpi(false)`, or a guest that
+    /// ignores them) the `hlt` is how Linux's poweroff and halt end (`cli; hlt` in a loop). A
+    /// reset request made just before the `hlt` wins and is reported as `Reset`.
     Shutdown,
     /// The guest asked for a reset through the keyboard controller (port 0x64), fast A20 (0x92)
     /// or reset control (0xcf9) port; see `dev/mod.rs`. Only produced with
@@ -227,9 +228,10 @@ impl MachineConfig {
     }
 
     /// Adds an AMD IOMMU (AMD-Vi) as PCI function 00:00.2, and translates the DMA of every PCI
-    /// function through it once the guest enables it. Off by default. A guest only finds it
-    /// through the ACPI IVRS table, so without firmware or ACPI that describes it (see
-    /// `plans/16-iommu.md`) it just sits on the bus.
+    /// function through it once the guest enables it; I/O APIC, HPET and MSI-X interrupts go
+    /// through its interrupt remapping, and the virtio functions offer `ACCESS_PLATFORM` so the
+    /// guest maps their buffers. Off by default. The guest finds it through the ACPI IVRS table,
+    /// which needs `acpi` (on by default); see `plans/16-iommu.md`.
     pub fn iommu(mut self, on: bool) -> Self {
         self.iommu = on;
         self

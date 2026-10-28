@@ -23,7 +23,7 @@ Follow the kernel's 64-bit boot protocol (Documentation/arch/x86/boot.rst, "64-b
 4. e820 table in `boot_params.e820_table`, `e820_entries`:
    - `0x0 – 0x9FC00` usable (kernel needs low memory for trampoline), reserved `0x9FC00 – 0x100000`, usable `0x100000 – top`.
 5. Initial CPU state: long mode active (CR0.PE|PG, CR4.PAE, EFER.LME|LMA), identity-mapped page tables covering the first 4 GiB (2 MiB pages) placed at e.g. `0x9000`; GDT with `__BOOT_CS` at selector 0x10 (64-bit code) and `__BOOT_DS` at 0x18 per protocol; `RIP = 0x1000200`; `RSI = &boot_params`; interrupts masked; `CLD`; other GPRs zero.
-6. No ACPI, no MP table → `acpi=off`. No LAPIC/IOAPIC in CPUID → kernel uses 8259 PIC + PIT.
+6. No ACPI, no MP table → `acpi=off` (superseded for `EmulatedMachine`: `boot::load_with_acpi` publishes tables, see 07; `Platform` hosts still say `acpi=off`). No LAPIC/IOAPIC in CPUID → kernel uses 8259 PIC + PIT.
 
 ## Things to verify during implementation
 

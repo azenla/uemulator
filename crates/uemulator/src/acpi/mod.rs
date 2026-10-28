@@ -80,6 +80,10 @@ fn ivrs(config: &AcpiConfig) -> Vec<u8> {
     pci_devices.extend(
         (0..config.pci_functions).map(|index| (FIRST_VIRTIO_SLOT + index as u16) << PCI_SLOT_SHIFT),
     );
+    // Linux sizes the IOMMU's device table from the highest device id in the select and range
+    // entries only, not the special ones: without these two the table would end below the
+    // I/O APIC's requester id and every I/O APIC interrupt would fault.
+    pci_devices.extend([IOAPIC_REQUESTER, HPET_REQUESTER]);
     iommu::Iommu::new().ivrs_table(&IvrsTopology {
         pci_devices,
         ioapics: vec![SpecialDevice {

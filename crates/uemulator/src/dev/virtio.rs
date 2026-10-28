@@ -14,6 +14,12 @@ pub(crate) const DEVICE_TYPE_CONSOLE: u16 = 3;
 /// Feature bit 32. We only implement modern (virtio 1.x) split queues, so the driver must accept it.
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
+/// Feature bit 33: addresses in the virtqueues are device addresses, to be mapped through the
+/// DMA API (the IOMMU), not guest physical ones. Offered only when an IOMMU translates this
+/// function's DMA: without it a Linux driver hands the device bare physical addresses, which the
+/// IOMMU's page tables do not map, and every transfer faults.
+const VIRTIO_F_ACCESS_PLATFORM: u64 = 1 << 33;
+
 /// Device status bits (virtio "device status field"). ACKNOWLEDGE (1) and DRIVER (2) are not
 /// checked, the driver sets them and we just store them.
 const STATUS_DRIVER_OK: u8 = 4;
@@ -386,6 +392,8 @@ pub(crate) struct Transport {
     queue_vectors: Vec<u16>,
     /// Messages sent since `take_messages`: (address, data).
     messages: Vec<(u64, u32)>,
+    /// Offer `VIRTIO_F_ACCESS_PLATFORM` (the function sits behind the IOMMU).
+    behind_iommu: bool,
 }
 
 /// One MSI-X table entry. Masked at reset, as the PCI spec requires.
@@ -430,7 +438,13 @@ impl Transport {
             config_vector: MSI_NO_VECTOR,
             queue_vectors: vec![MSI_NO_VECTOR; queue_count],
             messages: Vec::new(),
+            behind_iommu: false,
         }
+    }
+
+    /// Marks the function as behind an IOMMU, which makes it offer `VIRTIO_F_ACCESS_PLATFORM`.
+    pub fn set_behind_iommu(&mut self, behind: bool) {
+        self.behind_iommu = behind;
     }
 
     /// Entries in the MSI-X table: one for configuration changes and one per queue.
@@ -577,7 +591,12 @@ impl Transport {
     }
 
     fn dev_features(&self) -> u64 {
-        self.dev.features() | VIRTIO_F_VERSION_1
+        let access_platform = if self.behind_iommu {
+            VIRTIO_F_ACCESS_PLATFORM
+        } else {
+            0
+        };
+        self.dev.features() | VIRTIO_F_VERSION_1 | access_platform
     }
 
     /// Sets ISR bits and returns true only on the 0 -> nonzero transition. The PIC line is
@@ -1347,6 +1366,41 @@ mod tests {
         assert_eq!(status & STATUS_FEATURES_OK, 0);
         let status = negotiate(&mut rig, 0x24, VERSION_1_HIGH_WORD_BIT | 0x4);
         assert_eq!(status & STATUS_FEATURES_OK, 0);
+    }
+
+    #[test]
+    fn access_platform_is_offered_only_behind_an_iommu_and_then_the_driver_may_take_it() {
+        const ACCESS_PLATFORM_HIGH_WORD_BIT: u32 = 1 << 1;
+        let mut plain = Rig::new(1, 0);
+        plain.write(COMMON_DEVICE_FEATURE_SELECT, 4, 1);
+        assert_eq!(
+            plain.read(COMMON_DEVICE_FEATURE, 4),
+            VERSION_1_HIGH_WORD_BIT
+        );
+        let status = negotiate(
+            &mut plain,
+            0,
+            VERSION_1_HIGH_WORD_BIT | ACCESS_PLATFORM_HIGH_WORD_BIT,
+        );
+        assert_eq!(
+            status & STATUS_FEATURES_OK,
+            0,
+            "not offered, so not accepted"
+        );
+
+        let mut behind = Rig::new(1, 0);
+        behind.transport.set_behind_iommu(true);
+        behind.write(COMMON_DEVICE_FEATURE_SELECT, 4, 1);
+        assert_eq!(
+            behind.read(COMMON_DEVICE_FEATURE, 4),
+            VERSION_1_HIGH_WORD_BIT | ACCESS_PLATFORM_HIGH_WORD_BIT
+        );
+        let status = negotiate(
+            &mut behind,
+            0,
+            VERSION_1_HIGH_WORD_BIT | ACCESS_PLATFORM_HIGH_WORD_BIT,
+        );
+        assert_ne!(status & STATUS_FEATURES_OK, 0);
     }
 
     #[test]

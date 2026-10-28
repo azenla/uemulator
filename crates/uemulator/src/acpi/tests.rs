@@ -123,8 +123,16 @@ fn ivrs_lists_every_function_and_the_special_requesters_the_interrupt_path_uses(
     let ram = ram_with_tables(&config(1, 2, true));
     let ivrs = find(&ram, "IVRS");
     let contains = |needle: &[u8]| ivrs.windows(needle.len()).any(|window| window == needle);
-    // Select entries: host bridge 00:00.0, IOMMU 00:00.2, slots 1 and 2.
-    for devfn in [0x0000u16, 0x0002, 0x0008, 0x0010] {
+    // Select entries: host bridge 00:00.0, IOMMU 00:00.2, slots 1 and 2, and the requester ids
+    // of the I/O APIC and the HPET (which sets how large Linux makes the device table).
+    for devfn in [
+        0x0000u16,
+        0x0002,
+        0x0008,
+        0x0010,
+        IOAPIC_REQUESTER,
+        HPET_REQUESTER,
+    ] {
         let mut entry = vec![0x02];
         entry.extend_from_slice(&devfn.to_le_bytes());
         entry.push(0);

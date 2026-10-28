@@ -34,7 +34,7 @@ mod tests;
 
 pub(crate) use irq::{
     DeliveryMode, InterruptFault, InterruptRequest, RemappedInterrupt, decode_message,
-    ioapic_request,
+    ioapic_request, ioapic_request_raw,
 };
 pub(crate) use ivrs::{IvrsTopology, SpecialDevice};
 use tables::{DeviceTableEntry, WalkError};
@@ -80,10 +80,10 @@ const CAP_BASE_HIGH: usize = CAPABILITY_AT + 0x08;
 const CAP_RANGE: usize = CAPABILITY_AT + 0x0c;
 const CAP_MISC: usize = CAPABILITY_AT + 0x10;
 const MSI_AT: usize = 0x58;
-const MSI_CONTROL: usize = MSI_AT + 0x02;
-const MSI_ADDRESS_LOW: usize = MSI_AT + 0x04;
-const MSI_ADDRESS_HIGH: usize = MSI_AT + 0x08;
-const MSI_DATA: usize = MSI_AT + 0x0c;
+pub(crate) const MSI_CONTROL: usize = MSI_AT + 0x02;
+pub(crate) const MSI_ADDRESS_LOW: usize = MSI_AT + 0x04;
+pub(crate) const MSI_ADDRESS_HIGH: usize = MSI_AT + 0x08;
+pub(crate) const MSI_DATA: usize = MSI_AT + 0x0c;
 const CAPABILITY_ID_IOMMU: u8 = 0x0f;
 const CAPABILITY_ID_MSI: u8 = 0x05;
 /// CapType (bits 18:16) is 011b for an IOMMU block, CapRev (23:19) is 1.
@@ -97,7 +97,7 @@ const CAP_EXTENDED: u32 = 1 << 28;
 const CAP_BASE_ENABLE: u32 = 1;
 const CAP_BASE_ADDRESS_LOW_MASK: u32 = 0xffff_c000;
 /// MSI control: enable, 64-bit capable. One message only, so the multiple-message bits stay 0.
-const MSI_CONTROL_ENABLE: u16 = 1 << 0;
+pub(crate) const MSI_CONTROL_ENABLE: u16 = 1 << 0;
 const MSI_CONTROL_64BIT: u16 = 1 << 7;
 const MSI_CONTROL_WRITABLE: u8 = 0x01;
 /// The misc info register at cap+0x10 (MsiNum 0, GvaSize 48 bit, PaSize 48, VaSize 64).
@@ -500,7 +500,8 @@ impl Iommu {
         self.event_tail = tail;
     }
 
-    fn raise_msi(&mut self) {
+    /// An event or completion-wait interrupt is due; `take_interrupt` hands it out once.
+    pub(crate) fn raise_msi(&mut self) {
         self.msi_pending = true;
     }
 

@@ -25,7 +25,7 @@ use apic::{Interrupt, Lapic};
 use guestmem::GuestMem;
 use hpet::{Hpet, HpetOutput};
 use ioapic::IoApic;
-use iommu::{DeliveryMode, InterruptRequest, IommuInterrupt, PhysRead, ioapic_request};
+use iommu::{InterruptRequest, IommuInterrupt, PhysRead, ioapic_request_raw};
 use pci::PciHost;
 use pic::Pics;
 use pit::Pit;
@@ -119,11 +119,14 @@ const CMOS_STATUS_B_VALUE: u8 = 0x02;
 /// Status D: battery good (VRT), so the kernel trusts the time.
 const CMOS_STATUS_D_VALUE: u8 = 0x80;
 
-/// Requester ids the IOMMU sees for interrupts that do not come from a PCI function: functions
-/// 1 and 3 of the host bridge's slot, which exist as nothing else (the IOMMU is function 2).
-/// Must match the IVRS special-device entries (`acpi`).
-pub(crate) const IOAPIC_REQUESTER: u16 = 0x0001;
-pub(crate) const HPET_REQUESTER: u16 = 0x0003;
+/// Requester ids the IOMMU sees for interrupts that do not come from a PCI function. Linux's
+/// AMD IOMMU driver insists on finding an I/O APIC at the "southbridge" id 00:14.0 in the IVRS
+/// (`IOAPIC_SB_DEVID`) and turns interrupt remapping off otherwise; the HPET gets the next
+/// function. A virtio function in slot 0x14 (the 20th) would share the IOAPIC's table entry,
+/// which still works because both only need the same interrupt table. Must match the IVRS
+/// special-device entries (`acpi`).
+pub(crate) const IOAPIC_REQUESTER: u16 = 0x00a0;
+pub(crate) const HPET_REQUESTER: u16 = 0x00a1;
 
 /// A device interrupt on its way to the LAPIC.
 enum Source {
@@ -362,13 +365,10 @@ impl Devices {
         };
         let (request, pin) = match source {
             Source::IoApic { pin, interrupt } => {
-                let Some(mode) = DeliveryMode::from_msi(interrupt.delivery_mode) else {
-                    return;
-                };
-                let request = ioapic_request(
+                let request = ioapic_request_raw(
                     IOAPIC_REQUESTER,
                     interrupt.vector,
-                    mode,
+                    interrupt.delivery_mode,
                     interrupt.logical,
                     interrupt.level_triggered,
                     interrupt.destination as u8,
@@ -2354,5 +2354,329 @@ mod tests {
         let deadline = dev.next_deadline(0).unwrap();
         tick(&mut dev, deadline);
         assert_eq!(dev.interrupt_ack(), Some(FSB_VECTOR as u8));
+    }
+
+    const IOMMU_BASE: u64 = 0xfed8_0000;
+    const IOMMU_DEVICE_TABLE_REGISTER: u64 = 0x00;
+    const IOMMU_CONTROL_REGISTER: u64 = 0x18;
+    const IOMMU_ENABLE: u64 = 1;
+    const IOMMU_RAM_BYTES: usize = 1 << 20;
+    const DEVICE_TABLE_AT: usize = 0x1_0000;
+    const DEVICE_TABLE_TWO_PAGES: u64 = 1;
+    const INTERRUPT_TABLE_AT: usize = 0x2_0000;
+    const DEVICE_TABLE_ENTRY_BYTES: usize = 32;
+    /// The I/O APIC's entry has V clear, as Linux leaves it: only IV matters for interrupts.
+    const DTE_INTERRUPT_QUAD: usize = 16;
+    /// IV, IntTabLen 9 (512 entries), IntCtl 2 (remap).
+    const DTE_REMAP_9: u64 = 1 | 9 << 1 | 2 << 60;
+    const IRTE_REMAP_ENABLE: u32 = 1;
+    const IRTE_VECTOR_SHIFT: u32 = 16;
+    const ISA_IRQ_1_PIN: u64 = 1;
+    const REMAPPED_VECTOR: u8 = 0x77;
+    const IRTE_INDEX: u8 = 5;
+    const MSI_ADDRESS_LOW_OFFSET: u64 = iommu::MSI_ADDRESS_LOW as u64;
+    const MSI_DATA_OFFSET: u64 = iommu::MSI_DATA as u64;
+    const MSI_CONTROL_OFFSET: u64 = iommu::MSI_CONTROL as u64;
+    const IOMMU_FUNCTION_ECAM: u64 = pci::ECAM_BASE + (2 << 12);
+
+    /// A machine with the IOMMU and a console, the local APIC on and the I/O APIC pin `pin`
+    /// routed to the IRTE index `IRTE_INDEX`; a megabyte of RAM for the guest's tables.
+    fn iommu_machine(pin: u64, level: bool) -> (Devices, Vec<u8>) {
+        let mut dev = Devices::new(
+            ConsoleHandle::default(),
+            DevConfig {
+                iommu: true,
+                virtio_consoles: vec![ConsoleHandle::default()],
+                ..Default::default()
+            },
+        );
+        let mut ram = vec![0u8; IOMMU_RAM_BYTES];
+        let mut mem = test_mem(&mut ram);
+        assert!(dev.mmio_write(
+            LAPIC_SPURIOUS_VECTOR_REGISTER,
+            4,
+            LAPIC_SOFTWARE_ENABLE,
+            &mut mem
+        ));
+        let register = IOAPIC_FIRST_REDIRECTION + 2 * pin;
+        let low = IRTE_INDEX as u64 | (level as u64) << 15;
+        for (select, value) in [(register + 1, 0), (register, low)] {
+            assert!(dev.mmio_write(IOAPIC_SELECT, 4, select, &mut mem));
+            assert!(dev.mmio_write(IOAPIC_WINDOW, 4, value, &mut mem));
+        }
+        (dev, ram)
+    }
+
+    fn write_u64(ram: &mut [u8], at: usize, value: u64) {
+        ram[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Gives `requester` a remapping device table entry over the one interrupt table, and IRTE
+    /// `IRTE_INDEX` the vector `vector` (or a disabled entry for `None`).
+    fn remap_requester(ram: &mut [u8], requester: u16, vector: Option<u8>) {
+        let entry = DEVICE_TABLE_AT + requester as usize * DEVICE_TABLE_ENTRY_BYTES;
+        write_u64(
+            ram,
+            entry + DTE_INTERRUPT_QUAD,
+            DTE_REMAP_9 | INTERRUPT_TABLE_AT as u64,
+        );
+        let irte = vector.map_or(0, |vector| {
+            IRTE_REMAP_ENABLE | (vector as u32) << IRTE_VECTOR_SHIFT
+        });
+        let at = INTERRUPT_TABLE_AT + 4 * IRTE_INDEX as usize;
+        ram[at..at + 4].copy_from_slice(&irte.to_le_bytes());
+    }
+
+    fn enable_iommu(dev: &mut Devices, ram: &mut [u8]) {
+        // Two pages of device table (the size field is pages - 1): entries up to device id 255.
+        let table = DEVICE_TABLE_AT as u64 | DEVICE_TABLE_TWO_PAGES;
+        mmio_write(dev, ram, IOMMU_BASE + IOMMU_DEVICE_TABLE_REGISTER, 8, table);
+        mmio_write(
+            dev,
+            ram,
+            IOMMU_BASE + IOMMU_CONTROL_REGISTER,
+            8,
+            IOMMU_ENABLE,
+        );
+    }
+
+    fn fire_hpet_timer(dev: &mut Devices, ram: &mut [u8], pin: u64, level: bool) {
+        mmio_write(dev, ram, HPET_CONFIG, 8, HPET_ENABLE);
+        let mut config = HPET_TIMER_INTERRUPT_ENABLE | pin << HPET_ROUTE_SHIFT;
+        if level {
+            config |= HPET_TIMER_LEVEL;
+        }
+        mmio_write(dev, ram, HPET_TIMER0_CONFIG, 8, config);
+        mmio_write(dev, ram, HPET_TIMER0_COMPARATOR, 8, 1000);
+        let deadline = dev.next_deadline(0).unwrap();
+        let mut mem = test_mem(ram);
+        dev.tick(deadline, &mut mem);
+    }
+
+    #[test]
+    fn ioapic_interrupts_are_remapped_through_the_irte_once_the_iommu_is_on() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        remap_requester(&mut ram, IOAPIC_REQUESTER, Some(REMAPPED_VECTOR));
+        enable_iommu(&mut dev, &mut ram);
+        fire_hpet_timer(&mut dev, &mut ram, HPET_PIN, false);
+        assert!(dev.interrupt_pending());
+        assert_eq!(dev.interrupt_ack(), Some(REMAPPED_VECTOR));
+        assert_eq!(
+            dev.interrupt_ack(),
+            None,
+            "the index itself is never delivered"
+        );
+    }
+
+    #[test]
+    fn with_the_iommu_off_the_ioapics_vector_field_is_the_vector() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        remap_requester(&mut ram, IOAPIC_REQUESTER, Some(REMAPPED_VECTOR));
+        // The table is programmed but IOMMUEn is clear.
+        let table = DEVICE_TABLE_AT as u64 | DEVICE_TABLE_TWO_PAGES;
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            IOMMU_BASE + IOMMU_DEVICE_TABLE_REGISTER,
+            8,
+            table,
+        );
+        // Vector 5 is below the first valid one: give the entry a real vector instead.
+        let register = IOAPIC_FIRST_REDIRECTION + 2 * HPET_PIN;
+        mmio_write(&mut dev, &mut ram, IOAPIC_SELECT, 4, register);
+        mmio_write(&mut dev, &mut ram, IOAPIC_WINDOW, 4, TEST_VECTOR as u64);
+        fire_hpet_timer(&mut dev, &mut ram, HPET_PIN, false);
+        assert_eq!(dev.interrupt_ack(), Some(TEST_VECTOR));
+    }
+
+    #[test]
+    fn an_interrupt_the_irte_does_not_enable_is_dropped() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        remap_requester(&mut ram, IOAPIC_REQUESTER, None);
+        enable_iommu(&mut dev, &mut ram);
+        fire_hpet_timer(&mut dev, &mut ram, HPET_PIN, false);
+        assert!(!dev.interrupt_pending());
+        assert_eq!(dev.interrupt_ack(), None);
+    }
+
+    #[test]
+    fn an_isa_line_raised_on_the_cpu_path_waits_for_the_next_tick_to_be_remapped() {
+        let (mut dev, mut ram) = iommu_machine(ISA_IRQ_1_PIN, false);
+        remap_requester(&mut ram, IOAPIC_REQUESTER, Some(REMAPPED_VECTOR));
+        enable_iommu(&mut dev, &mut ram);
+        // As a kernel running on the APIC leaves it: every PIC input masked.
+        out(&mut dev, PIC_MASTER_DATA, 1, 0xff);
+        dev.pic.raise(1);
+        // `interrupt_pending` has no RAM to read the IRTE from.
+        assert!(!dev.interrupt_pending());
+        let mut mem = test_mem(&mut ram);
+        dev.tick(1, &mut mem);
+        assert!(dev.interrupt_pending());
+        assert_eq!(dev.interrupt_ack(), Some(REMAPPED_VECTOR));
+    }
+
+    #[test]
+    fn a_level_interrupt_is_re_sent_after_the_eoi_of_the_remapped_vector() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, true);
+        remap_requester(&mut ram, IOAPIC_REQUESTER, Some(REMAPPED_VECTOR));
+        enable_iommu(&mut dev, &mut ram);
+        fire_hpet_timer(&mut dev, &mut ram, HPET_PIN, true);
+        assert_eq!(dev.interrupt_ack(), Some(REMAPPED_VECTOR));
+        // The EOI carries the delivered vector, not the index in the redirection entry.
+        mmio_write(&mut dev, &mut ram, 0xfee0_00b0, 4, 0);
+        let mut mem = test_mem(&mut ram);
+        dev.tick(2_000_000, &mut mem);
+        assert_eq!(
+            dev.interrupt_ack(),
+            Some(REMAPPED_VECTOR),
+            "the line is still high"
+        );
+    }
+
+    #[test]
+    fn hpet_fsb_messages_go_through_the_iommu_as_the_hpets_requester() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        remap_requester(&mut ram, HPET_REQUESTER, Some(REMAPPED_VECTOR));
+        enable_iommu(&mut dev, &mut ram);
+        mmio_write(&mut dev, &mut ram, HPET_CONFIG, 8, HPET_ENABLE);
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            HPET_TIMER0_FSB_ROUTE,
+            8,
+            MSI_ADDRESS_BASE << 32 | IRTE_INDEX as u64,
+        );
+        let config = HPET_TIMER_INTERRUPT_ENABLE | HPET_TIMER_FSB_ENABLE;
+        mmio_write(&mut dev, &mut ram, HPET_TIMER0_CONFIG, 8, config);
+        mmio_write(&mut dev, &mut ram, HPET_TIMER0_COMPARATOR, 8, 500);
+        let deadline = dev.next_deadline(0).unwrap();
+        let mut mem = test_mem(&mut ram);
+        dev.tick(deadline, &mut mem);
+        assert_eq!(dev.interrupt_ack(), Some(REMAPPED_VECTOR));
+    }
+
+    /// Brings the console's MSI-X up by hand: memory space on, MSI-X on, driver OK, table entry
+    /// 0 pointing at the local APIC with data `data`, the configuration vector assigned to it.
+    fn console_with_msix_config_vector(dev: &mut Devices, ram: &mut [u8], data: u64) {
+        const CONSOLE_DEVFN: u64 = 8;
+        const MSIX_CONTROL_HIGH_BYTE: u64 = 0x87;
+        const MSIX_ENABLE_BIT_IN_HIGH_BYTE: u64 = 0x80;
+        const COMMON_MSIX_CONFIG_OFFSET: u64 = 0x10;
+        const MSIX_TABLE: u64 = 0x4000;
+        let function = pci::ECAM_BASE + (CONSOLE_DEVFN << 12);
+        let command = function + COMMAND_REGISTER as u64;
+        mmio_write(dev, ram, command, 2, MEMORY_SPACE_ENABLE as u64);
+        mmio_write(
+            dev,
+            ram,
+            function + MSIX_CONTROL_HIGH_BYTE,
+            1,
+            MSIX_ENABLE_BIT_IN_HIGH_BYTE,
+        );
+        let bar = |offset: u64| MMIO_BASE + offset;
+        let status = bar(COMMON_DEVICE_STATUS_OFFSET);
+        mmio_write(dev, ram, status, 1, STATUS_DRIVER_OK as u64);
+        mmio_write(dev, ram, bar(MSIX_TABLE), 4, MSI_ADDRESS_BASE);
+        mmio_write(dev, ram, bar(MSIX_TABLE + 4), 4, 0);
+        mmio_write(dev, ram, bar(MSIX_TABLE + 8), 4, data);
+        mmio_write(dev, ram, bar(MSIX_TABLE + 12), 4, 0);
+        mmio_write(dev, ram, bar(COMMON_MSIX_CONFIG_OFFSET), 2, 0);
+    }
+
+    #[test]
+    fn a_virtio_msix_message_reaches_the_lapic_without_the_iommu() {
+        let console = ConsoleHandle::default();
+        let mut dev = bus_with_console(&console);
+        let mut ram = vec![0u8; IOMMU_RAM_BYTES];
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            LAPIC_SPURIOUS_VECTOR_REGISTER,
+            4,
+            LAPIC_SOFTWARE_ENABLE,
+        );
+        console_with_msix_config_vector(&mut dev, &mut ram, TEST_VECTOR as u64);
+        console.resize(100, 30);
+        let mut mem = test_mem(&mut ram);
+        dev.tick(1, &mut mem);
+        assert_eq!(dev.interrupt_ack(), Some(TEST_VECTOR));
+    }
+
+    #[test]
+    fn a_virtio_msix_message_is_remapped_with_the_functions_requester_id() {
+        const CONSOLE_REQUESTER: u16 = 8;
+        let console = ConsoleHandle::default();
+        let mut dev = Devices::new(
+            ConsoleHandle::default(),
+            DevConfig {
+                iommu: true,
+                virtio_consoles: vec![console.clone()],
+                ..Default::default()
+            },
+        );
+        let mut ram = vec![0u8; IOMMU_RAM_BYTES];
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            LAPIC_SPURIOUS_VECTOR_REGISTER,
+            4,
+            LAPIC_SOFTWARE_ENABLE,
+        );
+        remap_requester(&mut ram, CONSOLE_REQUESTER, Some(REMAPPED_VECTOR));
+        enable_iommu(&mut dev, &mut ram);
+        console_with_msix_config_vector(&mut dev, &mut ram, IRTE_INDEX as u64);
+        console.resize(100, 30);
+        let mut mem = test_mem(&mut ram);
+        dev.tick(1, &mut mem);
+        assert_eq!(dev.interrupt_ack(), Some(REMAPPED_VECTOR));
+    }
+
+    #[test]
+    fn the_iommus_own_msi_is_delivered_to_the_lapic_once() {
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        let function = IOMMU_FUNCTION_ECAM;
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            function + MSI_ADDRESS_LOW_OFFSET,
+            4,
+            MSI_ADDRESS_BASE,
+        );
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            function + MSI_DATA_OFFSET,
+            2,
+            TEST_VECTOR as u64,
+        );
+        mmio_write(&mut dev, &mut ram, function + MSI_CONTROL_OFFSET, 2, 1);
+        dev.pci.iommu().unwrap().raise_msi();
+        let mut mem = test_mem(&mut ram);
+        dev.tick(1, &mut mem);
+        assert_eq!(dev.interrupt_ack(), Some(TEST_VECTOR));
+        dev.tick(2, &mut mem);
+        assert_eq!(dev.interrupt_ack(), None);
+    }
+
+    #[test]
+    fn with_intcapxt_the_iommus_interrupt_uses_the_xt_register_and_skips_remapping() {
+        const XT_GENERAL_REGISTER: u64 = 0x170;
+        const CONTROL_XT: u64 = 1 << 50 | 1 << 51;
+        const XT_VECTOR_SHIFT: u32 = 32;
+        let (mut dev, mut ram) = iommu_machine(HPET_PIN, false);
+        let control = IOMMU_BASE + IOMMU_CONTROL_REGISTER;
+        mmio_write(&mut dev, &mut ram, control, 8, CONTROL_XT);
+        let register = IOMMU_BASE + XT_GENERAL_REGISTER;
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            register,
+            8,
+            (TEST_VECTOR as u64) << XT_VECTOR_SHIFT,
+        );
+        dev.pci.iommu().unwrap().raise_msi();
+        let mut mem = test_mem(&mut ram);
+        dev.tick(1, &mut mem);
+        assert_eq!(dev.interrupt_ack(), Some(TEST_VECTOR));
     }
 }

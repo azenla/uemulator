@@ -161,12 +161,33 @@ pub(crate) fn ioapic_request(
     level_triggered: bool,
     destination: u8,
 ) -> InterruptRequest {
+    ioapic_request_raw(
+        requester,
+        vector,
+        delivery_mode.msi_bits(),
+        logical_destination,
+        level_triggered,
+        destination,
+    )
+}
+
+/// `ioapic_request` with the delivery mode as the entry's three bits. With remapping on those
+/// bits are the top of the IRTE index, so a value that is no valid mode (3, 6) still has to
+/// reach the IOMMU.
+pub(crate) fn ioapic_request_raw(
+    requester: u16,
+    vector: u8,
+    delivery_mode_bits: u32,
+    logical_destination: bool,
+    level_triggered: bool,
+    destination: u8,
+) -> InterruptRequest {
     let mut address =
         INTERRUPT_WINDOW_FIRST | (destination as u64) << MSI_ADDRESS_DESTINATION_SHIFT;
     if logical_destination {
         address |= MSI_ADDRESS_LOGICAL_DESTINATION;
     }
-    let mut data = vector as u32 | delivery_mode.msi_bits() << MSI_DATA_DELIVERY_SHIFT;
+    let mut data = vector as u32 | delivery_mode_bits << MSI_DATA_DELIVERY_SHIFT;
     if level_triggered {
         data |= MSI_DATA_LEVEL_TRIGGERED;
     }
@@ -223,7 +244,9 @@ impl Iommu {
                 return Err(InterruptFault::DeviceTable);
             }
         };
-        if !entry.valid() || !entry.interrupt_map_valid() {
+        // Only IV decides, not V: Linux leaves V clear in the entries of the I/O APIC and HPET
+        // special devices (nothing translates their DMA) and still has their interrupts remapped.
+        if !entry.interrupt_map_valid() {
             return decode_message(&request);
         }
         match self.remap_with_entry(mem, &request, &entry) {

@@ -358,6 +358,9 @@ impl PciHost {
     /// Adds the AMD IOMMU (`MachineConfig::iommu`).
     pub fn with_iommu(mut self, enabled: bool) -> Self {
         self.iommu = enabled.then(Iommu::new);
+        for function in &mut self.funcs {
+            function.transport.set_behind_iommu(enabled);
+        }
         self
     }
 
@@ -1860,5 +1863,141 @@ mod tests {
         host.funcs[0].transport.isr = 1;
         host.funcs[0].command |= COMMAND_INTX_DISABLE;
         assert!(!host.line_asserted(line));
+    }
+
+    const IOMMU_DEVICE_TABLE_REGISTER: u64 = 0x00;
+    const IOMMU_EVENT_BASE_REGISTER: u64 = 0x10;
+    const IOMMU_CONTROL_REGISTER: u64 = 0x18;
+    const IOMMU_EVENT_TAIL_REGISTER: u64 = 0x2018;
+    const CONTROL_IOMMU_ENABLE: u64 = 1;
+    const CONTROL_EVENT_LOG_ENABLE: u64 = 1 << 2;
+    const RING_LENGTH_256_ENTRIES: u64 = 8 << 56;
+    const EVENT_BYTES: u64 = 16;
+    const DEVICE_TABLE_AT: u64 = 0x1_0000;
+    const EVENT_LOG_AT: u64 = 0x3_0000;
+    const DESCRIPTORS_AT: u64 = 0x5_0000;
+    const AVAILABLE_AT: u64 = 0x6_0000;
+    const USED_AT: u64 = 0x7_0000;
+    const DTE_VALID: u64 = 1;
+    const DTE_TRANSLATION_VALID: u64 = 1 << 1;
+    const COMMON_DRIVER_FEATURE_SELECT_OFFSET: u64 = 0x08;
+    const COMMON_DRIVER_FEATURE_OFFSET: u64 = 0x0c;
+    const STATUS_FEATURES_OK: u32 = 8;
+    const STATUS_ACKNOWLEDGE_DRIVER: u32 = 3;
+
+    #[test]
+    fn with_an_iommu_every_function_offers_access_platform_and_without_none_does() {
+        for iommu in [false, true] {
+            let mut h = PciHost::new(vec![
+                console_transport(),
+                block_transport(),
+                net_transport(),
+            ])
+            .with_iommu(iommu);
+            for (slot, bar) in [
+                (1u32, MMIO_BASE),
+                (2, MMIO_BASE + BAR_SIZE),
+                (3, MMIO_BASE + 2 * BAR_SIZE),
+            ] {
+                enable_memory_space(&mut h, slot);
+                // Device feature select 1, the word with bits 32..63.
+                h.mmio_write(bar, 4, 1, &mut test_mem(&mut [0u8; 16]));
+                let features = h.mmio_read(bar + 4, 4).unwrap();
+                assert_eq!(features & 0b10 != 0, iommu, "slot {slot}, iommu {iommu}");
+                assert_ne!(features & 1, 0, "VERSION_1 either way");
+            }
+        }
+    }
+
+    /// Programs queue `queue` of the function at `bar` the way a driver does and kicks it, with
+    /// the rings in RAM at the `*_AT` addresses and one buffer available.
+    fn kick_a_queue(h: &mut PciHost, ram: &mut [u8], bar: u64, queue: u64) {
+        ram[AVAILABLE_AT as usize + 2] = 1;
+        let mut mem = test_mem(ram);
+        let mut write = |h: &mut PciHost, offset: u64, size: u8, value: u64| {
+            h.mmio_write(bar + offset, size, value as u32, &mut mem);
+        };
+        // Accept VERSION_1 and, when offered, ACCESS_PLATFORM, so FEATURES_OK sticks.
+        write(h, COMMON_DRIVER_FEATURE_SELECT_OFFSET, 4, 1);
+        write(h, COMMON_DRIVER_FEATURE_OFFSET, 4, 1);
+        write(
+            h,
+            COMMON_DEVICE_STATUS_OFFSET,
+            1,
+            (STATUS_ACKNOWLEDGE_DRIVER | STATUS_FEATURES_OK) as u64,
+        );
+        write(h, COMMON_QUEUE_SELECT_OFFSET, 2, queue);
+        for (register, address) in [(0, DESCRIPTORS_AT), (8, AVAILABLE_AT), (16, USED_AT)] {
+            write(h, COMMON_QUEUE_DESC_OFFSET + register, 4, address);
+            write(h, COMMON_QUEUE_DESC_OFFSET + register + 4, 4, 0);
+        }
+        write(h, COMMON_QUEUE_ENABLE_OFFSET, 2, 1);
+        write(
+            h,
+            COMMON_DEVICE_STATUS_OFFSET,
+            1,
+            (STATUS_ACKNOWLEDGE_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK) as u64,
+        );
+        write(
+            h,
+            NOTIFY_REGION_OFFSET + queue * NOTIFY_OFF_MULTIPLIER as u64,
+            2,
+            queue,
+        );
+    }
+
+    #[test]
+    fn the_dma_of_every_virtio_function_goes_through_the_iommu_as_its_own_requester() {
+        let mut h = full_host().with_iommu(true);
+        let mut ram = vec![0u8; 1 << 20];
+        let functions = [(CONSOLE_SLOT, 1u64), (BLOCK_SLOT, 0), (NET_SLOT, 1)];
+        // A translating entry with no mapping and no read or write permission: DMA is refused.
+        for (slot, _) in functions {
+            let devfn = (slot << DEVFN_SLOT_SHIFT) as usize;
+            let entry = DEVICE_TABLE_AT as usize + devfn * 32;
+            ram[entry..entry + 8]
+                .copy_from_slice(&(DTE_VALID | DTE_TRANSLATION_VALID).to_le_bytes());
+        }
+        {
+            let mut mem = test_mem(&mut ram);
+            for (register, value) in [
+                (IOMMU_DEVICE_TABLE_REGISTER, DEVICE_TABLE_AT),
+                (
+                    IOMMU_EVENT_BASE_REGISTER,
+                    EVENT_LOG_AT | RING_LENGTH_256_ENTRIES,
+                ),
+                (
+                    IOMMU_CONTROL_REGISTER,
+                    CONTROL_IOMMU_ENABLE | CONTROL_EVENT_LOG_ENABLE,
+                ),
+            ] {
+                assert!(h.iommu_mmio_write(iommu::MMIO_BASE + register, 8, value, &mut mem));
+            }
+        }
+        for (slot, queue) in functions {
+            enable_memory_space(&mut h, slot);
+            let bar = bar_base(&mut h, slot);
+            kick_a_queue(&mut h, &mut ram, bar, queue);
+        }
+        let tail = h
+            .iommu_mmio_read(iommu::MMIO_BASE + IOMMU_EVENT_TAIL_REGISTER, 8)
+            .unwrap();
+        let requesters: Vec<u16> = (0..tail / EVENT_BYTES)
+            .map(|index| {
+                let at = (EVENT_LOG_AT + index * EVENT_BYTES) as usize;
+                u16::from_le_bytes([ram[at], ram[at + 1]])
+            })
+            .collect();
+        for (slot, _) in functions {
+            let devfn = (slot << DEVFN_SLOT_SHIFT) as u16;
+            assert!(
+                requesters.contains(&devfn),
+                "no fault from {devfn:#x}: {requesters:x?}"
+            );
+        }
+        assert!(
+            requesters.iter().all(|r| [8, 16, 24].contains(r)),
+            "{requesters:x?}"
+        );
     }
 }
