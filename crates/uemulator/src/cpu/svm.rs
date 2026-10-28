@@ -1058,6 +1058,7 @@ mod tests {
     use super::*;
     use crate::cpu::BeforeStep;
     use crate::cpu::mem::AccessKind;
+    use crate::testkit::RBX;
     use crate::cpu::test_support::{LegacyTables, PTE_P, PaeTables};
     use crate::testkit::{CODE_BASE, Harness, SCRATCH};
 
@@ -2061,6 +2062,38 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_fault_in_the_middle_of_a_block_saves_the_guest_and_restores_the_host() {
+        // The #VMEXIT happens inside the memory access, with earlier instructions of the same
+        // block already executed (a JIT block keeps registers in host registers and must not
+        // write them back over the host state the exit just restored).
+        let mut h = nested_rig(&[
+            0xbb, 0x11, 0, 0, 0, // mov ebx, 0x11
+            0xb8, 0x22, 0, 0, 0, // mov eax, 0x22
+            0x48, 0x89, 0x03, // mov [rbx], rax: placeholder, rewritten below
+            0x0f, 0xa2,
+        ]);
+        h.write(
+            GUEST_CODE,
+            &[
+                0xbb, 0, 0, 0x80, 0, // mov ebx, 0x800000
+                0xb8, 0x22, 0, 0, 0, // mov eax, 0x22
+                0x48, 0x89, 0x03, // mov [rbx], rax
+                0x0f, 0xa2,
+            ],
+        );
+        h.write(NPT + 0x3000, &0u64.to_le_bytes());
+        let host_rsp = h.cpu.gpr[GPR_RSP];
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NPF);
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 10);
+        assert_eq!(get(&h, SAVE_RAX, 8), 0x22);
+        assert_eq!(h.cpu.gpr[RBX], NESTED_REMAPPED_GPA);
+        assert_eq!(h.cpu.gpr[RAX], VMCB, "the host's RAX is back");
+        assert_eq!(h.cpu.gpr[GPR_RSP], host_rsp);
+        assert_eq!(h.cpu.rip, CODE_BASE + 4, "the host resumes after vmrun");
+    }
+
+    #[test]
     fn a_nested_fault_while_delivering_an_event_reports_it_in_exit_int_info() {
         let handler = GUEST_CODE + 0x100;
         for (event, expected) in [
@@ -2172,6 +2205,7 @@ mod tests {
         event_injection_delivers_through_the_guest_idt_before_the_first_instruction,
         nested_paging_remaps_guest_physical_addresses,
         nested_page_faults_exit_with_the_gpa_and_error_code,
+        a_nested_fault_in_the_middle_of_a_block_saves_the_guest_and_restores_the_host,
         a_pending_virtual_interrupt_is_injected_when_the_guest_can_take_it,
     );
 }

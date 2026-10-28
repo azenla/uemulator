@@ -292,7 +292,7 @@ mod twin_devices {
         config_dword(devices, slot, 0)
     }
 
-    fn mirrored(main: &DevConfig) -> DevConfig {
+    fn mirrored(main: &mut DevConfig) -> DevConfig {
         mirrored_devices(main, &ConsoleHandle::default()).0
     }
 
@@ -332,8 +332,8 @@ mod twin_devices {
 
     #[test]
     fn mirror_has_the_same_virtio_functions_in_the_same_slots() {
-        let main = full_config(false);
-        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&main));
+        let mut main = full_config(false);
+        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&mut main));
         let mut original = Devices::new(ConsoleHandle::default(), main);
         for slot in 0..5 {
             assert_eq!(
@@ -350,35 +350,35 @@ mod twin_devices {
 
     #[test]
     fn mirror_of_an_empty_config_is_empty() {
-        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&DevConfig::default()));
+        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&mut DevConfig::default()));
         assert_eq!(id_of(&mut mirror, 1), u32::MAX);
     }
 
     #[test]
     fn mirror_gives_each_optional_device_independently() {
-        let net_only = DevConfig {
+        let mut net_only = DevConfig {
             nets: vec![(MAC, NetHandle::default())],
             ..DevConfig::default()
         };
-        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&net_only));
+        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&mut net_only));
         assert_eq!(id_of(&mut mirror, 1), device_id(DEVICE_TYPE_NET));
         assert_eq!(id_of(&mut mirror, 2), u32::MAX);
-        let console_only = DevConfig {
+        let mut console_only = DevConfig {
             virtio_consoles: vec![ConsoleHandle::default()],
             ..DevConfig::default()
         };
-        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&console_only));
+        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&mut console_only));
         assert_eq!(id_of(&mut mirror, 1), device_id(DEVICE_TYPE_CONSOLE));
     }
 
     #[test]
     fn mirrored_net_device_has_its_own_frame_queue() {
         let host_handle = NetHandle::default();
-        let main = DevConfig {
+        let mut main = DevConfig {
             nets: vec![(MAC, host_handle.clone())],
             ..DevConfig::default()
         };
-        let mirror = mirrored(&main);
+        let mirror = mirrored(&mut main);
         let (mac, mirror_handle) = mirror.nets.into_iter().next().unwrap();
         assert_eq!(mac, MAC);
         assert!(host_handle.send_frame(b"frame"));
@@ -388,7 +388,7 @@ mod twin_devices {
     #[test]
     fn mirrored_disk_has_the_capacity_and_read_only_flag_of_the_original() {
         for read_only in [false, true] {
-            let mut mirror = mirrored(&full_config(read_only));
+            let mut mirror = mirrored(&mut full_config(read_only));
             let disk = mirror.disks.remove(0);
             assert_eq!(disk.backend.len(), DISK_BYTES as u64);
             assert_eq!(disk.backend.read_only(), read_only);
@@ -396,24 +396,30 @@ mod twin_devices {
     }
 
     #[test]
-    fn mirrored_disk_reads_zeros_and_discards_writes() {
-        let mut disk = mirrored(&full_config(false)).disks.remove(0);
-        let mut buf = [0xffu8; 16];
-        disk.backend.read_at(512, &mut buf).unwrap();
-        assert_eq!(buf, [0u8; 16]);
-        disk.backend.write_at(0, &[1, 2, 3]).unwrap();
-        disk.backend.read_at(0, &mut buf).unwrap();
-        assert_eq!(buf, [0u8; 16]);
-        disk.backend.flush().unwrap();
+    fn mirrored_disk_replays_what_the_main_disk_returned_and_discards_writes() {
+        let mut main = full_config(false);
+        let mut twin = mirrored(&mut main).disks.remove(0);
+        let mut real = main.disks.remove(0);
+        let mut buf = [0u8; 16];
+        real.backend.read_at(512, &mut buf).unwrap();
+        assert_eq!(buf, [0x5a; 16]);
+        let mut replayed = [0xffu8; 16];
+        twin.backend.read_at(512, &mut replayed).unwrap();
+        assert_eq!(replayed, [0x5a; 16]);
+        twin.backend.write_at(0, &[1, 2, 3]).unwrap();
+        twin.backend.flush().unwrap();
+        // A request the main disk never served reads zeros: the check reports a divergence.
+        twin.backend.read_at(0, &mut replayed).unwrap();
+        assert_eq!(replayed, [0u8; 16]);
     }
 
     #[test]
     fn mirroring_a_huge_disk_does_not_allocate_it() {
-        let huge = DevConfig {
+        let mut huge = DevConfig {
             disks: vec![Disk::from_backend(ReadOnlyFlagDisk(usize::MAX / 2, false))],
             ..DevConfig::default()
         };
-        let disk = mirrored(&huge).disks.remove(0);
+        let disk = mirrored(&mut huge).disks.remove(0);
         assert_eq!(disk.backend.len(), (usize::MAX / 2) as u64);
     }
 

@@ -457,12 +457,52 @@ fn host_unix_time() -> u64 {
     }
 }
 
+/// The data the main CPU's disk handed to the guest, in order, for the twin's disks to replay.
+/// Both CPUs issue the same requests in the same order (the twin runs each block after the main
+/// CPU), so a FIFO is enough; the twin's own writes vanish and a later read of what the guest wrote
+/// is answered from what the main CPU read.
+#[cfg(not(freestanding))]
+type DiskReplay = Arc<Mutex<std::collections::VecDeque<(u64, Vec<u8>)>>>;
+
+/// The main CPU's disk under verify: every read is also queued for the twin.
+#[cfg(not(freestanding))]
+struct RecordingDisk {
+    inner: Box<dyn crate::disk::BlockBackend>,
+    replay: DiskReplay,
+}
+
+#[cfg(not(freestanding))]
+impl crate::disk::BlockBackend for RecordingDisk {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.inner.read_at(offset, buf)?;
+        self.replay
+            .lock()
+            .unwrap()
+            .push_back((offset, buf.to_vec()));
+        Ok(())
+    }
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+    fn read_only(&self) -> bool {
+        self.inner.read_only()
+    }
+}
+
 /// Stands in for a disk on the verify twin: same capacity and read-only flag as the real one so
-/// the guest sees the same device, but no data behind it. Reads return zeros, writes vanish.
+/// the guest sees the same device. Reads replay what the main CPU's disk returned; a request the
+/// main CPU did not make (or made at another offset) reads zeros and shows up as a divergence.
 #[cfg(not(freestanding))]
 struct ShadowDisk {
     len: u64,
     read_only: bool,
+    replay: DiskReplay,
 }
 
 #[cfg(not(freestanding))]
@@ -470,8 +510,13 @@ impl crate::disk::BlockBackend for ShadowDisk {
     fn len(&self) -> u64 {
         self.len
     }
-    fn read_at(&mut self, _offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        buf.fill(0);
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        match self.replay.lock().unwrap().pop_front() {
+            Some((recorded_offset, data)) if recorded_offset == offset && data.len() == buf.len() => {
+                buf.copy_from_slice(&data);
+            }
+            _ => buf.fill(0),
+        }
         Ok(())
     }
     fn write_at(&mut self, _offset: u64, _data: &[u8]) -> std::io::Result<()> {
@@ -487,22 +532,35 @@ impl crate::disk::BlockBackend for ShadowDisk {
 
 /// Devices for the verify twin that look the same to the guest as `main`: same virtio functions
 /// in the same PCI slots. The twin cannot share the real backends (a disk or a host frame
-/// queue has one owner), so their data is not mirrored: the first guest read of disk contents
-/// is a legitimate divergence of this check, as is host console input.
+/// queue has one owner): the twin's disks replay what the main CPU's disk returned, but host
+/// console input and network frames are not mirrored and diverge legitimately.
 ///
 /// Returns the twin's UART console too: consoles that share a handle with the UART on `main`
 /// share one on the twin as well, because that sharing decides whether the UART takes host input.
-fn mirrored_devices(main: &DevConfig, main_uart: &ConsoleHandle) -> (DevConfig, ConsoleHandle) {
+fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConfig, ConsoleHandle) {
     let twin_uart = ConsoleHandle::default();
     let devices = DevConfig {
         #[cfg(not(freestanding))]
         disks: main
             .disks
-            .iter()
+            .iter_mut()
             .map(|disk| {
+                let replay = DiskReplay::default();
+                let (len, read_only) = (disk.backend.len(), disk.backend.read_only());
+                let placeholder = Disk::from_backend(ShadowDisk {
+                    len,
+                    read_only,
+                    replay: replay.clone(),
+                });
+                let inner = core::mem::replace(&mut disk.backend, placeholder.backend);
+                disk.backend = Box::new(RecordingDisk {
+                    inner,
+                    replay: replay.clone(),
+                });
                 Disk::from_backend(ShadowDisk {
-                    len: disk.backend.len(),
-                    read_only: disk.backend.read_only(),
+                    len,
+                    read_only,
+                    replay,
                 })
             })
             .collect(),
@@ -612,7 +670,7 @@ impl Vcpu {
         // Under verify both CPUs must start from one boot time even when the caller gave none;
         // two separate wall-clock reads could straddle a second boundary.
         let verify_twin = self.verify.then(|| {
-            let (devices, uart_console) = mirrored_devices(&self.devcfg, &self.uart_console);
+            let (devices, uart_console) = mirrored_devices(&mut self.devcfg, &self.uart_console);
             (
                 devices,
                 uart_console,
