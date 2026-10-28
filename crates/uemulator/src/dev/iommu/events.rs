@@ -116,7 +116,7 @@ impl Iommu {
                 break;
             }
             let mut entry = [0u8; RING_ENTRY_BYTES as usize];
-            for (chunk, dword) in entry.chunks_exact_mut(4).zip(event) {
+            for (chunk, dword) in entry.as_chunks_mut::<4>().0.iter_mut().zip(event) {
                 chunk.copy_from_slice(&dword.to_le_bytes());
             }
             if !mem.write_phys(base + tail, &entry) {
