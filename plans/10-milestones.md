@@ -73,3 +73,6 @@ Each has an observable serial-output exit criterion. Interpreter first.
 5. Iterate on the boot: each unimplemented opcode/MSR/port is logged once; fix in order of appearance.
 
 - ACPI platform done (see 07, "ACPI, PM block, HPET, ECAM"): `acpi/` builds RSDP/XSDT/FADT/DSDT/MADT/MCFG/HPET/IVRS into the BIOS area for direct Linux boots (`boot_params.acpi_rsdp_addr`, e820 ACPI data), with the PM1 block and PM timer, ACPI S5 power-off as `ExitReason::Shutdown`, a three-timer HPET, PCIe ECAM, virtio MSI-X and `MachineConfig::acpi` (default on; the default command line loses `acpi=off`). Alpine 6.18 and Debian 6.12 boot on the I/O APIC with `hpet` and `acpi_pm` clocksource candidates, virtio disk and network work, `poweroff` ends the run through the sleep register. Steps 1 and 2 of 18-xen-dom0.md.
+## UEFI firmware (plans/19)
+
+Done: `MachineConfig::uefi_firmware` and `key_value_store`, `crates/uemulator-firmware`, `advanced boot-uefi`, `quick` machines with `firmware = "uefi"`. Exit criteria met in a real guest: the Linux EFI stub and Debian GRUB 2.12 boot Alpine from a GPT ESP, and a variable written by Linux survives a guest reset through the nvram file. Open: Xen (`xen.efi`, multiboot2), Fedora shim, ACPI tables in the handoff.

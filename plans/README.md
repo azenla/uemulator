@@ -23,5 +23,7 @@ Index. Read in order; each file ends with open questions where the answer needs 
 | 16-iommu.md | AMD IOMMU: registers, command buffer, event log, device table, I/O page tables, interrupt remapping, IVRS |
 | 17-bios.md | BIOS services as host code, booting a disk's boot sector |
 | 18-xen-dom0.md | Fedora Xen dom0 through UEFI: ACPI, IOMMU wiring, SMP and what follows; status per step |
+| 18-xen-dom0.md | plan for a Xen dom0 on a modern AMD machine |
+| 19-uefi-firmware.md | the UEFI firmware, key-value store, handoff page |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. Zero crate dependencies.

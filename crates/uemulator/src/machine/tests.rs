@@ -2389,3 +2389,121 @@ mod boot_disk {
         assert_eq!(exit, ExitReason::Reset);
     }
 }
+
+mod uefi_firmware {
+    use super::*;
+    use crate::boot::uefi::{FIRMWARE_BASE, HANDOFF_ADDR};
+    use crate::kv::{KeyValueError, KeyValueStore, MemoryKeyValueStore};
+
+    /// Prints the first handoff byte ('U'), stores "k" = "v" through the key-value device, reads
+    /// it back, prints the value and asks for a reset.
+    const STORE_AND_PRINT: [u8; 130] = [
+        0x44, 0x0f, 0xb7, 0x47, 0x4a, 0x66, 0xba, 0xf8, 0x03, 0x0f, 0xb6, 0x07, 0xee, 0x44, 0x89,
+        0xc2, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xef, 0x41, 0x8d, 0x50, 0x08, 0xb8, 0x01, 0x00, 0x00,
+        0x00, 0xef, 0x41, 0x8d, 0x50, 0x04, 0xb8, 0x6b, 0x00, 0x00, 0x00, 0xef, 0x44, 0x89, 0xc2,
+        0xb8, 0x02, 0x00, 0x00, 0x00, 0xef, 0x41, 0x8d, 0x50, 0x08, 0xb8, 0x01, 0x00, 0x00, 0x00,
+        0xef, 0x41, 0x8d, 0x50, 0x04, 0xb8, 0x76, 0x00, 0x00, 0x00, 0xef, 0x44, 0x89, 0xc2, 0xb8,
+        0x04, 0x00, 0x00, 0x00, 0xef, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xef, 0x41, 0x8d, 0x50, 0x08,
+        0xb8, 0x01, 0x00, 0x00, 0x00, 0xef, 0x41, 0x8d, 0x50, 0x04, 0xb8, 0x6b, 0x00, 0x00, 0x00,
+        0xef, 0x44, 0x89, 0xc2, 0xb8, 0x03, 0x00, 0x00, 0x00, 0xef, 0x41, 0x8d, 0x50, 0x04, 0xed,
+        0x66, 0xba, 0xf8, 0x03, 0xee, 0xb0, 0xfe, 0xe6, 0x64, 0xf4,
+    ];
+
+    /// A store the test can look into after the machine owns it.
+    #[derive(Clone, Default)]
+    struct SharedStore(Arc<Mutex<MemoryKeyValueStore>>);
+
+    impl KeyValueStore for SharedStore {
+        fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.lock().unwrap().get(key)
+        }
+        fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), KeyValueError> {
+            self.0.lock().unwrap().set(key, value)
+        }
+        fn delete(&mut self, key: &[u8]) -> Result<(), KeyValueError> {
+            self.0.lock().unwrap().delete(key)
+        }
+        fn list(&mut self, prefix: &[u8]) -> Vec<Vec<u8>> {
+            self.0.lock().unwrap().list(prefix)
+        }
+    }
+
+    /// The image header the library expects, then `code` at `ENTRY_OFFSET`.
+    const ENTRY_OFFSET: usize = 0x20;
+
+    fn image(code: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; ENTRY_OFFSET];
+        bytes[..8].copy_from_slice(b"UEMUFW64");
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&(ENTRY_OFFSET as u32).to_le_bytes());
+        bytes.extend_from_slice(code);
+        let footprint = bytes.len() as u64 + 0x1000;
+        bytes[16..24].copy_from_slice(&footprint.to_le_bytes());
+        bytes
+    }
+
+    fn run(
+        config: impl FnOnce(MachineConfig) -> MachineConfig,
+        limit: Duration,
+    ) -> crate::testkit::MachineRun {
+        run_machine(Vec::new(), JitMode::Off, limit, config)
+    }
+
+    #[test]
+    fn the_firmware_runs_with_the_handoff_and_reaches_the_store() {
+        let store = SharedStore::default();
+        let shared = store.clone();
+        let result = run(
+            |config| {
+                config
+                    .uefi_firmware(image(&STORE_AND_PRINT))
+                    .key_value_store(shared)
+            },
+            GENEROUS_LIMIT,
+        );
+        assert_eq!(result.text(), "Uv");
+        assert!(
+            matches!(result.exit, ExitReason::Reset),
+            "{:?}",
+            result.exit
+        );
+        let mut store = store;
+        assert_eq!(store.get(b"k"), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn a_reset_runs_the_firmware_again_and_the_store_survives() {
+        let store = SharedStore::default();
+        let result = run(
+            |config| {
+                config
+                    .reboot(true)
+                    .uefi_firmware(image(&STORE_AND_PRINT))
+                    .key_value_store(store)
+            },
+            WATCHDOG_LIMIT,
+        );
+        assert!(result.text().starts_with("UvUv"), "{:?}", result.text());
+    }
+
+    #[test]
+    fn the_handoff_and_image_are_in_guest_memory_at_the_documented_places() {
+        assert_eq!(FIRMWARE_BASE, 0x10_0000);
+        assert_eq!(HANDOFF_ADDR, 0x7000);
+    }
+
+    #[test]
+    fn uefi_firmware_excludes_the_other_boot_paths() {
+        let firmware = image(&[0xf4]);
+        let with_kernel = MachineConfig::new()
+            .kernel(fake_bzimage(&SPIN))
+            .uefi_firmware(firmware.clone());
+        assert!(expect_config_error(EmulatedMachine::new(with_kernel)).contains("uefi_firmware"));
+        let with_bios = MachineConfig::new()
+            .firmware(vec![0xf4])
+            .uefi_firmware(firmware.clone());
+        assert!(expect_config_error(EmulatedMachine::new(with_bios)).contains("uefi_firmware"));
+        let bad = MachineConfig::new().uefi_firmware(vec![0; 64]);
+        assert!(expect_config_error(EmulatedMachine::new(bad)).contains("UEFI firmware image"));
+    }
+}

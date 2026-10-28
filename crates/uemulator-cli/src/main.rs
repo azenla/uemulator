@@ -1,4 +1,5 @@
 mod args;
+mod firmware;
 mod machines;
 mod netgw;
 mod quick;
@@ -15,8 +16,8 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use uemulator::ExitReason;
 
 use args::{
-    BootSourceArgs, HardwareArgs, LinuxArgs, NewDiskArgs, RemoveArgs, RuntimeArgs, Settings,
-    attach_only,
+    BootSourceArgs, FirmwareArgs, HardwareArgs, LinuxArgs, NewDiskArgs, RemoveArgs, RuntimeArgs,
+    Settings, attach_only,
 };
 use quick::Distro;
 
@@ -96,6 +97,8 @@ enum QuickCmd {
         linux: LinuxArgs,
         #[command(flatten)]
         source: BootSourceArgs,
+        #[command(flatten)]
+        firmware: FirmwareArgs,
         /// Boot the machine once it is created
         #[arg(long)]
         boot: bool,
@@ -117,6 +120,8 @@ enum QuickCmd {
         remove: RemoveArgs,
         #[command(flatten)]
         source: BootSourceArgs,
+        #[command(flatten)]
+        firmware: FirmwareArgs,
     },
     /// Boot a machine, optionally with options that apply to this run only
     Boot {
@@ -194,6 +199,28 @@ enum AdvancedCmd {
         #[command(flatten)]
         runtime: RuntimeArgs,
     },
+    /// Boot the machine's disks through the built-in UEFI firmware
+    ///
+    /// The firmware runs the boot entries in the nvram file's BootOrder, else
+    /// EFI/BOOT/BOOTX64.EFI from the first file system that has it.
+    BootUefi {
+        /// Persist UEFI variables (BootOrder, Boot####, anything the guest writes) in this file,
+        /// created if missing. Without it variables last until the guest resets
+        #[arg(long, value_name = "FILE")]
+        nvram: Option<PathBuf>,
+        /// Make Boot0000 run this path on the first file system that has it, and put it first in
+        /// BootOrder. Needs --nvram
+        #[arg(long, value_name = "PATH", requires = "nvram")]
+        boot_loader: Option<String>,
+        /// Load options of --boot-loader: for a Linux EFI stub the kernel command line, with
+        /// initrd=PATH naming the initramfs
+        #[arg(long, value_name = "OPTIONS", requires = "boot_loader")]
+        boot_options: Option<String>,
+        #[command(flatten)]
+        hardware: HardwareArgs,
+        #[command(flatten)]
+        runtime: RuntimeArgs,
+    },
 }
 
 impl Cmd {
@@ -207,7 +234,10 @@ impl Cmd {
                     | QuickCmd::Boot { hardware, .. },
             }
             | Cmd::Advanced {
-                cmd: AdvancedCmd::Boot { hardware, .. } | AdvancedCmd::BootFirmware { hardware, .. },
+                cmd:
+                    AdvancedCmd::Boot { hardware, .. }
+                    | AdvancedCmd::BootFirmware { hardware, .. }
+                    | AdvancedCmd::BootUefi { hardware, .. },
             } => Some(hardware),
             Cmd::Quick { .. } => None,
         }
@@ -229,7 +259,12 @@ fn boot_launch(launch: machines::Launch, runtime: &RuntimeArgs) -> Result<ExitRe
     match launch.source {
         args::BootSource::Disk => {
             eprintln!("booting from the disk");
-            run::run_disk(&launch.settings, runtime)
+            match launch.firmware {
+                args::Firmware::Bios => run::run_disk(&launch.settings, runtime),
+                args::Firmware::Uefi => {
+                    run::run_uefi(&launch.settings, runtime, launch.nvram.as_deref(), None)
+                }
+            }
         }
         _ => {
             eprintln!("booting the installer");
@@ -249,10 +284,18 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             new_disks: _,
             linux,
             source,
+            firmware,
             boot,
         } => {
-            let machine =
-                machines::create(&home, &name, install, &hardware, &linux, source.boot_from)?;
+            let machine = machines::create(
+                &home,
+                &name,
+                install,
+                &hardware,
+                &linux,
+                source.boot_from,
+                firmware.firmware,
+            )?;
             machines::fetch_artifacts(&machine, quick::download).map_err(|e| {
                 format!("{e}\nmachine {name} was created; `quick boot {name}` retries the download")
             })?;
@@ -277,9 +320,17 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             linux,
             remove,
             source,
+            firmware,
         } => {
-            let edited =
-                machines::edit(&home, &name, &hardware, &linux, &remove, source.boot_from)?;
+            let edited = machines::edit(
+                &home,
+                &name,
+                &hardware,
+                &linux,
+                &remove,
+                source.boot_from,
+                firmware.firmware,
+            )?;
             for disk in &edited.detached {
                 eprintln!(
                     "detached {} (the image is left in place)",
@@ -373,6 +424,23 @@ fn advanced_command(cmd: AdvancedCmd) -> Result<ExitReason, String> {
             let image = read(&firmware)?;
             let settings = settings_of(&hardware, &LinuxArgs::default())?;
             run::run_firmware(image, &settings, &runtime)
+        }
+        AdvancedCmd::BootUefi {
+            nvram,
+            boot_loader,
+            boot_options,
+            hardware,
+            runtime,
+        } => {
+            let settings = settings_of(&hardware, &LinuxArgs::default())?;
+            run::run_uefi(
+                &settings,
+                &runtime,
+                nvram.as_deref(),
+                boot_loader
+                    .as_deref()
+                    .map(|loader| (loader, boot_options.as_deref().unwrap_or(""))),
+            )
         }
     }
 }
@@ -1280,6 +1348,38 @@ mod tests {
     }
 
     #[test]
+    fn firmware_is_on_create_and_edit_only() {
+        use crate::args::Firmware;
+        let from = |args: &[&str]| match parse(args).unwrap().cmd {
+            Cmd::Quick {
+                cmd: QuickCmd::Create { firmware, .. } | QuickCmd::Edit { firmware, .. },
+            } => firmware.firmware,
+            _ => panic!("no firmware"),
+        };
+        assert_eq!(from(&["quick", "edit", "m"]), None);
+        for (value, want) in [("bios", Firmware::Bios), ("uefi", Firmware::Uefi)] {
+            assert_eq!(
+                from(&["quick", "edit", "m", "--firmware", value]),
+                Some(want)
+            );
+            assert_eq!(
+                from(&[
+                    "quick",
+                    "create",
+                    "m",
+                    "--install",
+                    "alpine",
+                    "--firmware",
+                    value
+                ]),
+                Some(want)
+            );
+        }
+        assert!(parse(&["quick", "edit", "m", "--firmware", "coreboot"]).is_err());
+        assert!(parse(&["quick", "boot", "m", "--firmware", "uefi"]).is_err());
+    }
+
+    #[test]
     fn boot_from_is_on_create_edit_and_boot_only() {
         use crate::args::BootSource;
         let from = |args: &[&str]| match parse(args).unwrap().cmd {
@@ -1387,8 +1487,16 @@ mod tests {
             Some(&home.path().to_string_lossy()),
         )]);
         let (hardware, linux) = (HardwareArgs::default(), LinuxArgs::default());
-        let machine =
-            machines::create(home.path(), "m", Distro::Alpine, &hardware, &linux, None).unwrap();
+        let machine = machines::create(
+            home.path(),
+            "m",
+            Distro::Alpine,
+            &hardware,
+            &linux,
+            None,
+            None,
+        )
+        .unwrap();
         let error = quick_command(QuickCmd::Delete {
             name: "m".into(),
             yes: false,

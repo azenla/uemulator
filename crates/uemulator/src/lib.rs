@@ -19,6 +19,7 @@ mod dev;
 #[cfg(not(freestanding))]
 mod disk;
 mod jit;
+mod kv;
 mod machine;
 #[cfg(freestanding)]
 mod math;
@@ -36,6 +37,9 @@ pub use boot::{BootMode, BootState};
 pub use console::ConsoleHandle;
 #[cfg(not(freestanding))]
 pub use disk::{BlockBackend, Disk};
+#[cfg(not(freestanding))]
+pub use kv::FileKeyValueStore;
+pub use kv::{KeyValueError, KeyValueStore, MemoryKeyValueStore};
 pub use machine::{
     ClockMode, ConsoleKind, EmulatedMachine, Error, ExitReason, JitMode, MachineConfig, StopHandle,
 };
@@ -117,6 +121,7 @@ mod api_tests {
         let state = BootState {
             rip: 1,
             rsi: 2,
+            rdi: 0,
             cr3: 3,
             gdt_base: 4,
             gdt_limit: 5,

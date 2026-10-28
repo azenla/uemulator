@@ -6,6 +6,7 @@ pub(crate) mod guestmem;
 pub(crate) mod hpet;
 pub(crate) mod ioapic;
 pub(crate) mod iommu;
+pub(crate) mod kv;
 pub(crate) mod pci;
 mod pic;
 mod pit;
@@ -26,6 +27,7 @@ use guestmem::GuestMem;
 use hpet::{Hpet, HpetOutput};
 use ioapic::IoApic;
 use iommu::{InterruptRequest, IommuInterrupt, PhysRead, ioapic_request_raw};
+use kv::{KV_PORT_BASE, KV_PORT_COUNT, KvDevice, SharedKeyValueStore};
 use pci::PciHost;
 use pic::Pics;
 use pit::Pit;
@@ -62,6 +64,8 @@ const RESET_CONTROL_PORT: u16 = 0xcf9;
 /// inside the address window but is the reset control register, so its match arm must come first.
 const PCI_CONFIG_PORT_FIRST: u16 = 0xcf8;
 const PCI_CONFIG_PORT_LAST: u16 = 0xcff;
+const KV_PORT_FIRST: u16 = KV_PORT_BASE;
+const KV_PORT_LAST: u16 = KV_PORT_BASE + KV_PORT_COUNT - 1;
 const UART_COM1_BASE: u16 = 0x3f8;
 const UART_COM1_LAST: u16 = 0x3ff;
 
@@ -149,10 +153,15 @@ pub(crate) struct DevConfig {
     pub virtio_consoles: Vec<ConsoleHandle>,
     /// Adds the AMD IOMMU function (00:00.2) and translates every PCI function's DMA by it.
     pub iommu: bool,
+    /// The store behind the firmware's variable device; its ports exist only when set.
+    pub key_value_store: Option<SharedKeyValueStore>,
 }
 
 /// Most virtio functions one machine can hold (PCI slots 1..=31).
 pub(crate) const MAX_VIRTIO_FUNCTIONS: usize = pci::MAX_VIRTIO_FUNCTIONS;
+/// The BARs the virtio functions are given, for the firmware's memory map.
+pub(crate) const PCI_MMIO_BASE: u64 = pci::MMIO_BASE;
+pub(crate) const PCI_MMIO_BYTES: u64 = pci::MAX_VIRTIO_FUNCTIONS as u64 * pci::BAR_SIZE;
 
 /// The whole device bus: legacy port-I/O devices plus the virtio-pci host. Port I/O goes
 /// through `io_in`/`io_out`, physical accesses above RAM through `mmio_read`/`mmio_write`.
@@ -168,6 +177,7 @@ pub(crate) struct Devices {
     system_control_port_a: u8,
     reset_control: u8,
     pci: PciHost,
+    kv: Option<KvDevice>,
     pub lapic: Lapic,
     ioapic: IoApic,
     pm: AcpiPm,
@@ -266,6 +276,7 @@ impl Devices {
             system_control_port_a: 0,
             reset_control: 0,
             pci: PciHost::new(virtio_devices).with_iommu(cfg.iommu),
+            kv: cfg.key_value_store.map(KvDevice::new),
             lapic: Lapic::new(),
             ioapic: IoApic::new(),
             pm: AcpiPm::new(),
@@ -749,6 +760,9 @@ impl Devices {
             PCI_CONFIG_PORT_FIRST..=PCI_CONFIG_PORT_LAST if !self.pci.is_empty() => {
                 return self.pci.io_in(port, size);
             }
+            KV_PORT_FIRST..=KV_PORT_LAST if self.kv.is_some() => {
+                return self.kv.as_mut().unwrap().io_in(port, size);
+            }
             _ => return ones,
         };
         if matches!(port, UART_COM1_BASE..=UART_COM1_LAST) {
@@ -791,6 +805,9 @@ impl Devices {
             port if AcpiPm::decodes(port) => {
                 self.pm.write(port, size, value, now);
                 self.update_sci(now);
+            }
+            KV_PORT_FIRST..=KV_PORT_LAST if self.kv.is_some() => {
+                self.kv.as_mut().unwrap().io_out(port, size, value)
             }
             UART_COM1_BASE..=UART_COM1_LAST => {
                 self.uart.write(port - UART_COM1_BASE, byte);

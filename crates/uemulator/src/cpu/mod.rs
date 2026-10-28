@@ -78,6 +78,7 @@ pub(crate) const PAGE_OFFSET_MASK: u64 = PAGE_SIZE - 1;
 /// Indices into `Cpu::gpr`, which follows the x86 register encoding (rax=0 ... r15=15).
 pub(crate) const GPR_RSP: usize = 4;
 pub(crate) const GPR_RSI: usize = 6;
+pub(crate) const GPR_RDI: usize = 7;
 
 /// Indices into `Cpu::seg`, the same numbering as the segment-override and `mov sreg` encodings.
 pub(crate) const SEG_ES: usize = 0;
@@ -460,6 +461,7 @@ impl Cpu {
         seg[SEG_DS] = flat_data;
         let mut gpr = [0u64; 16];
         gpr[GPR_RSI] = boot.rsi;
+        gpr[GPR_RDI] = boot.rdi;
         let mut cpu = Cpu {
             gpr,
             rip: boot.rip,

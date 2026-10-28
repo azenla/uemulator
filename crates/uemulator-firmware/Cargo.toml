@@ -1,0 +1,15 @@
+[package]
+name = "uemulator-firmware"
+description = "Minimal UEFI firmware for uemulator, booted with MachineConfig::uefi_firmware"
+version.workspace = true
+edition.workspace = true
+
+# Built for x86_64-unknown-none (see build.rs for the linker script); on a hosted target
+# `cargo test` compiles the hardware-independent modules and runs their tests.
+[[bin]]
+name = "uemulator-firmware"
+path = "src/main.rs"
+
+[features]
+# Progress messages on the serial port while the firmware starts up.
+trace = []

@@ -17,7 +17,7 @@ pub(crate) const PCI_MMIO_WINDOW_BYTES: u64 = 0x2000_0000;
 /// Each virtio function gets one BAR0 of this size, laid out back to back from `MMIO_BASE`.
 /// Six `REGION_SIZE` regions (common cfg, ISR, device cfg, notify, MSI-X table, MSI-X PBA),
 /// rounded up to a power of two.
-const BAR_SIZE: u64 = 8 * REGION_SIZE;
+pub(crate) const BAR_SIZE: u64 = 8 * REGION_SIZE;
 
 /// PCIe enhanced configuration access (ECAM): 4 KiB of config space per function, laid out as
 /// `bus << 20 | devfn << 12 | register` from this base. The MCFG table advertises it for bus 0
