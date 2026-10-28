@@ -61,6 +61,7 @@ impl MemoryMap {
         self.key
     }
 
+    #[cfg(test)]
     /// The type of the page holding `address`, `None` outside every range.
     pub fn kind_at(&self, address: u64) -> Option<u32> {
         self.regions()
@@ -231,6 +232,7 @@ impl MemoryMap {
         )
     }
 
+    #[cfg(test)]
     /// Total free pages, for `QueryVariableInfo`-style questions and diagnostics.
     pub fn free_pages(&self) -> u64 {
         self.regions()

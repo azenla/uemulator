@@ -1,0 +1,57 @@
+# UEFI firmware
+
+`crates/uemulator-firmware` is a small `no_std` UEFI 2.9 firmware (not EDK2) for `x86_64-unknown-none`. The library starts it with `MachineConfig::uefi_firmware(image)`; the CLI embeds it (`crates/uemulator-cli/build.rs` builds it into its own target dir, so `rustup target add x86_64-unknown-none` is needed) and runs it with `advanced boot-uefi` or a `quick` machine with `firmware = "uefi"`.
+
+## Image and start state
+
+The image is a flat binary linked at 1 MiB (`link.ld`). Header (little endian): `"UEMUFW64"`, version u32 = 1, entry offset u32, footprint u64 (image plus zero-initialised data). The library copies the image to `FIRMWARE_BASE = 0x100000`, builds the same GDT and 4 GiB identity map as the direct 64-bit Linux boot, and starts the CPU at the entry in long mode, interrupts off, `rdi` = the handoff page. A guest reset loads everything again (the key-value store survives).
+
+The firmware's first instructions enable SSE (CR4.OSFXSR; loaded applications use it), install an IDT that prints exceptions to the 16550, and remap the PIC so a PIT one-shot can wake `hlt` (idle waits cost no host time).
+
+## Handoff page (0x7000, 0x308 bytes, version 1)
+
+| offset | field |
+|---|---|
+| 0x00 | magic `"UEMUHAND"`; 0x08 version u32; 0x0c size u32 |
+| 0x10 / 0x18 | firmware base / footprint u64 |
+| 0x20 | RAM top u64 |
+| 0x28 | ACPI RSDP address (0: none); 0x30 / 0x38 ACPI table region base / size (reported as ACPI reclaim) |
+| 0x40 | boot unix time u64 |
+| 0x48 / 0x4a / 0x4c / 0x4e | serial port, key-value base port (0: no store), its port count, PCI config address port (0xcf8) u16 |
+| 0x50 | PCI ECAM base (0: none, config is via 0xcf8) |
+| 0x58 / 0x5c | RAM region count, MMIO region count u32 |
+| 0x60 | 32 random bytes (splitmix64 of `random_seed`) |
+| 0x80 | up to 16 RAM regions: base u64, size u64, e820 type u32, pad (24 bytes) |
+| 0x200 | up to 16 MMIO regions: base u64, size u64 (virtio BARs, IOAPIC, LAPIC) |
+| 0x300 | TSC frequency in Hz (the guest TSC counts nanoseconds) |
+
+`crates/uemulator/src/boot/uefi.rs` writes it, `crates/uemulator-firmware/src/handoff.rs` reads it; both have tests. Other agents fill `rsdp`/ACPI region through `FirmwareParams` when ACPI tables exist.
+
+## Key-value store
+
+`trait KeyValueStore: Send { get, set, delete, list(prefix) }` (byte strings), `MemoryKeyValueStore`, and `FileKeyValueStore` (hosted only). File format: magic `"UEMUKV01"` then records `length u32 | crc32 u32 | payload` (payload: op u8 (1 set, 2 delete), key length u16, key, value). Every `set`/`delete` appends one record and syncs. Opening replays the log (a short or bad-checksum record ends it: a torn write), then rewrites it compacted through `path.tmp`, fsync and atomic rename; the log is also rewritten when it holds 1 MiB of dead bytes. A file without the magic is refused, not overwritten. Limits: keys 1 KiB, values 256 KiB.
+
+Guest device, port I/O at 0x580..0x58f, 32-bit registers: +0 command (w) / status (r: 0 ok, 1 not found, 2 too large, 3 I/O error, 4 bad command), +4 data (w appends up to 4 bytes to the selected input, r pops 4 output bytes), +8 length (w: bytes the selected input will carry; r: output length), +0xc ident `"UKV1"`. Commands: 1 select key buffer, 2 select aux buffer (both clear it), 3 get (key -> output), 4 set (key, aux = value), 5 delete, 6 next (output = the smallest key greater than the key buffer that starts with the aux buffer). Absent device: the ports read all ones.
+
+Variables: key `var/<guid>/<name utf8>`, value = attributes u32 + data. Non-volatile variables go to the store (RAM if there is none); the rest live in a 192 KiB arena in the firmware image, which stays reserved.
+
+## What the firmware implements
+
+- Boot services: memory pages/pool with a real map and map key (top-down allocation), events/timers (polled; notifications run at TPL transitions), the full protocol database (install/reinstall/uninstall incl. the variadic multiple forms, Handle/Open/Close/LocateHandle(Buffer)/LocateProtocol/LocateDevicePath/ProtocolsPerHandle/RegisterProtocolNotify), LoadImage (file by device path, short-form paths search every volume, or a source buffer) with a PE32+ loader and relocations, StartImage/Exit (stack-switching setjmp), UnloadImage, ExitBootServices (map key check, event group, virtio reset, PIC mask), Stall, watchdog, CRC32, CopyMem/SetMem, monotonic count, configuration tables.
+- Runtime services: GetTime (CMOS RTC), SetTime/wakeup/capsules unsupported, variables with NV/BS/RT attributes and append, SecureBoot=0 / SetupMode=1 / AuditMode / DeployedMode / PlatformLangCodes / OsIndicationsSupported / BootOptionSupport read-only, QueryVariableInfo, ResetSystem (0xCF9; shutdown halts with IF clear), SetVirtualAddressMap with ConvertPointer (table pointers are rewritten; the whole firmware is one runtime-code region so code finds its data), GetNextHighMonotonicCount. After ExitBootServices allocations come from a 1 MiB arena in the image that each runtime call rewinds.
+- Protocols: LoadedImage, LoadedImageDevicePath, DevicePath, DevicePathToText, DevicePathUtilities (instances unsupported), SimpleTextInput/InputEx/Output on the 16550 (ANSI cursor/clear/colour, key decoding for arrows, Home/End, F-keys, one 80x25 mode), BlockIO and DiskIO for every virtio-blk disk and GPT/MBR partition, SimpleFileSystem (read-only FAT12/16/32 with long names; writes return `WRITE_PROTECTED`), RNG.
+- Tables: ACPI 2.0/1.0 (when the handoff has an RSDP), SMBIOS 3.0 (BIOS and system information). Memory types: runtime code (the image), BS data, ACPI reclaim, MMIO for BARs/IOAPIC/LAPIC.
+- Boot manager: `BootNext`, then `BootOrder`/`Boot####` (device path to a file, partial paths searched on every volume, optional data = load options), then `\EFI\BOOT\BOOTX64.EFI` on every file system; `BootCurrent` is set.
+
+Not implemented: Graphics Output, USB/network/PCI I/O protocols, file writes, Secure Boot and authenticated variables, EFI_MEMORY_ATTRIBUTES_TABLE, SetTime, multi-instance device paths, key-notify callbacks. For Xen/Fedora shim: no known blocker, but only the Linux EFI stub and Debian GRUB 2.12 are verified; shim's `ShimLock`/MOK paths and Xen's `xen.efi` are untested.
+
+## Tools
+
+- `hack/uefi/make-disk.py OUT --size MiB DEST=SRC...` builds a GPT disk with a FAT32 ESP (pure python).
+- `UEMULATOR_FIRMWARE_TRACE=1 cargo build -p uemulator-cli` compiles in start-up trace messages; `UEMULATOR_FIRMWARE_ELF=1 cargo build -p uemulator-firmware --target x86_64-unknown-none --target-dir X` keeps an ELF for `objdump`.
+- `advanced boot-uefi --disk D --nvram F [--boot-loader PATH --boot-options TEXT]` writes `Boot0000`/`BootOrder` into F first.
+
+## Verification (not tests; needs downloaded artifacts)
+
+- Alpine `vmlinuz-virt` as `\EFI\BOOT\BOOTX64.EFI` with `initrd=\initramfs-virt console=ttyS0` in `Boot0000`: kernel prints `efi: EFI v2.9 by uemulator`, SMBIOS 3.0, RNG, reaches userspace, `/sys/firmware/efi` exists. With the matching `efivarfs.ko` appended to the initramfs, a variable written from Linux survives a guest reset (read back from the nvram file after the second boot).
+- Debian `grub-efi-amd64-signed` 2.12 (`grubx64.efi.signed` as BOOTX64.EFI, `grub.cfg` in `\EFI\debian`): menu, countdown, `linux`/`initrd` from the ESP, Alpine to userspace.

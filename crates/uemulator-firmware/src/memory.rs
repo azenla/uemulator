@@ -146,24 +146,6 @@ pub fn free_pages(address: u64, pages: u64) -> bool {
     MAP.get().free(address, pages).is_ok()
 }
 
-pub fn set_type(address: u64, pages: u64, kind: u32, attribute: u64) {
-    let _ = MAP.get().set(address, pages, kind, attribute);
-}
-
-pub fn kind_at(address: u64) -> Option<u32> {
-    MAP.get().kind_at(address)
-}
-
-/// Regions with the `RUNTIME` attribute, for `SetVirtualAddressMap`'s sanity check and the
-/// handoff to the OS.
-pub fn runtime_regions() -> impl Iterator<Item = crate::memory_map::Region> {
-    MAP.get()
-        .regions()
-        .iter()
-        .copied()
-        .filter(|region| region.attribute & RUNTIME != 0)
-}
-
 pub fn enter_runtime_mode() {
     RUNTIME_MODE.store(true, Ordering::SeqCst);
     RUNTIME_USED.store(0, Ordering::SeqCst);
@@ -308,7 +290,7 @@ extern "efiapi" fn free_pool(buffer: *mut c_void) -> Status {
 }
 
 extern "efiapi" fn allocate_pages(mode: u32, kind: u32, pages: usize, address: *mut u64) -> Status {
-    if address.is_null() || pages == 0 || kind >= MAX && kind < 0x8000_0000 || kind == CONVENTIONAL
+    if address.is_null() || pages == 0 || (MAX..0x8000_0000).contains(&kind) || kind == CONVENTIONAL
     {
         return INVALID_PARAMETER;
     }
@@ -333,7 +315,7 @@ extern "efiapi" fn allocate_pages(mode: u32, kind: u32, pages: usize, address: *
 }
 
 extern "efiapi" fn free_pages_service(address: u64, pages: usize) -> Status {
-    if address % PAGE_SIZE != 0 || pages == 0 {
+    if !address.is_multiple_of(PAGE_SIZE) || pages == 0 {
         return INVALID_PARAMETER;
     }
     if free_pages(address, pages as u64) {

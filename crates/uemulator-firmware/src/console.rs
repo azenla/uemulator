@@ -85,7 +85,7 @@ static INPUT_EX: Global<SimpleTextInputEx> = Global::new(SimpleTextInputEx {
     reset: input_ex_reset,
     read_key_stroke_ex,
     wait_for_key_ex: ptr::null_mut(),
-    set_state: set_state,
+    set_state,
     register_key_notify,
     unregister_key_notify,
 });

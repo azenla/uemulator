@@ -19,8 +19,6 @@ const SLOTS: usize = 96;
 #[derive(Debug, PartialEq, Eq)]
 pub enum VariableError {
     NotFound,
-    /// The buffer holds fewer bytes than the answer needs.
-    BufferTooSmall(usize),
     InvalidParameter,
     WriteProtected,
     OutOfResources,
@@ -415,6 +413,7 @@ impl<P: Store> Variables<P> {
     }
 }
 
+#[cfg(test)]
 /// `"Boot0001"`-style names for the boot manager and tests.
 pub fn name_units(name: &str) -> Vec<u16> {
     name.encode_utf16().collect()

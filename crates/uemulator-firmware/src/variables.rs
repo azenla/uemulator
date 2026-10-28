@@ -66,7 +66,6 @@ pub fn write(name: &str, guid: &Guid, attributes: u32, data: &[u8]) {
 fn status_of(error: VariableError) -> Status {
     match error {
         VariableError::NotFound => NOT_FOUND,
-        VariableError::BufferTooSmall(_) => BUFFER_TOO_SMALL,
         VariableError::InvalidParameter => INVALID_PARAMETER,
         VariableError::WriteProtected => WRITE_PROTECTED,
         VariableError::OutOfResources => OUT_OF_RESOURCES,

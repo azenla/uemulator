@@ -27,9 +27,6 @@ const FIRST_DATA_CLUSTER: u32 = 2;
 const FAT_CACHE_BYTES: u64 = 4096;
 const FAT32_ENTRY_MASK: u32 = 0x0fff_ffff;
 
-const ATTRIBUTE_READ_ONLY: u8 = 0x01;
-const ATTRIBUTE_HIDDEN: u8 = 0x02;
-const ATTRIBUTE_SYSTEM: u8 = 0x04;
 const ATTRIBUTE_VOLUME_LABEL: u8 = 0x08;
 const ATTRIBUTE_DIRECTORY: u8 = 0x10;
 const ATTRIBUTE_LONG_NAME: u8 = 0x0f;
@@ -69,18 +66,6 @@ impl DirEntry {
     pub fn is_directory(&self) -> bool {
         self.attributes & ATTRIBUTE_DIRECTORY != 0
     }
-
-    pub fn is_read_only(&self) -> bool {
-        self.attributes & ATTRIBUTE_READ_ONLY != 0
-    }
-
-    pub fn is_hidden(&self) -> bool {
-        self.attributes & ATTRIBUTE_HIDDEN != 0
-    }
-
-    pub fn is_system(&self) -> bool {
-        self.attributes & ATTRIBUTE_SYSTEM != 0
-    }
 }
 
 /// A position in a file's cluster chain, so sequential reads do not walk it from the start.
@@ -115,7 +100,6 @@ pub struct Volume<S: Storage> {
     cluster_count: u32,
     total_bytes: u64,
     pub label: String,
-    pub serial: u32,
     fat_cache: Vec<u8>,
     fat_cache_at: Option<u64>,
 }
@@ -171,11 +155,7 @@ impl<S: Storage> Volume<S> {
         } else {
             Kind::Fat32
         };
-        let (label_at, serial_at) = if kind == Kind::Fat32 {
-            (71, 67)
-        } else {
-            (43, 39)
-        };
+        let label_at = if kind == Kind::Fat32 { 71 } else { 43 };
         let label = String::from_utf8_lossy(&boot[label_at..label_at + 11])
             .trim_end()
             .into();
@@ -195,7 +175,6 @@ impl<S: Storage> Volume<S> {
             cluster_count,
             total_bytes: total_sectors * sector_bytes,
             label,
-            serial: u32_at(&boot, serial_at),
             fat_cache: alloc::vec![0; FAT_CACHE_BYTES as usize],
             fat_cache_at: None,
         })
@@ -808,7 +787,6 @@ mod tests {
     fn check_volume(size: Size) {
         let (mut volume, kernel, fragmented) = sample(size);
         assert_eq!(volume.label, "TESTVOLUME");
-        assert_eq!(volume.serial, 0xcafe_f00d);
         let root = volume.list(volume.root()).unwrap();
         let names: Vec<&str> = root.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["EFI", "readme.txt"]);

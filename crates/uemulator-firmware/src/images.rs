@@ -1,7 +1,6 @@
 //! Loading and running UEFI images, and leaving boot services for the operating system.
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::ffi::c_void;
@@ -80,6 +79,9 @@ struct Record {
     returned: Option<Status>,
 }
 
+// Boxed because `StartImage` hands the saved stack pointer's address to assembly and the
+// list may grow while the image runs.
+#[allow(clippy::vec_box)]
 static IMAGES: Global<Vec<Box<Record>>> = Global::new(Vec::new());
 
 fn record_for(handle: Handle) -> Option<&'static mut Record> {
@@ -343,9 +345,4 @@ pub fn install(services: &mut BootServices) {
     services.exit = exit;
     services.unload_image = unload_image;
     services.exit_boot_services = exit_boot_services;
-}
-
-/// The text of a device path's file-path nodes, for messages.
-pub fn describe(path: &DevicePath) -> String {
-    path.file_name().unwrap_or_else(|| path.text())
 }

@@ -12,10 +12,6 @@ pub fn outb(port: u16, value: u8) {
     unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) }
 }
 
-pub fn outw(port: u16, value: u16) {
-    unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) }
-}
-
 pub fn outl(port: u16, value: u32) {
     unsafe { asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack)) }
 }
@@ -23,12 +19,6 @@ pub fn outl(port: u16, value: u32) {
 pub fn inb(port: u16) -> u8 {
     let value: u8;
     unsafe { asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack)) }
-    value
-}
-
-pub fn inw(port: u16) -> u16 {
-    let value: u16;
-    unsafe { asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack)) }
     value
 }
 
@@ -42,12 +32,6 @@ pub fn rdtsc() -> u64 {
     let (low, high): (u32, u32);
     unsafe { asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack)) }
     (high as u64) << 32 | low as u64
-}
-
-pub fn read_cr3() -> u64 {
-    let value: u64;
-    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack)) }
-    value
 }
 
 pub fn halt_forever() -> ! {
@@ -217,10 +201,13 @@ fn set_gate(vector: usize, handler: u64) {
 /// Installs the IDT and remaps the PIC so IRQ0 lands on `TIMER_VECTOR`, clear of the CPU's
 /// exception vectors; every line is masked until `idle_wait` needs the timer.
 pub fn init() {
-    for vector in 0..EXCEPTION_VECTORS {
-        set_gate(vector, unsafe { ISR_TABLE[vector] });
+    for (vector, handler) in unsafe { ISR_TABLE }.into_iter().enumerate() {
+        set_gate(vector, handler);
     }
-    set_gate(TIMER_VECTOR as usize, timer_isr as usize as u64);
+    set_gate(
+        TIMER_VECTOR as usize,
+        timer_isr as *const () as usize as u64,
+    );
     let idtr = Idtr {
         limit: (IDT_ENTRIES * core::mem::size_of::<Gate>() - 1) as u16,
         base: IDT.get().as_ptr() as u64,

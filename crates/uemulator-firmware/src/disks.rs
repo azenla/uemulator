@@ -71,7 +71,7 @@ fn read_bytes(device: &mut BlockDevice, offset: u64, buffer: &mut [u8]) -> bool 
         return false;
     }
     let disk = unsafe { &mut *device.disk };
-    if offset % block == 0 && buffer.len() as u64 % block == 0 {
+    if offset.is_multiple_of(block) && (buffer.len() as u64).is_multiple_of(block) {
         return disk.read(device.first_block + offset / block, buffer);
     }
     let first = offset / block;
@@ -125,7 +125,7 @@ fn check_transfer(
     if media_id != MEDIA_ID {
         return Err(MEDIA_CHANGED);
     }
-    if size % SECTOR_BYTES != 0 {
+    if !size.is_multiple_of(SECTOR_BYTES) {
         return Err(BAD_BUFFER_SIZE);
     }
     if size == 0 {

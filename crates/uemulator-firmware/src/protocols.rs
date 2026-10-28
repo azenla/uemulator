@@ -38,6 +38,8 @@ struct Registration {
 
 struct Database {
     handles: Vec<*mut HandleData>,
+    // Boxed: the registration token handed to applications is the entry's address.
+    #[allow(clippy::vec_box)]
     registrations: Vec<Box<Registration>>,
 }
 
@@ -693,6 +695,6 @@ pub fn install_services(services: &mut BootServices) {
     services.protocols_per_handle = protocols_per_handle;
     services.locate_handle_buffer = locate_handle_buffer;
     services.locate_protocol = locate_protocol;
-    services.install_multiple_protocol_interfaces = install_multiple as usize;
-    services.uninstall_multiple_protocol_interfaces = uninstall_multiple as usize;
+    services.install_multiple_protocol_interfaces = install_multiple as *const () as usize;
+    services.uninstall_multiple_protocol_interfaces = uninstall_multiple as *const () as usize;
 }

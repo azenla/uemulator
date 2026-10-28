@@ -101,6 +101,8 @@ unsafe fn write64(base: *mut u8, offset: usize, value: u64) {
 }
 
 /// The virtio block devices on the bus, initialised and ready.
+// Boxed: the disks are leaked and BlockIO devices keep their addresses.
+#[allow(clippy::vec_box)]
 pub fn probe_all() -> Vec<Box<VirtioBlk>> {
     pci::scan()
         .into_iter()
@@ -276,7 +278,7 @@ impl VirtioBlk {
     }
 
     pub fn read(&mut self, first_sector: u64, buffer: &mut [u8]) -> bool {
-        if buffer.len() % SECTOR_BYTES != 0
+        if !buffer.len().is_multiple_of(SECTOR_BYTES)
             || first_sector + (buffer.len() / SECTOR_BYTES) as u64 > self.sector_count
         {
             return false;
@@ -293,7 +295,7 @@ impl VirtioBlk {
 
     pub fn write(&mut self, first_sector: u64, buffer: &[u8]) -> bool {
         if self.read_only
-            || buffer.len() % SECTOR_BYTES != 0
+            || !buffer.len().is_multiple_of(SECTOR_BYTES)
             || first_sector + (buffer.len() / SECTOR_BYTES) as u64 > self.sector_count
         {
             return false;

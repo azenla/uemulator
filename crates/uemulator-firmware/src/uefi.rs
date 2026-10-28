@@ -1,3 +1,4 @@
+#![allow(dead_code)] // the specification's vocabulary, only part of which is used
 //! The UEFI 2.9 ABI: status codes, GUIDs, the tables and the structures that cross it. Layouts
 //! follow the specification; every function pointer is `extern "efiapi"` (the Microsoft x64
 //! convention) and every pointer an application hands us is untrusted.

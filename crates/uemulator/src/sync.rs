@@ -35,6 +35,7 @@ mod uefi_stubs {
     pub(crate) struct Guard<'a, T>(&'a Mutex<T>);
 
     impl<T> Mutex<T> {
+        #[cfg_attr(not(freestanding), allow(dead_code))]
         pub fn new(value: T) -> Self {
             Self {
                 locked: AtomicBool::new(false),

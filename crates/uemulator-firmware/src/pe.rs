@@ -266,7 +266,7 @@ mod tests {
             let at = sections + index * SECTION_HEADER_BYTES;
             file[at + 8..at + 12].copy_from_slice(&size.to_le_bytes());
             file[at + 12..at + 16].copy_from_slice(&rva.to_le_bytes());
-            let raw_size = if index == 0 { 0x200u32 } else { 0x200 };
+            let raw_size = 0x200u32;
             file[at + 16..at + 20].copy_from_slice(&raw_size.to_le_bytes());
             file[at + 20..at + 24].copy_from_slice(&raw.to_le_bytes());
         }

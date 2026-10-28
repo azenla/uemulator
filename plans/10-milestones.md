@@ -71,3 +71,7 @@ Each has an observable serial-output exit criterion. Interpreter first.
 3. Interpreter + helpers; `tlb`/`mmu`; exceptions/IDT delivery.
 4. Devices from 07; run loop with clock and HLT warp.
 5. Iterate on the boot: each unimplemented opcode/MSR/port is logged once; fix in order of appearance.
+
+## UEFI firmware (plans/19)
+
+Done: `MachineConfig::uefi_firmware` and `key_value_store`, `crates/uemulator-firmware`, `advanced boot-uefi`, `quick` machines with `firmware = "uefi"`. Exit criteria met in a real guest: the Linux EFI stub and Debian GRUB 2.12 boot Alpine from a GPT ESP, and a variable written by Linux survives a guest reset through the nvram file. Open: Xen (`xen.efi`, multiboot2), Fedora shim, ACPI tables in the handoff.

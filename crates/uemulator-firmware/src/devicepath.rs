@@ -13,7 +13,6 @@ pub const TYPE_MESSAGING: u8 = 3;
 pub const TYPE_MEDIA: u8 = 4;
 pub const TYPE_END: u8 = 0x7f;
 pub const SUBTYPE_END_ENTIRE: u8 = 0xff;
-pub const SUBTYPE_END_INSTANCE: u8 = 0x01;
 pub const SUBTYPE_PCI: u8 = 1;
 pub const SUBTYPE_ACPI: u8 = 1;
 pub const SUBTYPE_HARD_DRIVE: u8 = 1;
@@ -136,6 +135,7 @@ impl DevicePath {
         self.0.len() >= length && self.0[..length] == prefix.0[..length]
     }
 
+    #[cfg(test)]
     /// The nodes of `self` after `prefix`, as a path of their own.
     pub fn strip_prefix(&self, prefix: &DevicePath) -> Option<DevicePath> {
         let length = prefix.0.len() - END_NODE.len();
@@ -143,6 +143,7 @@ impl DevicePath {
             .then(|| Self(self.0[length..].to_vec()))
     }
 
+    #[cfg(test)]
     /// The hard-drive node's partition, if the path has one: (number, first block, blocks).
     pub fn partition(&self) -> Option<(u32, u64, u64)> {
         self.nodes()
@@ -306,8 +307,8 @@ pub mod protocol {
     }
 
     pub static TO_TEXT: ToText = ToText {
-        convert_device_node: convert_device_node,
-        convert_device_path: convert_device_path,
+        convert_device_node,
+        convert_device_path,
     };
 
     pub static UTILITIES: Utilities = Utilities {
@@ -317,7 +318,7 @@ pub mod protocol {
         append_device_node: append_node,
         append_device_path_instance: append_instance,
         get_next_device_path_instance: next_instance,
-        is_multi_instance: is_multi_instance,
+        is_multi_instance,
         create_device_node: create_node,
     };
 

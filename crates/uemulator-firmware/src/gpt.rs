@@ -11,6 +11,7 @@ pub trait Blocks {
     fn read_blocks(&mut self, first: u64, buffer: &mut [u8]) -> bool;
 }
 
+#[cfg(test)]
 /// `C12A7328-F81F-11D2-BA4B-00A0C93EC93B`.
 pub const ESP_TYPE: Guid = Guid::new(
     0xc12a7328,
@@ -50,6 +51,7 @@ pub enum Scheme {
 }
 
 impl Partition {
+    #[cfg(test)]
     pub fn is_esp(&self) -> bool {
         matches!(&self.scheme, Scheme::Gpt { type_guid, .. } if *type_guid == ESP_TYPE)
     }

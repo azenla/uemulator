@@ -18,7 +18,7 @@ pub unsafe fn length(string: *const u16) -> usize {
 
 /// # Safety
 /// As `length`.
-pub unsafe fn to_units<'a>(string: *const u16) -> Vec<u16> {
+pub unsafe fn to_units(string: *const u16) -> Vec<u16> {
     let length = unsafe { length(string) };
     (0..length)
         .map(|index| unsafe { string.add(index).read_unaligned() })
