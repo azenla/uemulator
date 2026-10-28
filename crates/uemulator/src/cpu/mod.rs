@@ -640,6 +640,9 @@ impl Cpu {
         if self.dev.reset_requested {
             return Some(ExitReason::Reset);
         }
+        if self.dev.shutdown_requested() {
+            return Some(ExitReason::Shutdown);
+        }
         self.next_event = self.icount + EVENT_INTERVAL;
         None
     }
@@ -924,6 +927,9 @@ impl Cpu {
         // kernel's reboot path) must win over the shutdown check below.
         if self.dev.reset_requested {
             return Some(ExitReason::Reset);
+        }
+        if self.dev.shutdown_requested() {
+            return Some(ExitReason::Shutdown);
         }
         // `hlt` with IF=0 can only be woken by NMI, SMI, INIT or RESET (SDM vol. 3 sec. 6.8,
         // HLT), and nothing here raises the first three: the guest is dead, which is how Linux's

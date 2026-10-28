@@ -1744,6 +1744,11 @@ impl Cpu {
                 self.rip = next;
                 return Err(Exception::Exit(ExitReason::Reset));
             }
+            // The ACPI sleep register: S5 is the only state the DSDT offers and nothing wakes it.
+            if self.dev.shutdown_requested() {
+                self.rip = next;
+                return Err(Exception::Exit(ExitReason::Shutdown));
+            }
         }
         self.rip = next;
         Ok(())

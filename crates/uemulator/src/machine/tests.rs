@@ -1155,7 +1155,7 @@ mod guest_view {
 
     #[test]
     fn default_command_line_is_the_virtio_one_from_platform() {
-        let printed = printed_cmdline(|config| config);
+        let printed = printed_cmdline(|config| config.acpi(false));
         assert_eq!(printed, DEFAULT_CMDLINE);
         assert!(printed.contains("console=hvc0"));
         assert!(printed.contains("earlyprintk=serial,ttyS0"));
@@ -1164,7 +1164,7 @@ mod guest_view {
     #[test]
     fn default_command_line_for_a_serial_console_names_ttys0() {
         assert_eq!(
-            printed_cmdline(|config| config.console(ConsoleKind::Serial)),
+            printed_cmdline(|config| config.console(ConsoleKind::Serial).acpi(false)),
             DEFAULT_SERIAL_CMDLINE
         );
         assert!(DEFAULT_SERIAL_CMDLINE.contains("console=ttyS0"));
@@ -1175,7 +1175,8 @@ mod guest_view {
         assert_eq!(
             printed_cmdline(|config| config
                 .console(ConsoleKind::Serial)
-                .console(ConsoleKind::Virtio)),
+                .console(ConsoleKind::Virtio)
+                .acpi(false)),
             DEFAULT_SERIAL_CMDLINE
         );
     }
@@ -1201,7 +1202,7 @@ mod guest_view {
     #[test]
     fn appended_text_follows_the_default_after_a_space() {
         assert_eq!(
-            printed_cmdline(|config| config.cmdline_append("loglevel=7")),
+            printed_cmdline(|config| config.cmdline_append("loglevel=7").acpi(false)),
             format!("{DEFAULT_CMDLINE} loglevel=7")
         );
     }
@@ -1227,9 +1228,29 @@ mod guest_view {
     }
 
     #[test]
-    fn e820_describes_three_ranges() {
-        let run = run_guest(&PRINT_E820_COUNT, JitMode::Off);
+    fn with_acpi_the_default_command_line_no_longer_says_acpi_off() {
+        let printed = printed_cmdline(|config| config);
+        assert_eq!(printed, DEFAULT_CMDLINE.replace(" acpi=off", ""));
+        assert!(!printed.contains("acpi"));
+        let serial = printed_cmdline(|config| config.console(ConsoleKind::Serial));
+        assert_eq!(serial, DEFAULT_SERIAL_CMDLINE.replace(" acpi=off", ""));
+    }
+
+    #[test]
+    fn e820_describes_three_ranges_without_acpi() {
+        let run = run_machine(
+            fake_bzimage(&PRINT_E820_COUNT),
+            JitMode::Off,
+            GENEROUS_LIMIT,
+            |config| config.acpi(false),
+        );
         assert_eq!(run.console_output, [3]);
+    }
+
+    #[test]
+    fn with_acpi_e820_also_lists_the_tables_and_the_ecam_window() {
+        let run = run_guest(&PRINT_E820_COUNT, JitMode::Off);
+        assert_eq!(run.console_output, [6]);
     }
 
     #[test]
@@ -1239,7 +1260,7 @@ mod guest_view {
                 fake_bzimage(&PRINT_E820_LAST_SIZE),
                 JitMode::Off,
                 GENEROUS_LIMIT,
-                |config| config.memory_mib(mib),
+                |config| config.memory_mib(mib).acpi(false),
             );
             let size = u32::from_le_bytes(run.console_output[..4].try_into().unwrap());
             assert_eq!(size as usize, (mib - 1) * MIB, "{mib} MiB");
@@ -1482,6 +1503,45 @@ mod exits {
         0x66, 0xba, 0xf9, 0x0c, 0xb0, 0x0b, 0xee, 0x66, 0xba, 0xf8, 0x03, 0xb0, 0x6b, 0xee, 0xeb,
         0xfe,
     ];
+
+    // mov dx, 0x604; mov ax, 0x3401 (SLP_EN, SLP_TYP 5, SCI_EN); out dx, ax; jmp $
+    const ACPI_POWER_OFF: [u8; 10] = [0x66, 0xba, 0x04, 0x06, 0x66, 0xb8, 0x01, 0x34, 0x66, 0xef];
+    // The same with sleep type 3 (an S3 the DSDT does not offer), then print 'k'; jmp $
+    const ACPI_SLEEP_TYPE_3: [u8; 19] = [
+        0x66, 0xba, 0x04, 0x06, 0x66, 0xb8, 0x01, 0x2c, 0x66, 0xef, 0x66, 0xba, 0xf8, 0x03, 0xb0,
+        0x6b, 0xee, 0xeb, 0xfe,
+    ];
+    // mov dx, 0xcf9; mov al, 6 (what the FADT's reset register holds); out dx, al; jmp $
+    const ACPI_RESET_REGISTER: [u8; 9] = [0x66, 0xba, 0xf9, 0x0c, 0xb0, 0x06, 0xee, 0xeb, 0xfe];
+
+    #[test]
+    fn writing_s5_to_the_acpi_sleep_register_powers_the_machine_off() {
+        for jit in auto_and_off() {
+            let mut code = ACPI_POWER_OFF.to_vec();
+            code.extend_from_slice(&[0xeb, 0xfe]);
+            assert_eq!(run_guest(&code, jit).exit, ExitReason::Shutdown, "{jit:?}");
+        }
+    }
+
+    #[test]
+    fn other_acpi_sleep_types_do_not_power_off() {
+        for jit in auto_and_off() {
+            let run = run_spinning(&ACPI_SLEEP_TYPE_3, jit);
+            assert_eq!(run.exit, ExitReason::Stopped, "{jit:?}");
+            assert_eq!(run.console_output, [ALIVE_MARKER], "{jit:?}");
+        }
+    }
+
+    #[test]
+    fn the_fadts_reset_register_value_resets_the_machine() {
+        for jit in auto_and_off() {
+            assert_eq!(
+                run_guest(&ACPI_RESET_REGISTER, jit).exit,
+                ExitReason::Reset,
+                "{jit:?}"
+            );
+        }
+    }
 
     #[test]
     fn keyboard_controller_pulse_reset_is_reset() {

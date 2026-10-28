@@ -1,3 +1,4 @@
+use crate::acpi::{self, AcpiConfig};
 use crate::machine::Error;
 #[cfg(freestanding)]
 use crate::prelude::*;
@@ -99,6 +100,10 @@ const E820_TABLE_OFFSET: usize = 0x2d0;
 const E820_ENTRY_SIZE: usize = 20;
 pub(crate) const E820_RAM: u32 = 1;
 pub(crate) const E820_RESERVED: u32 = 2;
+pub(crate) const E820_ACPI: u32 = 3;
+/// `boot_params.acpi_rsdp_addr` (boot protocol 2.14): where the kernel finds the RSDP without
+/// scanning for it.
+const ACPI_RSDP_ADDR_OFFSET: usize = 0x70;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SetupHeader {
@@ -185,6 +190,24 @@ pub(crate) fn e820_map(ram_top: u64) -> [(u64, u64, u32); 3] {
     ]
 }
 
+/// `e820_map` with the ACPI tables marked as ACPI data and the ECAM window reserved: the
+/// regions Linux checks before it trusts MCFG and the tables.
+pub(crate) fn e820_map_with_acpi(ram_top: u64) -> Vec<(u64, u64, u32)> {
+    let (ecam_base, ecam_bytes) = acpi::ECAM_RANGE;
+    vec![
+        (0, LOW_RAM_END, E820_RAM),
+        (LOW_RAM_END, acpi::REGION_BASE - LOW_RAM_END, E820_RESERVED),
+        (acpi::REGION_BASE, acpi::REGION_BYTES, E820_ACPI),
+        (
+            acpi::REGION_BASE + acpi::REGION_BYTES,
+            ONE_MIB - (acpi::REGION_BASE + acpi::REGION_BYTES),
+            E820_RESERVED,
+        ),
+        (ONE_MIB, ram_top - ONE_MIB, E820_RAM),
+        (ecam_base, ecam_bytes, E820_RESERVED),
+    ]
+}
+
 /// Register state of a Linux entry: in 64-bit mode paging on with `cr3`; in 32-bit mode paging
 /// off. The GDT is at `gdt_base`, `cs` and `ds` select its flat code and data descriptors.
 #[derive(Debug, Clone, Copy, Default)]
@@ -222,6 +245,18 @@ pub(crate) fn load(
     kernel: &[u8],
     initrd: Option<&[u8]>,
     cmdline: &str,
+) -> Result<BootState, Error> {
+    load_with_acpi(ram, kernel, initrd, cmdline, None)
+}
+
+/// `load`, and with `acpi` the tables are written into RAM, the memory map marks them, and
+/// `boot_params.acpi_rsdp_addr` points the kernel at them.
+pub(crate) fn load_with_acpi(
+    ram: &mut [u8],
+    kernel: &[u8],
+    initrd: Option<&[u8]>,
+    cmdline: &str,
+    acpi: Option<&AcpiConfig>,
 ) -> Result<BootState, Error> {
     let header = SetupHeader::parse(kernel)?;
     // +1 for the NUL; RAM is zeroed so the terminator is already there. The command line must
@@ -284,7 +319,15 @@ pub(crate) fn load(
             .copy_from_slice(&(initrd.len() as u32).to_le_bytes());
     }
 
-    let e820 = e820_map(ram_top);
+    let e820 = match acpi {
+        Some(config) => {
+            let rsdp = acpi::install(ram, config)?;
+            boot_params[ACPI_RSDP_ADDR_OFFSET..ACPI_RSDP_ADDR_OFFSET + 8]
+                .copy_from_slice(&rsdp.to_le_bytes());
+            e820_map_with_acpi(ram_top)
+        }
+        None => e820_map(ram_top).to_vec(),
+    };
     boot_params[E820_ENTRIES_OFFSET] = e820.len() as u8;
     for (index, (base, size, kind)) in e820.iter().enumerate() {
         let entry = E820_TABLE_OFFSET + index * E820_ENTRY_SIZE;

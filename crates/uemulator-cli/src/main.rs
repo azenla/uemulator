@@ -883,6 +883,9 @@ mod tests {
         assert_eq!(hardware(&["--disable-jit"]).disable_jit, Some(true));
         assert_eq!(hardware(&["--disable-jit=true"]).disable_jit, Some(true));
         assert_eq!(hardware(&["--disable-jit=false"]).disable_jit, Some(false));
+        assert_eq!(hardware(&[]).iommu, None);
+        assert_eq!(hardware(&["--iommu"]).iommu, Some(true));
+        assert_eq!(hardware(&["--iommu=false"]).iommu, Some(false));
         assert_eq!(
             error_kind(&["advanced", "boot", "--kernel", "k", "--disable-jit=maybe"]),
             ErrorKind::InvalidValue

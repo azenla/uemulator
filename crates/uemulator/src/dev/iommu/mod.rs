@@ -33,7 +33,8 @@ mod tables;
 mod tests;
 
 pub(crate) use irq::{
-    DeliveryMode, InterruptFault, InterruptRequest, RemappedInterrupt, ioapic_request,
+    DeliveryMode, InterruptFault, InterruptRequest, RemappedInterrupt, decode_message,
+    ioapic_request,
 };
 pub(crate) use ivrs::{IvrsTopology, SpecialDevice};
 use tables::{DeviceTableEntry, WalkError};
@@ -119,6 +120,20 @@ const REG_COMMAND_TAIL: u64 = 0x2008;
 const REG_EVENT_HEAD: u64 = 0x2010;
 const REG_EVENT_TAIL: u64 = 0x2018;
 const REG_STATUS: u64 = 0x2020;
+/// With XTEn the event and completion-wait interrupts are not MSIs: software programs the vector
+/// and a 32-bit destination here (IntCapXT, `drivers/iommu/amd/init.c`), and the IOMMU sends
+/// them to the local APIC itself. The PPR and GA log ones have no event source here and are only
+/// stored.
+const REG_XT_GENERAL_INTERRUPT: u64 = 0x0170;
+const REG_XT_PPR_INTERRUPT: u64 = 0x0178;
+const REG_XT_GA_LOG_INTERRUPT: u64 = 0x0180;
+/// Layout of an XT interrupt control register: DM (bit 2), destination bits 23:0 at 31:8, vector
+/// at 39:32, destination bits 31:24 at 63:56.
+const XT_DESTINATION_MODE_LOGICAL: u64 = 1 << 2;
+const XT_DESTINATION_LOW_SHIFT: u32 = 8;
+const XT_DESTINATION_LOW_MASK: u64 = 0xff_ffff;
+const XT_VECTOR_SHIFT: u32 = 32;
+const XT_DESTINATION_HIGH_SHIFT: u32 = 56;
 
 /// Device table base: address bits 51:12, Size (bits 8:0): the table has (Size + 1) * 4 KiB.
 const DEVICE_TABLE_WRITABLE: u64 = 0x000f_ffff_ffff_f1ff;
@@ -152,6 +167,10 @@ const CONTROL_COMPLETION_WAIT_INTERRUPT_ENABLE: u64 = 1 << 4;
 const CONTROL_COMMAND_BUFFER_ENABLE: u64 = 1 << 12;
 /// Guest APIC (128-bit IRTE) mode.
 const CONTROL_GUEST_APIC_ENABLE: u64 = 1 << 17;
+/// XTEn: x2APIC mode, where IRTEs carry a 32-bit destination. IntCapXTEn: the IOMMU's own
+/// interrupts use the XT registers instead of the MSI capability.
+const CONTROL_XT_ENABLE: u64 = 1 << 50;
+const CONTROL_INTCAPXT_ENABLE: u64 = 1 << 51;
 /// InvTimeOut (7:5), PassPW, ResPassPW, Coherent, Isoc: stored, no effect.
 const CONTROL_STORED_ONLY: u64 = 0xe0 | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
 const CONTROL_WRITABLE: u64 = CONTROL_IOMMU_ENABLE
@@ -160,6 +179,8 @@ const CONTROL_WRITABLE: u64 = CONTROL_IOMMU_ENABLE
     | CONTROL_COMPLETION_WAIT_INTERRUPT_ENABLE
     | CONTROL_COMMAND_BUFFER_ENABLE
     | CONTROL_GUEST_APIC_ENABLE
+    | CONTROL_XT_ENABLE
+    | CONTROL_INTCAPXT_ENABLE
     | CONTROL_STORED_ONLY;
 
 /// Status register: overflow, event interrupt and completion-wait interrupt are
@@ -172,14 +193,19 @@ const STATUS_COMMAND_BUFFER_RUNNING: u64 = 1 << 4;
 const STATUS_WRITE_ONE_TO_CLEAR: u64 =
     STATUS_EVENT_OVERFLOW | STATUS_EVENT_INTERRUPT | STATUS_COMPLETION_WAIT_INTERRUPT;
 
-/// Extended feature register: PreFSup (the prefetch command is accepted), IASup (invalidate
-/// all), GASup (128-bit IRTEs) and HATS = 10b (host page tables of up to six levels).
+/// Extended feature register: PreFSup (the prefetch command is accepted), XTSup (x2APIC: 32-bit
+/// IRTE destinations and the IntCapXT interrupt registers), IASup (invalidate all), GASup
+/// (128-bit IRTEs) and HATS = 10b (host page tables of up to six levels).
 const EFR_PREFETCH: u64 = 1 << 0;
+const EFR_X2APIC: u64 = 1 << 2;
 const EFR_INVALIDATE_ALL: u64 = 1 << 6;
 const EFR_GUEST_APIC: u64 = 1 << 7;
 const EFR_HOST_ADDRESS_TRANSLATION_SIZE_6_LEVEL: u64 = 2 << 10;
-pub(crate) const EXTENDED_FEATURES: u64 =
-    EFR_PREFETCH | EFR_INVALIDATE_ALL | EFR_GUEST_APIC | EFR_HOST_ADDRESS_TRANSLATION_SIZE_6_LEVEL;
+pub(crate) const EXTENDED_FEATURES: u64 = EFR_PREFETCH
+    | EFR_X2APIC
+    | EFR_INVALIDATE_ALL
+    | EFR_GUEST_APIC
+    | EFR_HOST_ADDRESS_TRANSLATION_SIZE_6_LEVEL;
 
 /// A cached translation is dropped wholesale when the table reaches this many pages.
 const IOTLB_MAX_ENTRIES: usize = 1024;
@@ -227,7 +253,15 @@ pub(crate) struct Translation {
     pub bytes_left: u64,
 }
 
-/// An MSI the IOMMU wants delivered (event log or completion-wait interrupt).
+/// An interrupt the IOMMU wants delivered (event log or completion-wait).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum IommuInterrupt {
+    Message(MsiMessage),
+    /// Straight to the local APIC, bypassing interrupt remapping (IntCapXT).
+    Direct(crate::dev::apic::Interrupt),
+}
+
+/// An MSI the IOMMU's capability holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct MsiMessage {
     pub address: u64,
@@ -257,6 +291,9 @@ pub(crate) struct Iommu {
     event_head: u64,
     event_tail: u64,
     status: u64,
+    xt_general_interrupt: u64,
+    xt_ppr_interrupt: u64,
+    xt_ga_log_interrupt: u64,
 
     /// Set by an illegal command or a failed completion-wait store: nothing runs until software
     /// toggles CmdBufEn.
@@ -288,6 +325,9 @@ impl Iommu {
             event_head: 0,
             event_tail: 0,
             status: 0,
+            xt_general_interrupt: 0,
+            xt_ppr_interrupt: 0,
+            xt_ga_log_interrupt: 0,
             command_stalled: false,
             pending_events: Vec::new(),
             msi_pending: false,
@@ -493,6 +533,33 @@ impl Iommu {
         Some(MsiMessage { address, data })
     }
 
+    /// What the pending event or completion-wait interrupt turns into: the MSI the capability
+    /// holds, or with IntCapXTEn the vector and destination of the XT general interrupt register.
+    /// Once, like `take_msi`.
+    pub fn take_interrupt(&mut self) -> Option<IommuInterrupt> {
+        if self.control & CONTROL_INTCAPXT_ENABLE == 0 {
+            return self.take_msi().map(IommuInterrupt::Message);
+        }
+        if !core::mem::take(&mut self.msi_pending) {
+            return None;
+        }
+        let register = self.xt_general_interrupt;
+        let low = (register >> XT_DESTINATION_LOW_SHIFT) & XT_DESTINATION_LOW_MASK;
+        let high = register >> XT_DESTINATION_HIGH_SHIFT;
+        Some(IommuInterrupt::Direct(crate::dev::apic::Interrupt {
+            vector: (register >> XT_VECTOR_SHIFT) as u8,
+            delivery_mode: crate::dev::apic::DELIVERY_FIXED,
+            level_triggered: false,
+            destination: (high << 24 | low) as u32,
+            logical: register & XT_DESTINATION_MODE_LOGICAL != 0,
+        }))
+    }
+
+    /// XTEn: IRTEs carry a 32-bit destination (the top 8 bits live in the high qword).
+    fn xt_enabled(&self) -> bool {
+        self.control & CONTROL_XT_ENABLE != 0
+    }
+
     fn read_register(&self, offset: u64) -> u64 {
         match offset {
             REG_DEVICE_TABLE => self.device_table,
@@ -507,6 +574,9 @@ impl Iommu {
             REG_EVENT_HEAD => self.event_head,
             REG_EVENT_TAIL => self.event_tail,
             REG_STATUS => self.status,
+            REG_XT_GENERAL_INTERRUPT => self.xt_general_interrupt,
+            REG_XT_PPR_INTERRUPT => self.xt_ppr_interrupt,
+            REG_XT_GA_LOG_INTERRUPT => self.xt_ga_log_interrupt,
             _ => 0,
         }
     }
@@ -566,6 +636,13 @@ impl Iommu {
             REG_EVENT_HEAD => self.event_head = merge(self.event_head, RING_POINTER_MASK),
             REG_EVENT_TAIL => self.event_tail = merge(self.event_tail, RING_POINTER_MASK),
             REG_STATUS => self.status &= !(written & STATUS_WRITE_ONE_TO_CLEAR),
+            REG_XT_GENERAL_INTERRUPT => {
+                self.xt_general_interrupt = merge(self.xt_general_interrupt, u64::MAX)
+            }
+            REG_XT_PPR_INTERRUPT => self.xt_ppr_interrupt = merge(self.xt_ppr_interrupt, u64::MAX),
+            REG_XT_GA_LOG_INTERRUPT => {
+                self.xt_ga_log_interrupt = merge(self.xt_ga_log_interrupt, u64::MAX)
+            }
             _ => {}
         }
         self.service(mem);

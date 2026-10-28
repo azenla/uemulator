@@ -724,6 +724,10 @@ impl Cpu {
                     self.rip = next;
                     return Err(Exception::Exit(ExitReason::Reset));
                 }
+                if self.dev.shutdown_requested() {
+                    self.rip = next;
+                    return Err(Exception::Exit(ExitReason::Shutdown));
+                }
             }
             if !rep {
                 break;

@@ -162,7 +162,7 @@ fn build_config(
     if settings.disable_jit {
         cfg = cfg.jit(JitMode::Off);
     }
-    cfg = cfg.reboot(!settings.no_reboot);
+    cfg = cfg.reboot(!settings.no_reboot).iommu(settings.iommu);
     Ok(cfg)
 }
 

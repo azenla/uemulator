@@ -44,6 +44,9 @@ const IRTE_LEGACY_VECTOR_SHIFT: u32 = 16;
 /// The 128-bit IRTE (guest APIC mode) has the same flags in its low qword, a 24-bit destination
 /// at 31:8 and the vector in the low byte of the high qword.
 const IRTE_GUEST_APIC_DESTINATION_MASK: u64 = 0xff_ffff;
+/// With XTEn the destination's top byte is in the high qword (`irte_ga` in Linux: vector 7:0,
+/// then ga_log_intr, then destination at 16).
+const IRTE_XT_DESTINATION_HIGH_SHIFT: u32 = 16;
 const IRTE_INT_TYPE_FIXED: u64 = 0;
 const IRTE_INT_TYPE_ARBITRATED: u64 = 1;
 
@@ -58,7 +61,7 @@ pub(crate) enum DeliveryMode {
 }
 
 impl DeliveryMode {
-    fn from_msi(bits: u32) -> Option<Self> {
+    pub(crate) fn from_msi(bits: u32) -> Option<Self> {
         match bits {
             0 => Some(Self::Fixed),
             1 => Some(Self::LowestPriority),
@@ -70,7 +73,7 @@ impl DeliveryMode {
         }
     }
 
-    fn msi_bits(self) -> u32 {
+    pub(crate) fn msi_bits(self) -> u32 {
         match self {
             Self::Fixed => 0,
             Self::LowestPriority => 1,
@@ -101,6 +104,19 @@ pub(crate) struct RemappedInterrupt {
     pub redirection_hint: bool,
     pub level_triggered: bool,
     pub destination: u32,
+}
+
+impl RemappedInterrupt {
+    /// The message the local APIC accepts.
+    pub(crate) fn into_interrupt(self) -> crate::dev::apic::Interrupt {
+        crate::dev::apic::Interrupt {
+            vector: self.vector,
+            delivery_mode: self.delivery_mode.msi_bits(),
+            level_triggered: self.level_triggered,
+            destination: self.destination,
+            logical: self.logical_destination,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -162,7 +178,9 @@ pub(crate) fn ioapic_request(
 }
 
 /// An unremapped message read as the MSI it is.
-fn decode_message(request: &InterruptRequest) -> Result<RemappedInterrupt, InterruptFault> {
+pub(crate) fn decode_message(
+    request: &InterruptRequest,
+) -> Result<RemappedInterrupt, InterruptFault> {
     let mode_bits = (request.data >> MSI_DATA_DELIVERY_SHIFT) & MSI_DATA_DELIVERY_MASK;
     let delivery_mode = DeliveryMode::from_msi(mode_bits).ok_or(InterruptFault::Unsupported)?;
     Ok(RemappedInterrupt {
@@ -279,7 +297,11 @@ impl Iommu {
         let (flags, destination, vector) = if guest_apic {
             let low = read_u64(mem, address).ok_or(InterruptFault::InterruptTable)?;
             let high = read_u64(mem, address + 8).ok_or(InterruptFault::InterruptTable)?;
-            let destination = (low >> IRTE_DESTINATION_SHIFT) & IRTE_GUEST_APIC_DESTINATION_MASK;
+            let mut destination =
+                (low >> IRTE_DESTINATION_SHIFT) & IRTE_GUEST_APIC_DESTINATION_MASK;
+            if self.xt_enabled() {
+                destination |= ((high >> IRTE_XT_DESTINATION_HIGH_SHIFT) & 0xff) << 24;
+            }
             (low, destination, high as u8)
         } else {
             let mut bytes = [0u8; 4];

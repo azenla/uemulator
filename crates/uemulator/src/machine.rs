@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(freestanding))]
 use std::thread::JoinHandle;
 
+use crate::acpi::AcpiConfig;
 use crate::boot::{self, BootState};
 use crate::console::ConsoleHandle;
 use crate::cpu::Cpu;
@@ -101,6 +102,8 @@ pub const MIN_MEMORY_MIB: usize = 64;
 pub const MAX_MEMORY_MIB: usize = 3072;
 const DEFAULT_MEMORY_MIB: usize = 512;
 const BYTES_PER_MIB_SHIFT: usize = 20;
+/// The word `DEFAULT_CMDLINE` carries for hosts without ACPI tables.
+const ACPI_OFF_WORD: &str = "acpi=off";
 
 pub(crate) type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 /// The poll hook as the CPU sees it: the console is already bound, the flag means "guest is
@@ -122,6 +125,7 @@ pub struct MachineConfig {
     net_macs: Vec<[u8; 6]>,
     consoles: Vec<ConsoleKind>,
     iommu: bool,
+    acpi: bool,
     jit: JitMode,
     clock: ClockMode,
     log: Option<LogFn>,
@@ -148,6 +152,7 @@ impl Default for MachineConfig {
             net_macs: Vec::new(),
             consoles: Vec::new(),
             iommu: false,
+            acpi: true,
             jit: JitMode::Auto,
             clock: ClockMode::Virtual,
             log: None,
@@ -227,6 +232,16 @@ impl MachineConfig {
     /// `plans/16-iommu.md`) it just sits on the bus.
     pub fn iommu(mut self, on: bool) -> Self {
         self.iommu = on;
+        self
+    }
+
+    /// Publishes ACPI tables (RSDP, XSDT, FADT, DSDT, MADT, MCFG, HPET, and the IVRS with the
+    /// IOMMU) to a Linux guest, which then uses the I/O APIC, the HPET, the PM timer and ACPI
+    /// power-off. On by default; the default command line then no longer says `acpi=off`. Off
+    /// gives the table-less machine of earlier versions (PIC and PIT only; the guest powers off
+    /// with `hlt` and IF=0).
+    pub fn acpi(mut self, on: bool) -> Self {
+        self.acpi = on;
         self
     }
 
@@ -373,6 +388,7 @@ struct RebootImage {
     nets: Vec<([u8; 6], NetHandle)>,
     virtio_consoles: Vec<ConsoleHandle>,
     iommu: bool,
+    acpi: Option<AcpiConfig>,
 }
 
 /// Wall-clock seconds, or 0 where there is no clock (UEFI keeps its own, see `unix_time`).
@@ -500,11 +516,12 @@ impl Vcpu {
             // Fresh zeroed RAM, not a `fill(0)` of the old one: `boot::load` relies on zeroes,
             // and filling would commit every page the host had lazily left untouched.
             let mut ram = vec![0u8; finished.ram_bytes];
-            match boot::load(
+            match boot::load_with_acpi(
                 &mut ram,
                 &image.kernel,
                 image.initrd.as_deref(),
                 &image.cmdline,
+                image.acpi.as_ref(),
             ) {
                 Ok(boot) => self.boot = boot,
                 Err(e) => return ExitReason::Internal(format!("reboot: {e}")),
@@ -669,7 +686,12 @@ impl EmulatedMachine {
             } else {
                 DEFAULT_SERIAL_CMDLINE
             };
-            default.to_string()
+            // The defaults are the table-less ones (`Platform` hosts need `acpi=off`).
+            if cfg.acpi {
+                default.replace(ACPI_OFF_WORD, "").replace("  ", " ")
+            } else {
+                default.to_string()
+            }
         });
         for extra in &cfg.cmdline_extra {
             cmdline.push(' ');
@@ -692,10 +714,21 @@ impl EmulatedMachine {
                 ));
             }
         }
+        let acpi = cfg.acpi.then_some(AcpiConfig {
+            pci_functions: functions,
+            iommu: cfg.iommu,
+            ..Default::default()
+        });
         let boot = match &cfg.firmware {
             _ if cfg.boot_disk => boot::load_bios(),
             Some(image) => boot::load_firmware(&mut ram, image)?,
-            None => boot::load(&mut ram, &cfg.kernel, cfg.initrd.as_deref(), &cmdline)?,
+            None => boot::load_with_acpi(
+                &mut ram,
+                &cfg.kernel,
+                cfg.initrd.as_deref(),
+                &cmdline,
+                acpi.as_ref(),
+            )?,
         };
         let nets: Vec<([u8; 6], NetHandle)> = cfg
             .net_macs
@@ -733,6 +766,7 @@ impl EmulatedMachine {
                     nets: devcfg.nets.clone(),
                     virtio_consoles: devcfg.virtio_consoles.clone(),
                     iommu: cfg.iommu,
+                    acpi,
                 }
             });
         let stop = Arc::new(AtomicBool::new(false));

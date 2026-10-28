@@ -10,6 +10,8 @@ use super::apic::{DELIVERY_EXTINT, Interrupt};
 pub(crate) const IOAPIC_DEFAULT_BASE: u64 = 0xfec0_0000;
 pub(crate) const IOAPIC_MMIO_SIZE: u64 = 0x1000;
 pub(crate) const IOAPIC_PINS: usize = 24;
+/// The id the MADT and IVRS give the I/O APIC (QEMU numbers it after the CPUs; one CPU here).
+pub(crate) const IOAPIC_ID: u8 = 1;
 
 const REGISTER_SELECT: u64 = 0x00;
 const REGISTER_WINDOW: u64 = 0x10;
@@ -53,18 +55,36 @@ pub(crate) struct IoApic {
     line: u32,
     /// Latched edge requests (a pulse while the pin was masked) and unserviced level requests.
     request: u32,
+    /// Pins of the messages `service` produced, in order, for the caller that routes them.
+    sent_pins: Vec<usize>,
+    /// The vector the local APIC actually received for a level-triggered pin. With interrupt
+    /// remapping the redirection entry holds an IRTE index instead, but the EOI carries the real
+    /// vector (`note_delivered`).
+    delivered_vector: [Option<u8>; IOAPIC_PINS],
 }
 
 impl IoApic {
     pub fn new() -> Self {
         IoApic {
-            id: 0,
+            id: IOAPIC_ID as u32,
             select: 0,
             // Every pin starts masked, edge triggered, vector 0.
             redirection: [RTE_MASKED; IOAPIC_PINS],
             line: 0,
             request: 0,
+            sent_pins: Vec::new(),
+            delivered_vector: [None; IOAPIC_PINS],
         }
+    }
+
+    /// Pins of the messages produced since the last call, one per entry pushed to `out`.
+    pub fn take_sent_pins(&mut self) -> Vec<usize> {
+        core::mem::take(&mut self.sent_pins)
+    }
+
+    /// Records the vector the LAPIC received for `pin` after the IOMMU remapped it.
+    pub fn note_delivered(&mut self, pin: usize, vector: u8) {
+        self.delivered_vector[pin] = Some(vector);
     }
 
     pub fn decodes(&self, phys: u64) -> bool {
@@ -107,6 +127,7 @@ impl IoApic {
             // CPU with the PIC connected through LINT0 already gets.
             if interrupt.delivery_mode != DELIVERY_EXTINT {
                 out.push(interrupt);
+                self.sent_pins.push(pin);
             }
         }
     }
@@ -136,9 +157,10 @@ impl IoApic {
     pub fn eoi(&mut self, vector: u8, out: &mut Vec<Interrupt>) {
         for pin in 0..IOAPIC_PINS {
             let entry = self.redirection[pin];
+            let sent_vector = self.delivered_vector[pin].unwrap_or(entry as u8);
             if entry & RTE_LEVEL != 0
                 && entry & RTE_REMOTE_IRR != 0
-                && entry & RTE_VECTOR_MASK == vector as u64
+                && (entry & RTE_VECTOR_MASK == vector as u64 || sent_vector == vector)
             {
                 self.redirection[pin] &= !RTE_REMOTE_IRR;
                 if self.line & (1 << pin) != 0 {

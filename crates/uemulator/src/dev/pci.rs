@@ -1,9 +1,10 @@
 use super::guestmem::GuestMem;
-use super::iommu::{self, Iommu};
+use super::iommu::{self, InterruptRequest, Iommu};
 use super::size_mask;
 use super::virtio::{
     COMMON_CFG_OFFSET, DEVICE_CFG_OFFSET, DEVICE_TYPE_BLOCK, DEVICE_TYPE_CONSOLE, DEVICE_TYPE_NET,
-    ISR_OFFSET, NOTIFY_OFF_MULTIPLIER, NOTIFY_OFFSET, REGION_SIZE, Transport,
+    ISR_OFFSET, MSIX_CONTROL_ENABLE, MSIX_CONTROL_FUNCTION_MASK, MSIX_PBA_OFFSET,
+    MSIX_TABLE_OFFSET, NOTIFY_OFF_MULTIPLIER, NOTIFY_OFFSET, REGION_SIZE, Transport,
 };
 #[cfg(freestanding)]
 use crate::prelude::*;
@@ -11,14 +12,27 @@ use crate::prelude::*;
 /// Start of the MMIO window; everything at or above guest RAM size dispatches to the devices.
 /// RAM is capped at 0xC000_0000 so the two never overlap (plans/11).
 pub(crate) const MMIO_BASE: u64 = 0xc000_0000;
+/// The part of it the ACPI root bridge hands out as BAR space (up to the ECAM window).
+pub(crate) const PCI_MMIO_WINDOW_BYTES: u64 = 0x2000_0000;
 /// Each virtio function gets one BAR0 of this size, laid out back to back from `MMIO_BASE`.
-/// Four `REGION_SIZE` regions: common cfg, ISR, device cfg, notify.
-const BAR_SIZE: u64 = 4 * REGION_SIZE;
+/// Six `REGION_SIZE` regions (common cfg, ISR, device cfg, notify, MSI-X table, MSI-X PBA),
+/// rounded up to a power of two.
+const BAR_SIZE: u64 = 8 * REGION_SIZE;
+
+/// PCIe enhanced configuration access (ECAM): 4 KiB of config space per function, laid out as
+/// `bus << 20 | devfn << 12 | register` from this base. The MCFG table advertises it for bus 0
+/// only. Chosen below the 4 GiB hole's devices and above the BAR window.
+pub(crate) const ECAM_BASE: u64 = 0xe000_0000;
+const ECAM_DEVFN_SHIFT: u32 = 12;
+const ECAM_BUS_SHIFT: u32 = 20;
+pub(crate) const ECAM_BYTES_PER_BUS: u64 = 1 << ECAM_BUS_SHIFT;
+const ECAM_FUNCTION_BYTES: u64 = 1 << ECAM_DEVFN_SHIFT;
 /// Legacy PIC lines handed out to functions in order, wrapping around (functions past the fourth
-/// share a line; `line_asserted` ORs them). There is no IOAPIC or ACPI, so the kernel takes
-/// `int_line` as the IRQ. Never 0, `mmio_write` uses 0 for "no interrupt". 9-11 are the lines
-/// QEMU's PIIX routes PCI interrupts to; 5 is free on a machine without a sound card or LPT.
-const LEGACY_IRQS: [u8; 4] = [9, 10, 11, 5];
+/// share a line; `line_asserted` ORs them). Without ACPI the kernel takes `int_line` as the IRQ;
+/// with it, the DSDT's `_PRT` repeats this assignment as GSIs (`acpi::pci_interrupt_gsi`). Never
+/// 0, `mmio_write` uses 0 for "no interrupt". 9-11 are the lines QEMU's PIIX routes PCI
+/// interrupts to; 5 is free on a machine without a sound card or LPT.
+pub(crate) const LEGACY_IRQS: [u8; 4] = [9, 10, 11, 5];
 
 /// Config mechanism #1 ports: the address dword at 0xCF8..=0xCFB and the data window at
 /// 0xCFC..=0xCFF. Either may be accessed as a byte, word or dword; the low two bits of the
@@ -107,6 +121,17 @@ const CAP_COMMON_AT: usize = 0x40;
 const CAP_NOTIFY_AT: usize = 0x50;
 const CAP_ISR_AT: usize = 0x64;
 const CAP_DEVICE_AT: usize = 0x74;
+const CAP_MSIX_AT: usize = 0x84;
+
+/// MSI-X capability: id 0x11, next, message control (table size - 1 in bits 10:0, function mask
+/// bit 14, enable bit 15), table offset | BIR, PBA offset | BIR. Both live in BAR0 (BIR 0).
+const CAP_ID_MSIX: u8 = 0x11;
+const MSIX_CAP_CONTROL_FIELD: usize = 2;
+const MSIX_CAP_TABLE_FIELD: usize = 4;
+const MSIX_CAP_PBA_FIELD: usize = 8;
+const MSIX_CONTROL_TABLE_SIZE_MASK: u16 = 0x7ff;
+/// The control register's high byte holds the two writable bits.
+const MSIX_CONTROL_HIGH_BYTE: usize = CAP_MSIX_AT + MSIX_CAP_CONTROL_FIELD + 1;
 /// `struct virtio_pci_common_cfg` is 56 bytes.
 const COMMON_CFG_LENGTH: u32 = 0x38;
 const ISR_LENGTH: u32 = 4;
@@ -208,12 +233,21 @@ impl PciFunction {
         write_virtio_cap(
             &mut b,
             CAP_DEVICE_AT,
-            0,
+            CAP_MSIX_AT,
             VIRTIO_CAP_LEN,
             VIRTIO_PCI_CAP_DEVICE_CFG,
             DEVICE_CFG_OFFSET as u32,
             DEVICE_CFG_LENGTH,
         );
+        b[CAP_MSIX_AT] = CAP_ID_MSIX;
+        let control = (self.transport.msix_vectors() as u16 - 1) & MSIX_CONTROL_TABLE_SIZE_MASK
+            | self.transport.msix_control();
+        let control_at = CAP_MSIX_AT + MSIX_CAP_CONTROL_FIELD;
+        b[control_at..control_at + 2].copy_from_slice(&control.to_le_bytes());
+        let table_at = CAP_MSIX_AT + MSIX_CAP_TABLE_FIELD;
+        b[table_at..table_at + 4].copy_from_slice(&(MSIX_TABLE_OFFSET as u32).to_le_bytes());
+        let pba_at = CAP_MSIX_AT + MSIX_CAP_PBA_FIELD;
+        b[pba_at..pba_at + 4].copy_from_slice(&(MSIX_PBA_OFFSET as u32).to_le_bytes());
         b
     }
 
@@ -237,6 +271,11 @@ impl PciFunction {
                     self.bar0 &= size_mask;
                 }
                 CFG_INTERRUPT_LINE => self.int_line = byte,
+                MSIX_CONTROL_HIGH_BYTE => {
+                    let control =
+                        ((byte as u16) << 8) & (MSIX_CONTROL_ENABLE | MSIX_CONTROL_FUNCTION_MASK);
+                    self.transport.set_msix_control(control);
+                }
                 _ => {}
             }
         }
@@ -260,6 +299,17 @@ impl PciFunction {
     /// False when the guest set the command register's INTx-disable bit.
     fn intx_enabled(&self) -> bool {
         self.command & COMMAND_INTX_DISABLE == 0
+    }
+}
+
+/// Moves the MSI-X messages a function sent into `messages`, tagged with its requester id.
+fn collect_messages(function: &mut PciFunction, messages: &mut Vec<InterruptRequest>) {
+    for (address, data) in function.transport.take_messages() {
+        messages.push(InterruptRequest {
+            requester: function.devfn as u16,
+            address,
+            data,
+        });
     }
 }
 
@@ -397,6 +447,10 @@ impl PciHost {
         }
         let devfn = ((self.config_address >> CONFIG_ADDRESS_DEVFN_SHIFT) & 0xff) as u8;
         let reg = (self.config_address & CONFIG_ADDRESS_REGISTER_MASK) as usize + lane;
+        self.config_write(devfn, reg, bytes, val);
+    }
+
+    fn config_write(&mut self, devfn: u8, reg: usize, bytes: usize, val: u32) {
         if let (Some(iommu), iommu::PCI_DEVFN) = (&mut self.iommu, devfn) {
             iommu.config_write(reg, bytes, val);
         } else if let Some(f) = self.funcs.iter_mut().find(|f| f.devfn == devfn) {
@@ -408,6 +462,47 @@ impl PciHost {
         self.funcs
             .iter_mut()
             .find_map(|f| f.bar0_offset(phys_addr).map(|offset| (f, offset)))
+    }
+
+    /// Whether `phys_addr` is in the ECAM window of bus 0.
+    pub fn ecam_decodes(phys_addr: u64) -> bool {
+        (ECAM_BASE..ECAM_BASE + ECAM_BYTES_PER_BUS).contains(&phys_addr)
+    }
+
+    /// An ECAM read: the function's config space for registers below 256 (extended space reads
+    /// zero, there are no extended capabilities) and all ones for an absent function, like the
+    /// 0xCF8 mechanism. `size` is 1, 2 or 4 and the access may not cross a dword.
+    pub fn ecam_read(&self, phys_addr: u64, size: u8) -> u32 {
+        let offset = phys_addr - ECAM_BASE;
+        let devfn = (offset / ECAM_FUNCTION_BYTES) as u32;
+        let register = (offset % ECAM_FUNCTION_BYTES) as u32;
+        let address = CONFIG_ADDRESS_ENABLE
+            | devfn << CONFIG_ADDRESS_DEVFN_SHIFT
+            | (register & CONFIG_ADDRESS_REGISTER_MASK);
+        let lane = (register & 3) as usize;
+        if register as usize >= CONFIG_SPACE_SIZE {
+            return if self.function_exists(devfn as u8) {
+                0
+            } else {
+                size_mask(size)
+            };
+        }
+        self.config_read(address, size as usize, lane)
+    }
+
+    pub fn ecam_write(&mut self, phys_addr: u64, size: u8, value: u32) {
+        let offset = phys_addr - ECAM_BASE;
+        let devfn = (offset / ECAM_FUNCTION_BYTES) as u8;
+        let register = (offset % ECAM_FUNCTION_BYTES) as usize;
+        if register < CONFIG_SPACE_SIZE {
+            self.config_write(devfn, register, size as usize, value);
+        }
+    }
+
+    fn function_exists(&self, devfn: u8) -> bool {
+        devfn == 0
+            || (self.iommu.is_some() && devfn == iommu::PCI_DEVFN)
+            || self.funcs.iter().any(|f| f.devfn == devfn)
     }
 
     /// IRQ numbers the functions can be wired to.
@@ -430,13 +525,15 @@ impl PciHost {
             .map(|(f, offset)| f.transport.mmio_read(offset, size))
     }
 
-    /// None if no BAR decodes `phys_addr`; otherwise the PIC IRQ to raise, or 0 for none.
-    pub fn mmio_write(
+    /// None if no BAR decodes `phys_addr`; otherwise the PIC IRQ to raise, or 0 for none. MSI-X
+    /// messages the access caused are appended to `messages`.
+    pub fn mmio_write_collecting(
         &mut self,
         phys_addr: u64,
         size: u8,
         val: u32,
         mem: &mut GuestMem,
+        messages: &mut Vec<InterruptRequest>,
     ) -> Option<u8> {
         let PciHost { funcs, iommu, .. } = self;
         let (f, offset) = funcs
@@ -449,6 +546,7 @@ impl PciHost {
             }),
             None => f.transport.mmio_write(offset, size, val, mem),
         };
+        collect_messages(f, messages);
         if let Some(iommu) = iommu {
             iommu.service(mem);
         }
@@ -459,8 +557,14 @@ impl PciHost {
         })
     }
 
-    /// Appends the IRQ of every function that has a new interrupt to `raise`.
-    pub fn poll(&mut self, mem: &mut GuestMem, raise: &mut Vec<u8>) {
+    /// Appends the IRQ of every function that has a new INTx interrupt to `raise` and the MSI-X
+    /// messages of every function to `messages`.
+    pub fn poll_collecting(
+        &mut self,
+        mem: &mut GuestMem,
+        raise: &mut Vec<u8>,
+        messages: &mut Vec<InterruptRequest>,
+    ) {
         let PciHost { funcs, iommu, .. } = self;
         for f in funcs {
             let interrupted = match iommu {
@@ -470,6 +574,7 @@ impl PciHost {
             if interrupted && f.intx_enabled() {
                 raise.push(f.int_line);
             }
+            collect_messages(f, messages);
         }
         if let Some(iommu) = iommu {
             iommu.service(mem);
@@ -512,6 +617,25 @@ mod tests {
     use crate::disk::Disk;
     use crate::netdev::NetHandle;
 
+    impl PciHost {
+        /// The accessors without the MSI-X outbox, which most tests do not look at.
+        fn mmio_write(
+            &mut self,
+            phys_addr: u64,
+            size: u8,
+            val: u32,
+            mem: &mut GuestMem,
+        ) -> Option<u8> {
+            self.mmio_write_collecting(phys_addr, size, val, mem, &mut Vec::new())
+        }
+
+        fn poll(&mut self, mem: &mut GuestMem, raise: &mut Vec<u8>) {
+            self.poll_collecting(mem, raise, &mut Vec::new());
+        }
+    }
+
+    /// Bytes of the MSI-X capability: id, next, control, table, PBA.
+    const MSIX_CAP_LENGTH: u32 = 12;
     const PCI_SLOTS: u32 = 32;
     const PCI_FUNCTIONS: u32 = 8;
     const SLOT_SHIFT: u32 = 11;
@@ -833,15 +957,15 @@ mod tests {
     #[test]
     fn bar_low_bits_below_the_size_are_hardwired_to_zero() {
         let mut h = host();
-        cfg_write(&mut h, CONSOLE_SLOT, CFG_BAR0 as u32, 4, 0xd000_3fff);
+        cfg_write(&mut h, CONSOLE_SLOT, CFG_BAR0 as u32, 4, 0xd000_7fff);
         assert_eq!(
             cfg_read32(&mut h, CONSOLE_SLOT, CFG_BAR0 as u32),
             0xd000_0000
         );
-        cfg_write(&mut h, CONSOLE_SLOT, CFG_BAR0 as u32, 4, 0xd000_4001);
+        cfg_write(&mut h, CONSOLE_SLOT, CFG_BAR0 as u32, 4, 0xd000_8001);
         assert_eq!(
             cfg_read32(&mut h, CONSOLE_SLOT, CFG_BAR0 as u32),
-            0xd000_4000
+            0xd000_8000
         );
     }
 
@@ -1042,6 +1166,8 @@ mod tests {
         region_length: u32,
     }
 
+    /// The vendor-specific (virtio) capabilities, found by following the whole chain (which
+    /// also holds the MSI-X capability at its end).
     fn walk_capabilities(h: &mut PciHost, slot: u32) -> Vec<Capability> {
         let mut caps = Vec::new();
         let mut at = cfg_read(h, slot, CFG_CAPABILITIES_POINTER as u32, 1);
@@ -1051,16 +1177,18 @@ mod tests {
                 return caps;
             }
             let header = cfg_read32(h, slot, at);
-            caps.push(Capability {
-                at,
-                id: header as u8,
-                next: (header >> 8) as u8,
-                len: (header >> 16) as u8,
-                cfg_type: (header >> 24) as u8,
-                bar: cfg_read(h, slot, at + 4, 1) as u8,
-                region_offset: cfg_read32(h, slot, at + VIRTIO_CAP_OFFSET_FIELD as u32),
-                region_length: cfg_read32(h, slot, at + VIRTIO_CAP_LENGTH_FIELD as u32),
-            });
+            if header as u8 == CAPABILITY_ID_VENDOR {
+                caps.push(Capability {
+                    at,
+                    id: header as u8,
+                    next: (header >> 8) as u8,
+                    len: (header >> 16) as u8,
+                    cfg_type: (header >> 24) as u8,
+                    bar: cfg_read(h, slot, at + 4, 1) as u8,
+                    region_offset: cfg_read32(h, slot, at + VIRTIO_CAP_OFFSET_FIELD as u32),
+                    region_length: cfg_read32(h, slot, at + VIRTIO_CAP_LENGTH_FIELD as u32),
+                });
+            }
             at = (header >> 8) & 0xff;
         }
         panic!("capability list does not terminate");
@@ -1072,12 +1200,47 @@ mod tests {
         let caps = walk_capabilities(&mut h, CONSOLE_SLOT);
         assert_eq!(caps.len(), 4);
         assert_eq!(
-            caps.last().unwrap().next,
-            0,
-            "last capability has next == 0"
+            caps.last().unwrap().next as usize,
+            CAP_MSIX_AT,
+            "the virtio capabilities are followed by MSI-X"
         );
         assert!(caps.iter().all(|cap| cap.id == CAPABILITY_ID_VENDOR));
         assert!(caps.iter().all(|cap| cap.at % 4 == 0 && cap.at >= 0x40));
+    }
+
+    #[test]
+    fn msix_capability_ends_the_chain_and_points_at_the_table_and_pba_in_bar0() {
+        let mut h = host();
+        let at = CAP_MSIX_AT as u32;
+        assert_eq!(
+            cfg_read(&mut h, CONSOLE_SLOT, at, 2),
+            0x0011,
+            "id, next = 0"
+        );
+        // The console has two queues and one configuration vector: three table entries.
+        assert_eq!(cfg_read(&mut h, CONSOLE_SLOT, at + 2, 2), 2);
+        assert_eq!(
+            cfg_read32(&mut h, CONSOLE_SLOT, at + 4),
+            MSIX_TABLE_OFFSET as u32
+        );
+        assert_eq!(
+            cfg_read32(&mut h, CONSOLE_SLOT, at + 8),
+            MSIX_PBA_OFFSET as u32
+        );
+        const { assert!(MSIX_PBA_OFFSET + REGION_SIZE <= BAR_SIZE) };
+    }
+
+    #[test]
+    fn msix_enable_and_function_mask_are_the_only_writable_control_bits() {
+        let mut h = host();
+        let control = CAP_MSIX_AT as u32 + 2;
+        cfg_write(&mut h, CONSOLE_SLOT, control, 2, 0xffff);
+        assert_eq!(
+            cfg_read(&mut h, CONSOLE_SLOT, control, 2),
+            (MSIX_CONTROL_ENABLE | MSIX_CONTROL_FUNCTION_MASK) as u32 | 2
+        );
+        cfg_write(&mut h, CONSOLE_SLOT, control, 2, 0);
+        assert_eq!(cfg_read(&mut h, CONSOLE_SLOT, control, 2), 2);
     }
 
     #[test]
@@ -1170,9 +1333,7 @@ mod tests {
     #[test]
     fn bytes_past_the_last_capability_read_zero() {
         let mut h = host();
-        for reg in
-            (CAP_DEVICE_AT as u32 + VIRTIO_CAP_LEN as u32..CONFIG_SPACE_SIZE as u32).step_by(4)
-        {
+        for reg in (CAP_MSIX_AT as u32 + MSIX_CAP_LENGTH..CONFIG_SPACE_SIZE as u32).step_by(4) {
             assert_eq!(cfg_read32(&mut h, CONSOLE_SLOT, reg), 0, "offset {reg:#x}");
         }
     }
@@ -1589,7 +1750,9 @@ mod tests {
         let mut p = rd(&mut h, 1, CFG_CAPABILITIES_POINTER as u32) & 0xff;
         while p != 0 {
             let w = rd(&mut h, 1, p);
-            caps.push((w >> 24) as u8);
+            if w as u8 == CAP_ID_VENDOR_SPECIFIC {
+                caps.push((w >> 24) as u8);
+            }
             p = (w >> 8) & 0xff;
         }
         assert_eq!(

@@ -33,7 +33,20 @@ pub(crate) const COMMON_CFG_OFFSET: u64 = 0x0000;
 pub(crate) const ISR_OFFSET: u64 = 0x1000;
 pub(crate) const DEVICE_CFG_OFFSET: u64 = 0x2000;
 pub(crate) const NOTIFY_OFFSET: u64 = 0x3000;
+/// MSI-X table and pending bit array, also in BAR0 (the PCI capability points here).
+pub(crate) const MSIX_TABLE_OFFSET: u64 = 0x4000;
+pub(crate) const MSIX_PBA_OFFSET: u64 = 0x5000;
 pub(crate) const REGION_SIZE: u64 = 0x1000;
+/// MSI-X table entry: message address (low, high), message data, vector control.
+const MSIX_ENTRY_SIZE: u64 = 16;
+const MSIX_ENTRY_ADDRESS_LOW: u64 = 0;
+const MSIX_ENTRY_ADDRESS_HIGH: u64 = 4;
+const MSIX_ENTRY_DATA: u64 = 8;
+const MSIX_ENTRY_CONTROL: u64 = 12;
+const MSIX_ENTRY_MASKED: u32 = 1;
+/// MSI-X message control bits (PCI capability, offset +2).
+pub(crate) const MSIX_CONTROL_FUNCTION_MASK: u16 = 1 << 14;
+pub(crate) const MSIX_CONTROL_ENABLE: u16 = 1 << 15;
 /// Notify address of queue N is `NOTIFY_OFFSET + N * NOTIFY_OFF_MULTIPLIER`; the multiplier is
 /// advertised in the notify capability and `queue_notify_off` reads back as the queue index.
 pub(crate) const NOTIFY_OFF_MULTIPLIER: u32 = 4;
@@ -79,8 +92,9 @@ const COMMON_FIELDS: [(u64, u64); 16] = [
     (COMMON_QUEUE_DEVICE, 8),
 ];
 
-/// Read back for msix_config and queue_msix_vector (`VIRTIO_MSI_NO_VECTOR`): MSI-X is not supported.
-const MSI_NO_VECTOR: u64 = 0xffff;
+/// `VIRTIO_MSI_NO_VECTOR`: what msix_config and queue_msix_vector hold until the driver assigns a
+/// table entry, and the answer to an assignment the device refuses.
+const MSI_NO_VECTOR: u16 = 0xffff;
 
 /// Split virtqueue layout (descriptor table, available ring, used ring). Descriptor is 16 bytes:
 /// addr u64, len u32, flags u16, next u16.
@@ -364,6 +378,24 @@ pub(crate) struct Transport {
     device_feature_select: u32,
     driver_features: u64,
     queue_select: u16,
+    /// MSI-X message control as the guest wrote it (enable and function mask only).
+    msix_control: u16,
+    msix_table: Vec<MsixEntry>,
+    /// Table entry the configuration-change interrupt uses, and one per queue.
+    config_vector: u16,
+    queue_vectors: Vec<u16>,
+    /// Messages sent since `take_messages`: (address, data).
+    messages: Vec<(u64, u32)>,
+}
+
+/// One MSI-X table entry. Masked at reset, as the PCI spec requires.
+#[derive(Clone, Copy)]
+struct MsixEntry {
+    address: u64,
+    data: u32,
+    masked: bool,
+    /// The pending bit: the vector fired while masked and has not been delivered.
+    pending: bool,
 }
 
 impl Transport {
@@ -385,6 +417,134 @@ impl Transport {
             device_feature_select: 0,
             driver_features: 0,
             queue_select: 0,
+            msix_control: 0,
+            msix_table: vec![
+                MsixEntry {
+                    address: 0,
+                    data: 0,
+                    masked: true,
+                    pending: false,
+                };
+                queue_count + 1
+            ],
+            config_vector: MSI_NO_VECTOR,
+            queue_vectors: vec![MSI_NO_VECTOR; queue_count],
+            messages: Vec::new(),
+        }
+    }
+
+    /// Entries in the MSI-X table: one for configuration changes and one per queue.
+    pub fn msix_vectors(&self) -> usize {
+        self.msix_table.len()
+    }
+
+    pub fn msix_control(&self) -> u16 {
+        self.msix_control
+    }
+
+    /// The guest wrote the capability's message control. Enabling or unmasking the function
+    /// delivers what fired in the meantime.
+    pub fn set_msix_control(&mut self, control: u16) {
+        self.msix_control = control & (MSIX_CONTROL_ENABLE | MSIX_CONTROL_FUNCTION_MASK);
+        self.flush_pending_vectors();
+    }
+
+    fn msix_active(&self) -> bool {
+        self.msix_control & MSIX_CONTROL_ENABLE != 0
+    }
+
+    /// Sends vector `vector`'s message, or latches its pending bit while the entry or the whole
+    /// function is masked.
+    fn signal_vector(&mut self, vector: u16) {
+        let function_masked = self.msix_control & MSIX_CONTROL_FUNCTION_MASK != 0;
+        let Some(entry) = self.msix_table.get_mut(vector as usize) else {
+            return;
+        };
+        if entry.masked || function_masked {
+            entry.pending = true;
+        } else {
+            self.messages.push((entry.address, entry.data));
+        }
+    }
+
+    fn flush_pending_vectors(&mut self) {
+        if !self.msix_active() || self.msix_control & MSIX_CONTROL_FUNCTION_MASK != 0 {
+            return;
+        }
+        for entry in &mut self.msix_table {
+            if entry.pending && !entry.masked {
+                entry.pending = false;
+                self.messages.push((entry.address, entry.data));
+            }
+        }
+    }
+
+    /// MSI messages the device sent since the last call.
+    pub fn take_messages(&mut self) -> Vec<(u64, u32)> {
+        core::mem::take(&mut self.messages)
+    }
+
+    fn msix_read(&self, offset: u64, size: u8) -> u32 {
+        let region = offset & !(REGION_SIZE - 1);
+        let in_region = offset & (REGION_SIZE - 1);
+        let value = if region == MSIX_PBA_OFFSET {
+            // One bit per vector, packed into qwords.
+            let qword = in_region / 8;
+            let bits = self
+                .msix_table
+                .iter()
+                .enumerate()
+                .filter(|(index, entry)| entry.pending && *index as u64 / 64 == qword)
+                .fold(0u64, |bits, (index, _)| bits | 1 << (index % 64));
+            bits >> (8 * (in_region % 8))
+        } else {
+            let Some(entry) = self.msix_table.get((in_region / MSIX_ENTRY_SIZE) as usize) else {
+                return 0;
+            };
+            let field = in_region % MSIX_ENTRY_SIZE;
+            let (base, word) = match field & !3 {
+                MSIX_ENTRY_ADDRESS_LOW => (MSIX_ENTRY_ADDRESS_LOW, entry.address as u32),
+                MSIX_ENTRY_ADDRESS_HIGH => (MSIX_ENTRY_ADDRESS_HIGH, (entry.address >> 32) as u32),
+                MSIX_ENTRY_DATA => (MSIX_ENTRY_DATA, entry.data),
+                MSIX_ENTRY_CONTROL => (MSIX_ENTRY_CONTROL, entry.masked as u32),
+                _ => return 0,
+            };
+            (word >> (8 * (field - base))) as u64
+        };
+        let mask = if size >= 4 {
+            u32::MAX
+        } else {
+            (1u32 << (8 * size)) - 1
+        };
+        value as u32 & mask
+    }
+
+    /// Table writes are dword accesses (a qword write arrives as two), as the spec requires.
+    fn msix_write(&mut self, offset: u64, size: u8, value: u32) {
+        let region = offset & !(REGION_SIZE - 1);
+        let in_region = offset & (REGION_SIZE - 1);
+        if region != MSIX_TABLE_OFFSET || size != 4 {
+            return;
+        }
+        let Some(entry) = self
+            .msix_table
+            .get_mut((in_region / MSIX_ENTRY_SIZE) as usize)
+        else {
+            return;
+        };
+        match in_region % MSIX_ENTRY_SIZE {
+            MSIX_ENTRY_ADDRESS_LOW => {
+                entry.address = (entry.address & !0xffff_ffff) | value as u64;
+            }
+            MSIX_ENTRY_ADDRESS_HIGH => {
+                entry.address = (entry.address & 0xffff_ffff) | (value as u64) << 32;
+            }
+            MSIX_ENTRY_DATA => entry.data = value,
+            MSIX_ENTRY_CONTROL => {
+                entry.masked = value & MSIX_ENTRY_MASKED != 0;
+                self.flush_pending_vectors();
+            }
+            _ => {}
         }
     }
 
@@ -409,6 +569,10 @@ impl Transport {
         self.device_feature_select = 0;
         self.driver_features = 0;
         self.queue_select = 0;
+        // The vector assignments are virtio state (the table and message control are PCI state
+        // and survive a device reset).
+        self.config_vector = MSI_NO_VECTOR;
+        self.queue_vectors.fill(MSI_NO_VECTOR);
         self.dev.reset();
     }
 
@@ -430,15 +594,43 @@ impl Transport {
     /// did not suppress it. A queue found broken puts the device into DEVICE_NEEDS_RESET and
     /// notifies the driver with a configuration change, as the spec requires.
     fn finish_device_call(&mut self, completed: bool) -> bool {
-        let interrupt_due = self.queues.iter_mut().fold(false, |due, queue| {
-            core::mem::take(&mut queue.interrupt_due) | due
-        });
-        let mut raise = completed && interrupt_due && self.set_isr(ISR_QUEUE_INTERRUPT);
+        let mut due_queues = Vec::new();
+        for (index, queue) in self.queues.iter_mut().enumerate() {
+            if core::mem::take(&mut queue.interrupt_due) {
+                due_queues.push(index);
+            }
+        }
+        let mut raise = false;
+        if completed {
+            for index in due_queues {
+                raise |= self.queue_interrupt(index);
+            }
+        }
         if self.status & STATUS_DEVICE_NEEDS_RESET == 0 && self.queues.iter().any(|q| q.broken) {
             self.status |= STATUS_DEVICE_NEEDS_RESET;
-            raise |= self.set_isr(ISR_CONFIG_CHANGE);
+            raise |= self.config_interrupt();
         }
         raise
+    }
+
+    /// With MSI-X on, an interrupt is the queue's vector (none assigned: none sent) and the ISR
+    /// stays out of it; otherwise it is the INTx edge. Returns true for that edge.
+    fn queue_interrupt(&mut self, queue: usize) -> bool {
+        if self.msix_active() {
+            self.signal_vector(self.queue_vectors[queue]);
+            false
+        } else {
+            self.set_isr(ISR_QUEUE_INTERRUPT)
+        }
+    }
+
+    fn config_interrupt(&mut self) -> bool {
+        if self.msix_active() {
+            self.signal_vector(self.config_vector);
+            false
+        } else {
+            self.set_isr(ISR_CONFIG_CHANGE)
+        }
     }
 
     pub fn poll(&mut self, mem: &mut GuestMem) -> bool {
@@ -449,7 +641,7 @@ impl Transport {
         let mut raise = self.finish_device_call(completed);
         if self.dev.config_event() {
             self.config_gen = self.config_gen.wrapping_add(1);
-            raise |= self.set_isr(ISR_CONFIG_CHANGE);
+            raise |= self.config_interrupt();
         }
         raise
     }
@@ -467,6 +659,7 @@ impl Transport {
             DEVICE_CFG_OFFSET => (0..size as usize).fold(0u32, |v, k| {
                 v | (self.dev.config_read(in_region as usize + k) as u32) << (8 * k)
             }),
+            MSIX_TABLE_OFFSET | MSIX_PBA_OFFSET => self.msix_read(off, size),
             _ => 0,
         }
     }
@@ -482,6 +675,7 @@ impl Transport {
                         .config_write(in_region as usize + k, (val >> (8 * k)) as u8);
                 }
             }
+            MSIX_TABLE_OFFSET => self.msix_write(off, size, val),
             NOTIFY_OFFSET => {
                 // The queue is identified by the address, the written value is ignored.
                 let queue = (in_region / NOTIFY_OFF_MULTIPLIER as u64) as usize;
@@ -493,6 +687,16 @@ impl Transport {
             _ => {}
         }
         false
+    }
+
+    /// A vector assignment sticks only if the table has that entry; the driver reads the field
+    /// back to find out.
+    fn checked_vector(&self, vector: u16) -> u16 {
+        if (vector as usize) < self.msix_table.len() {
+            vector
+        } else {
+            MSI_NO_VECTOR
+        }
     }
 
     /// Queue picked by `queue_select`, if it exists.
@@ -521,7 +725,12 @@ impl Transport {
                 0 | 1 => (self.driver_features >> (32 * self.driver_feature_select)) as u32 as u64,
                 _ => 0,
             },
-            COMMON_MSIX_CONFIG | COMMON_QUEUE_MSIX_VECTOR => MSI_NO_VECTOR,
+            COMMON_MSIX_CONFIG => self.config_vector as u64,
+            COMMON_QUEUE_MSIX_VECTOR => self
+                .queue_vectors
+                .get(self.queue_select as usize)
+                .copied()
+                .unwrap_or(MSI_NO_VECTOR) as u64,
             COMMON_NUM_QUEUES => self.queues.len() as u64,
             COMMON_DEVICE_STATUS => self.status as u64,
             COMMON_CONFIG_GENERATION => self.config_gen as u64,
@@ -573,6 +782,13 @@ impl Transport {
                 }
             }
             (COMMON_QUEUE_SELECT, 2) => self.queue_select = val as u16,
+            (COMMON_MSIX_CONFIG, 2) => self.config_vector = self.checked_vector(val as u16),
+            (COMMON_QUEUE_MSIX_VECTOR, 2) => {
+                let vector = self.checked_vector(val as u16);
+                if let Some(slot) = self.queue_vectors.get_mut(self.queue_select as usize) {
+                    *slot = vector;
+                }
+            }
             (COMMON_QUEUE_SIZE, 2) => {
                 let size = val as u16;
                 if let Some(queue) = self.selected_queue()
@@ -1241,15 +1457,223 @@ mod tests {
         assert_eq!(rig.read(COMMON_CONFIG_GENERATION, 1), 0x42);
     }
 
+    const MSIX_MESSAGE_ADDRESS: u64 = 0xfee0_1000;
+    const MSIX_MESSAGE_DATA: u32 = 0x41;
+
+    fn table_entry(vector: u64, field: u64) -> u64 {
+        MSIX_TABLE_OFFSET + vector * MSIX_ENTRY_SIZE + field
+    }
+
+    /// Points table entry `vector` at `MSIX_MESSAGE_ADDRESS` with data `MSIX_MESSAGE_DATA +
+    /// vector`, unmasked.
+    fn program_vector(rig: &mut Rig, vector: u64) {
+        rig.write(
+            table_entry(vector, MSIX_ENTRY_ADDRESS_LOW),
+            4,
+            MSIX_MESSAGE_ADDRESS as u32,
+        );
+        rig.write(table_entry(vector, MSIX_ENTRY_ADDRESS_HIGH), 4, 0);
+        rig.write(
+            table_entry(vector, MSIX_ENTRY_DATA),
+            4,
+            MSIX_MESSAGE_DATA + vector as u32,
+        );
+        rig.write(table_entry(vector, MSIX_ENTRY_CONTROL), 4, 0);
+    }
+
+    fn assign_queue_vector(rig: &mut Rig, queue: u32, vector: u32) {
+        rig.write(COMMON_QUEUE_SELECT, 2, queue);
+        rig.write(COMMON_QUEUE_MSIX_VECTOR, 2, vector);
+    }
+
+    fn enable_msix(rig: &mut Rig) {
+        rig.transport.set_msix_control(MSIX_CONTROL_ENABLE);
+    }
+
+    fn complete_one_buffer(rig: &mut Rig, head: u16) -> bool {
+        put_desc(&mut rig.ram, DESC0, head, BUF_A, 4, DESC_F_WRITE, 0);
+        post(&mut rig.ram, AVAIL0, QUEUE_SIZE, head);
+        rig.kick(0)
+    }
+
     #[test]
-    fn msix_vectors_read_no_vector_and_cannot_be_set() {
-        let mut rig = Rig::new(1, 0);
+    fn msix_vectors_start_unassigned_and_stick_only_inside_the_table() {
+        let mut rig = Rig::new(2, 0);
+        assert_eq!(rig.transport.msix_vectors(), 3, "config plus one per queue");
         assert_eq!(rig.read(COMMON_MSIX_CONFIG, 2), NO_VECTOR);
         assert_eq!(rig.read(COMMON_QUEUE_MSIX_VECTOR, 2), NO_VECTOR);
         rig.write(COMMON_MSIX_CONFIG, 2, 0);
-        rig.write(COMMON_QUEUE_MSIX_VECTOR, 2, 3);
+        assert_eq!(rig.read(COMMON_MSIX_CONFIG, 2), 0);
+        assign_queue_vector(&mut rig, 1, 2);
+        assert_eq!(rig.read(COMMON_QUEUE_MSIX_VECTOR, 2), 2);
+        assign_queue_vector(&mut rig, 1, 3);
+        assert_eq!(
+            rig.read(COMMON_QUEUE_MSIX_VECTOR, 2),
+            NO_VECTOR,
+            "no entry 3"
+        );
+        assign_queue_vector(&mut rig, 0, 1);
+        assert_eq!(
+            rig.read(COMMON_QUEUE_MSIX_VECTOR, 2),
+            1,
+            "queues are independent"
+        );
+    }
+
+    #[test]
+    fn a_device_reset_unassigns_the_vectors_but_keeps_the_table() {
+        let mut rig = Rig::new(1, 0);
+        program_vector(&mut rig, 1);
+        rig.write(COMMON_MSIX_CONFIG, 2, 0);
+        assign_queue_vector(&mut rig, 0, 1);
+        rig.write(COMMON_DEVICE_STATUS, 1, 0);
         assert_eq!(rig.read(COMMON_MSIX_CONFIG, 2), NO_VECTOR);
         assert_eq!(rig.read(COMMON_QUEUE_MSIX_VECTOR, 2), NO_VECTOR);
+        assert_eq!(
+            rig.read(table_entry(1, MSIX_ENTRY_DATA), 4),
+            MSIX_MESSAGE_DATA + 1
+        );
+    }
+
+    #[test]
+    fn table_entries_are_masked_at_reset_and_read_back_in_pieces() {
+        let mut rig = Rig::new(1, 0);
+        assert_eq!(rig.read(table_entry(0, MSIX_ENTRY_CONTROL), 4), 1);
+        program_vector(&mut rig, 0);
+        assert_eq!(
+            rig.read(table_entry(0, MSIX_ENTRY_ADDRESS_LOW), 4),
+            MSIX_MESSAGE_ADDRESS as u32
+        );
+        assert_eq!(
+            rig.read(table_entry(0, MSIX_ENTRY_ADDRESS_LOW) + 1, 1),
+            0x10
+        );
+        assert_eq!(rig.read(table_entry(0, MSIX_ENTRY_CONTROL), 4), 0);
+        assert_eq!(
+            rig.read(table_entry(2, MSIX_ENTRY_DATA), 4),
+            0,
+            "no entry 2 with one queue"
+        );
+    }
+
+    #[test]
+    fn table_writes_that_are_not_dwords_are_ignored() {
+        let mut rig = Rig::new(1, 0);
+        rig.write(table_entry(0, MSIX_ENTRY_DATA), 2, 0x1234);
+        rig.write(table_entry(0, MSIX_ENTRY_DATA), 1, 0x12);
+        assert_eq!(rig.read(table_entry(0, MSIX_ENTRY_DATA), 4), 0);
+    }
+
+    #[test]
+    fn with_msix_on_a_completion_sends_the_queues_message_not_an_intx() {
+        let mut rig = Rig::new(1, 0);
+        rig.bring_up();
+        program_vector(&mut rig, 1);
+        assign_queue_vector(&mut rig, 0, 1);
+        enable_msix(&mut rig);
+        assert!(!complete_one_buffer(&mut rig, 0), "no INTx edge");
+        assert_eq!(
+            rig.transport.take_messages(),
+            vec![(MSIX_MESSAGE_ADDRESS, MSIX_MESSAGE_DATA + 1)]
+        );
+        assert_eq!(rig.read(ISR_OFFSET, 1), 0, "the ISR stays out of MSI-X");
+        assert!(rig.transport.take_messages().is_empty(), "taken once");
+    }
+
+    #[test]
+    fn each_completion_is_its_own_message() {
+        let mut rig = Rig::new(1, 0);
+        rig.bring_up();
+        program_vector(&mut rig, 1);
+        assign_queue_vector(&mut rig, 0, 1);
+        enable_msix(&mut rig);
+        complete_one_buffer(&mut rig, 0);
+        complete_one_buffer(&mut rig, 1);
+        assert_eq!(rig.transport.take_messages().len(), 2);
+    }
+
+    #[test]
+    fn a_queue_without_a_vector_sends_nothing() {
+        let mut rig = Rig::new(1, 0);
+        rig.bring_up();
+        program_vector(&mut rig, 1);
+        enable_msix(&mut rig);
+        assert!(!complete_one_buffer(&mut rig, 0));
+        assert!(rig.transport.take_messages().is_empty());
+    }
+
+    #[test]
+    fn with_msix_off_the_ordinary_intx_path_is_unchanged() {
+        let mut rig = Rig::new(1, 0);
+        rig.bring_up();
+        program_vector(&mut rig, 1);
+        assign_queue_vector(&mut rig, 0, 1);
+        assert!(complete_one_buffer(&mut rig, 0));
+        assert!(rig.transport.take_messages().is_empty());
+    }
+
+    #[test]
+    fn a_masked_entry_latches_its_pending_bit_and_delivers_on_unmask() {
+        let mut rig = Rig::new(1, 0);
+        rig.bring_up();
+        program_vector(&mut rig, 1);
+        rig.write(table_entry(1, MSIX_ENTRY_CONTROL), 4, 1);
+        assign_queue_vector(&mut rig, 0, 1);
+        enable_msix(&mut rig);
+        complete_one_buffer(&mut rig, 0);
+        complete_one_buffer(&mut rig, 1);
+        assert!(rig.transport.take_messages().is_empty());
+        assert_eq!(
+            rig.read(MSIX_PBA_OFFSET, 8) & 0b10,
+            0b10,
+            "pending bit of vector 1"
+        );
+        rig.write(table_entry(1, MSIX_ENTRY_CONTROL), 4, 0);
+        assert_eq!(
+            rig.transport.take_messages().len(),
+            1,
+            "pending is one message"
+        );
+        assert_eq!(rig.read(MSIX_PBA_OFFSET, 8), 0);
+    }
+
+    #[test]
+    fn the_function_mask_holds_every_vector_until_it_is_cleared() {
+        let mut rig = Rig::new(1, 0);
+        rig.bring_up();
+        program_vector(&mut rig, 1);
+        assign_queue_vector(&mut rig, 0, 1);
+        rig.transport
+            .set_msix_control(MSIX_CONTROL_ENABLE | MSIX_CONTROL_FUNCTION_MASK);
+        complete_one_buffer(&mut rig, 0);
+        assert!(rig.transport.take_messages().is_empty());
+        enable_msix(&mut rig);
+        assert_eq!(rig.transport.take_messages().len(), 1);
+    }
+
+    #[test]
+    fn a_config_change_uses_the_config_vector() {
+        let mut rig = Rig::new(1, 0);
+        rig.bring_up();
+        program_vector(&mut rig, 0);
+        rig.write(COMMON_MSIX_CONFIG, 2, 0);
+        enable_msix(&mut rig);
+        rig.probe.lock().unwrap().config_event = true;
+        assert!(!rig.poll());
+        assert_eq!(
+            rig.transport.take_messages(),
+            vec![(MSIX_MESSAGE_ADDRESS, MSIX_MESSAGE_DATA)]
+        );
+    }
+
+    #[test]
+    fn msix_control_keeps_only_enable_and_function_mask() {
+        let mut rig = Rig::new(1, 0);
+        rig.transport.set_msix_control(0xffff);
+        assert_eq!(
+            rig.transport.msix_control(),
+            MSIX_CONTROL_ENABLE | MSIX_CONTROL_FUNCTION_MASK
+        );
     }
 
     #[test]
