@@ -1,10 +1,10 @@
 # AVX and nested virtualization (not implemented)
 
-Status: AVX, AVX2, FMA, F16C and SVM (long-mode guests) are implemented (03). VMX below is a design only and is not advertised.
+Status: AVX, AVX2, FMA, F16C, AVX-512 and SVM (long-mode guests) are implemented (03). VMX below is a design only and is not advertised.
 
 ## AVX, AVX2, FMA, F16C
 
-Done: see 03, "AVX, AVX2, FMA, F16C". Not done: AVX-512 (EVEX), VAES, VPCLMULQDQ.
+Done: see 03, "AVX, AVX2, FMA, F16C" and "AVX-512". Not done: AVX512_FP16/BF16/VP2INTERSECT, the Xeon Phi sets (PF, ER), AVX-VNNI.
 
 ## SVM (AMD-V) for nested guests
 

@@ -24,10 +24,6 @@ pub(super) const XCR0_AVX512: u64 = XCR0_OPMASK | XCR0_ZMM_HI256 | XCR0_HI16_ZMM
 /// area layout below, or the kernel will size its buffers for state the instructions skip.
 pub(super) const XCR0_SUPPORTED: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX | XCR0_AVX512;
 
-/// What CPUID leaf 0xD reports as supported. The AVX-512 components are accepted by xsetbv (tests
-/// enable them) but stay unadvertised until the instruction set is complete.
-pub(super) const XCR0_ADVERTISED: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX;
-
 /// The XSAVE area is the legacy image plus a 64-byte header: XSTATE_BV (8 bytes), XCOMP_BV (8)
 /// and 48 reserved bytes, all of which xrstor requires to be zero except XSTATE_BV.
 pub(super) const XSAVE_HEADER_SIZE: u64 = 64;
@@ -39,6 +35,8 @@ pub(super) const XSAVE_AREA_SIZE: u64 = FXSAVE_AREA_SIZE + XSAVE_HEADER_SIZE;
 /// hardware gave them, and software hard-codes these numbers.
 pub(super) struct Component {
     pub bit: u64,
+    /// The component number (CPUID.0xD subleaf).
+    pub index: u32,
     pub offset: u64,
     pub size: u64,
 }
@@ -46,7 +44,6 @@ pub(super) struct Component {
 /// The AVX component sits right after the header and holds YMM0_H..YMM15_H, 16 bytes each.
 pub(super) const AVX_STATE_OFFSET: u64 = XSAVE_AREA_SIZE;
 pub(super) const AVX_STATE_SIZE: u64 = 256;
-pub(super) const XSAVE_AREA_SIZE_WITH_AVX: u64 = AVX_STATE_OFFSET + AVX_STATE_SIZE;
 const OPMASK_STATE_OFFSET: u64 = 1088;
 const OPMASK_STATE_SIZE: u64 = 64;
 const ZMM_HI256_STATE_OFFSET: u64 = 1152;
@@ -56,21 +53,25 @@ const HI16_ZMM_STATE_SIZE: u64 = 1024;
 pub(super) const COMPONENTS: [Component; 4] = [
     Component {
         bit: XCR0_AVX,
+        index: 2,
         offset: AVX_STATE_OFFSET,
         size: AVX_STATE_SIZE,
     },
     Component {
         bit: XCR0_OPMASK,
+        index: 5,
         offset: OPMASK_STATE_OFFSET,
         size: OPMASK_STATE_SIZE,
     },
     Component {
         bit: XCR0_ZMM_HI256,
+        index: 6,
         offset: ZMM_HI256_STATE_OFFSET,
         size: ZMM_HI256_STATE_SIZE,
     },
     Component {
         bit: XCR0_HI16_ZMM,
+        index: 7,
         offset: HI16_ZMM_STATE_OFFSET,
         size: HI16_ZMM_STATE_SIZE,
     },

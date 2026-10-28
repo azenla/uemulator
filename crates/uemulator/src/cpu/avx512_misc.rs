@@ -2,59 +2,13 @@
 //! VBMI, VBMI2 and GFNI. The floating-point instructions are in `avx512_fp.rs`.
 
 use super::*;
+use crate::cpu::sse::ext::crypto;
 
 const OPCODE_MAP_0F38: u16 = 2;
 const OPCODE_MAP_0F3A: u16 = 3;
 /// IFMA operates on the low 52 bits of each quadword.
 const IFMA_BITS: u32 = 52;
 const IFMA_MASK: u64 = (1 << IFMA_BITS) - 1;
-/// The GF(2^8) reduction polynomial x^8 + x^4 + x^3 + x + 1 (without the x^8 term).
-const GF_POLYNOMIAL: u8 = 0x1b;
-/// Order of the multiplicative group of GF(2^8): a^254 is the inverse of a.
-const GF_INVERSE_EXPONENT: u32 = 254;
-
-pub(in crate::cpu) fn gf_multiply(a: u8, b: u8) -> u8 {
-    let (mut a, mut b, mut product) = (a, b, 0u8);
-    for _ in 0..8 {
-        if b & 1 == 1 {
-            product ^= a;
-        }
-        let carry = a & 0x80 != 0;
-        a <<= 1;
-        if carry {
-            a ^= GF_POLYNOMIAL;
-        }
-        b >>= 1;
-    }
-    product
-}
-
-/// Multiplicative inverse in GF(2^8); 0 maps to 0.
-fn gf_inverse(a: u8) -> u8 {
-    let (mut result, mut power) = (1u8, a);
-    let mut exponent = GF_INVERSE_EXPONENT;
-    while exponent > 0 {
-        if exponent & 1 == 1 {
-            result = gf_multiply(result, power);
-        }
-        power = gf_multiply(power, power);
-        exponent >>= 1;
-    }
-    if a == 0 { 0 } else { result }
-}
-
-/// One byte of vgf2p8affineqb: bit `n` of the result is the parity of (matrix byte 7-n AND x),
-/// XOR bit `n` of the immediate.
-fn affine_byte(matrix: u64, x: u8, immediate: u8) -> u8 {
-    let mut result = 0u8;
-    for n in 0..8 {
-        let row = (matrix >> (8 * (7 - n))) as u8;
-        let bit = (row & x).count_ones() as u8 & 1;
-        result |= (bit ^ (immediate >> n & 1)) << n;
-    }
-    result
-}
-
 impl Cpu {
     pub(super) fn exec_evex_misc(
         &mut self,
@@ -197,7 +151,7 @@ impl Cpu {
                 shape.broadcast = false;
                 self.exec_vector_op(i, next, shape, |_, _, a, b, bytes| {
                     Ok(build(bytes, 1, |k| {
-                        gf_multiply(element(a, 1, k) as u8, element(b, 1, k) as u8) as u64
+                        crypto::gf_multiply(element(a, 1, k) as u8, element(b, 1, k) as u8) as u64
                     }))
                 })?;
             }
@@ -210,8 +164,8 @@ impl Cpu {
                 self.exec_vector_op(i, next, shape, |_, _, data, matrix, bytes| {
                     Ok(build(bytes, 1, |k| {
                         let x = element(data, 1, k) as u8;
-                        let x = if inverse { gf_inverse(x) } else { x };
-                        affine_byte(element(matrix, 8, k / 8), x, immediate) as u64
+                        let x = if inverse { crypto::gf_inverse(x) } else { x };
+                        crypto::gf_affine_byte(element(matrix, 8, k / 8), x, immediate) as u64
                     }))
                 })?;
             }

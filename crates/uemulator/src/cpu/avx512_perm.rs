@@ -240,6 +240,21 @@ impl Cpu {
                 }
                 self.opmask[(i.reg & 7) as usize] = bits;
             }
+            // vpbroadcastmb2q / vpbroadcastmw2d (AVX512CD): the low byte / word of an opmask
+            // register repeated over every qword / dword; no write mask
+            (OPCODE_MAP_0F38, 0x2a | 0x3a, F3) if wide == (opcode == 0x2a) => {
+                if i.vex_v != 0 || i.md != 3 || i.evex_mask != 0 || i.evex_zeroing {
+                    return Err(Exception::invalid_opcode());
+                }
+                let bytes = self.vector_bytes(i, Rounding::None)?;
+                let (size, bits) = if opcode == 0x2a {
+                    (8, 0xff)
+                } else {
+                    (4, 0xffff)
+                };
+                let value = self.opmask[(i.rm & 7) as usize] & bits;
+                self.set_zmm(i.reg as usize, build(bytes, size, |_| value));
+            }
             (OPCODE_MAP_0F38, 0x88 | 0x89 | 0x62, P66) => self.expand(i, next, opcode, wide)?,
             (OPCODE_MAP_0F38, 0x8a | 0x8b | 0x63, P66) => self.compress(i, next, opcode, wide)?,
             _ => return self.exec_evex_misc(i, next, map, opcode, prefix, wide),

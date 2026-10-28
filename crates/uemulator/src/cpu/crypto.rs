@@ -37,7 +37,7 @@ pub(super) fn crc32c(mut crc: u32, data: u64, bytes: u8) -> u32 {
 }
 
 /// Multiplication in GF(2^8) with the AES reduction polynomial x^8 + x^4 + x^3 + x + 1.
-const fn gf_multiply(mut a: u8, mut b: u8) -> u8 {
+pub(in crate::cpu::sse) const fn gf_multiply(mut a: u8, mut b: u8) -> u8 {
     const REDUCTION: u8 = 0x1b;
     let mut product = 0;
     while b != 0 {
@@ -196,4 +196,56 @@ pub(super) fn carry_less_multiply(a: u64, b: u64) -> u128 {
         }
     }
     product
+}
+
+/// Multiplicative inverse in GF(2^8) (a^254); 0 has no inverse and maps to 0, as gf2p8affineinvqb
+/// defines it.
+pub(in crate::cpu::sse) fn gf_inverse(a: u8) -> u8 {
+    /// The multiplicative group has order 255, so a^254 = a^-1.
+    const INVERSE_EXPONENT: u32 = 254;
+    if a == 0 {
+        return 0;
+    }
+    let (mut result, mut power, mut exponent) = (1u8, a, INVERSE_EXPONENT);
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            result = gf_multiply(result, power);
+        }
+        power = gf_multiply(power, power);
+        exponent >>= 1;
+    }
+    result
+}
+
+/// One byte of gf2p8affineqb: bit `n` of the result is the parity of (matrix byte 7-n AND x) XOR
+/// bit `n` of `immediate`, where `matrix` is the 8x8 bit matrix held in one quadword.
+pub(in crate::cpu::sse) fn gf_affine_byte(matrix: u64, x: u8, immediate: u8) -> u8 {
+    let mut result = 0u8;
+    for bit in 0..8 {
+        let row = (matrix >> (8 * (7 - bit))) as u8;
+        let parity = (row & x).count_ones() as u8 & 1;
+        result |= (parity ^ (immediate >> bit & 1)) << bit;
+    }
+    result
+}
+
+/// gf2p8mulb on one 128-bit lane: bytewise GF(2^8) products.
+pub(super) fn gf_multiply_bytes(a: u128, b: u128) -> u128 {
+    let (a, b) = (a.to_le_bytes(), b.to_le_bytes());
+    u128::from_le_bytes(core::array::from_fn(|k| gf_multiply(a[k], b[k])))
+}
+
+/// gf2p8affineqb/gf2p8affineinvqb on one 128-bit lane: `data` bytes transformed (after inversion
+/// for the `inverse` form) by the matrix in the corresponding quadword of `matrix`.
+pub(super) fn gf_affine(data: u128, matrix: u128, immediate: u8, inverse: bool) -> u128 {
+    let (data, matrices) = (data.to_le_bytes(), matrix.to_le_bytes());
+    u128::from_le_bytes(core::array::from_fn(|k| {
+        let quadword = u64::from_le_bytes(matrices[k / 8 * 8..k / 8 * 8 + 8].try_into().unwrap());
+        let x = if inverse {
+            gf_inverse(data[k])
+        } else {
+            data[k]
+        };
+        gf_affine_byte(quadword, x, immediate)
+    }))
 }

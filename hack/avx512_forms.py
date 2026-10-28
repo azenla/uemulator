@@ -338,3 +338,16 @@ form("VPSADBW", "vpsadbw", "bin", 0)
 form("VAESENC", "vaesenc", "bin", 0)
 form("VAESDECLAST", "vaesdeclast", "bin", 0)
 form("VPCLMULQDQ", "vpclmulqdq", "bin", 0, 0x11)
+
+for n, asm in [("VEX_VAESENC_Y", "vaesenc ymm0, ymm1, ymm2"), ("VEX_VAESDECLAST_YM", "vaesdeclast ymm0, ymm1, [rsi]"),
+               ("VEX_VPCLMULQDQ_Y", "vpclmulqdq ymm0, ymm1, ymm2, 0x11"), ("VEX_GF2P8MULB_Y", "vgf2p8mulb ymm0, ymm1, ymm2"),
+               ("VEX_GF2P8AFFINEQB_Y", "vgf2p8affineqb ymm0, ymm1, ymm2, 0x63"),
+               ("VEX_GF2P8AFFINEINVQB_X", "vgf2p8affineinvqb xmm0, xmm1, xmm2, 0x63"),
+               ("SSE_GF2P8MULB", "gf2p8mulb xmm0, xmm1"), ("SSE_GF2P8AFFINEQB", "gf2p8affineqb xmm0, xmm1, 0x63"),
+               ("SSE_GF2P8AFFINEINVQB", "gf2p8affineinvqb xmm0, xmm1, 0x63"),
+               ("VEX_AESIMC_X", "vaesimc xmm0, xmm1"), ("VEX_VAESENC_X", "vaesenc xmm0, xmm1, xmm2")]:
+    single(n, asm)
+
+single("VPBROADCASTMB2Q_Z", "vpbroadcastmb2q zmm0, k1")
+single("VPBROADCASTMW2D_Y", "vpbroadcastmw2d ymm0, k1")
+single("VPBROADCASTMW2D_HIGH", "vpbroadcastmw2d zmm20, k1")

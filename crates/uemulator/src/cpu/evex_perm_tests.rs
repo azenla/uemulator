@@ -794,6 +794,24 @@ mod extensions {
     }
 
     #[test]
+    fn mask_registers_broadcast_into_vectors() {
+        let k = 0x1234_5678_9abc_def0u64;
+        let h = run(VPBROADCASTMB2Q_Z, |h| h.cpu.opmask[1] = k);
+        assert_eq!(
+            h.cpu.zmm(0),
+            [(k & 0xff) as u128 * 0x1_0000_0000_0000_0001; 4]
+        );
+        let h = run(VPBROADCASTMW2D_Y, |h| {
+            h.cpu.opmask[1] = k;
+            h.cpu.set_zmm(0, [u128::MAX; 4]);
+        });
+        let want = build(32, 4, |_| k & 0xffff);
+        assert_eq!(h.cpu.zmm(0), [want[0], want[1], 0, 0]);
+        let h = run(VPBROADCASTMW2D_HIGH, |h| h.cpu.opmask[1] = k);
+        assert_eq!(h.cpu.zmm(20), build(64, 4, |_| k & 0xffff));
+    }
+
+    #[test]
     fn ifma_accumulates_the_low_or_high_half_of_the_52_bit_product() {
         let (old, a, b, h) = run3(VPMADD52LUQ, 0x92);
         let mask52 = (1u64 << 52) - 1;
@@ -963,6 +981,131 @@ mod extensions {
             }
         }
         result as u8
+    }
+
+    #[test]
+    fn gfni_vaes_and_vpclmulqdq_exist_in_the_legacy_and_vex_encodings_too() {
+        let mut rng = Rng(0xd1);
+        let (a, b) = (rng.vector(), rng.vector());
+        // legacy SSE: data in the destination, matrix in the source
+        let h = run(SSE_GF2P8MULB, |h| {
+            h.cpu.cr4 |= crate::cpu::sys::CR4_OSFXSR;
+            h.cpu.set_zmm(0, a);
+            h.cpu.set_zmm(1, b);
+        });
+        let want = build(16, 1, |k| {
+            gf_product(element(&a, 1, k) as u8, element(&b, 1, k) as u8) as u64
+        });
+        assert_eq!(h.cpu.zmm(0)[0], want[0]);
+        assert_eq!(
+            h.cpu.zmm(0)[1..],
+            a[1..],
+            "legacy SSE leaves the upper bits alone"
+        );
+        let matrix = |v: &Vector, k: usize| element(v, 8, k / 8);
+        let affine = |matrix: u64, x: u8| {
+            let mut out = 0u8;
+            for bit in 0..8 {
+                let row = (matrix >> (8 * (7 - bit))) as u8;
+                out |= (((row & x).count_ones() as u8 & 1) ^ (0x63 >> bit & 1)) << bit;
+            }
+            out
+        };
+        let h = run(SSE_GF2P8AFFINEQB, |h| {
+            h.cpu.cr4 |= crate::cpu::sys::CR4_OSFXSR;
+            h.cpu.set_zmm(0, a);
+            h.cpu.set_zmm(1, b);
+        });
+        let want = build(16, 1, |k| {
+            affine(matrix(&b, k), element(&a, 1, k) as u8) as u64
+        });
+        assert_eq!(h.cpu.zmm(0)[0], want[0]);
+        let h = run(SSE_GF2P8AFFINEINVQB, |h| {
+            h.cpu.cr4 |= crate::cpu::sys::CR4_OSFXSR;
+            h.cpu.set_zmm(0, a);
+            h.cpu.set_zmm(1, b);
+        });
+        let inverse = |x: u8| (0..=255u8).find(|&y| gf_product(x, y) == 1).unwrap_or(0);
+        let want = build(16, 1, |k| {
+            affine(matrix(&b, k), inverse(element(&a, 1, k) as u8)) as u64
+        });
+        assert_eq!(h.cpu.zmm(0)[0], want[0]);
+        // VEX.256 forms run each 128-bit lane
+        let h = run(VEX_GF2P8MULB_Y, |h| {
+            h.cpu.set_zmm(1, a);
+            h.cpu.set_zmm(2, b);
+        });
+        let want = build(32, 1, |k| {
+            gf_product(element(&a, 1, k) as u8, element(&b, 1, k) as u8) as u64
+        });
+        assert_eq!(h.cpu.zmm(0), [want[0], want[1], 0, 0]);
+        let h = run(VEX_GF2P8AFFINEQB_Y, |h| {
+            h.cpu.set_zmm(1, a);
+            h.cpu.set_zmm(2, b);
+        });
+        let want = build(32, 1, |k| {
+            affine(matrix(&b, k), element(&a, 1, k) as u8) as u64
+        });
+        assert_eq!(h.cpu.zmm(0), [want[0], want[1], 0, 0]);
+        let h = run(VEX_GF2P8AFFINEINVQB_X, |h| {
+            h.cpu.set_zmm(1, a);
+            h.cpu.set_zmm(2, b);
+        });
+        let want = build(16, 1, |k| {
+            affine(matrix(&b, k), inverse(element(&a, 1, k) as u8)) as u64
+        });
+        assert_eq!(h.cpu.zmm(0), [want[0], 0, 0, 0]);
+        // VAES: a 256-bit AES round is two independent 128-bit rounds
+        let h = run(VEX_VAESENC_Y, |h| {
+            h.cpu.set_zmm(1, a);
+            h.cpu.set_zmm(2, b);
+        });
+        for lane in 0..2 {
+            let legacy = run(&[0x66, 0x0f, 0x38, 0xdc, 0xc1, 0xf4], |l| {
+                l.cpu.cr4 |= crate::cpu::sys::CR4_OSFXSR;
+                l.cpu.set_zmm(0, [a[lane], 0, 0, 0]);
+                l.cpu.set_zmm(1, [b[lane], 0, 0, 0]);
+            });
+            assert_eq!(h.cpu.zmm(0)[lane], legacy.cpu.zmm(0)[0], "lane {lane}");
+        }
+        assert_eq!(h.cpu.zmm(0)[2..], [0, 0]);
+        let h = run(VEX_VAESDECLAST_YM, |h| {
+            h.cpu.set_zmm(1, a);
+            h.write(DATA, &bytes_of(&b));
+        });
+        for lane in 0..2 {
+            let legacy = run(&[0x66, 0x0f, 0x38, 0xdf, 0xc1, 0xf4], |l| {
+                l.cpu.cr4 |= crate::cpu::sys::CR4_OSFXSR;
+                l.cpu.set_zmm(0, [a[lane], 0, 0, 0]);
+                l.cpu.set_zmm(1, [b[lane], 0, 0, 0]);
+            });
+            assert_eq!(
+                h.cpu.zmm(0)[lane],
+                legacy.cpu.zmm(0)[0],
+                "memory lane {lane}"
+            );
+        }
+        // VPCLMULQDQ with imm 0x11: high quadwords of each lane
+        let h = run(VEX_VPCLMULQDQ_Y, |h| {
+            h.cpu.set_zmm(1, a);
+            h.cpu.set_zmm(2, b);
+        });
+        for lane in 0..2 {
+            let mut product = 0u128;
+            for bit in 0..64 {
+                if (b[lane] >> 64) as u64 >> bit & 1 == 1 {
+                    product ^= ((a[lane] >> 64) as u64 as u128) << bit;
+                }
+            }
+            assert_eq!(h.cpu.zmm(0)[lane], product, "lane {lane}");
+        }
+        // aesimc stays 128-bit only; its VEX.256 form is undefined
+        let mut code = VEX_AESIMC_X.to_vec();
+        code[2] |= 0x04;
+        assert!(matches!(
+            stop_of(&code, |_| {}),
+            Stop::Fault { vector: 6, .. }
+        ));
     }
 
     #[test]

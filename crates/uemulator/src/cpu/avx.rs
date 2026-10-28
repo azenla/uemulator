@@ -153,8 +153,9 @@ pub(super) fn vex_form(map: u16, opcode: u8, prefix: Prefix) -> Option<Form> {
 fn form_for_extension(op: Op, map: u16, opcode: u8) -> Option<Form> {
     Some(match op {
         Op::Movddup | Op::Movsldup | Op::Movshdup | Op::Lddqu | Op::LoadAligned | Op::Unary(_) => {
-            // pabs*, phminposuw (128-bit only), pmovsx/zx are widening and handled elsewhere
-            if map == OPCODE_MAP_0F38 && opcode == 0x41 {
+            // pabs*, phminposuw and aesimc (128-bit only), pmovsx/zx are widening and handled
+            // elsewhere
+            if map == OPCODE_MAP_0F38 && matches!(opcode, 0x41 | 0xdb) {
                 return form(Merge::No, Dest::Reg, Width::Xmm);
             }
             Form {
@@ -164,9 +165,10 @@ fn form_for_extension(op: Op, map: u16, opcode: u8) -> Option<Form> {
             }
         }
         Op::AddSub { .. } | Op::Horizontal { .. } | Op::Binary(_) | Op::WithImm(_) => {
-            // AES and PCLMULQDQ have 256-bit forms only with VAES/VPCLMULQDQ, which are not here.
-            let crypto = (map == OPCODE_MAP_0F38 && matches!(opcode, 0xdb..=0xdf))
-                || (map == OPCODE_MAP_0F3A && matches!(opcode, 0x44 | 0xdf));
+            // aesimc and aeskeygenassist have no 256-bit form; the AES rounds (VAES), PCLMULQDQ
+            // (VPCLMULQDQ) and GFNI do, one 128-bit lane at a time.
+            let crypto = (map == OPCODE_MAP_0F38 && opcode == 0xdb)
+                || (map == OPCODE_MAP_0F3A && opcode == 0xdf);
             Form {
                 merge: Merge::Always,
                 dest: Dest::Reg,

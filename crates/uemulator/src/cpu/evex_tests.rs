@@ -17,6 +17,8 @@ use crate::cpu::test_support::unmap_boot_identity_2m;
 use crate::cpu::xsave::{XCR0_SUPPORTED, XCR0_X87};
 use crate::testkit::{Harness, RDI, RSI, SCRATCH, Stop};
 
+// One shape per line is the point of the generated table: keep rustfmt out of it.
+#[rustfmt::skip]
 #[path = "avx512_encodings.rs"]
 pub(in crate::cpu) mod encodings;
 pub(in crate::cpu) use encodings::*;
