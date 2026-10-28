@@ -13977,10 +13977,11 @@ mod exec_tests {
         assert_ne!(ecx & LAHF_SAHF, 0, "lahf/sahf work in 64-bit mode");
         // prefetch/prefetchw are executed as hints in sys.rs's `prefetchw_is_a_hint_that_never_faults`
         const PREFETCHW: u64 = 1 << 8;
+        const TOPOEXT: u64 = 1 << 22;
         assert_eq!(
-            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM | PREFETCHW),
+            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM | PREFETCHW | TOPOEXT),
             0,
-            "nothing beyond lahf, svm, abm and prefetchw"
+            "nothing beyond lahf, svm, abm, prefetchw and the topology leaves"
         );
     }
 

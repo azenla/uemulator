@@ -1030,16 +1030,13 @@ mod tests {
             h.cpu.gpr[RAX] as u32, 0xf,
             "xsaveopt, xsavec, xgetbv1, xsaves"
         );
-        assert_eq!(
-            h.cpu.gpr[RBX] as u64,
-            COMPACT_HI16_ZMM + HI16_ZMM_STATE_SIZE
-        );
+        assert_eq!(h.cpu.gpr[RBX], COMPACT_HI16_ZMM + HI16_ZMM_STATE_SIZE);
         assert_eq!((h.cpu.gpr[RCX], h.cpu.gpr[RDX]), (0, 0), "no IA32_XSS bits");
         h.cpu.xcr0 = XCR0_X87 | XCR0_SSE;
         h.cpu.gpr[RAX] = 0xd;
         h.cpu.gpr[RCX] = 1;
         h.cpu.cpuid();
-        assert_eq!(h.cpu.gpr[RBX] as u64, XSAVE_AREA_SIZE);
+        assert_eq!(h.cpu.gpr[RBX], XSAVE_AREA_SIZE);
         // subleaf 2: no supervisor bit and no 64-byte alignment, which the packing relies on
         h.cpu.gpr[RAX] = 0xd;
         h.cpu.gpr[RCX] = 2;

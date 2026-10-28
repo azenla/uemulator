@@ -6,6 +6,7 @@ mod avx_special;
 #[cfg(not(freestanding))]
 mod bios;
 mod bmi;
+mod cpuid;
 pub(crate) mod decode;
 pub(crate) mod exception;
 mod exec;
@@ -306,6 +307,8 @@ pub(crate) struct Cpu {
     /// IA32_KERNEL_GS_BASE, exchanged with the GS base by SWAPGS.
     pub kgsbase: u64,
     pub tsc_aux: u64,
+    /// What CPUID reports about the package and this processor in it.
+    pub topology: cpuid::CpuTopology,
     /// IA32_SPEC_CTRL (stored, no speculation to control; see `SPEC_CTRL_WRITABLE` in sys.rs).
     pub spec_ctrl: u64,
     /// XCR0, the enabled extended-state components (xgetbv/xsetbv). Bit 0 (x87) is always set.
@@ -424,7 +427,10 @@ impl Cpu {
         dev_config: DevConfig,
     ) -> Self {
         // Stored-only MSRs; names follow Linux's msr-index.h.
+        /// MSR_AMD64_PATCH_LEVEL: the microcode revision. A plausible Genoa value, because Linux
+        /// treats 0 as "no microcode information" and invents the lowest known revision.
         const MSR_UCODE_REV: u32 = 0x8b;
+        const UCODE_REV_GENOA: u64 = 0x0a10_113e;
         const MSR_K7_HWCR: u32 = 0xc001_0015;
         /// IA32_DEBUGCTL: a KVM host saves and restores it around every guest run. Stored only (no
         /// branch recording).
@@ -442,6 +448,18 @@ impl Cpu {
         const MSR_AMD64_TOP_MEM: u32 = 0xc001_001a;
         const MSR_AMD64_TOP_MEM2: u32 = 0xc001_001d;
         const SYSCFG_INITIAL: u64 = (1 << 18) | (1 << 20);
+        /// The four legacy performance event selectors and counters, which Linux probes with a
+        /// write-and-read-back before it trusts a PMU. They store but never count (there is no PMU
+        /// model), so perf sees counters that stay at zero instead of a "broken PMU" warning.
+        const MSR_K7_PERF_FIRST: u32 = 0xc001_0000;
+        const MSR_K7_PERF_LAST: u32 = 0xc001_0007;
+        /// Instruction-cache, data-cache and bus-unit configuration and the Zen 4 branch predictor
+        /// control: Linux and Xen set workaround bits in these with rdmsr/wrmsr_safe depending on
+        /// family and model. Storage only, so the read-modify-write sequences succeed quietly.
+        const MSR_AMD64_IC_CFG: u32 = 0xc001_1021;
+        const MSR_AMD64_DC_CFG: u32 = 0xc001_1022;
+        const MSR_AMD64_BU_CFG2: u32 = 0xc001_102a;
+        const MSR_ZEN4_BP_CFG: u32 = 0xc001_102e;
 
         let pages = ram.len() >> PAGE_SHIFT;
         // RAM never reaches 4 GiB (the PCI window starts at 3 GiB), so TOP_MEM2 stays zero.
@@ -492,6 +510,7 @@ impl Cpu {
             sfmask: 0,
             kgsbase: 0,
             tsc_aux: 0,
+            topology: cpuid::CpuTopology::SINGLE_PROCESSOR,
             spec_ctrl: 0,
             xcr0: xsave::XCR0_X87,
             svm: svm::Svm::new(),
@@ -502,18 +521,23 @@ impl Cpu {
             sysenter: [0; 3],
             dr: [0, 0, 0, 0, 0, 0, DR6_RESET, DR7_RESET],
             msr_misc: [
-                (MSR_UCODE_REV, 0),
+                (MSR_UCODE_REV, UCODE_REV_GENOA),
                 (MSR_IA32_DEBUGCTL, 0),
                 (MSR_K7_HWCR, HWCR_INITIAL),
                 (MSR_AMD64_NB_CFG, 0),
                 (MSR_AMD64_LS_CFG, 0),
                 (MSR_AMD64_DE_CFG, 0),
+                (MSR_AMD64_IC_CFG, 0),
+                (MSR_AMD64_DC_CFG, 0),
+                (MSR_AMD64_BU_CFG2, 0),
+                (MSR_ZEN4_BP_CFG, 0),
                 (MSR_AMD64_SYSCFG, SYSCFG_INITIAL),
                 (MSR_AMD64_TOP_MEM, top_of_memory),
                 (MSR_AMD64_TOP_MEM2, 0),
             ]
             .into_iter()
             .chain((MSR_AMD64_IORR_FIRST..=MSR_AMD64_IORR_LAST).map(|msr| (msr, 0)))
+            .chain((MSR_K7_PERF_FIRST..=MSR_K7_PERF_LAST).map(|msr| (msr, 0)))
             .collect(),
             cpl: 0,
             xmm: [0; 16],
@@ -1247,8 +1271,20 @@ mod cpu_tests {
         #[test]
         fn stored_only_msrs_are_seeded() {
             let h = harness();
-            let expected: [(u32, u64); 13] = [
-                (0x8b, 0),
+            let expected: [(u32, u64); 25] = [
+                (0x8b, 0x0a10_113e),
+                (0xc001_0000, 0),
+                (0xc001_0001, 0),
+                (0xc001_0002, 0),
+                (0xc001_0003, 0),
+                (0xc001_0004, 0),
+                (0xc001_0005, 0),
+                (0xc001_0006, 0),
+                (0xc001_0007, 0),
+                (0xc001_1021, 0),
+                (0xc001_1022, 0),
+                (0xc001_102a, 0),
+                (0xc001_102e, 0),
                 (0x1d9, 0),
                 (0xc001_0010, (1 << 18) | (1 << 20)),
                 (0xc001_0015, 1 << 24),

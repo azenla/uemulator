@@ -123,7 +123,7 @@ pub(super) const CR4_SUPPORTED_BITS: u64 = CR4_SUPPORTED;
 
 /// Address widths reported by CPUID 0x8000_0008. CR3 and the canonical-address checks follow them.
 pub(super) const PHYSICAL_ADDRESS_BITS: u32 = 40;
-const VIRTUAL_ADDRESS_BITS: u32 = 48;
+pub(super) const VIRTUAL_ADDRESS_BITS: u32 = 48;
 
 /// CR3 bits kept on write: physical address bits 51:12 plus PWT (bit 3) and PCD (bit 4).
 /// Everything else (bits 2:0 and 11:5, the PCID field) is ignored without CR4.PCIDE.
@@ -223,314 +223,11 @@ const USER_DATA_FLAGS: u32 = SEG_FLAGS_FLAT_DATA | DESC_DPL_USER;
 const LOG_KEY_RDMSR_FAULT: u64 = 1 << 60;
 const LOG_KEY_WRMSR_FAULT: u64 = 1 << 59;
 
-// CPUID identity: AuthenticAMD, family 0x14, model 0, stepping 1 (plans/03-cpu.md). Only
-// features that have tests behind them are advertised; everything else reads as zero.
-const CPUID_LEAF_VENDOR: u32 = 0;
-const CPUID_LEAF_FEATURES: u32 = 1;
-const CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES: u32 = 7;
-/// Processor extended state enumeration (xsave component sizes).
-const CPUID_LEAF_XSTATE: u32 = 0xd;
-/// MONITOR/MWAIT parameters.
-const CPUID_LEAF_MONITOR: u32 = 5;
-/// Extended topology enumeration: x2APIC id and the SMT/core levels.
-const CPUID_LEAF_EXTENDED_TOPOLOGY: u32 = 0xb;
-/// ECX of leaf 0xB: level type in bits 15:8 (1 = SMT, 2 = core), level number in 7:0.
-const TOPOLOGY_LEVEL_SMT: u32 = 1 << 8;
-const TOPOLOGY_LEVEL_CORE: u32 = 2 << 8;
-/// One logical processor in the package: each level is a single unit and shifts x2APIC ids by 0
-/// bits (SMT) or 1 bit (core: a one-bit field still has to exist to be well formed).
-const TOPOLOGY_SMT_SHIFT: u32 = 0;
-const TOPOLOGY_CORE_SHIFT: u32 = 1;
-const TOPOLOGY_LOGICAL_PROCESSORS: u32 = 1;
-/// Leaf 5 smallest/largest monitor-line size, and ECX bits: extensions enumerated, interrupts
-/// break MWAIT even when masked.
-const MONITOR_LINE_BYTES: u32 = 64;
-const MONITOR_ECX_EXTENSIONS_AND_BREAK: u32 = 0b11;
-const CPUID_LEAF_EXT_MAX: u32 = 0x8000_0000;
-const CPUID_LEAF_EXT_FEATURES: u32 = 0x8000_0001;
-const CPUID_LEAF_BRAND_FIRST: u32 = 0x8000_0002;
-const CPUID_LEAF_BRAND_LAST: u32 = 0x8000_0004;
-const CPUID_LEAF_L1_CACHE_TLB: u32 = 0x8000_0005;
-const CPUID_LEAF_L2_CACHE_TLB: u32 = 0x8000_0006;
-const CPUID_LEAF_ADVANCED_POWER: u32 = 0x8000_0007;
-const CPUID_LEAF_ADDRESS_SIZES: u32 = 0x8000_0008;
-
-/// Highest standard leaf. Leaves 2-6 are within range and read as zero (no cache or thermal
-/// descriptors; Linux only consults them on Intel).
-const CPUID_MAX_STANDARD_LEAF: u32 = CPUID_LEAF_XSTATE;
-const CPUID_MAX_EXTENDED_LEAF: u32 = CPUID_LEAF_SVM;
-/// SVM revision and features.
-const CPUID_LEAF_SVM: u32 = 0x8000_000a;
-/// Leaf 0x8000_0001 ECX bit 2: AMD SVM.
-const EXT_FEATURE_SVM: u32 = 1 << 2;
-
-/// Vendor string "AuthenticAMD" is returned in EBX, EDX, ECX order.
-const VENDOR_EBX: u32 = u32::from_le_bytes(*b"Auth");
-const VENDOR_EDX: u32 = u32::from_le_bytes(*b"enti");
-const VENDOR_ECX: u32 = u32::from_le_bytes(*b"cAMD");
-
-/// Returned as EAX of leaf 1 and leaf 0x8000_0001: stepping 1, model 0, base family 0xf plus
-/// extended family 5, i.e. family 0x14. Not 0x15: Linux's vulnerability table names AMD families
-/// 0x15, 0x16, 0x17... as RETBLEED (and later SRSO) victims by family number alone, no matter what
-/// ARCH_CAPABILITIES says, and answers with return thunks on every `ret`. Family 0x14 is in no
-/// such list and takes the same generic AMD paths (REP_GOOD, no Zen quirks).
-const CPUID_SIGNATURE: u32 = 0x0050_0f01;
-/// Leaf 1 EBX: CLFLUSH line size in 8-byte units (bits 15:8) and logical processor count
-/// (23:16). The initial APIC id (31:24) is 0.
-const CPUID_LEAF1_EBX: u32 = (1 << 16) | (8 << 8);
-
-const FEATURE_FPU: u32 = 1 << 0;
-const FEATURE_DE: u32 = 1 << 2;
-const FEATURE_PSE: u32 = 1 << 3;
-const FEATURE_TSC: u32 = 1 << 4;
-const FEATURE_MSR: u32 = 1 << 5;
-const FEATURE_PAE: u32 = 1 << 6;
-const FEATURE_MCE: u32 = 1 << 7;
-/// On-chip local APIC (`dev/apic.rs`); its MMIO window is enabled by IA32_APIC_BASE.
-const FEATURE_APIC: u32 = 1 << 9;
-const FEATURE_MTRR: u32 = 1 << 12;
-const FEATURE_MCA: u32 = 1 << 14;
-const FEATURE_SEP: u32 = 1 << 11;
-const FEATURE_CX8: u32 = 1 << 8;
-const FEATURE_PGE: u32 = 1 << 13;
-const FEATURE_CMOV: u32 = 1 << 15;
-const FEATURE_PAT: u32 = 1 << 16;
-const FEATURE_PSE36: u32 = 1 << 17;
-const FEATURE_CLFSH: u32 = 1 << 19;
-const FEATURE_MMX: u32 = 1 << 23;
-const FEATURE_FXSR: u32 = 1 << 24;
-const FEATURE_SSE: u32 = 1 << 25;
-const FEATURE_SSE2: u32 = 1 << 26;
-/// Leaf 1 EDX. MMX is advertised because glibc's x86-64 baseline ISA check (CMOV, CX8, FPU,
-/// FXSR, MMX, SSE, SSE2) needs the bit; without it every Debian binary refuses to start ("CPU ISA
-/// level is lower than required"). SEP is set for protected-mode sysenter/sysexit (`do_sysenter`). PSE-36 is set together with the 4 MiB
-/// PDE address bits 39:32 (`mem.rs`), which match the 40 physical address bits of leaf 0x8000_0008.
-const CPUID_LEAF1_EDX: u32 = FEATURE_FPU
-    | FEATURE_DE
-    | FEATURE_PSE
-    | FEATURE_TSC
-    | FEATURE_MSR
-    | FEATURE_PAE
-    | FEATURE_MCE
-    | FEATURE_APIC
-    | FEATURE_MTRR
-    | FEATURE_MCA
-    | FEATURE_CX8
-    | FEATURE_SEP
-    | FEATURE_PGE
-    | FEATURE_CMOV
-    | FEATURE_PAT
-    | FEATURE_PSE36
-    | FEATURE_CLFSH
-    | FEATURE_MMX
-    | FEATURE_FXSR
-    | FEATURE_SSE
-    | FEATURE_SSE2;
-
-// Leaf 1 ECX. Each bit is advertised together with the tests of the instructions behind it.
-// MONITOR/MWAIT, VMX/SVM, AVX and the hypervisor bit stay clear.
-/// SSE3: movddup, movshdup, movsldup, lddqu, addsub*, hadd*, hsub*, and x87 fisttp.
-const FEATURE_SSE3: u32 = 1 << 0;
-/// PCLMULQDQ.
-const FEATURE_PCLMULQDQ: u32 = 1 << 1;
-/// CMPXCHG16B.
-const FEATURE_CX16: u32 = 1 << 13;
-/// SSSE3, XMM forms only (the MMX forms are #UD, see `sse_ext.rs`).
-const FEATURE_SSSE3: u32 = 1 << 9;
-const FEATURE_SSE4_1: u32 = 1 << 19;
-/// SSE4.2: pcmpgtq, CRC32 and the pcmp[ei]str[im] string instructions.
-const FEATURE_SSE4_2: u32 = 1 << 20;
-/// MONITOR/MWAIT (leaf 5 describes them).
-const FEATURE_MONITOR: u32 = 1 << 3;
-/// CR4.PCIDE and the PCID field of CR3.
-const FEATURE_PCID: u32 = 1 << 17;
-/// MOVBE.
-const FEATURE_MOVBE: u32 = 1 << 22;
-const FEATURE_POPCNT: u32 = 1 << 23;
-/// AES-NI: aesenc, aesenclast, aesdec, aesdeclast, aesimc, aeskeygenassist.
-const FEATURE_AES: u32 = 1 << 25;
-/// xsave, xrstor, xsaveopt, xgetbv, xsetbv (x87 and SSE state only; see `xsave.rs`).
-const FEATURE_XSAVE: u32 = 1 << 26;
-/// FMA3: the vfmadd/vfmsub/vfnmadd/vfnmsub families.
-const FEATURE_FMA: u32 = 1 << 12;
-/// AVX (VEX-encoded 128/256-bit floating point and the AVX forms of the SSE integer set).
-const FEATURE_AVX: u32 = 1 << 28;
-/// F16C: vcvtph2ps and vcvtps2ph.
-const FEATURE_F16C: u32 = 1 << 29;
-/// x2APIC mode of the local APIC: register access by MSR (0x800..=0x8ff), 32-bit APIC ids.
-const FEATURE_X2APIC: u32 = 1 << 21;
-/// IA32_TSC_DEADLINE (0x6e0) and the LVT timer's deadline mode.
-const FEATURE_TSC_DEADLINE: u32 = 1 << 24;
-/// Mirrors CR4.OSXSAVE; computed in `cpuid`, never part of the static mask.
-const FEATURE_OSXSAVE: u32 = 1 << 27;
-/// rdrand (see `MachineConfig::random_seed`).
-const FEATURE_RDRAND: u32 = 1 << 30;
-const CPUID_LEAF1_ECX: u32 = FEATURE_SSE3
-    | FEATURE_PCLMULQDQ
-    | FEATURE_SSSE3
-    | FEATURE_CX16
-    | FEATURE_SSE4_1
-    | FEATURE_SSE4_2
-    | FEATURE_MOVBE
-    | FEATURE_POPCNT
-    | FEATURE_AES
-    | FEATURE_XSAVE
-    | FEATURE_RDRAND
-    | FEATURE_MONITOR
-    | FEATURE_PCID
-    | FEATURE_FMA
-    | FEATURE_AVX
-    | FEATURE_F16C
-    | FEATURE_X2APIC
-    | FEATURE_TSC_DEADLINE;
-
-/// Leaf 7 subleaf 0 EBX bit 0: rdfsbase, rdgsbase, wrfsbase, wrgsbase.
-///
-/// ERMS (EBX bit 9) and FSRM (EDX bit 4) make the kernel's memcpy, clear_page and copy_user use
-/// `rep movsb`/`rep stosb` for everything, which is only a win because `Cpu::rep_bulk` turns each
-/// page of such an instruction into one host copy and `REP_BYTES_PER_SLICE` lets one run-loop
-/// round trip cover 32 KiB. An earlier attempt (with a slice counted in elements, so 4 KiB for
-/// bytes) was slower than `rep movsq`; measured with the byte-sized slice: a `dd` of 2 GB
-/// zero -> null (all copy_to_user) went from 3.6 s to 0.3 s, boot and the rest unchanged.
-const STRUCTURED_FEATURE_FSGSBASE: u32 = 1 << 0;
-/// rdseed.
-const STRUCTURED_FEATURE_RDSEED: u32 = 1 << 18;
-/// AVX2: the 256-bit integer set, vperm*, vpgather*, vpmaskmov*, variable shifts, broadcasts.
-const STRUCTURED_FEATURE_AVX2: u32 = 1 << 5;
-/// BMI1: andn, bextr, blsi, blsmsk, blsr (VEX) and tzcnt.
-const STRUCTURED_FEATURE_BMI1: u32 = 1 << 3;
-/// BMI2: bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx (VEX).
-const STRUCTURED_FEATURE_BMI2: u32 = 1 << 8;
-/// SMEP, INVPCID, SMAP.
-const STRUCTURED_FEATURE_SMEP: u32 = 1 << 7;
-const STRUCTURED_FEATURE_INVPCID: u32 = 1 << 10;
-const STRUCTURED_FEATURE_SMAP: u32 = 1 << 20;
-/// AVX-512 foundation and its sub-extensions (EBX): F, DQ, IFMA, CD, BW, VL. PF and ER (Xeon Phi
-/// only) are absent. The state they need is XCR0 bits 7:5 (leaf 0xd).
-const STRUCTURED_FEATURE_AVX512F: u32 = 1 << 16;
-const STRUCTURED_FEATURE_AVX512DQ: u32 = 1 << 17;
-const STRUCTURED_FEATURE_AVX512IFMA: u32 = 1 << 21;
-const STRUCTURED_FEATURE_AVX512CD: u32 = 1 << 28;
-const STRUCTURED_FEATURE_AVX512BW: u32 = 1 << 30;
-const STRUCTURED_FEATURE_AVX512VL: u32 = 1 << 31;
-/// Leaf 7 ECX bit 2: UMIP.
-const STRUCTURED_ECX_UMIP: u32 = 1 << 2;
-/// Leaf 7 ECX: AVX512_VBMI, AVX512_VBMI2, GFNI, VAES, VPCLMULQDQ, AVX512_VNNI, AVX512_BITALG and
-/// AVX512_VPOPCNTDQ. GFNI, VAES and VPCLMULQDQ also cover the legacy and VEX encodings.
-const STRUCTURED_ECX_AVX512_VBMI: u32 = 1 << 1;
-const STRUCTURED_ECX_AVX512_VBMI2: u32 = 1 << 6;
-const STRUCTURED_ECX_GFNI: u32 = 1 << 8;
-const STRUCTURED_ECX_VAES: u32 = 1 << 9;
-const STRUCTURED_ECX_VPCLMULQDQ: u32 = 1 << 10;
-const STRUCTURED_ECX_AVX512_VNNI: u32 = 1 << 11;
-const STRUCTURED_ECX_AVX512_BITALG: u32 = 1 << 12;
-const STRUCTURED_ECX_AVX512_VPOPCNTDQ: u32 = 1 << 14;
-const STRUCTURED_ECX: u32 = STRUCTURED_ECX_UMIP
-    | STRUCTURED_ECX_AVX512_VBMI
-    | STRUCTURED_ECX_AVX512_VBMI2
-    | STRUCTURED_ECX_GFNI
-    | STRUCTURED_ECX_VAES
-    | STRUCTURED_ECX_VPCLMULQDQ
-    | STRUCTURED_ECX_AVX512_VNNI
-    | STRUCTURED_ECX_AVX512_BITALG
-    | STRUCTURED_ECX_AVX512_VPOPCNTDQ;
-/// ERMS: fast `rep movsb`/`rep stosb`.
-const STRUCTURED_FEATURE_ERMS: u32 = 1 << 9;
-const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE
-    | STRUCTURED_FEATURE_ERMS
-    | STRUCTURED_FEATURE_SMEP
-    | STRUCTURED_FEATURE_AVX2
-    | STRUCTURED_FEATURE_INVPCID
-    | STRUCTURED_FEATURE_SMAP
-    | STRUCTURED_FEATURE_BMI1
-    | STRUCTURED_FEATURE_BMI2
-    | STRUCTURED_FEATURE_RDSEED
-    | STRUCTURED_FEATURE_AVX512F
-    | STRUCTURED_FEATURE_AVX512DQ
-    | STRUCTURED_FEATURE_AVX512IFMA
-    | STRUCTURED_FEATURE_AVX512CD
-    | STRUCTURED_FEATURE_AVX512BW
-    | STRUCTURED_FEATURE_AVX512VL;
-
-// Leaf 7 subleaf 0 EDX: the speculation-control interface. The MSRs behind these bits are
-// implemented as inert storage (see `ARCH_CAPABILITIES`).
-/// IA32_SPEC_CTRL and IA32_PRED_CMD (IBRS and IBPB).
-const STRUCTURED_FEATURE_SPEC_CTRL: u32 = 1 << 26;
-/// STIBP bit in IA32_SPEC_CTRL.
-const STRUCTURED_FEATURE_STIBP: u32 = 1 << 27;
-/// IA32_FLUSH_CMD.
-const STRUCTURED_FEATURE_L1D_FLUSH: u32 = 1 << 28;
-/// IA32_ARCH_CAPABILITIES.
-const STRUCTURED_FEATURE_ARCH_CAPABILITIES: u32 = 1 << 29;
-/// SSBD bit in IA32_SPEC_CTRL.
-const STRUCTURED_FEATURE_SSBD: u32 = 1 << 31;
-/// FSRM: fast short `rep movsb`.
-const STRUCTURED_FEATURE_FSRM: u32 = 1 << 4;
-const STRUCTURED_EDX: u32 = STRUCTURED_FEATURE_FSRM
-    | STRUCTURED_FEATURE_SPEC_CTRL
-    | STRUCTURED_FEATURE_STIBP
-    | STRUCTURED_FEATURE_L1D_FLUSH
-    | STRUCTURED_FEATURE_ARCH_CAPABILITIES
-    | STRUCTURED_FEATURE_SSBD;
-
-// Leaf 0x8000_0008 EBX: the AMD spelling of the same interface (Linux consults these on AMD
-// vendor CPUs).
-const EXT_ADDRESS_IBPB: u32 = 1 << 12;
-const EXT_ADDRESS_IBRS: u32 = 1 << 14;
-const EXT_ADDRESS_STIBP: u32 = 1 << 15;
-const EXT_ADDRESS_SSBD: u32 = 1 << 24;
-const EXT_ADDRESS_EBX: u32 =
-    EXT_ADDRESS_IBPB | EXT_ADDRESS_IBRS | EXT_ADDRESS_STIBP | EXT_ADDRESS_SSBD;
-
-/// Leaf 0xd subleaf 1 EAX bit 0.
-const XSTATE_FEATURE_XSAVEOPT: u32 = 1 << 0;
-/// Leaf 0xd subleaf 1 EAX bit 1: xsavec and the compacted format in xrstor.
-const XSTATE_FEATURE_XSAVEC: u32 = 1 << 1;
-/// Leaf 0xd subleaf 1 EAX bit 2: xgetbv with ECX=1 (XINUSE).
-const XSTATE_FEATURE_XGETBV1: u32 = 1 << 2;
-/// Leaf 0xd subleaf 1 EAX bit 3: xsaves, xrstors and IA32_XSS.
-const XSTATE_FEATURE_XSAVES: u32 = 1 << 3;
-
-/// Leaf 0x8000_0001 EDX repeats this subset of the leaf 1 bits (the AMD aliases); DE and PSE
-/// are not mirrored.
-const CPUID_EXT_ALIASED_EDX: u32 = FEATURE_FPU
-    | FEATURE_TSC
-    | FEATURE_MSR
-    | FEATURE_PAE
-    | FEATURE_CX8
-    | FEATURE_PGE
-    | FEATURE_CMOV
-    | FEATURE_PAT
-    | FEATURE_MMX
-    | FEATURE_FXSR;
-const EXT_FEATURE_SYSCALL: u32 = 1 << 11;
-const EXT_FEATURE_NX: u32 = 1 << 20;
-/// rdtscp: rdtsc plus IA32_TSC_AUX in ECX.
-const EXT_FEATURE_RDTSCP: u32 = 1 << 27;
-const EXT_FEATURE_LONG_MODE: u32 = 1 << 29;
-/// Leaf 0x8000_0001 ECX bit 0: LAHF/SAHF in 64-bit mode.
-const EXT_FEATURE_LAHF_LM: u32 = 1 << 0;
-/// Leaf 0x8000_0001 ECX bit 5: advanced bit manipulation, i.e. LZCNT (POPCNT has its own bit in
-/// leaf 1).
-const EXT_FEATURE_ABM: u32 = 1 << 5;
-/// Leaf 0x8000_0001 ECX bit 8: PREFETCH and PREFETCHW (`0F 0D`, hints that execute as no-ops).
-/// Windows 8.1 and later refuse to start without it.
-const EXT_FEATURE_PREFETCHW: u32 = 1 << 8;
-/// Leaf 0x8000_0007 EDX bit 8: invariant TSC, so the kernel trusts it as a clocksource.
-const APM_INVARIANT_TSC: u32 = 1 << 8;
-
-/// Leaf 0x8000_0008 EAX: physical address bits (7:0) and linear address bits (15:8).
-const CPUID_ADDRESS_SIZES: u32 = (VIRTUAL_ADDRESS_BITS << 8) | PHYSICAL_ADDRESS_BITS;
-
-/// 48 bytes returned over leaves 0x8000_0002..=0x8000_0004, NUL padded.
-const BRAND_STRING: &[u8; 48] =
-    b"uemulator virtual x86-64 cpu\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-
 /// Indices into `Cpu::gpr`: hardware register numbers, so RCX is 1 and RBX is 3.
 pub(super) const RAX: usize = 0;
 pub(super) const RCX: usize = 1;
 pub(super) const RDX: usize = 2;
-const RBX: usize = 3;
+pub(super) const RBX: usize = 3;
 const R11: usize = 11;
 
 /// Whether bits 63:47 of `address` are all copies of bit 47.
@@ -547,121 +244,6 @@ impl Cpu {
         } else {
             Ok(())
         }
-    }
-
-    /// The subleaf (ECX) only matters for leaf 7; unknown leaves return zeros.
-    pub fn cpuid(&mut self) {
-        let leaf = self.gpr[RAX] as u32;
-        let (eax, ebx, ecx, edx): (u32, u32, u32, u32) = match leaf {
-            CPUID_LEAF_VENDOR => (CPUID_MAX_STANDARD_LEAF, VENDOR_EBX, VENDOR_ECX, VENDOR_EDX),
-            CPUID_LEAF_STRUCTURED_EXTENDED_FEATURES => {
-                // Only subleaf 0 exists; EAX is the highest subleaf.
-                if self.gpr[RCX] as u32 == 0 {
-                    (0, STRUCTURED_EBX, STRUCTURED_ECX, STRUCTURED_EDX)
-                } else {
-                    (0, 0, 0, 0)
-                }
-            }
-            CPUID_LEAF_FEATURES => {
-                let osxsave = if self.cr4 & CR4_OSXSAVE != 0 {
-                    FEATURE_OSXSAVE
-                } else {
-                    0
-                };
-                (
-                    CPUID_SIGNATURE,
-                    CPUID_LEAF1_EBX,
-                    CPUID_LEAF1_ECX | osxsave,
-                    CPUID_LEAF1_EDX,
-                )
-            }
-            CPUID_LEAF_EXTENDED_TOPOLOGY => {
-                let x2apic_id = 0;
-                match self.gpr[RCX] as u32 {
-                    0 => (
-                        TOPOLOGY_SMT_SHIFT,
-                        TOPOLOGY_LOGICAL_PROCESSORS,
-                        TOPOLOGY_LEVEL_SMT,
-                        x2apic_id,
-                    ),
-                    1 => (
-                        TOPOLOGY_CORE_SHIFT,
-                        TOPOLOGY_LOGICAL_PROCESSORS,
-                        TOPOLOGY_LEVEL_CORE | 1,
-                        x2apic_id,
-                    ),
-                    // Level 2 is the invalid terminator; ECX echoes the subleaf.
-                    subleaf => (0, 0, subleaf, x2apic_id),
-                }
-            }
-            CPUID_LEAF_MONITOR => (
-                MONITOR_LINE_BYTES,
-                MONITOR_LINE_BYTES,
-                MONITOR_ECX_EXTENSIONS_AND_BREAK,
-                0,
-            ),
-            // Subleaf 0: supported XCR0 bits, size of the area for the currently enabled bits and
-            // for all supported ones. Subleaf 1: EAX bit 0 = xsaveopt.
-            CPUID_LEAF_XSTATE => match self.gpr[RCX] as u32 {
-                0 => (
-                    xsave::XCR0_SUPPORTED as u32,
-                    xsave::enabled_area_size(self.xcr0),
-                    xsave::enabled_area_size(xsave::XCR0_SUPPORTED),
-                    0,
-                ),
-                // EBX is the compacted size for the enabled components; ECX:EDX are the
-                // IA32_XSS bits the OS may enable
-                1 => (
-                    XSTATE_FEATURE_XSAVEOPT
-                        | XSTATE_FEATURE_XSAVEC
-                        | XSTATE_FEATURE_XGETBV1
-                        | XSTATE_FEATURE_XSAVES,
-                    xsave::compacted_area_size(self.xcr0),
-                    xsave::XSS_SUPPORTED as u32,
-                    (xsave::XSS_SUPPORTED >> 32) as u32,
-                ),
-                // Components 2 (AVX) and 5-7 (AVX-512): size and offset in the standard format
-                subleaf => match xsave::COMPONENTS.iter().find(|part| part.index == subleaf) {
-                    Some(part) => (part.size as u32, part.offset as u32, 0, 0),
-                    None => (0, 0, 0, 0),
-                },
-            },
-            CPUID_LEAF_EXT_MAX => (CPUID_MAX_EXTENDED_LEAF, VENDOR_EBX, VENDOR_ECX, VENDOR_EDX),
-            CPUID_LEAF_EXT_FEATURES => (
-                CPUID_SIGNATURE,
-                0,
-                EXT_FEATURE_LAHF_LM | EXT_FEATURE_SVM | EXT_FEATURE_ABM | EXT_FEATURE_PREFETCHW,
-                EXT_FEATURE_SYSCALL
-                    | EXT_FEATURE_NX
-                    | EXT_FEATURE_RDTSCP
-                    | EXT_FEATURE_LONG_MODE
-                    | (CPUID_LEAF1_EDX & CPUID_EXT_ALIASED_EDX),
-            ),
-            CPUID_LEAF_BRAND_FIRST..=CPUID_LEAF_BRAND_LAST => {
-                let offset = (leaf - CPUID_LEAF_BRAND_FIRST) as usize * 16;
-                let word = |k: usize| {
-                    u32::from_le_bytes(
-                        BRAND_STRING[offset + k * 4..offset + k * 4 + 4]
-                            .try_into()
-                            .unwrap(),
-                    )
-                };
-                (word(0), word(1), word(2), word(3))
-            }
-            // Fixed AMD-layout cache/TLB descriptors: L1D 32 KiB 8-way, L1I 64 KiB 2-way,
-            // L2 512 KiB, all with 64-byte lines; no L3.
-            CPUID_LEAF_L1_CACHE_TLB => (0xff40_ff40, 0xff40_ff40, 0x2008_0140, 0x4002_0140),
-            CPUID_LEAF_L2_CACHE_TLB => (0x6400_6400, 0x6400_4200, 0x0200_6140, 0),
-            CPUID_LEAF_ADVANCED_POWER => (0, 0, 0, APM_INVARIANT_TSC),
-            CPUID_LEAF_ADDRESS_SIZES => (CPUID_ADDRESS_SIZES, EXT_ADDRESS_EBX, 0, 0),
-            // revision 1, number of ASIDs, features
-            CPUID_LEAF_SVM => (1, super::svm::SVM_ASIDS, 0, super::svm::SVM_FEATURES),
-            _ => (0, 0, 0, 0),
-        };
-        self.gpr[RAX] = eax as u64;
-        self.gpr[RBX] = ebx as u64;
-        self.gpr[RCX] = ecx as u64;
-        self.gpr[RDX] = edx as u64;
     }
 
     /// Unknown MSRs raise #GP(0) (the kernel probes with `rdmsr_safe`); each is logged once.
@@ -1971,66 +1553,8 @@ mod sys_tests {
         Harness::new(&[crate::testkit::HLT])
     }
 
-    mod cpuid_leaves {
+    mod cpuid_instruction {
         use super::*;
-
-        #[test]
-        fn leaf_0_reports_the_max_standard_leaf_and_vendor_string() {
-            let mut h = blank();
-            let [eax, ebx, ecx, edx] = cpuid(&mut h, 0, 0);
-            assert_eq!(eax, 0xd);
-            // "AuthenticAMD" comes back in EBX, EDX, ECX order.
-            let mut vendor = Vec::new();
-            for register in [ebx, edx, ecx] {
-                vendor.extend_from_slice(&register.to_le_bytes());
-            }
-            assert_eq!(vendor, b"AuthenticAMD");
-        }
-
-        #[test]
-        fn leaf_1_signature_is_family_14h_model_0_stepping_1() {
-            let mut h = blank();
-            let [eax, ..] = cpuid(&mut h, 1, 0);
-            let stepping = eax & 0xf;
-            let model = (eax >> 4) & 0xf;
-            let base_family = (eax >> 8) & 0xf;
-            let extended_model = (eax >> 16) & 0xf;
-            let extended_family = (eax >> 20) & 0xff;
-            assert_eq!(
-                (
-                    stepping,
-                    model,
-                    base_family,
-                    extended_model,
-                    extended_family
-                ),
-                (1, 0, 0xf, 0, 5)
-            );
-            assert_eq!(eax, 0x0050_0f01);
-        }
-
-        #[test]
-        fn leaf_1_ebx_has_a_64_byte_clflush_line_one_logical_cpu_and_apic_id_0() {
-            let mut h = blank();
-            let [_, ebx, ..] = cpuid(&mut h, 1, 0);
-            assert_eq!((ebx >> 8) & 0xff, 8, "CLFLUSH line size in 8-byte units");
-            assert_eq!((ebx >> 16) & 0xff, 1, "logical processor count");
-            assert_eq!(ebx >> 24, 0, "initial APIC id");
-            assert_eq!(ebx & 0xff, 0, "brand index");
-        }
-
-        #[test]
-        fn leaf_1_edx_advertises_exactly_the_implemented_features() {
-            let mut h = blank();
-            let [_, _, _, edx] = cpuid(&mut h, 1, 0);
-            // FPU DE PSE TSC MSR PAE MCE CX8 APIC SEP MTRR PGE MCA CMOV PAT PSE-36 CLFSH MMX FXSR
-            // SSE SSE2
-            let expected = bits(&[
-                0, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 19, 23, 24, 25, 26,
-            ]);
-            assert_eq!(edx, expected, "{edx:#034b}");
-            assert_eq!(edx, 0x78bfbfd);
-        }
 
         #[test]
         fn leaf_1_advertises_mmx_and_the_register_forms_execute() {
@@ -2052,208 +1576,6 @@ mod sys_tests {
         }
 
         #[test]
-        fn leaf_1_edx_leaves_unimplemented_features_clear() {
-            let mut h = blank();
-            let [_, _, _, edx] = cpuid(&mut h, 1, 0);
-            let clear = [
-                (1, "VME"),
-                (18, "PSN"),
-                (21, "DS"),
-                (22, "ACPI"),
-                (27, "SS"),
-                (28, "HTT"),
-                (29, "TM"),
-                (31, "PBE"),
-            ];
-            for (bit, name) in clear {
-                assert_eq!(edx & (1 << bit), 0, "{name} must not be advertised");
-            }
-        }
-
-        #[test]
-        fn leaf_1_ecx_advertises_only_what_is_implemented() {
-            const SSE3: u32 = 1 << 0;
-            const PCLMULQDQ: u32 = 1 << 1;
-            const SSSE3: u32 = 1 << 9;
-            const CX16: u32 = 1 << 13;
-            const SSE4_1: u32 = 1 << 19;
-            const SSE4_2: u32 = 1 << 20;
-            const MOVBE: u32 = 1 << 22;
-            const POPCNT: u32 = 1 << 23;
-            const AES: u32 = 1 << 25;
-            const XSAVE: u32 = 1 << 26;
-            const OSXSAVE: u32 = 1 << 27;
-            const RDRAND: u32 = 1 << 30;
-            const MONITOR: u32 = 1 << 3;
-            const PCID: u32 = 1 << 17;
-            const FMA: u32 = 1 << 12;
-            const AVX: u32 = 1 << 28;
-            const F16C: u32 = 1 << 29;
-            const X2APIC: u32 = 1 << 21;
-            const TSC_DEADLINE: u32 = 1 << 24;
-            let mut h = blank();
-            let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
-            assert_eq!(
-                ecx,
-                SSE3 | PCLMULQDQ
-                    | SSSE3
-                    | CX16
-                    | SSE4_1
-                    | SSE4_2
-                    | MOVBE
-                    | POPCNT
-                    | AES
-                    | XSAVE
-                    | RDRAND
-                    | MONITOR
-                    | PCID
-                    | FMA
-                    | AVX
-                    | F16C
-                    | X2APIC
-                    | TSC_DEADLINE,
-                "no VMX, SMX or hypervisor bit, and OSXSAVE only follows CR4"
-            );
-            h.cpu.cr4 |= CR4_OSXSAVE;
-            let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
-            assert_ne!(ecx & OSXSAVE, 0);
-            h.cpu.cr4 &= !CR4_OSXSAVE;
-            let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
-            assert_eq!(ecx & OSXSAVE, 0);
-        }
-
-        #[test]
-        fn leaf_1_ignores_the_subleaf() {
-            let mut h = blank();
-            assert_eq!(cpuid(&mut h, 1, 0), cpuid(&mut h, 1, 7));
-        }
-
-        #[test]
-        fn leaf_7_subleaf_0_features() {
-            const FSGSBASE: u32 = 1 << 0;
-            const RDSEED: u32 = 1 << 18;
-            const ERMS: u32 = 1 << 9;
-            const BMI1: u32 = 1 << 3;
-            const BMI2: u32 = 1 << 8;
-            const SMEP: u32 = 1 << 7;
-            const AVX2: u32 = 1 << 5;
-            const INVPCID: u32 = 1 << 10;
-            const SMAP: u32 = 1 << 20;
-            const UMIP: u32 = 1 << 2;
-            // AVX-512 F, DQ, IFMA, CD, BW, VL
-            const AVX512: u32 = 1 << 16 | 1 << 17 | 1 << 21 | 1 << 28 | 1 << 30 | 1 << 31;
-            // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ
-            const ECX_EXTENSIONS: u32 =
-                1 << 1 | 1 << 6 | 1 << 8 | 1 << 9 | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 14;
-            let mut h = blank();
-            // EAX is the highest subleaf; EDX is the speculation-control set plus FSRM.
-            assert_eq!(
-                cpuid(&mut h, 7, 0),
-                [
-                    0,
-                    FSGSBASE | BMI1 | BMI2 | RDSEED | ERMS | SMEP | AVX2 | INVPCID | SMAP | AVX512,
-                    UMIP | ECX_EXTENSIONS,
-                    STRUCTURED_EDX
-                ]
-            );
-        }
-
-        #[test]
-        fn leaf_7_has_no_other_subleaves() {
-            let mut h = blank();
-            for subleaf in [1, 2, 5, 0x8000_0000] {
-                assert_eq!(cpuid(&mut h, 7, subleaf), [0, 0, 0, 0], "subleaf {subleaf}");
-            }
-        }
-
-        #[test]
-        fn other_standard_leaves_are_zero() {
-            let mut h = blank();
-            for leaf in [2, 3, 4, 6, 8, 0xa, 0xc, 0xe, 0xf, 0x10, 0x14, 0x15, 0x1f] {
-                assert_eq!(cpuid(&mut h, leaf, 0), [0, 0, 0, 0], "leaf {leaf:#x}");
-            }
-        }
-
-        #[test]
-        fn leaf_0xb_describes_one_logical_processor_with_x2apic_id_0() {
-            let mut h = blank();
-            // SMT level: 0 shift bits, 1 processor, level type 1; core level: type 2; then invalid.
-            assert_eq!(cpuid(&mut h, 0xb, 0), [0, 1, 0x100, 0]);
-            assert_eq!(cpuid(&mut h, 0xb, 1), [1, 1, 0x201, 0]);
-            assert_eq!(cpuid(&mut h, 0xb, 2), [0, 0, 2, 0]);
-        }
-
-        #[test]
-        fn leaf_5_describes_monitor_mwait() {
-            let mut h = blank();
-            assert_eq!(cpuid(&mut h, 5, 0), [64, 64, 0b11, 0]);
-        }
-
-        #[test]
-        fn leaf_0xd_describes_the_xsave_area() {
-            let mut h = blank();
-            // supported XCR0 bits (x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM), size for the
-            // enabled set, size for all supported
-            assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 576, 2688, 0]);
-            h.cpu.xcr0 = 7;
-            assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 832, 2688, 0]);
-            h.cpu.xcr0 = 0xe7;
-            assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 2688, 2688, 0]);
-            // xsaveopt, xsavec, xgetbv1, xsaves; EBX is the compacted size for the enabled set
-            assert_eq!(cpuid(&mut h, 0xd, 1), [0xf, 2432, 0, 0]);
-            h.cpu.xcr0 = 7;
-            assert_eq!(cpuid(&mut h, 0xd, 1), [0xf, 832, 0, 0]);
-            h.cpu.xcr0 = 0xe7;
-            // component 2 (AVX): 256 bytes at offset 576
-            assert_eq!(cpuid(&mut h, 0xd, 2), [256, 576, 0, 0]);
-            assert_eq!(cpuid(&mut h, 0xd, 3), [0, 0, 0, 0]);
-            assert_eq!(cpuid(&mut h, 0xd, 4), [0, 0, 0, 0]);
-            // opmask: 64 bytes at 1088; ZMM_Hi256: 512 at 1152; Hi16_ZMM: 1024 at 1664
-            assert_eq!(cpuid(&mut h, 0xd, 5), [64, 1088, 0, 0]);
-            assert_eq!(cpuid(&mut h, 0xd, 6), [512, 1152, 0, 0]);
-            assert_eq!(cpuid(&mut h, 0xd, 7), [1024, 1664, 0, 0]);
-            assert_eq!(cpuid(&mut h, 0xd, 8), [0, 0, 0, 0]);
-        }
-
-        #[test]
-        fn hypervisor_leaves_are_absent() {
-            let mut h = blank();
-            for leaf in [0x4000_0000, 0x4000_0001, 0x4000_0100] {
-                assert_eq!(cpuid(&mut h, leaf, 0), [0, 0, 0, 0], "leaf {leaf:#x}");
-            }
-        }
-
-        #[test]
-        fn extended_leaf_0_reports_the_max_extended_leaf_and_vendor() {
-            let mut h = blank();
-            let [eax, ebx, ecx, edx] = cpuid(&mut h, 0x8000_0000, 0);
-            assert_eq!(eax, 0x8000_000a);
-            assert_eq!(
-                [ebx, edx, ecx].map(u32::to_le_bytes).concat(),
-                b"AuthenticAMD"
-            );
-        }
-
-        #[test]
-        fn extended_leaf_1_matches_the_standard_signature() {
-            let mut h = blank();
-            let [eax, ebx, ..] = cpuid(&mut h, 0x8000_0001, 0);
-            assert_eq!(eax, cpuid(&mut h, 1, 0)[0]);
-            assert_eq!(ebx, 0);
-        }
-
-        #[test]
-        fn extended_leaf_1_ecx_has_lahf_in_long_mode_svm_and_abm() {
-            const LAHF_LM: u32 = 1 << 0;
-            const SVM: u32 = 1 << 2;
-            const ABM: u32 = 1 << 5;
-            const PREFETCHW: u32 = 1 << 8;
-            let mut h = blank();
-            let [_, _, ecx, _] = cpuid(&mut h, 0x8000_0001, 0);
-            assert_eq!(ecx, LAHF_LM | SVM | ABM | PREFETCHW);
-        }
-
-        #[test]
         fn prefetchw_is_a_hint_that_never_faults() {
             // prefetchw [rax]; prefetch [rax]; hlt, with rax pointing at nothing
             let mut h = Harness::new(&[0x0f, 0x0d, 0x08, 0x0f, 0x0d, 0x00, 0xf4]);
@@ -2262,121 +1584,10 @@ mod sys_tests {
         }
 
         #[test]
-        fn leaf_0x8000000a_describes_svm() {
-            let mut h = blank();
-            let [revision, asids, ecx, features] = cpuid(&mut h, 0x8000_000a, 0);
-            assert_eq!((revision, asids, ecx), (1, 64, 0));
-            // nested paging, next-RIP save, VMCB clean bits, flush by ASID
-            assert_eq!(features, (1 << 0) | (1 << 3) | (1 << 5) | (1 << 6));
-        }
-
-        #[test]
-        fn extended_leaf_1_edx_has_syscall_nx_long_mode_and_the_amd_aliases() {
-            let mut h = blank();
-            let [_, _, _, edx] = cpuid(&mut h, 0x8000_0001, 0);
-            // SYSCALL NX RDTSCP LM, then the aliased FPU TSC MSR PAE CX8 PGE CMOV PAT MMX FXSR
-            let expected = bits(&[11, 20, 27, 29, 0, 4, 5, 6, 8, 13, 15, 16, 23, 24]);
-            assert_eq!(edx, expected, "{edx:#034b}");
-            assert_eq!(edx, 0x2991_a971);
-        }
-
-        #[test]
-        fn extended_leaf_1_edx_has_no_mmxext_page1gb_or_3dnow() {
-            let mut h = blank();
-            let [_, _, _, edx] = cpuid(&mut h, 0x8000_0001, 0);
-            for (bit, name) in [
-                (22, "MMXEXT"),
-                (26, "PDPE1GB"),
-                (30, "3DNOWEXT"),
-                (31, "3DNOW"),
-            ] {
-                assert_eq!(edx & (1 << bit), 0, "{name}");
-            }
-        }
-
-        #[test]
-        fn brand_string_spans_three_leaves() {
-            let mut h = blank();
-            let mut brand = Vec::new();
-            for leaf in 0x8000_0002..=0x8000_0004 {
-                for register in cpuid(&mut h, leaf, 0) {
-                    brand.extend_from_slice(&register.to_le_bytes());
-                }
-            }
-            assert_eq!(brand.len(), 48);
-            assert!(brand.starts_with(b"uemulator virtual x86-64 cpu"));
-            assert!(
-                brand[28..].iter().all(|&byte| byte == 0),
-                "the rest is NUL padding"
-            );
-        }
-
-        #[test]
-        fn l1_cache_leaf_describes_32k_8way_data_and_64k_2way_instruction_with_64_byte_lines() {
-            let mut h = blank();
-            let [_, _, l1d, l1i] = cpuid(&mut h, 0x8000_0005, 0);
-            assert_eq!(l1d >> 24, 32, "L1D KiB");
-            assert_eq!((l1d >> 16) & 0xff, 8, "L1D ways");
-            assert_eq!(l1d & 0xff, 64, "L1D line size");
-            assert_eq!(l1i >> 24, 64, "L1I KiB");
-            assert_eq!((l1i >> 16) & 0xff, 2, "L1I ways");
-            assert_eq!(l1i & 0xff, 64, "L1I line size");
-        }
-
-        #[test]
-        fn l2_cache_leaf_reports_512k_with_64_byte_lines_and_no_l3() {
-            let mut h = blank();
-            let [_, _, l2, l3] = cpuid(&mut h, 0x8000_0006, 0);
-            assert_eq!(l2 >> 16, 512, "L2 KiB");
-            assert_eq!(l2 & 0xff, 64, "L2 line size");
-            assert_eq!(l3, 0, "no L3");
-        }
-
-        #[test]
-        fn advanced_power_leaf_marks_the_tsc_invariant_and_nothing_else() {
-            let mut h = blank();
-            assert_eq!(cpuid(&mut h, 0x8000_0007, 0), [0, 0, 0, 1 << 8]);
-        }
-
-        #[test]
-        fn address_size_leaf_reports_40_physical_and_48_virtual_bits() {
-            let mut h = blank();
-            let [eax, ebx, ecx, edx] = cpuid(&mut h, 0x8000_0008, 0);
-            assert_eq!(eax & 0xff, 40);
-            assert_eq!((eax >> 8) & 0xff, 48);
-            assert_eq!(eax >> 16, 0);
-            assert_eq!((ebx, ecx, edx), (EXT_ADDRESS_EBX, 0, 0));
-        }
-
-        #[test]
-        fn leaves_past_the_last_extended_leaf_are_zero() {
-            let mut h = blank();
-            for leaf in [
-                0x8000_0009,
-                0x8000_000b,
-                0x8000_001a,
-                0x8000_001d,
-                0x8000_001e,
-                0x8000_001f,
-                0x8000_0020,
-                0xffff_ffff,
-            ] {
-                assert_eq!(cpuid(&mut h, leaf, 0), [0, 0, 0, 0], "leaf {leaf:#x}");
-            }
-        }
-
-        #[test]
-        fn the_leaf_is_taken_from_eax_only() {
-            let mut h = blank();
-            // cpuid() puts garbage in the upper half of rax; leaf 0 still answers.
-            assert_eq!(cpuid(&mut h, 0, 0)[0], 0xd);
-        }
-
-        #[test]
         fn cpuid_instruction_fills_eax_ebx_ecx_edx() {
             // cpuid; hlt
             let h = run_ok(&[0x0f, 0xa2, 0xf4], |h| h.cpu.gpr[RAX] = 0);
-            assert_eq!(h.cpu.gpr[RAX], 0xd);
+            assert_eq!(h.cpu.gpr[RAX], 0x10);
             assert_eq!(h.cpu.gpr[RBX], u32::from_le_bytes(*b"Auth") as u64);
             assert_eq!(h.cpu.gpr[RDX], u32::from_le_bytes(*b"enti") as u64);
             assert_eq!(h.cpu.gpr[RCX], u32::from_le_bytes(*b"cAMD") as u64);
@@ -2399,12 +1610,12 @@ mod sys_tests {
                 "hlt at CPL 3 is the only fault"
             );
             assert_eq!(h.cpu.rip, CODE_BASE + 2);
-            assert_eq!(h.cpu.gpr[RAX], 0x0050_0f01);
+            assert_eq!(h.cpu.gpr[RAX], 0x00a1_0f11);
         }
 
         #[test]
         fn jit_and_interpreter_agree_on_cpuid() {
-            for leaf in [0u64, 1, 7, 0x8000_0001] {
+            for leaf in [0u64, 1, 7, 0xb, 0xd, 0x8000_0001, 0x8000_001d, 0x8000_001e] {
                 // cpuid; hlt
                 crate::testkit::assert_jit_matches_interpreter(&[0x0f, 0xa2, 0xf4], |h| {
                     h.cpu.gpr[RAX] = leaf
@@ -2787,17 +1998,25 @@ mod sys_tests {
         fn speculation_control_cpuid_bits_match_the_msrs() {
             let mut h = blank();
             let [_, _, _, edx] = cpuid(&mut h, 7, 0);
-            assert_eq!(edx, STRUCTURED_EDX);
+            // FSRM, SPEC_CTRL, STIBP, L1D_FLUSH, ARCH_CAPABILITIES, SSBD
+            assert_eq!(edx, bits(&[4, 26, 27, 28, 29, 31]));
             let [_, ebx, _, _] = cpuid(&mut h, 0x8000_0008, 0);
-            assert_eq!(ebx, EXT_ADDRESS_EBX);
+            // IBPB, IBRS, STIBP and SSBD in the AMD spelling
+            for bit in [12, 14, 15, 24] {
+                assert_ne!(ebx & (1 << bit), 0, "bit {bit}");
+            }
         }
 
+        /// Linux's `VULNBL_AMD` names families 0x15-0x17 for RETBLEED (a return thunk on every
+        /// `ret`) and 0x19 for SRSO; the model has family 0x19, so it must also say SRSO_NO.
         #[test]
-        fn cpu_family_is_not_one_linux_blacklists_for_retbleed() {
+        fn zen_4_says_it_has_neither_retbleed_nor_srso() {
             let mut h = blank();
             let [eax, _, _, _] = cpuid(&mut h, 1, 0);
             let family = ((eax >> 8) & 0xf) + ((eax >> 20) & 0xff);
-            assert_eq!(family, 0x14);
+            assert_eq!(family, 0x19);
+            let [srso_no, ..] = cpuid(&mut h, 0x8000_0021, 0);
+            assert_ne!(srso_no & (1 << 29), 0);
         }
 
         #[test]
