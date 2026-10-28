@@ -633,7 +633,7 @@ impl Cpu {
             }
             (OPCODE_MAP_0F38, 0x13, P66) if !wide => self.convert_half_to_single(i, next)?,
             (OPCODE_MAP_0F3A, 0x1d, P66) if !wide => self.convert_single_to_half(i, next)?,
-            _ => return self.exec_evex_convert(i, next, map, opcode, prefix, wide),
+            _ => return self.exec_evex_bfloat16(i, next, map, opcode, prefix, wide),
         }
         Ok(true)
     }
@@ -940,5 +940,7 @@ impl Cpu {
     }
 }
 
+#[path = "avx512_bf16.rs"]
+mod bf16;
 #[path = "avx512_convert.rs"]
 mod convert;

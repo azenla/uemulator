@@ -249,3 +249,133 @@ pub(super) fn gf_affine(data: u128, matrix: u128, immediate: u8, inverse: bool) 
         gf_affine_byte(quadword, x, immediate)
     }))
 }
+
+/// Dword `index` of a vector counted from the top: the SHA instructions name their operands
+/// `SRC[127:96]` first, so index 0 is bits 127:96 and index 3 is bits 31:0.
+fn dword_from_top(vector: u128, index: usize) -> u32 {
+    (vector >> (96 - 32 * index)) as u32
+}
+
+fn vector_from_dwords(dwords: [u32; 4]) -> u128 {
+    dwords
+        .into_iter()
+        .fold(0, |vector, dword| vector << 32 | dword as u128)
+}
+
+/// The boolean function and round constant of SHA-1 rounds 0-19, 20-39, 40-59 and 60-79, which
+/// sha1rnds4's imm8[1:0] selects (FIPS 180-4 section 4.1.1; groups 1 and 3 share the parity
+/// function).
+fn sha1_round_function(group: u8, b: u32, c: u32, d: u32) -> (u32, u32) {
+    match group & 3 {
+        0 => ((b & c) | (!b & d), 0x5a82_7999),
+        1 => (b ^ c ^ d, 0x6ed9_eba1),
+        2 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
+        _ => (b ^ c ^ d, 0xca62_c1d6),
+    }
+}
+
+/// sha1rnds4: four SHA-1 rounds. `state` holds A, B, C, D from the top. E is not an operand: software
+/// folds it into the first schedule dword with sha1nexte, so round 0 runs with E = 0.
+pub(super) fn sha1_four_rounds(state: u128, schedule: u128, group: u8) -> u128 {
+    let [mut a, mut b, mut c, mut d] = core::array::from_fn(|k| dword_from_top(state, k));
+    let mut e = 0u32;
+    for round in 0..4 {
+        let (function, constant) = sha1_round_function(group, b, c, d);
+        let next = function
+            .wrapping_add(a.rotate_left(5))
+            .wrapping_add(dword_from_top(schedule, round))
+            .wrapping_add(e)
+            .wrapping_add(constant);
+        e = d;
+        d = c;
+        c = b.rotate_left(30);
+        b = a;
+        a = next;
+    }
+    vector_from_dwords([a, b, c, d])
+}
+
+/// sha1nexte: the E for the next four rounds is A of the previous group rotated by 30, added to the
+/// top schedule dword; the other three pass through.
+pub(super) fn sha1_next_e(state: u128, schedule: u128) -> u128 {
+    let top = dword_from_top(schedule, 0).wrapping_add(dword_from_top(state, 0).rotate_left(30));
+    (top as u128) << 96 | schedule & (u128::MAX >> 32)
+}
+
+/// sha1msg1: `W[t-16] ^ W[t-14]` for four words, the first half of the message expansion.
+pub(super) fn sha1_message_1(older: u128, newer: u128) -> u128 {
+    let w = |k| dword_from_top(older, k);
+    vector_from_dwords([
+        w(2) ^ w(0),
+        w(3) ^ w(1),
+        dword_from_top(newer, 0) ^ w(2),
+        dword_from_top(newer, 1) ^ w(3),
+    ])
+}
+
+/// sha1msg2: `rol1(partial ^ W[t-3])`. The last word needs the first one computed on the way, so
+/// the words are not independent.
+pub(super) fn sha1_message_2(partial: u128, latest: u128) -> u128 {
+    let w16 = (dword_from_top(partial, 0) ^ dword_from_top(latest, 1)).rotate_left(1);
+    let w17 = (dword_from_top(partial, 1) ^ dword_from_top(latest, 2)).rotate_left(1);
+    let w18 = (dword_from_top(partial, 2) ^ dword_from_top(latest, 3)).rotate_left(1);
+    let w19 = (dword_from_top(partial, 3) ^ w16).rotate_left(1);
+    vector_from_dwords([w16, w17, w18, w19])
+}
+
+/// sha256rnds2: two SHA-256 rounds. `cdgh` is the destination (C, D, G, H from the top), `abef`
+/// the source (A, B, E, F) and `schedule` the two message-plus-constant dwords in the low half of
+/// xmm0. The result is the new A, B, E, F; C, D, G, H are what software swaps in for the next two
+/// rounds.
+pub(super) fn sha256_two_rounds(cdgh: u128, abef: u128, schedule: u128) -> u128 {
+    let [mut a, mut b, mut e, mut f] = core::array::from_fn(|k| dword_from_top(abef, k));
+    let [mut c, mut d, mut g, mut h] = core::array::from_fn(|k| dword_from_top(cdgh, k));
+    for round in 0..2 {
+        let schedule_word = (schedule >> (32 * round)) as u32;
+        let choose = (e & f) ^ (!e & g);
+        let majority = (a & b) ^ (a & c) ^ (b & c);
+        let sigma1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let sigma0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let temporary = choose
+            .wrapping_add(sigma1)
+            .wrapping_add(schedule_word)
+            .wrapping_add(h);
+        let next_a = temporary.wrapping_add(majority).wrapping_add(sigma0);
+        let next_e = temporary.wrapping_add(d);
+        (h, g, f, e) = (g, f, e, next_e);
+        (d, c, b, a) = (c, b, a, next_a);
+    }
+    vector_from_dwords([a, b, e, f])
+}
+
+fn sha256_small_sigma0(word: u32) -> u32 {
+    word.rotate_right(7) ^ word.rotate_right(18) ^ (word >> 3)
+}
+
+fn sha256_small_sigma1(word: u32) -> u32 {
+    word.rotate_right(17) ^ word.rotate_right(19) ^ (word >> 10)
+}
+
+/// sha256msg1: `W[t-16] + sigma0(W[t-15])` for four words. The first word of `newer` supplies the
+/// one sigma0 input past the end of `older`.
+pub(super) fn sha256_message_1(older: u128, newer: u128) -> u128 {
+    let w = |k| dword_from_top(older, k);
+    vector_from_dwords([
+        w(0).wrapping_add(sha256_small_sigma0(dword_from_top(newer, 3))),
+        w(1).wrapping_add(sha256_small_sigma0(w(0))),
+        w(2).wrapping_add(sha256_small_sigma0(w(1))),
+        w(3).wrapping_add(sha256_small_sigma0(w(2))),
+    ])
+}
+
+/// sha256msg2: adds `sigma1(W[t-2])` to the partial sums. Words 18 and 19 use words 16 and 17
+/// computed on the way, so the words are not independent.
+pub(super) fn sha256_message_2(partial: u128, latest: u128) -> u128 {
+    let w16 =
+        dword_from_top(partial, 3).wrapping_add(sha256_small_sigma1(dword_from_top(latest, 1)));
+    let w17 =
+        dword_from_top(partial, 2).wrapping_add(sha256_small_sigma1(dword_from_top(latest, 0)));
+    let w18 = dword_from_top(partial, 1).wrapping_add(sha256_small_sigma1(w16));
+    let w19 = dword_from_top(partial, 0).wrapping_add(sha256_small_sigma1(w17));
+    vector_from_dwords([w19, w18, w17, w16])
+}

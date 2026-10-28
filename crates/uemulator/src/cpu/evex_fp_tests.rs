@@ -3,6 +3,8 @@
 
 use super::*;
 
+#[path = "evex_bf16_tests.rs"]
+mod bfloat16;
 #[path = "evex_conv_tests.rs"]
 mod conversions;
 

@@ -137,7 +137,7 @@ impl Cpu {
 
     /// Packed conversion of `count` elements from `source_bytes`-wide to `destination_bytes`-wide
     /// elements, where `count` is the vector length over the wider of the two.
-    fn convert_packed(
+    pub(super) fn convert_packed(
         &mut self,
         i: &Insn,
         next: u64,

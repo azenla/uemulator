@@ -352,3 +352,9 @@ for n, asm in [("VEX_VAESENC_Y", "vaesenc ymm0, ymm1, ymm2"), ("VEX_VAESDECLAST_
 single("VPBROADCASTMB2Q_Z", "vpbroadcastmb2q zmm0, k1")
 single("VPBROADCASTMW2D_Y", "vpbroadcastmw2d ymm0, k1")
 single("VPBROADCASTMW2D_HIGH", "vpbroadcastmw2d zmm20, k1")
+
+# AVX512_BF16
+form("VCVTNE2PS2BF16", "vcvtne2ps2bf16", "bin", 32)
+form("VDPBF16PS", "vdpbf16ps", "bin", 32)
+form("VCVTNEPS2BF16", "vcvtneps2bf16", "cvtnarrow2", 32)
+single("VCVTNEPS2BF16_BROADCAST", "vcvtneps2bf16 ymm0, dword ptr [rsi]{1to16}")
