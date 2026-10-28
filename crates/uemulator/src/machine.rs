@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use crate::boot::{self, BootState};
 use crate::console::ConsoleHandle;
 use crate::cpu::Cpu;
-use crate::dev::DevConfig;
+use crate::dev::{DevConfig, MAX_VIRTIO_FUNCTIONS};
 #[cfg(not(freestanding))]
 use crate::disk::Disk;
 use crate::netdev::NetHandle;
@@ -85,12 +85,13 @@ pub enum ExitReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConsoleKind {
-    /// 16550 UART at COM1 (`ttyS0`).
+    /// 16550 UART at COM1 (`ttyS0`). There is one UART, so this may be configured once.
     Serial,
     /// virtio-console (`hvc0`); the only kind that delivers `ConsoleHandle::resize` to the guest.
-    /// The default. The UART is present either way and carries early boot text (`earlyprintk`),
-    /// but this needs a kernel whose `virtio_console` driver is built in (an initrd that only
-    /// loads it as a module has no console until then); pick `Serial` for such kernels.
+    /// The default, and it may be configured several times (`hvc0`, `hvc1`, ...). The UART is
+    /// present either way and carries early boot text (`earlyprintk`), but this needs a kernel
+    /// whose `virtio_console` driver is built in (an initrd that only loads it as a module has
+    /// no console until then); pick `Serial` for such kernels.
     #[default]
     Virtio,
 }
@@ -116,9 +117,9 @@ pub struct MachineConfig {
     cmdline_extra: Vec<String>,
     memory_mib: usize,
     #[cfg(not(freestanding))]
-    disk: Option<Disk>,
-    net_mac: Option<[u8; 6]>,
-    console_kind: ConsoleKind,
+    disks: Vec<Disk>,
+    net_macs: Vec<[u8; 6]>,
+    consoles: Vec<ConsoleKind>,
     jit: JitMode,
     clock: ClockMode,
     log: Option<LogFn>,
@@ -140,9 +141,9 @@ impl Default for MachineConfig {
             cmdline_extra: Vec::new(),
             memory_mib: DEFAULT_MEMORY_MIB,
             #[cfg(not(freestanding))]
-            disk: None,
-            net_mac: None,
-            console_kind: ConsoleKind::Virtio,
+            disks: Vec::new(),
+            net_macs: Vec::new(),
+            consoles: Vec::new(),
             jit: JitMode::Auto,
             clock: ClockMode::Virtual,
             log: None,
@@ -190,20 +191,28 @@ impl MachineConfig {
         self
     }
 
+    /// Adds a virtio-blk disk. Call it again for more: the guest sees them in call order
+    /// (`vda`, `vdb`, ...).
     #[cfg(not(freestanding))]
     pub fn disk(mut self, disk: Disk) -> Self {
-        self.disk = Some(disk);
+        self.disks.push(disk);
         self
     }
 
-    /// Adds a virtio-net device with this MAC; frames flow through `EmulatedMachine::net()`.
+    /// Adds a virtio-net device with this MAC; frames flow through `EmulatedMachine::nets()`
+    /// (`net()` for the first). Call it again for more NICs, each with its own MAC: the n-th
+    /// call is the n-th handle.
     pub fn net(mut self, mac: [u8; 6]) -> Self {
-        self.net_mac = Some(mac);
+        self.net_macs.push(mac);
         self
     }
 
+    /// Adds a guest console. The first one configured is the guest's primary console (the
+    /// default command line's `console=`). `Serial` may be added once, `Virtio` as often as
+    /// wanted; with none added the machine gets one virtio console. Each console has its own
+    /// `ConsoleHandle`, in call order (`EmulatedMachine::consoles()`).
     pub fn console(mut self, kind: ConsoleKind) -> Self {
-        self.console_kind = kind;
+        self.consoles.push(kind);
         self
     }
 
@@ -308,7 +317,11 @@ impl StopHandle {
 struct Vcpu {
     ram: Vec<u8>,
     boot: BootState,
-    console: ConsoleHandle,
+    /// What the host poll hook receives: the first configured console.
+    primary_console: ConsoleHandle,
+    /// The console behind the 16550: the `Serial` console if one is configured, else (so early
+    /// boot text reaches the host) the first console, shared with its virtio device.
+    uart_console: ConsoleHandle,
     stop: Arc<AtomicBool>,
     log: Option<LogFn>,
     poll: Option<HostPollFn>,
@@ -334,8 +347,8 @@ struct RebootImage {
     cmdline: String,
     /// The embedder's handle shares its queues with the device, so the new device must be built
     /// around this very handle.
-    net: Option<([u8; 6], NetHandle)>,
-    virtio_console: bool,
+    nets: Vec<([u8; 6], NetHandle)>,
+    virtio_consoles: Vec<ConsoleHandle>,
 }
 
 /// Wall-clock seconds, or 0 where there is no clock (UEFI keeps its own, see `unix_time`).
@@ -385,21 +398,41 @@ impl crate::disk::BlockBackend for ShadowDisk {
 /// in the same PCI slots. The twin cannot share the real backends (a disk or a host frame
 /// queue has one owner), so their data is not mirrored: the first guest read of disk contents
 /// is a legitimate divergence of this check, as is host console input.
-fn mirrored_devices(main: &DevConfig) -> DevConfig {
-    DevConfig {
+///
+/// Returns the twin's UART console too: consoles that share a handle with the UART on `main`
+/// share one on the twin as well, because that sharing decides whether the UART takes host input.
+fn mirrored_devices(main: &DevConfig, main_uart: &ConsoleHandle) -> (DevConfig, ConsoleHandle) {
+    let twin_uart = ConsoleHandle::default();
+    let devices = DevConfig {
         #[cfg(not(freestanding))]
-        disk: main.disk.as_ref().map(|disk| {
-            Disk::from_backend(ShadowDisk {
-                len: disk.backend.len(),
-                read_only: disk.backend.read_only(),
+        disks: main
+            .disks
+            .iter()
+            .map(|disk| {
+                Disk::from_backend(ShadowDisk {
+                    len: disk.backend.len(),
+                    read_only: disk.backend.read_only(),
+                })
             })
-        }),
-        net: main
-            .net
-            .as_ref()
-            .map(|(mac, _)| (*mac, NetHandle::default())),
-        virtio_console: main.virtio_console,
-    }
+            .collect(),
+        nets: main
+            .nets
+            .iter()
+            .map(|(mac, _)| (*mac, NetHandle::default()))
+            .collect(),
+        virtio_consoles: main
+            .virtio_consoles
+            .iter()
+            .map(|console| {
+                if console.is_same_console(main_uart) {
+                    twin_uart.clone()
+                } else {
+                    ConsoleHandle::default()
+                }
+            })
+            .collect(),
+    };
+    (devices, twin_uart)
 }
 
 /// The interpreter-only oracle for `Cpu::run_verify`. Anything a guest can observe must be
@@ -413,8 +446,9 @@ fn interpreter_twin(
     stop: Arc<AtomicBool>,
     boot_unix: u64,
     devices: DevConfig,
+    uart_console: ConsoleHandle,
 ) -> Cpu {
-    let mut twin = Cpu::new(ram, boot, ConsoleHandle::default(), stop, None, devices);
+    let mut twin = Cpu::new(ram, boot, uart_console, stop, None, devices);
     twin.dev.set_boot_time(boot_unix);
     twin.realtime = false;
     twin
@@ -424,7 +458,7 @@ fn interpreter_twin(
 struct Finished {
     ram_bytes: usize,
     #[cfg(not(freestanding))]
-    disk: Option<Disk>,
+    disks: Vec<Disk>,
 }
 
 impl Vcpu {
@@ -453,9 +487,9 @@ impl Vcpu {
             self.ram = ram;
             self.devcfg = DevConfig {
                 #[cfg(not(freestanding))]
-                disk: finished.disk,
-                net: image.net.clone(),
-                virtio_console: image.virtio_console,
+                disks: finished.disks,
+                nets: image.nets.clone(),
+                virtio_consoles: image.virtio_consoles.clone(),
             };
         }
     }
@@ -465,12 +499,14 @@ impl Vcpu {
     /// would never see stores to the new CPU's empty `page_has_code` map and could run
     /// translations of the previous run's RAM.
     fn run_once(&mut self) -> (ExitReason, Finished) {
-        let console = self.console.clone();
+        let console = self.primary_console.clone();
         // Under verify both CPUs must start from one boot time even when the caller gave none;
         // two separate wall-clock reads could straddle a second boundary.
         let verify_twin = self.verify.then(|| {
+            let (devices, uart_console) = mirrored_devices(&self.devcfg, &self.uart_console);
             (
-                mirrored_devices(&self.devcfg),
+                devices,
+                uart_console,
                 self.unix_time.unwrap_or_else(host_unix_time),
             )
         });
@@ -479,14 +515,14 @@ impl Vcpu {
         let mut cpu = Cpu::new(
             ram,
             self.boot,
-            self.console.clone(),
+            self.uart_console.clone(),
             self.stop.clone(),
             self.log.clone(),
             core::mem::take(&mut self.devcfg),
         );
         let boot_unix = verify_twin
             .as_ref()
-            .map(|(_, boot_unix)| *boot_unix)
+            .map(|(_, _, boot_unix)| *boot_unix)
             .or(self.unix_time);
         if let Some(boot_unix) = boot_unix {
             cpu.dev.set_boot_time(boot_unix);
@@ -514,13 +550,14 @@ impl Vcpu {
         // Lockstep needs generated code to compare; without any (`JitMode::Off`, a host without
         // a backend) `step_block` has nothing to run, so just interpret.
         let reason = match verify_twin {
-            Some((devices, boot_unix)) if lockstep => {
+            Some((devices, uart_console, boot_unix)) if lockstep => {
                 let mut twin = interpreter_twin(
                     self.boot_ram.take().unwrap(),
                     self.boot,
                     cpu.stop.clone(),
                     boot_unix,
                     devices,
+                    uart_console,
                 );
                 twin.rng_state = cpu.rng_state;
                 cpu.run_verify(&mut twin)
@@ -536,7 +573,7 @@ impl Vcpu {
         let finished = Finished {
             ram_bytes,
             #[cfg(not(freestanding))]
-            disk: cpu.dev.into_disk(),
+            disks: cpu.dev.into_disks(),
         };
         (reason, finished)
     }
@@ -549,9 +586,10 @@ pub struct EmulatedMachine {
     thread: Option<JoinHandle<ExitReason>>,
     #[cfg(freestanding)]
     started: bool,
-    console: ConsoleHandle,
-    /// Same queues as the virtio-net device in `Vcpu::devcfg`.
-    net: Option<NetHandle>,
+    /// One per configured console, in configuration order.
+    consoles: Vec<ConsoleHandle>,
+    /// Same queues as the virtio-net devices in `Vcpu::devcfg`, in configuration order.
+    nets: Vec<NetHandle>,
     stop: Arc<AtomicBool>,
 }
 
@@ -568,8 +606,39 @@ impl EmulatedMachine {
             return Err(Error::JitUnavailable);
         }
         let mut ram = vec![0u8; cfg.memory_mib << BYTES_PER_MIB_SHIFT];
+        let kinds = if cfg.consoles.is_empty() {
+            vec![ConsoleKind::Virtio]
+        } else {
+            cfg.consoles.clone()
+        };
+        if kinds
+            .iter()
+            .filter(|kind| **kind == ConsoleKind::Serial)
+            .count()
+            > 1
+        {
+            return Err(Error::BadConfig(
+                "there is one UART: ConsoleKind::Serial can be configured only once".into(),
+            ));
+        }
+        #[cfg(not(freestanding))]
+        let disk_count = cfg.disks.len();
+        #[cfg(freestanding)]
+        let disk_count = 0;
+        let virtio_console_count = kinds
+            .iter()
+            .filter(|kind| **kind == ConsoleKind::Virtio)
+            .count();
+        let functions = virtio_console_count + disk_count + cfg.net_macs.len();
+        if functions > MAX_VIRTIO_FUNCTIONS {
+            return Err(Error::BadConfig(format!(
+                "{functions} virtio devices configured (consoles, disks and NICs); \
+                 the PCI bus has room for {MAX_VIRTIO_FUNCTIONS}"
+            )));
+        }
         let mut cmdline = cfg.cmdline.clone().unwrap_or_else(|| {
-            let default = if cfg.console_kind == ConsoleKind::Virtio {
+            // The first console is the guest's primary one.
+            let default = if kinds[0] == ConsoleKind::Virtio {
                 DEFAULT_CMDLINE
             } else {
                 DEFAULT_SERIAL_CMDLINE
@@ -584,14 +653,28 @@ impl EmulatedMachine {
             Some(image) => boot::load_firmware(&mut ram, image)?,
             None => boot::load(&mut ram, &cfg.kernel, cfg.initrd.as_deref(), &cmdline)?,
         };
-        let net = cfg.net_mac.map(|mac| (mac, NetHandle::default()));
-        let net_handle = net.as_ref().map(|(_, handle)| handle.clone());
-        let virtio_console = cfg.console_kind == ConsoleKind::Virtio;
+        let nets: Vec<([u8; 6], NetHandle)> = cfg
+            .net_macs
+            .iter()
+            .map(|mac| (*mac, NetHandle::default()))
+            .collect();
+        let net_handles = nets.iter().map(|(_, handle)| handle.clone()).collect();
+        let consoles: Vec<ConsoleHandle> = kinds.iter().map(|_| ConsoleHandle::default()).collect();
+        let uart_console = kinds
+            .iter()
+            .position(|kind| *kind == ConsoleKind::Serial)
+            .map_or_else(|| consoles[0].clone(), |index| consoles[index].clone());
+        let virtio_consoles = kinds
+            .iter()
+            .zip(&consoles)
+            .filter(|(kind, _)| **kind == ConsoleKind::Virtio)
+            .map(|(_, handle)| handle.clone())
+            .collect();
         let devcfg = DevConfig {
             #[cfg(not(freestanding))]
-            disk: cfg.disk,
-            net,
-            virtio_console,
+            disks: cfg.disks,
+            nets,
+            virtio_consoles,
         };
         let boot_ram = cfg.verify.then(|| ram.clone());
         // Verification cannot restart (the twin's devices cannot be rebuilt in step), so it keeps
@@ -600,16 +683,16 @@ impl EmulatedMachine {
             kernel: cfg.kernel,
             initrd: cfg.initrd,
             cmdline,
-            net: devcfg.net.clone(),
-            virtio_console,
+            nets: devcfg.nets.clone(),
+            virtio_consoles: devcfg.virtio_consoles.clone(),
         });
-        let console = ConsoleHandle::default();
         let stop = Arc::new(AtomicBool::new(false));
         Ok(Self {
             vcpu: Some(Vcpu {
                 ram,
                 boot,
-                console: console.clone(),
+                primary_console: consoles[0].clone(),
+                uart_console,
                 stop: stop.clone(),
                 log: cfg.log,
                 poll: cfg.poll,
@@ -627,18 +710,32 @@ impl EmulatedMachine {
             thread: None,
             #[cfg(freestanding)]
             started: false,
-            console,
-            net: net_handle,
+            consoles,
+            nets: net_handles,
             stop,
         })
     }
 
+    /// The first configured console (the only one unless `MachineConfig::console` was called
+    /// more than once).
     pub fn console(&self) -> ConsoleHandle {
-        self.console.clone()
+        self.consoles[0].clone()
     }
 
+    /// Every console, in `MachineConfig::console` order (one virtio console if none was added).
+    /// Each has its own queues and size.
+    pub fn consoles(&self) -> Vec<ConsoleHandle> {
+        self.consoles.clone()
+    }
+
+    /// The first NIC's frame channel, `None` without one.
     pub fn net(&self) -> Option<NetHandle> {
-        self.net.clone()
+        self.nets.first().cloned()
+    }
+
+    /// Every NIC's frame channel, in `MachineConfig::net` order.
+    pub fn nets(&self) -> Vec<NetHandle> {
+        self.nets.clone()
     }
 
     pub fn stop_handle(&self) -> StopHandle {

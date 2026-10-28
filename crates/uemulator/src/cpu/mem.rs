@@ -2572,7 +2572,7 @@ mod tests {
             let mut h = Harness::with_devices(
                 &[HLT],
                 DevConfig {
-                    virtio_console: true,
+                    virtio_consoles: vec![crate::console::ConsoleHandle::default()],
                     ..Default::default()
                 },
             );
@@ -2591,7 +2591,7 @@ mod tests {
             let mut h = Harness::with_devices(
                 &[HLT],
                 DevConfig {
-                    virtio_console: true,
+                    virtio_consoles: vec![crate::console::ConsoleHandle::default()],
                     ..Default::default()
                 },
             );
@@ -2605,7 +2605,7 @@ mod tests {
             let mut h = Harness::with_devices(
                 &[HLT],
                 DevConfig {
-                    virtio_console: true,
+                    virtio_consoles: vec![crate::console::ConsoleHandle::default()],
                     ..Default::default()
                 },
             );

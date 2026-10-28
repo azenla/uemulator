@@ -195,7 +195,14 @@ mod rtc {
         let boot = boot::load(&mut ram, &fake_bzimage(&[0xf4]), None, "").unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         match boot_unix {
-            Some(boot_unix) => interpreter_twin(ram, boot, stop, boot_unix, DevConfig::default()),
+            Some(boot_unix) => interpreter_twin(
+                ram,
+                boot,
+                stop,
+                boot_unix,
+                DevConfig::default(),
+                ConsoleHandle::default(),
+            ),
             // What `Vcpu::run` built before the fix.
             None => Cpu::new(
                 ram,
@@ -239,7 +246,14 @@ mod rtc {
         let mut ram = vec![0u8; 64 * MIB];
         let boot = boot::load(&mut ram, &fake_bzimage(&[0xf4]), None, "").unwrap();
         let stop = Arc::new(AtomicBool::new(false));
-        let twin = interpreter_twin(ram, boot, stop.clone(), 1, DevConfig::default());
+        let twin = interpreter_twin(
+            ram,
+            boot,
+            stop.clone(),
+            1,
+            DevConfig::default(),
+            ConsoleHandle::default(),
+        );
         assert!(twin.jit.is_none());
         assert!(!twin.realtime);
         assert!(twin.poll.is_none());
@@ -278,11 +292,15 @@ mod twin_devices {
         config_dword(devices, slot, 0)
     }
 
+    fn mirrored(main: &DevConfig) -> DevConfig {
+        mirrored_devices(main, &ConsoleHandle::default()).0
+    }
+
     fn full_config(read_only: bool) -> DevConfig {
         DevConfig {
-            disk: Some(Disk::from_backend(ReadOnlyFlagDisk(DISK_BYTES, read_only))),
-            net: Some((MAC, NetHandle::default())),
-            virtio_console: true,
+            disks: vec![Disk::from_backend(ReadOnlyFlagDisk(DISK_BYTES, read_only))],
+            nets: vec![(MAC, NetHandle::default())],
+            virtio_consoles: vec![ConsoleHandle::default()],
         }
     }
 
@@ -314,7 +332,7 @@ mod twin_devices {
     #[test]
     fn mirror_has_the_same_virtio_functions_in_the_same_slots() {
         let main = full_config(false);
-        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored_devices(&main));
+        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&main));
         let mut original = Devices::new(ConsoleHandle::default(), main);
         for slot in 0..5 {
             assert_eq!(
@@ -331,27 +349,24 @@ mod twin_devices {
 
     #[test]
     fn mirror_of_an_empty_config_is_empty() {
-        let mut mirror = Devices::new(
-            ConsoleHandle::default(),
-            mirrored_devices(&DevConfig::default()),
-        );
+        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&DevConfig::default()));
         assert_eq!(id_of(&mut mirror, 1), u32::MAX);
     }
 
     #[test]
     fn mirror_gives_each_optional_device_independently() {
         let net_only = DevConfig {
-            net: Some((MAC, NetHandle::default())),
+            nets: vec![(MAC, NetHandle::default())],
             ..DevConfig::default()
         };
-        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored_devices(&net_only));
+        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&net_only));
         assert_eq!(id_of(&mut mirror, 1), device_id(DEVICE_TYPE_NET));
         assert_eq!(id_of(&mut mirror, 2), u32::MAX);
         let console_only = DevConfig {
-            virtio_console: true,
+            virtio_consoles: vec![ConsoleHandle::default()],
             ..DevConfig::default()
         };
-        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored_devices(&console_only));
+        let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&console_only));
         assert_eq!(id_of(&mut mirror, 1), device_id(DEVICE_TYPE_CONSOLE));
     }
 
@@ -359,11 +374,11 @@ mod twin_devices {
     fn mirrored_net_device_has_its_own_frame_queue() {
         let host_handle = NetHandle::default();
         let main = DevConfig {
-            net: Some((MAC, host_handle.clone())),
+            nets: vec![(MAC, host_handle.clone())],
             ..DevConfig::default()
         };
-        let mirror = mirrored_devices(&main);
-        let (mac, mirror_handle) = mirror.net.unwrap();
+        let mirror = mirrored(&main);
+        let (mac, mirror_handle) = mirror.nets.into_iter().next().unwrap();
         assert_eq!(mac, MAC);
         assert!(host_handle.send_frame(b"frame"));
         assert!(!mirror_handle.has_pending());
@@ -372,8 +387,8 @@ mod twin_devices {
     #[test]
     fn mirrored_disk_has_the_capacity_and_read_only_flag_of_the_original() {
         for read_only in [false, true] {
-            let mirror = mirrored_devices(&full_config(read_only));
-            let disk = mirror.disk.unwrap();
+            let mut mirror = mirrored(&full_config(read_only));
+            let disk = mirror.disks.remove(0);
             assert_eq!(disk.backend.len(), DISK_BYTES as u64);
             assert_eq!(disk.backend.read_only(), read_only);
         }
@@ -381,7 +396,7 @@ mod twin_devices {
 
     #[test]
     fn mirrored_disk_reads_zeros_and_discards_writes() {
-        let mut disk = mirrored_devices(&full_config(false)).disk.unwrap();
+        let mut disk = mirrored(&full_config(false)).disks.remove(0);
         let mut buf = [0xffu8; 16];
         disk.backend.read_at(512, &mut buf).unwrap();
         assert_eq!(buf, [0u8; 16]);
@@ -394,10 +409,10 @@ mod twin_devices {
     #[test]
     fn mirroring_a_huge_disk_does_not_allocate_it() {
         let huge = DevConfig {
-            disk: Some(Disk::from_backend(ReadOnlyFlagDisk(usize::MAX / 2, false))),
+            disks: vec![Disk::from_backend(ReadOnlyFlagDisk(usize::MAX / 2, false))],
             ..DevConfig::default()
         };
-        let disk = mirrored_devices(&huge).disk.unwrap();
+        let disk = mirrored(&huge).disks.remove(0);
         assert_eq!(disk.backend.len(), (usize::MAX / 2) as u64);
     }
 
@@ -518,6 +533,45 @@ mod twin_devices {
     }
 
     #[test]
+    fn several_disks_and_nets_take_consecutive_slots_in_config_order() {
+        let configure = |config: MachineConfig| {
+            config
+                .console(ConsoleKind::Serial)
+                .net(MAC)
+                .disk(Disk::memory(vec![0; MIB]))
+                .net([2, 0, 0, 0, 0, 9])
+                .disk(Disk::memory(vec![0; MIB]))
+        };
+        // Slots 1..=3 are the first three functions: disks come before nets whatever the call order.
+        assert_eq!(
+            probe(configure, JitMode::Off),
+            expected_slots([
+                id_bytes(DEVICE_TYPE_BLOCK),
+                id_bytes(DEVICE_TYPE_BLOCK),
+                id_bytes(DEVICE_TYPE_NET)
+            ])
+        );
+    }
+
+    #[test]
+    fn a_second_virtio_console_takes_the_next_slot() {
+        assert_eq!(
+            probe(
+                |config| config
+                    .console(ConsoleKind::Serial)
+                    .console(ConsoleKind::Virtio)
+                    .console(ConsoleKind::Virtio),
+                JitMode::Off
+            ),
+            expected_slots([
+                id_bytes(DEVICE_TYPE_CONSOLE),
+                id_bytes(DEVICE_TYPE_CONSOLE),
+                NOTHING
+            ])
+        );
+    }
+
+    #[test]
     fn the_verify_twin_sees_the_same_devices_as_the_main_cpu() {
         for jit in auto_and_off() {
             let disk = Disk::memory(vec![0; MIB]);
@@ -543,6 +597,221 @@ mod twin_devices {
     }
 }
 
+mod multiple_devices {
+    use super::*;
+
+    const MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
+    const SECOND_MAC: [u8; 6] = [2, 0, 0, 0, 0, 2];
+
+    fn machine_with(configure: impl FnOnce(MachineConfig) -> MachineConfig) -> EmulatedMachine {
+        EmulatedMachine::new(configure(
+            MachineConfig::new()
+                .reboot(false)
+                .jit(JitMode::Off)
+                .kernel(fake_bzimage(&HELLO_RESET))
+                .memory_mib(MIN_MEMORY_MIB),
+        ))
+        .expect("valid configuration")
+    }
+
+    /// Runs `HELLO_RESET` (writes "hi" to the UART) and returns what each console received.
+    fn run_hello(configure: impl FnOnce(MachineConfig) -> MachineConfig) -> Vec<Vec<u8>> {
+        let mut machine = machine_with(configure);
+        let outputs: Vec<Arc<Mutex<Vec<u8>>>> = machine
+            .consoles()
+            .iter()
+            .map(|console| {
+                let sink = Arc::new(Mutex::new(Vec::new()));
+                let writer = sink.clone();
+                console.on_output(move |bytes| writer.lock().unwrap().extend_from_slice(bytes));
+                sink
+            })
+            .collect();
+        machine.start().unwrap();
+        assert_eq!(machine.wait(), ExitReason::Reset);
+        outputs
+            .iter()
+            .map(|sink| sink.lock().unwrap().clone())
+            .collect()
+    }
+
+    #[test]
+    fn with_no_console_there_is_one_and_the_uart_shares_it() {
+        assert_eq!(run_hello(|config| config), [b"hi".to_vec()]);
+    }
+
+    #[test]
+    fn a_serial_console_next_to_a_virtio_one_owns_the_uart() {
+        assert_eq!(
+            run_hello(|config| config
+                .console(ConsoleKind::Serial)
+                .console(ConsoleKind::Virtio)),
+            [b"hi".to_vec(), Vec::new()]
+        );
+        assert_eq!(
+            run_hello(|config| config
+                .console(ConsoleKind::Virtio)
+                .console(ConsoleKind::Serial)),
+            [Vec::new(), b"hi".to_vec()]
+        );
+    }
+
+    #[test]
+    fn virtio_consoles_have_independent_handles() {
+        let machine = machine_with(|config| {
+            config
+                .console(ConsoleKind::Virtio)
+                .console(ConsoleKind::Virtio)
+        });
+        let consoles = machine.consoles();
+        assert_eq!(consoles.len(), 2);
+        consoles[1].resize(100, 40);
+        assert_eq!(consoles[0].size(), (80, 25));
+        assert_eq!(consoles[1].size(), (100, 40));
+        assert_eq!(machine.console().size(), (80, 25));
+    }
+
+    #[test]
+    fn console_handles_follow_config_order_and_the_first_is_console() {
+        let machine = machine_with(|config| {
+            config
+                .console(ConsoleKind::Serial)
+                .console(ConsoleKind::Virtio)
+        });
+        let consoles = machine.consoles();
+        consoles[0].resize(10, 10);
+        assert_eq!(machine.console().size(), (10, 10));
+        assert_eq!(consoles[1].size(), (80, 25));
+    }
+
+    #[test]
+    fn a_second_serial_console_is_a_config_error() {
+        let message = expect_config_error(EmulatedMachine::new(
+            MachineConfig::new()
+                .kernel(fake_bzimage(&[0xf4]))
+                .console(ConsoleKind::Serial)
+                .console(ConsoleKind::Virtio)
+                .console(ConsoleKind::Serial),
+        ));
+        assert!(message.contains("only once"), "{message}");
+    }
+
+    #[test]
+    fn nets_are_distinct_handles_wired_to_their_own_device_in_config_order() {
+        let machine = machine_with(|config| config.net(MAC).net(SECOND_MAC));
+        let handles = machine.nets();
+        assert_eq!(handles.len(), 2);
+        let devices = &machine.vcpu.as_ref().unwrap().devcfg.nets;
+        assert_eq!([devices[0].0, devices[1].0], [MAC, SECOND_MAC]);
+        assert!(handles[1].send_frame(b"to the second"));
+        assert!(!devices[0].1.has_pending());
+        assert_eq!(
+            devices[1].1.guest_recv().as_deref(),
+            Some(&b"to the second"[..])
+        );
+        devices[0].1.guest_send(b"from the first".to_vec());
+        assert_eq!(
+            handles[0].try_recv_frame().as_deref(),
+            Some(&b"from the first"[..])
+        );
+        assert!(handles[1].try_recv_frame().is_none());
+        assert!(machine.net().is_some());
+    }
+
+    #[test]
+    fn disks_keep_their_own_contents_in_config_order() {
+        let mut machine = machine_with(|config| {
+            config
+                .disk(Disk::memory(vec![0xaa; 4096]))
+                .disk(Disk::memory(vec![0xbb; 4096]))
+        });
+        let disks = &mut machine.vcpu.as_mut().unwrap().devcfg.disks;
+        let first_bytes: Vec<u8> = disks
+            .iter_mut()
+            .map(|disk| {
+                let mut byte = [0u8; 1];
+                disk.backend.read_at(0, &mut byte).unwrap();
+                byte[0]
+            })
+            .collect();
+        assert_eq!(first_bytes, [0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn a_reboot_hands_every_disk_nic_and_console_to_the_new_devices() {
+        let machine = EmulatedMachine::new(
+            MachineConfig::new()
+                .jit(JitMode::Off)
+                .kernel(fake_bzimage(&HELLO_RESET))
+                .memory_mib(MIN_MEMORY_MIB)
+                .disk(Disk::memory(vec![0; 4096]))
+                .disk(Disk::memory(vec![0; 4096]))
+                .net(MAC)
+                .net(SECOND_MAC)
+                .console(ConsoleKind::Virtio)
+                .console(ConsoleKind::Virtio),
+        )
+        .unwrap();
+        let image = machine.vcpu.as_ref().unwrap().reboot.as_ref().unwrap();
+        assert_eq!(image.nets.len(), 2);
+        assert_eq!(image.virtio_consoles.len(), 2);
+        let held = machine.nets();
+        assert!(held[1].send_frame(b"frame"));
+        assert!(image.nets[1].1.has_pending());
+        assert!(!image.nets[0].1.has_pending());
+    }
+
+    #[test]
+    fn a_machine_that_reboots_keeps_both_disks_in_order() {
+        const BOOT_SECTOR_OFFSET: u64 = 512;
+        let mut machine = EmulatedMachine::new(
+            MachineConfig::new()
+                .jit(JitMode::Off)
+                .kernel(fake_bzimage(&HELLO_RESET))
+                .memory_mib(MIN_MEMORY_MIB)
+                .disk(Disk::memory(vec![0x11; 4096]))
+                .disk(Disk::memory(vec![0x22; 4096])),
+        )
+        .unwrap();
+        let mut vcpu = machine.vcpu.take().unwrap();
+        // One power cycle, then the disks are recovered from the finished run.
+        let (reason, finished) = vcpu.run_once();
+        assert_eq!(reason, ExitReason::Reset);
+        let mut disks = finished.disks;
+        assert_eq!(disks.len(), 2);
+        let mut byte = [0u8; 1];
+        disks[0]
+            .backend
+            .read_at(BOOT_SECTOR_OFFSET, &mut byte)
+            .unwrap();
+        assert_eq!(byte[0], 0x11);
+        disks[1]
+            .backend
+            .read_at(BOOT_SECTOR_OFFSET, &mut byte)
+            .unwrap();
+        assert_eq!(byte[0], 0x22);
+    }
+
+    #[test]
+    fn too_many_virtio_devices_for_the_pci_bus_is_a_config_error() {
+        let mut config = MachineConfig::new()
+            .kernel(fake_bzimage(&[0xf4]))
+            .console(ConsoleKind::Virtio);
+        for _ in 0..MAX_VIRTIO_FUNCTIONS {
+            config = config.net(MAC);
+        }
+        let message = expect_config_error(EmulatedMachine::new(config));
+        assert!(message.contains("31"), "{message}");
+        let mut config = MachineConfig::new()
+            .kernel(fake_bzimage(&[0xf4]))
+            .console(ConsoleKind::Serial);
+        for _ in 0..MAX_VIRTIO_FUNCTIONS {
+            config = config.net(MAC);
+        }
+        assert!(EmulatedMachine::new(config).is_ok());
+    }
+}
+
 mod config {
     use super::*;
 
@@ -556,9 +825,9 @@ mod config {
         assert!(config.cmdline.is_none());
         assert!(config.cmdline_extra.is_empty());
         assert_eq!(config.memory_mib, 512);
-        assert!(config.disk.is_none());
-        assert!(config.net_mac.is_none());
-        assert_eq!(config.console_kind, ConsoleKind::Virtio);
+        assert!(config.disks.is_empty());
+        assert!(config.net_macs.is_empty());
+        assert!(config.consoles.is_empty());
         assert_eq!(config.jit, JitMode::Auto);
         assert_eq!(config.clock, ClockMode::Virtual);
         assert!(config.log.is_none());
@@ -601,9 +870,9 @@ mod config {
         assert_eq!(config.initrd.as_deref(), Some(&[4u8, 5][..]));
         assert_eq!(config.cmdline.as_deref(), Some("quiet"));
         assert_eq!(config.cmdline_extra, ["a=1", "b=2"]);
-        assert_eq!(config.disk.as_ref().unwrap().backend.len(), 512);
-        assert_eq!(config.net_mac, Some(MAC));
-        assert_eq!(config.console_kind, ConsoleKind::Virtio);
+        assert_eq!(config.disks[0].backend.len(), 512);
+        assert_eq!(config.net_macs, [MAC]);
+        assert_eq!(config.consoles, [ConsoleKind::Virtio]);
         assert_eq!(config.memory_mib, 128);
         assert_eq!(config.jit, JitMode::On);
         assert_eq!(config.clock, ClockMode::Realtime);
@@ -901,6 +1170,16 @@ mod guest_view {
     }
 
     #[test]
+    fn the_first_console_picks_the_default_command_line() {
+        assert_eq!(
+            printed_cmdline(|config| config
+                .console(ConsoleKind::Serial)
+                .console(ConsoleKind::Virtio)),
+            DEFAULT_SERIAL_CMDLINE
+        );
+    }
+
+    #[test]
     fn explicit_command_line_replaces_the_default() {
         assert_eq!(
             printed_cmdline(|config| config.cmdline("root=/dev/vda ro")),
@@ -1139,11 +1418,11 @@ mod lifecycle {
         .unwrap();
         machine.console().write(b"in");
         let vcpu = machine.vcpu.as_ref().unwrap();
-        assert_eq!(vcpu.console.guest_rx(), Some(b'i'));
-        assert_eq!(vcpu.console.guest_rx(), Some(b'n'));
+        assert_eq!(vcpu.uart_console.guest_rx(), Some(b'i'));
+        assert_eq!(vcpu.uart_console.guest_rx(), Some(b'n'));
         let net = machine.net().unwrap();
         assert!(net.send_frame(b"frame"));
-        let device_side = &vcpu.devcfg.net.as_ref().unwrap().1;
+        let device_side = &vcpu.devcfg.nets[0].1;
         assert_eq!(device_side.guest_recv().as_deref(), Some(&b"frame"[..]));
         // And the other direction.
         device_side.guest_send(b"reply".to_vec());
@@ -1871,7 +2150,7 @@ mod reboot {
         .unwrap();
         let held_by_embedder = machine.net().unwrap();
         let image = machine.vcpu.as_ref().unwrap().reboot.as_ref().unwrap();
-        let (mac, rebuilt) = image.net.as_ref().unwrap();
+        let (mac, rebuilt) = &image.nets[0];
         assert_eq!(*mac, [2, 0, 0, 0, 0, 1]);
         assert!(held_by_embedder.send_frame(b"frame"));
         assert!(

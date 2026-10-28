@@ -52,6 +52,11 @@ pub struct ConsoleHandle {
 }
 
 impl ConsoleHandle {
+    /// Whether both handles are clones of one console (same queues), as opposed to two consoles.
+    pub(crate) fn is_same_console(&self, other: &ConsoleHandle) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Host to guest.
     pub fn write(&self, bytes: &[u8]) {
         let mut state = self.inner.0.lock().unwrap();
