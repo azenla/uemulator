@@ -9,6 +9,8 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 - Run: `cargo run --release -- quick debian` (downloads and caches netboot artifacts in `~/.uemulator/cache/quick/<distro>/artifacts/` and creates a sparse disk at `~/.uemulator/quick/<distro>/disk.img`; `UEMULATOR_HOME` moves `~/.uemulator`, `UEMULATOR_CACHE` moves just the cache; `--update` refetches; `quick` uses user-mode networking so the installers can reach their mirrors) or `-- boot --kernel K --initramfs I`
 - Web: `./hack/web.sh serve` builds `crates/uemulator-web` for `wasm32-unknown-unknown` (`rustup target add` it first) into `target/web` and serves it on :8080 (needs the COOP/COEP headers `hack/web/serve.py` sends); `cargo clippy --release --target wasm32-unknown-unknown -p uemulator-web` must print zero warnings too
 - UEFI: `./hack/uefi/boot.sh [x86_64|aarch64]` builds `crates/uemulator-uefi` and boots it in QEMU (accelerated when the host matches; `UEFI_ACCEL=hv|emu` picks hardware virtualization or the emulator, and `-cpu max,svm=on` under TCG exercises the SVM path); `cargo clippy --release --target x86_64-unknown-uefi -p uemulator-uefi` (and `aarch64-unknown-uefi`) must print zero warnings too
+- Firmware / real mode: `uemulator firmware IMAGE` (image ends at 1 MiB, CPU starts in real mode at F000:FFF0); a bzImage without a 64-bit entry boots in 32-bit protected mode (`plans/15-legacy-modes.md`)
+- Linux KVM check: `hack/kvm/run.sh` loads `kvm_amd` in the emulated guest and runs vCPUs in every CPU mode on the emulator's SVM (needs `unsquashfs`, a musl cross gcc, the Alpine artifacts and network for the modloop); run it after touching `cpu/svm.rs`, paging or the 16/32-bit modes
 - Test: `cargo test --release --workspace` (also `-p uemulator --no-default-features`)
 - Before EVERY commit: run `./hack/autofix.sh` (clippy --fix + fmt), then fix by hand every warning it leaves; `cargo clippy --release --all-targets` must print zero warnings. Never commit with warnings.
 
@@ -28,7 +30,7 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 
 ## Tests
 
-- Unit tests only: no network, no cached kernels or initrds, nothing under `~/.uemulator`. A test that needs a guest builds a tiny one: `testkit::FakeKernel` makes a valid bzImage whose 64-bit entry point is hand-assembled code (`echo 'mov rax, 5; hlt' | hack/asm.sh` prints the bytes).
+- Unit tests only: no network, no cached kernels or initrds, nothing under `~/.uemulator`. A test that needs a guest builds a tiny one: `testkit::FakeKernel` makes a valid bzImage whose 64-bit entry point is hand-assembled code (`echo 'mov rax, 5; hlt' | hack/asm.sh` prints the bytes; `BITS=16` or `BITS=32` assembles for real mode or 32-bit protected mode).
 - `testkit::Harness` runs a snippet on one CPU, interpreter or JIT, with undelivered faults reported as `Stop::Fault`; `testkit::run_machine` boots a fake kernel on a full `EmulatedMachine`.
 - Anything the JIT compiles gets a case that runs `testkit::assert_jit_matches_interpreter`. The interpreter is the oracle.
 - Fixing a bug: write the failing test first.

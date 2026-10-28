@@ -43,7 +43,7 @@ Start from the fork's identity (read `target/i386/cpu.c` "XTCG CPU" model for th
 
 - Leaf 0/1: vendor AuthenticAMD family 0x14 (the fork says 0x15, but Linux blacklists 0x15 for RETBLEED and installs return thunks; see "Speculation control") model 0, FPU, VME no, PSE, TSC, MSR, PAE, CX8, SEP (protected-mode sysenter/sysexit; syscall too), MTRR, PGE, CMOV, PAT, PSE36 (4 MiB PDE address bits 39:32, tested in `cpu/paging_tests.rs`), CLFLUSH, MMX, FXSR, SSE, SSE2; **APIC clear**, SSE3 later after implementing, **hypervisor bit clear**
 - Leaf 7 subleaf 0: FSGSBASE, BMI1, AVX2, SMEP, BMI2, ERMS, INVPCID, RDSEED, SMAP, AVX512F/DQ/IFMA/CD/BW/VL (EBX); UMIP, AVX512_VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ, GFNI, VAES, VPCLMULQDQ (ECX); FSRM and the speculation-control bits (EDX); EAX = 0. No LA57, PKU, CET, SHA, AVX512_FP16/BF16/VP2INTERSECT, AVX512PF/ER (each feature has its section below)
-- Leaf 1 ECX: SSE3, PCLMULQDQ, SSSE3, CX16, SSE4.1, SSE4.2, MOVBE, POPCNT, AES; 0x80000001 ECX adds ABM (LZCNT). MONITOR/MWAIT, VMX/SVM, XSAVE/OSXSAVE, AVX, RDRAND and the hypervisor bit stay clear
+- Leaf 1 ECX: SSE3, PCLMULQDQ, SSSE3, CX16, SSE4.1, SSE4.2, MOVBE, POPCNT, AES; 0x80000001 ECX adds ABM (LZCNT) and PREFETCHW (a hint no-op that Windows 8.1+ requires). MONITOR/MWAIT, VMX/SVM, XSAVE/OSXSAVE, AVX, RDRAND and the hypervisor bit stay clear
 - Leaf 0x80000001: SYSCALL, NX, LM, (RDTSCP)
 - Leaf 0x80000007: invariant TSC set so the kernel trusts the TSC
 - XSAVE/OSXSAVE (x87, SSE, AVX, opmask, ZMM_Hi256 and Hi16_ZMM components), RDRAND/RDSEED, AVX, AVX2, FMA, F16C and AVX-512 are advertised, see "XSAVE and RDRAND", "AVX, AVX2, FMA, F16C" and "AVX-512"

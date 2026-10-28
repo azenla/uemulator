@@ -472,6 +472,9 @@ const EXT_FEATURE_LAHF_LM: u32 = 1 << 0;
 /// Leaf 0x8000_0001 ECX bit 5: advanced bit manipulation, i.e. LZCNT (POPCNT has its own bit in
 /// leaf 1).
 const EXT_FEATURE_ABM: u32 = 1 << 5;
+/// Leaf 0x8000_0001 ECX bit 8: PREFETCH and PREFETCHW (`0F 0D`, hints that execute as no-ops).
+/// Windows 8.1 and later refuse to start without it.
+const EXT_FEATURE_PREFETCHW: u32 = 1 << 8;
 /// Leaf 0x8000_0007 EDX bit 8: invariant TSC, so the kernel trusts it as a clocksource.
 const APM_INVARIANT_TSC: u32 = 1 << 8;
 
@@ -562,7 +565,7 @@ impl Cpu {
             CPUID_LEAF_EXT_FEATURES => (
                 CPUID_SIGNATURE,
                 0,
-                EXT_FEATURE_LAHF_LM | EXT_FEATURE_SVM | EXT_FEATURE_ABM,
+                EXT_FEATURE_LAHF_LM | EXT_FEATURE_SVM | EXT_FEATURE_ABM | EXT_FEATURE_PREFETCHW,
                 EXT_FEATURE_SYSCALL
                     | EXT_FEATURE_NX
                     | EXT_FEATURE_RDTSCP
@@ -2096,9 +2099,18 @@ mod sys_tests {
             const LAHF_LM: u32 = 1 << 0;
             const SVM: u32 = 1 << 2;
             const ABM: u32 = 1 << 5;
+            const PREFETCHW: u32 = 1 << 8;
             let mut h = blank();
             let [_, _, ecx, _] = cpuid(&mut h, 0x8000_0001, 0);
-            assert_eq!(ecx, LAHF_LM | SVM | ABM);
+            assert_eq!(ecx, LAHF_LM | SVM | ABM | PREFETCHW);
+        }
+
+        #[test]
+        fn prefetchw_is_a_hint_that_never_faults() {
+            // prefetchw [rax]; prefetch [rax]; hlt, with rax pointing at nothing
+            let mut h = Harness::new(&[0x0f, 0x0d, 0x08, 0x0f, 0x0d, 0x00, 0xf4]);
+            h.cpu.gpr[RAX] = 0x1234_5678_9000;
+            assert_eq!(h.run(10), Stop::Halted);
         }
 
         #[test]
