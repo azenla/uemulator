@@ -615,7 +615,8 @@ impl Cpu {
         self.vmcb_set_table(vmcb, SAVE_IDTR, &idtr);
         let (cpl, efer, cr4, cr3, cr0) = (self.cpl, self.efer, self.cr4, self.cr3, self.cr0);
         self.vmcb_write(vmcb, SAVE_CPL, 1, cpl as u64);
-        self.vmcb_write(vmcb, SAVE_EFER, 8, efer & !EFER_LMA);
+        // LMA is read-only and hardware-maintained; it is saved as the processor had it.
+        self.vmcb_write(vmcb, SAVE_EFER, 8, efer);
         self.vmcb_write(vmcb, SAVE_CR4, 8, cr4);
         self.vmcb_write(vmcb, SAVE_CR3, 8, cr3);
         self.vmcb_write(vmcb, SAVE_CR0, 8, cr0);
@@ -1184,6 +1185,16 @@ mod tests {
             }
         }
         panic!("budget exhausted\n{}", h.cpu.dump_regs());
+    }
+
+    #[test]
+    fn a_long_mode_guest_exits_with_efer_lma_saved() {
+        // Xen without intercepted CR0 writes learns that the guest entered long mode from this
+        // bit; with it clear it truncates the guest's RIP to 32 bits after every emulated
+        // instruction.
+        let mut h = rig(&[0x0f, 0xa2, 0xf4]);
+        run(&mut h);
+        assert_eq!(get(&h, SAVE_EFER, 8) & EFER_LMA, EFER_LMA);
     }
 
     #[test]

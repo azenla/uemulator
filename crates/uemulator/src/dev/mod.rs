@@ -2495,7 +2495,7 @@ mod tests {
         assert_eq!(dev.interrupt_ack(), Some(FSB_VECTOR as u8));
     }
 
-    const IOMMU_BASE: u64 = 0xfed8_0000;
+    const IOMMU_BASE: u64 = crate::dev::iommu::MMIO_BASE;
     const IOMMU_DEVICE_TABLE_REGISTER: u64 = 0x00;
     const IOMMU_CONTROL_REGISTER: u64 = 0x18;
     const IOMMU_ENABLE: u64 = 1;

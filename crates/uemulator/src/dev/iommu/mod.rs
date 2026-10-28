@@ -39,9 +39,11 @@ pub(crate) use irq::{
 pub(crate) use ivrs::{IvrsTopology, SpecialDevice};
 use tables::{DeviceTableEntry, WalkError};
 
-/// Where the register window sits. Nothing else lives in this part of the 4 GiB hole (the HPET
-/// is at 0xFED00000, the LAPIC at 0xFEE00000); QEMU uses the same address.
-pub(crate) const MMIO_BASE: u64 = 0xfed8_0000;
+/// Where the register window sits. Not at QEMU's 0xFED80000: that is the AMD FCH block (PM
+/// registers, reset status) Linux ioremaps on every Zen, and Xen refuses a PV dom0 a mapping of
+/// the IOMMU's page, which crashed it in `print_s5_reset_status_mmio`. Real Zen server parts put
+/// the IOMMU in the 0xFD000000 range.
+pub(crate) const MMIO_BASE: u64 = 0xfd20_0000;
 pub(crate) const MMIO_WINDOW_BYTES: u64 = 0x4000;
 /// 00:00.2, where AMD root complexes put the IOMMU function.
 pub(crate) const PCI_DEVFN: u8 = 0x02;

@@ -1629,3 +1629,11 @@ fn devices_route_the_register_window_only_when_the_iommu_is_configured() {
         Some(CONTROL_IOMMU_ENABLE)
     );
 }
+
+#[test]
+fn register_window_stays_clear_of_the_fch_block() {
+    // Linux reads the FCH reset status at 0xFED80000 + 0x3c0 on every AMD machine.
+    const FCH_BLOCK: core::ops::Range<u64> = 0xfed8_0000..0xfed9_0000;
+    assert!(!FCH_BLOCK.contains(&MMIO_BASE));
+    assert!(!FCH_BLOCK.contains(&(MMIO_BASE + MMIO_WINDOW_BYTES - 1)));
+}
