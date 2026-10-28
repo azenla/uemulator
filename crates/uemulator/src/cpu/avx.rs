@@ -244,10 +244,14 @@ impl Cpu {
             }
             // vzeroupper clears bits 255:128 of every register; vzeroall also clears the low halves
             self.ymm_hi = [0; REGISTER_COUNT];
+            self.zmm_hi = [[0; 2]; REGISTER_COUNT];
             if i.vex_l {
                 self.xmm = [0; REGISTER_COUNT];
             }
             self.rip = next;
+            return Ok(());
+        }
+        if self.exec_opmask(i, next)? {
             return Ok(());
         }
         let Some(form) = vex_form(map, opcode, prefix) else {
@@ -264,12 +268,12 @@ impl Cpu {
         {
             return Err(Exception::invalid_opcode());
         }
-        let snapshot = (self.xmm, self.ymm_hi);
+        let snapshot = (self.xmm, self.ymm_hi, self.zmm_hi);
         let result = self.run_vex_passes(i, next, form);
         self.vex_active = false;
         if let Err(error) = result {
             // A fault in the second lane must not leave the first one written.
-            (self.xmm, self.ymm_hi) = snapshot;
+            (self.xmm, self.ymm_hi, self.zmm_hi) = snapshot;
             return Err(error);
         }
         self.rip = next;
@@ -324,14 +328,16 @@ impl Cpu {
                 return Err(self.unimplemented_opcode(i));
             }
         }
-        if let Some(register) = destination
-            && !two_lanes
-        {
-            self.ymm_hi[register] = 0;
+        if let Some(register) = destination {
+            if !two_lanes {
+                self.ymm_hi[register] = 0;
+            }
+            self.clear_zmm_upper(register);
         }
         // vpcmpistrm/vpcmpestrm write xmm0 (not a ModRM operand), and zero its upper half too
         if map == OPCODE_MAP_0F3A && matches!(opcode, 0x60 | 0x62) {
             self.ymm_hi[0] = 0;
+            self.clear_zmm_upper(0);
         }
         Ok(())
     }

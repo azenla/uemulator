@@ -489,7 +489,7 @@ impl Cpu {
             // for all supported ones. Subleaf 1: EAX bit 0 = xsaveopt.
             CPUID_LEAF_XSTATE => match self.gpr[RCX] as u32 {
                 0 => (
-                    xsave::XCR0_SUPPORTED as u32,
+                    xsave::XCR0_ADVERTISED as u32,
                     xsave::enabled_area_size(self.xcr0),
                     xsave::XSAVE_AREA_SIZE_WITH_AVX as u32,
                     0,

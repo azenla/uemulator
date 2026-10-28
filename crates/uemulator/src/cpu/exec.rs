@@ -1098,6 +1098,9 @@ impl Cpu {
         if i.vex {
             return self.exec_vex(i, next);
         }
+        if i.evex {
+            return self.exec_evex(i, next);
+        }
         match op {
             // The eight ALU ops (add/or/adc/sbb/and/sub/xor/cmp), forms 0..=5: r/m,r (byte, full),
             // r,r/m (byte, full), al,imm and eax,imm.

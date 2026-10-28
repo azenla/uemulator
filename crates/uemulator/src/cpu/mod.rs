@@ -304,6 +304,13 @@ pub(crate) struct Cpu {
     /// Bits 255:128 of YMM0-15 (AVX). Legacy SSE instructions leave them alone; VEX.128 forms zero
     /// them.
     pub ymm_hi: [u128; 16],
+    /// Bits 511:256 of ZMM0-15 (AVX-512, XSAVE component ZMM_Hi256), as two 128-bit lanes each.
+    pub zmm_hi: [[u128; 2]; 16],
+    /// ZMM16-31 in full (XSAVE component Hi16_ZMM), lane 0 least significant.
+    pub zmm_extra: [[u128; 4]; 16],
+    /// Opmask registers k0-k7 (XSAVE component opmask). k0 is a real register, but as an EVEX
+    /// write mask the encoding 0 means "no masking".
+    pub opmask: [u64; 8],
     /// True while a VEX instruction runs through the legacy SSE kernels (see `avx.rs`): they then
     /// skip the CR4.OSFXSR gate and the 16-byte alignment rule.
     pub vex_active: bool,
@@ -456,6 +463,9 @@ impl Cpu {
             cpl: 0,
             xmm: [0; 16],
             ymm_hi: [0; 16],
+            zmm_hi: [[0; 2]; 16],
+            zmm_extra: [[0; 4]; 16],
+            opmask: [0; 8],
             vex_active: false,
             mxcsr: MXCSR_RESET,
             fcw: FCW_RESET,
@@ -784,6 +794,12 @@ impl Cpu {
             if ours != theirs {
                 differences.push(format!("{name}: {ours:#x} vs {theirs:#x}"));
             }
+        }
+        if self.zmm_hi != other.zmm_hi
+            || self.zmm_extra != other.zmm_extra
+            || self.opmask != other.opmask
+        {
+            differences.push("zmm/opmask".into());
         }
         if self.ymm_hi != other.ymm_hi {
             differences.push("ymm_hi".into());
