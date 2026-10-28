@@ -9,6 +9,7 @@ use super::decode::CodeMode;
 use super::exception::Exception;
 use super::flags::VM;
 use super::*;
+use crate::boot::BootState;
 
 /// Real mode and virtual-8086 mode form a linear address as `selector << 4` plus the offset.
 const REAL_MODE_SEGMENT_SHIFT: u32 = 4;
@@ -171,6 +172,37 @@ impl Cpu {
         self.tr = Seg::default();
         self.rip = RESET_IP;
         self.halted = false;
+        self.set_cpl(0);
+        self.flush_tlb();
+        self.flush_decode();
+    }
+
+    /// The 32-bit Linux boot protocol's CPU state (Documentation/arch/x86/boot.rst): protected
+    /// mode with flat 4 GiB code and data segments, paging off, interrupts off, ESI pointing at
+    /// `boot_params` and EBP, EDI and EBX zero.
+    pub(crate) fn enter_boot_protected_mode(&mut self, boot: BootState) {
+        let flat = |selector: u16, flags: u32| Seg {
+            sel: selector,
+            base: 0,
+            limit: SEG_LIMIT_4GIB,
+            flags,
+        };
+        let code_flags = SEG_GRANULARITY
+            | SEG_DEFAULT_BIG
+            | SEG_PRESENT
+            | SEG_NON_SYSTEM
+            | SEG_TYPE_EXECUTABLE
+            | SEG_TYPE_READ_WRITE;
+        self.seg[SEG_CS] = flat(boot.cs, code_flags);
+        for index in [SEG_ES, SEG_SS, SEG_DS, SEG_FS, SEG_GS] {
+            self.seg[index] = flat(boot.ds, SEG_FLAGS_FLAT_DATA);
+        }
+        self.cr0 = CR0_PE | CR0_ET;
+        self.cr3 = 0;
+        self.cr4 = 0;
+        self.efer = 0;
+        self.eflags = flags::RESERVED_ONE;
+        self.lazy_op = LazyFlagsOp::Eflags;
         self.set_cpl(0);
         self.flush_tlb();
         self.flush_decode();

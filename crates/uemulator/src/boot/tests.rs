@@ -201,16 +201,23 @@ mod header {
     }
 
     #[test]
-    fn xlf_kernel_64_unset_is_rejected() {
+    fn a_kernel_without_xlf_kernel_64_starts_in_32_bit_protected_mode_at_its_first_byte() {
         for xloadflags in [0, 2, 0xfffe] {
             let fake = FakeKernel {
                 xloadflags,
                 ..kernel()
             };
-            let message = bad_kernel(load_with(&fake, None, "", TEST_RAM).0);
-            assert!(
-                message.contains("XLF_KERNEL_64"),
-                "{xloadflags:#x}: {message}"
+            let (state, ram) = load_ok(&fake, None, "");
+            assert_eq!(state.mode, BootMode::Protected32, "{xloadflags:#x}");
+            assert_eq!(
+                state.rip, KERNEL_LOAD,
+                "startup_32 is the start of the image"
+            );
+            assert_eq!(state.rsi, BOOT_PARAMS);
+            let code = u64::from_le_bytes(ram[GDT_ADDR as usize + 16..][..8].try_into().unwrap());
+            assert_eq!(
+                code, BOOT_CODE32_DESCRIPTOR,
+                "the boot code segment is 32-bit"
             );
         }
     }

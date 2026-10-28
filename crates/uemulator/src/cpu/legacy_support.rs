@@ -196,3 +196,26 @@ pub(crate) fn enter_ring3(h: &mut Harness, esp: u64) {
     h.cpu.set_cpl(3);
     h.cpu.gpr[4] = esp;
 }
+
+/// Sets the User bit through the boot identity map (PML4, PDPT and its page directories) so
+/// ring 3 can run and touch any of it.
+pub(crate) fn make_identity_map_user_accessible(h: &mut Harness) {
+    const USER: u64 = 1 << 2;
+    const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+    const ENTRIES: u64 = 512;
+    const GIBIBYTES: u64 = 4;
+    let pml4 = h.cpu.cr3 & ADDRESS_MASK;
+    let pml4_entry = h.read_u64(pml4);
+    h.write_u64(pml4, pml4_entry | USER);
+    let pdpt = pml4_entry & ADDRESS_MASK;
+    for gib in 0..GIBIBYTES {
+        let pdpt_entry = h.read_u64(pdpt + gib * 8);
+        h.write_u64(pdpt + gib * 8, pdpt_entry | USER);
+        let directory = pdpt_entry & ADDRESS_MASK;
+        for slot in 0..ENTRIES {
+            let entry = h.read_u64(directory + slot * 8);
+            h.write_u64(directory + slot * 8, entry | USER);
+        }
+    }
+    h.cpu.flush_tlb();
+}

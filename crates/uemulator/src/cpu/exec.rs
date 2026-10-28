@@ -1751,6 +1751,7 @@ impl Cpu {
         match op {
             // group 6 / group 7 (sldt, ltr, sgdt, lidt, ...)
             0x100 | 0x101 => return self.sys_group(i, next),
+            0x102 | 0x103 => return self.load_access_rights_or_limit(i, next),
             0x105 => return self.do_syscall(next),
             0x134 => return self.do_sysenter(),
             0x135 => return self.do_sysexit(),

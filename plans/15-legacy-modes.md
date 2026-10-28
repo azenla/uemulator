@@ -34,7 +34,7 @@ Real mode builds a segment as `selector << 4` with a 64 KiB limit (`real_mode_se
 
 `Cpu::exec` calls `exec_legacy` first outside `Long64`. It claims the opcodes whose behaviour depends on the mode and returns false for the rest, which then run the shared code that only depends on the resolved operand size. In `legacy.rs`: inc/dec r, push/pop (all forms, operand size from the mode), pusha/popa, enter/leave, near call/jmp/jcc/loop/jcxz/ret with the target truncated to the operand size and checked against the CS limit, push/pop of segment registers, `mov sreg`, `les/lds/lss/lfs/lgs`, daa/das/aaa/aas/aam/aad/salc, bound, arpl, into, xlat, the string instructions with 16/32-bit address registers and the ES base, ins/outs (also reachable in `Long64`: they were missing), far `call`/`jmp ptr16:16/32`, group 5 far forms, retf and iret.
 
-Other places that changed: `mov cr/dr` is 32 bits wide outside IA-32e mode; `lgdt/lidt/sgdt/sidt` use a 24-bit base with a 16-bit operand size, 32-bit base with a 32-bit one; `lldt/ltr` use 8-byte descriptors outside IA-32e (`read_desc` no longer reads a second quadword there) and accept a 32-bit TSS; `fnstenv/fldenv/fnsave/frstor` have the 14/94-byte 16-bit formats; `sysenter`/`sysexit` exist in protected mode only (the CPUID identity is AMD, where they are #UD under IA-32e, so SEP is advertised and the instructions are #UD with EFER.LMA).
+Other places that changed: `mov cr/dr` is 32 bits wide outside IA-32e mode; `lgdt/lidt/sgdt/sidt` use a 24-bit base with a 16-bit operand size, 32-bit base with a 32-bit one; `lldt/ltr` use 8-byte descriptors outside IA-32e (`read_desc` no longer reads a second quadword there) and accept a 32-bit TSS; `fnstenv/fldenv/fnsave/frstor` have the 14/94-byte 16-bit formats; `sysenter`/`sysexit` exist in protected mode only; `syscall` from compatibility mode enters at CSTAR and `sysretl` returns to compatibility mode; `lar`/`lsl` exist (the CPUID identity is AMD, where they are #UD under IA-32e, so SEP is advertised and the instructions are #UD with EFER.LMA).
 
 ## Interrupts, exceptions and control transfers (`cpu/legacy_flow.rs`, `legacy_task.rs`)
 
@@ -51,6 +51,10 @@ Other places that changed: `mov cr/dr` is 32 bits wide outside IA-32e mode; `lgd
 
 `MachineConfig::firmware(image)` and `uemulator firmware IMAGE` place the image so that it ends at 1 MiB and start the CPU at the reset state (`Cpu::reset_to_real_mode`: real mode, paging and long mode off, F000:FFF0). There is no ROM or chipset: the image sits in RAM and the 4 GiB-top alias of the reset vector is not mapped (CS's base is set so that execution starts at F000:FFF0 = 0xFFFF0, which every BIOS image continues from with a far jump). The reboot hook is off for firmware images: a guest reset ends the run with `ExitReason::Reset`.
 
+## Booting a 32-bit Linux kernel
+
+A bzImage without `XLF_KERNEL_64` is no longer rejected: `boot::load` places it exactly like a 64-bit one but returns `BootMode::Protected32` with `rip` at the first byte of the protected-mode image (`startup_32`), a boot GDT whose `__BOOT_CS` (0x10) is a 32-bit code descriptor, and `Cpu::enter_boot_protected_mode` (CR0.PE only, flat segments, paging and long mode off, ESI = `boot_params`). Verified end to end with Alpine's x86 `vmlinuz-lts` (6.18, non-PAE i686): the kernel enables 32-bit paging itself, takes timer and device interrupts through 32-bit gates, runs busybox in ring 3 via `int 0x80`/`sysenter`, and reaches a shell on the serial console (`uemulator boot --kernel vmlinuz-lts --initramfs initramfs-lts --console serial -m 512 --cmdline "console=ttyS0 rdinit=/bin/sh"`). Everything runs on the interpreter (the JIT is 64-bit-only), so expect it to be several times slower than a 64-bit guest.
+
 ## Tests
 
 `cpu/legacy_tests.rs` holds 49 tests, generated from assembly snippets (`BITS=16 hack/asm.sh`, `BITS=32 hack/asm.sh`) and run on real-mode and flat 32-bit harnesses (`Harness::real`, `legacy_support::protected32`): 16-bit addressing and wrap, segment bases and limits, stack widths, real-mode interrupts, far jumps/calls, string ops, BCD, 32-bit gates, error codes, ring 3 to ring 0 and back through the TSS, V86 entry and exit, sysenter/sysexit, call gates with parameters, task switch and nested-task return, LDT, 16-bit code in protected mode, real mode to protected mode to long mode with the boot code a real loader runs, compatibility mode and the far jump back to 64-bit mode. `machine/tests.rs` boots a real-mode firmware image on the full machine under both JIT modes.
@@ -59,5 +63,6 @@ SVM guests may be in any of these modes (see 03, "SVM"); the VMRUN state swap al
 
 ## Not implemented
 
+- Everything 32-bit runs on the interpreter only; a 32-bit JIT is not planned.
 - Virtual-8086 extensions (CR4.VME/PVI, the interrupt redirection bitmap, VIF/VIP), SMM, and the segment-write and straddling-limit checks listed above.
-- 16-bit TSS switching, `syscall`/`sysret` from compatibility mode, 64-bit call gates and task switches in IA-32e mode (not architectural), the debug registers' breakpoints.
+- 16-bit TSS switching, legacy-mode (non-IA-32e) `syscall`, 64-bit call gates and task switches in IA-32e mode (not architectural), the debug registers' breakpoints.

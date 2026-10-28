@@ -857,3 +857,60 @@ fn mov_to_and_from_control_registers_are_thirty_two_bits_wide_outside_long_mode(
     assert_eq!(h.cpu.gpr[RBX], CR0_PE | CR0_ET);
     assert_eq!(h.cpu.gpr[RAX], 0);
 }
+
+#[test]
+fn lar_and_lsl_read_access_rights_and_limits() {
+    let code = [
+        0x66, 0xb8, 0x10, 0x00, 0x0f, 0x03, 0xd8, 0x0f, 0x02, 0xc8, 0x9c, 0x5a, 0xf4,
+    ];
+    let mut h = prot(&code);
+    halted(&mut h);
+    assert_eq!(h.cpu.gpr[RBX], 0xffff_ffff);
+    assert_eq!(h.cpu.gpr[RCX], 0x00cf_9200);
+    assert_ne!(h.cpu.gpr[RDX] & flags::ZF, 0);
+}
+
+#[test]
+fn lar_with_an_unusable_selector_clears_zf_and_keeps_the_destination() {
+    let code = [
+        0xbb, 0x34, 0x12, 0x00, 0x00, 0x66, 0xb8, 0x38, 0x12, 0x0f, 0x02, 0xd8, 0x9c, 0x5a, 0xf4,
+    ];
+    let mut h = prot(&code);
+    halted(&mut h);
+    assert_eq!(h.cpu.gpr[RBX], 0x1234);
+    assert_eq!(h.cpu.gpr[RDX] & flags::ZF, 0);
+}
+
+#[test]
+fn lar_is_undefined_in_real_mode() {
+    let code = [0x0f, 0x02, 0xc3, 0xf4];
+    assert_eq!(real_fault(&code), (6, None));
+}
+
+#[test]
+fn compatibility_mode_system_calls_enter_at_cstar_and_sysretl_returns() {
+    let code = [
+        0xbb, 0x06, 0x00, 0x00, 0x00, 0xb8, 0x05, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x43, 0x0f, 0x05,
+        0xf4,
+    ];
+    let handler = [0x83, 0xfb, 0x07, 0x74, 0x02, 0x0f, 0x07, 0xf4];
+    let mut h = Harness::new(&code);
+    h.cpu.efer |= 1;
+    h.cpu.star = (0x1bu64 << 48) | (0x08u64 << 32);
+    h.cpu.cstar = HANDLER;
+    h.cpu.seg[SEG_CS] = flat_segment(0x1b, dpl(0x9a, 3), 0xc);
+    h.cpu.set_cpl(3);
+    make_identity_map_user_accessible(&mut h);
+    h.write(HANDLER, &handler);
+    assert_eq!(h.cpu.code_mode(), CodeMode::Bits32);
+    halted(&mut h);
+    assert_eq!(
+        h.cpu.gpr[RBX], 7,
+        "inc ebx ran as 32-bit code after sysretl"
+    );
+    assert_eq!(
+        h.cpu.cpl, 0,
+        "the second syscall stopped in the 64-bit handler"
+    );
+    assert_eq!(h.cpu.code_mode(), CodeMode::Long64);
+}

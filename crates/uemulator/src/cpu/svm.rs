@@ -43,6 +43,7 @@ const VMCB_EXITCODE: u64 = 0x70;
 const VMCB_EXITINFO1: u64 = 0x78;
 const VMCB_EXITINFO2: u64 = 0x80;
 const VMCB_EXIT_INT_INFO: u64 = 0x88;
+const VMCB_EXIT_INT_INFO_ERROR: u64 = 0x8c;
 const VMCB_NP_ENABLE: u64 = 0x90;
 const VMCB_EVENTINJ: u64 = 0xa8;
 const VMCB_EVENTINJ_ERROR: u64 = 0xac;
@@ -197,10 +198,10 @@ const EVENTINJ_ERROR_VALID: u32 = 1 << 11;
 const EVENTINJ_VECTOR_MASK: u32 = 0xff;
 const EVENTINJ_TYPE_SHIFT: u32 = 8;
 const EVENTINJ_TYPE_MASK: u32 = 7;
-const EVENT_TYPE_INTERRUPT: u32 = 0;
+pub(super) const EVENT_TYPE_INTERRUPT: u32 = 0;
 const EVENT_TYPE_NMI: u32 = 2;
-const EVENT_TYPE_EXCEPTION: u32 = 3;
-const EVENT_TYPE_SOFTWARE: u32 = 4;
+pub(super) const EVENT_TYPE_EXCEPTION: u32 = 3;
+pub(super) const EVENT_TYPE_SOFTWARE: u32 = 4;
 
 // V_INTR.
 const V_IRQ: u64 = 1 << 8;
@@ -276,6 +277,9 @@ pub(crate) struct Svm {
     /// Global interrupt flag: clear while the host handles a #VMEXIT (`clgi`).
     pub(crate) gif: bool,
     pub(crate) guest: Option<Box<Guest>>,
+    /// The VMCB of the guest that exited last, so an exit that happened while delivering an event
+    /// can still report that event (`exit_int_info`).
+    last_vmcb: u64,
 }
 
 impl Svm {
@@ -285,6 +289,7 @@ impl Svm {
             vm_cr: 0,
             gif: true,
             guest: None,
+            last_vmcb: 0,
         }
     }
 }
@@ -575,6 +580,7 @@ impl Cpu {
     pub(crate) fn vmexit(&mut self, code: u64, info1: u64, info2: u64, next_rip: u64) -> Exception {
         let guest = self.svm.guest.take().expect("vmexit outside a guest");
         let vmcb = guest.vmcb;
+        self.svm.last_vmcb = vmcb;
         for (offset, segment) in [
             (SAVE_ES, self.seg[SEG_ES]),
             (SAVE_CS, self.seg[SEG_CS]),
@@ -655,6 +661,19 @@ impl Cpu {
         self.flush_tlb();
         self.flush_decode();
         Exception::Vmexit
+    }
+
+    /// Records the event whose delivery a #VMEXIT just interrupted (a nested page fault while
+    /// pushing the frame): `exit_int_info`, so the hypervisor can inject it again after fixing the
+    /// cause. `kind` is the SVM event type (interrupt, NMI, exception or software interrupt).
+    pub(crate) fn svm_event_in_flight(&mut self, vector: u8, error_code: Option<u32>, kind: u32) {
+        let vmcb = self.svm.last_vmcb;
+        let mut info = EVENTINJ_VALID | (kind << EVENTINJ_TYPE_SHIFT) | vector as u32;
+        if let Some(code) = error_code {
+            info |= EVENTINJ_ERROR_VALID;
+            self.vmcb_write(vmcb, VMCB_EXIT_INT_INFO_ERROR, 4, code as u64);
+        }
+        self.vmcb_write(vmcb, VMCB_EXIT_INT_INFO, 4, info as u64);
     }
 
     /// The guest's time stamp counter is the host's plus the VMCB offset.
@@ -1979,6 +1998,50 @@ mod tests {
             (info & NPF_PRESENT != 0, info & NPF_WRITE != 0),
             (true, true)
         );
+    }
+
+    #[test]
+    fn a_nested_fault_while_delivering_an_event_reports_it_in_exit_int_info() {
+        let handler = GUEST_CODE + 0x100;
+        for (event, expected) in [
+            (
+                EVENTINJ_VALID | (EVENT_TYPE_INTERRUPT << EVENTINJ_TYPE_SHIFT) | 0x30,
+                EVENTINJ_VALID | (EVENT_TYPE_INTERRUPT << EVENTINJ_TYPE_SHIFT) | 0x30,
+            ),
+            (
+                EVENTINJ_VALID
+                    | (EVENT_TYPE_EXCEPTION << EVENTINJ_TYPE_SHIFT)
+                    | 0x31
+                    | EVENTINJ_ERROR_VALID,
+                EVENTINJ_VALID
+                    | (EVENT_TYPE_EXCEPTION << EVENTINJ_TYPE_SHIFT)
+                    | 0x31
+                    | EVENTINJ_ERROR_VALID,
+            ),
+        ] {
+            let mut h = nested_rig(ASM_HLT);
+            h.write(handler, &[0x0f, 0xa2]);
+            let cs = h.cpu.seg[SEG_CS].sel;
+            install_idt_gate(&mut h, 0x30, handler, cs);
+            install_idt_gate(&mut h, 0x31, handler, cs);
+            put(&mut h, SAVE_IDTR + SEGMENT_LIMIT, 4, 0x4ff);
+            put(&mut h, SAVE_IDTR + SEGMENT_BASE, 8, IDT);
+            // the frame is pushed onto the page the nested tables do not map
+            h.write(NPT + 0x3000, &0u64.to_le_bytes());
+            put(&mut h, SAVE_RSP, 8, NESTED_REMAPPED_GPA + 0x800);
+            put(&mut h, VMCB_EVENTINJ, 4, event as u64);
+            put(&mut h, VMCB_EVENTINJ_ERROR, 4, 0xe);
+            run(&mut h);
+            assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NPF, "{event:#x}");
+            assert_eq!(
+                get(&h, VMCB_EXIT_INT_INFO, 4),
+                expected as u64,
+                "{event:#x}"
+            );
+            if event & EVENTINJ_ERROR_VALID != 0 {
+                assert_eq!(get(&h, VMCB_EXIT_INT_INFO_ERROR, 4), 0xe);
+            }
+        }
     }
 
     #[test]

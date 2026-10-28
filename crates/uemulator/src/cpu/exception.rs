@@ -169,8 +169,19 @@ impl Cpu {
             match self.deliver(vector, error_code, software) {
                 Ok(()) => return None,
                 Err(Exception::Exit(reason)) => return Some(reason),
-                // a nested-paging fault while delivering switched to the host already
-                Err(Exception::Vmexit) => return None,
+                // a nested-paging fault while delivering switched to the host already; the event
+                // being delivered is reported to the hypervisor so it can inject it again
+                Err(Exception::Vmexit) => {
+                    let kind = if software {
+                        super::svm::EVENT_TYPE_SOFTWARE
+                    } else if class != FaultClass::Benign || first_is_exception {
+                        super::svm::EVENT_TYPE_EXCEPTION
+                    } else {
+                        super::svm::EVENT_TYPE_INTERRUPT
+                    };
+                    self.svm_event_in_flight(vector, error_code, kind);
+                    return None;
+                }
                 Err(Exception::Fault {
                     vector: nested_vector,
                     error_code: nested_error,

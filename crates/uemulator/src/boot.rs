@@ -29,6 +29,8 @@ const BOOT_DS: u16 = 0x18;
 /// code, execute/read), flags G|L. `Cpu::new` loads the cached segment state for `cs` with the
 /// same access byte; keep the two in sync.
 const BOOT_CODE_DESCRIPTOR: u64 = 0x00af_9a00_0000_ffff;
+/// The same selector for a 32-bit kernel: flags G|D instead of G|L.
+const BOOT_CODE32_DESCRIPTOR: u64 = 0x00cf_9a00_0000_ffff;
 /// Flat data segment: access 0x92 (present, DPL 0, data, read/write), flags G|D/B. Matches the
 /// cached `ds`/`es`/`ss` state in `Cpu::new`.
 const BOOT_DATA_DESCRIPTOR: u64 = 0x00cf_9200_0000_ffff;
@@ -143,9 +145,6 @@ impl SetupHeader {
         if header.loadflags & LOADFLAGS_LOADED_HIGH == 0 {
             return Err(bad("not a bzImage (LOADED_HIGH unset)"));
         }
-        if header.xloadflags & XLF_KERNEL_64 == 0 {
-            return Err(bad("kernel has no 64-bit entry (XLF_KERNEL_64 unset)"));
-        }
         if header.protected_offset() >= image.len() {
             return Err(bad("truncated image"));
         }
@@ -159,8 +158,21 @@ impl SetupHeader {
     }
 }
 
-/// Register state of a 64-bit Linux entry: paging on with `cr3`, the GDT at `gdt_base`, `cs` and
-/// `ds` selecting its flat code and data descriptors.
+/// How the CPU starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BootMode {
+    /// 64-bit mode with paging on (the 64-bit Linux boot protocol).
+    #[default]
+    Long64,
+    /// 32-bit protected mode, flat segments, paging off (the 32-bit Linux boot protocol, for a
+    /// kernel without a 64-bit entry point).
+    Protected32,
+    /// Real mode at the reset vector (a firmware image).
+    Real16,
+}
+
+/// Register state of a Linux entry: in 64-bit mode paging on with `cr3`; in 32-bit mode paging
+/// off. The GDT is at `gdt_base`, `cs` and `ds` select its flat code and data descriptors.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BootState {
     pub rip: u64,
@@ -171,9 +183,7 @@ pub struct BootState {
     pub gdt_limit: u16,
     pub cs: u16,
     pub ds: u16,
-    /// Start in real mode at the reset vector instead of in 64-bit mode (a firmware image;
-    /// the other fields are then unused).
-    pub real_mode: bool,
+    pub mode: BootMode,
 }
 
 fn put(ram: &mut [u8], addr: u64, data: &[u8]) -> Result<(), Error> {
@@ -278,7 +288,13 @@ pub(crate) fn load(
 
     // Entries 0 and 1 stay null so the code and data descriptors land on the selectors
     // `BOOT_CS` and `BOOT_DS`.
-    let gdt: [u64; 4] = [0, 0, BOOT_CODE_DESCRIPTOR, BOOT_DATA_DESCRIPTOR];
+    let kernel_is_64_bit = header.xloadflags & XLF_KERNEL_64 != 0;
+    let code_descriptor = if kernel_is_64_bit {
+        BOOT_CODE_DESCRIPTOR
+    } else {
+        BOOT_CODE32_DESCRIPTOR
+    };
+    let gdt: [u64; 4] = [0, 0, code_descriptor, BOOT_DATA_DESCRIPTOR];
     let gdt_bytes: Vec<u8> = gdt.iter().flat_map(|entry| entry.to_le_bytes()).collect();
     put(ram, GDT_ADDR, &gdt_bytes)?;
 
@@ -303,14 +319,19 @@ pub(crate) fn load(
     put(ram, PML4, &tables)?;
 
     Ok(BootState {
-        rip: load_addr + ENTRY_64_OFFSET,
+        // A 32-bit kernel starts at the first byte of its protected-mode image (`startup_32`).
+        rip: load_addr + if kernel_is_64_bit { ENTRY_64_OFFSET } else { 0 },
         rsi: BOOT_PARAMS,
         cr3: PML4,
         gdt_base: GDT_ADDR,
         gdt_limit: (gdt_bytes.len() - 1) as u16,
         cs: BOOT_CS,
         ds: BOOT_DS,
-        real_mode: false,
+        mode: if header.xloadflags & XLF_KERNEL_64 != 0 {
+            BootMode::Long64
+        } else {
+            BootMode::Protected32
+        },
     })
 }
 
@@ -331,7 +352,7 @@ pub(crate) fn load_firmware(ram: &mut [u8], image: &[u8]) -> Result<BootState, E
     }
     put(ram, FIRMWARE_END - image.len() as u64, image)?;
     Ok(BootState {
-        real_mode: true,
+        mode: BootMode::Real16,
         ..Default::default()
     })
 }

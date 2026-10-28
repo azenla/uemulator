@@ -914,6 +914,12 @@ impl Cpu {
         if self.efer & EFER_SCE == 0 {
             return Err(Exception::invalid_opcode());
         }
+        // SYSCALL only exists in IA-32e mode here (legacy-mode SYSCALL is not implemented); from
+        // compatibility mode it enters 64-bit code at CSTAR instead of LSTAR.
+        if self.efer & EFER_LMA == 0 {
+            return Err(Exception::invalid_opcode());
+        }
+        let from_compatibility_mode = !self.is_long64();
         let rflags = self.eflags_full();
         self.gpr[RCX] = next;
         self.gpr[R11] = rflags & !RF;
@@ -933,7 +939,11 @@ impl Cpu {
         self.eflags = (rflags & !self.sfmask & !RF) | EFLAGS_ALWAYS_ONE;
         self.lazy_op = LazyFlagsOp::Eflags;
         self.set_cpl(0);
-        self.rip = self.lstar;
+        self.rip = if from_compatibility_mode {
+            self.cstar
+        } else {
+            self.lstar
+        };
         Ok(())
     }
 
@@ -1003,22 +1013,29 @@ impl Cpu {
         Ok(())
     }
 
-    /// Only the 64-bit form (REX.W, `sysretq`) is implemented: CS = STAR[63:48] + 16 and
-    /// SS = STAR[63:48] + 8, both RPL 3. Returning to compatibility mode is #UD (logged).
+    /// SYSRET. With REX.W (`sysretq`) it returns to 64-bit mode (CS = STAR[63:48] plus 16); without
+    /// it (`sysretl`) to compatibility mode (CS = STAR[63:48], a flat 32-bit code segment). SS is
+    /// STAR[63:48] plus 8 either way. Both use RPL 3 and take RIP from RCX and the flags from R11.
     pub fn do_sysret(&mut self, i: &Insn) -> ExecResult<()> {
-        if self.efer & EFER_SCE == 0 {
+        if self.efer & EFER_SCE == 0 || self.efer & EFER_LMA == 0 {
             return Err(Exception::invalid_opcode());
         }
         self.need_cpl0()?;
-        if i.opsize != 8 {
-            return Err(self.unimplemented_opcode(i));
-        }
         let selector_base = (self.star >> STAR_SYSRET_SELECTOR_SHIFT) as u16 & !SELECTOR_RPL_MASK;
+        let (code_selector, code_flags, target) = if i.opsize == 8 {
+            (selector_base + 16, USER_CODE64_FLAGS, self.gpr[RCX])
+        } else {
+            (
+                selector_base,
+                SEG_FLAGS_CODE32 | DESC_DPL_USER,
+                self.gpr[RCX] & 0xffff_ffff,
+            )
+        };
         self.seg[SEG_CS] = Seg {
-            sel: (selector_base + 16) | SELECTOR_RPL_USER,
+            sel: code_selector | SELECTOR_RPL_USER,
             base: 0,
             limit: FLAT_LIMIT,
-            flags: USER_CODE64_FLAGS,
+            flags: code_flags,
         };
         self.seg[SEG_SS] = Seg {
             sel: (selector_base + 8) | SELECTOR_RPL_USER,
@@ -1030,7 +1047,7 @@ impl Cpu {
         self.eflags = (r11 & SYSRET_RESTORED_FLAGS) | EFLAGS_ALWAYS_ONE;
         self.lazy_op = LazyFlagsOp::Eflags;
         self.set_cpl(3);
-        self.rip = self.gpr[RCX];
+        self.rip = target;
         Ok(())
     }
 
@@ -1167,6 +1184,80 @@ impl Cpu {
         } else {
             4
         }
+    }
+
+    /// LAR (`0F 02`) and LSL (`0F 03`): read a descriptor's access rights or limit through a
+    /// selector, setting ZF when the selector is usable at the current privilege and leaving the
+    /// destination alone (and ZF clear) when it is not. Both are #UD outside protected mode.
+    pub(super) fn load_access_rights_or_limit(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
+        const AR_VISIBLE_MASK: u64 = 0x00ff_ff00;
+        if self.cr0 & CR0_PE == 0 || self.eflags & VM != 0 {
+            return Err(Exception::invalid_opcode());
+        }
+        let loc = self.modrm_location(i, next)?;
+        let selector = self.load_operand(loc, 2, i)? as u16;
+        let wants_limit = i.op == 0x103;
+        let flags = self.eflags_full();
+        let usable = self.descriptor_for_lar_lsl(selector, wants_limit)?;
+        match usable {
+            Some((high_dword, limit)) => {
+                let value = if wants_limit {
+                    limit as u64
+                } else {
+                    high_dword as u64 & AR_VISIBLE_MASK
+                };
+                self.write_gpr(i.reg, i.opsize, true, value);
+                self.set_eflags_arith(flags | ZF);
+            }
+            None => self.set_eflags_arith(flags & !ZF),
+        }
+        self.rip = next;
+        Ok(())
+    }
+
+    /// The upper descriptor dword and the scaled limit of `selector` when LAR/LSL accept it.
+    fn descriptor_for_lar_lsl(
+        &mut self,
+        selector: u16,
+        wants_limit: bool,
+    ) -> ExecResult<Option<(u32, u32)>> {
+        const LAR_TYPES: [u32; 8] = [1, 2, 3, 4, 5, 9, 0xb, 0xc];
+        const LSL_TYPES: [u32; 5] = [1, 2, 3, 9, 0xb];
+        if selector & !SELECTOR_RPL_MASK == 0 {
+            return Ok(None);
+        }
+        let table_limit = if selector & SELECTOR_TABLE_INDICATOR != 0 {
+            self.ldtr.limit
+        } else {
+            self.gdtr.limit as u32
+        };
+        if (selector & SELECTOR_OFFSET_MASK) as u64 + DESCRIPTOR_BYTES - 1 > table_limit as u64 {
+            return Ok(None);
+        }
+        let (lo, _) = self.read_desc(selector)?;
+        let high = (lo >> 32) as u32;
+        let flags = high & SEG_DESCRIPTOR_FLAGS_MASK;
+        let dpl = ((flags >> SEG_DPL_SHIFT) & SEG_DPL_MASK) as u8;
+        let conforming_code = flags & SEG_NON_SYSTEM != 0
+            && flags & SEG_TYPE_EXECUTABLE != 0
+            && flags & SEG_TYPE_CONFORMING != 0;
+        let privileged_enough =
+            conforming_code || (dpl >= self.cpl && dpl >= (selector & SELECTOR_RPL_MASK) as u8);
+        let type_field = (flags >> DESC_TYPE_SHIFT) & DESC_TYPE_MASK;
+        let type_ok = flags & SEG_NON_SYSTEM != 0
+            || if wants_limit {
+                LSL_TYPES.contains(&type_field)
+            } else {
+                LAR_TYPES.contains(&type_field)
+            };
+        if !privileged_enough || !type_ok {
+            return Ok(None);
+        }
+        let mut limit = (lo as u32 & 0xffff) | (high & DESC_LIMIT_HIGH_MASK);
+        if high & SEG_GRANULARITY != 0 {
+            limit = (limit << 12) | 0xfff;
+        }
+        Ok(Some((high, limit)))
     }
 
     /// 0F 00 (group 6: sldt, str, lldt, ltr, verr, verw) and 0F 01 (group 7: sgdt, sidt,
@@ -5151,14 +5242,32 @@ mod sys_tests {
         }
 
         #[test]
-        fn sysret_without_rex_w_is_not_implemented_and_raises_ud() {
-            // The 32-bit return (return to compatibility mode) is a documented limitation.
+        fn sysret_without_rex_w_returns_to_compatibility_mode() {
             // .byte 0x0f, 0x07; hlt
-            let h = assert_invalid_opcode(&[0x0f, 0x07, 0xf4], |h| {
-                enable(h);
-                h.cpu.gpr[RCX] = USER_CODE;
-            });
-            assert_eq!(h.cpu.cpl, 0);
+            let mut h = Harness::new(&[0x0f, 0x07, 0xf4]);
+            enable(&mut h);
+            h.cpu.gpr[RCX] = USER_CODE;
+            assert_eq!(h.run(1), Stop::Limit);
+            assert_eq!(h.cpu.cpl, 3);
+            assert_eq!(h.cpu.rip, USER_CODE);
+            assert_eq!(h.cpu.code_mode(), crate::cpu::decode::CodeMode::Bits32);
+            let cs = h.cpu.seg[SEG_CS];
+            assert_eq!(cs.flags & SEG_LONG, 0, "CS.L is clear: compatibility mode");
+            assert_ne!(cs.flags & SEG_DEFAULT_BIG, 0);
+        }
+
+        #[test]
+        fn syscall_from_compatibility_mode_enters_at_cstar() {
+            let mut h = Harness::new(&[0x0f, 0x05, 0xf4]);
+            enable(&mut h);
+            h.cpu.cstar = 0x2345_6000;
+            h.cpu.lstar = 0x1111_1000;
+            h.cpu.seg[SEG_CS].flags &= !SEG_LONG;
+            h.cpu.seg[SEG_CS].flags |= SEG_DEFAULT_BIG;
+            assert_eq!(h.run(1), Stop::Limit);
+            assert_eq!(h.cpu.rip, 0x2345_6000);
+            assert_eq!(h.cpu.gpr[RCX], CODE_BASE + 2);
+            assert!(h.cpu.is_long64(), "the entry is always 64-bit code");
         }
 
         #[test]

@@ -31,7 +31,7 @@ mod sys;
 #[cfg(test)]
 mod testkit;
 
-pub use boot::BootState;
+pub use boot::{BootMode, BootState};
 pub use console::ConsoleHandle;
 #[cfg(not(freestanding))]
 pub use disk::{BlockBackend, Disk};
@@ -121,7 +121,7 @@ mod api_tests {
             gdt_limit: 5,
             cs: 6,
             ds: 7,
-            real_mode: false,
+            mode: BootMode::Long64,
         };
         assert_eq!(
             (

@@ -515,11 +515,16 @@ impl Cpu {
         };
         cpu.ram_base = cpu.ram.as_ptr() as u64;
         cpu.set_cpl(0);
-        if boot.real_mode {
-            cpu.reset_to_real_mode();
-            // The chipset would alias the top of the 4 GiB space onto the BIOS; there is no ROM
-            // here, so execution starts at the same code through the plain real-mode address.
-            cpu.seg[SEG_CS].base = (cpu.seg[SEG_CS].sel as u64) << 4;
+        match boot.mode {
+            crate::boot::BootMode::Long64 => {}
+            crate::boot::BootMode::Real16 => {
+                cpu.reset_to_real_mode();
+                // The chipset would alias the top of the 4 GiB space onto the BIOS; there is no
+                // ROM here, so execution starts at the same code through the plain real-mode
+                // address.
+                cpu.seg[SEG_CS].base = (cpu.seg[SEG_CS].sel as u64) << 4;
+            }
+            crate::boot::BootMode::Protected32 => cpu.enter_boot_protected_mode(boot),
         }
         cpu
     }
