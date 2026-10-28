@@ -47,7 +47,13 @@ pub fn build_table() -> Vec<u8> {
     bios.push(3);
     bios.push(0);
     bios.extend_from_slice(&BIOS_CHARACTERISTICS_UNSUPPORTED.to_le_bytes());
-    table.extend(structure(TYPE_BIOS, BIOS_LENGTH, 0, &bios, &["uemulator", "1", "01/01/2026"]));
+    table.extend(structure(
+        TYPE_BIOS,
+        BIOS_LENGTH,
+        0,
+        &bios,
+        &["uemulator", "1", "01/01/2026"],
+    ));
     // Manufacturer, product, version, serial, SKU, family are strings 1-6; the UUID stays zero.
     let mut system = Vec::new();
     system.extend_from_slice(&[1, 2, 3, 4]);
@@ -58,7 +64,14 @@ pub fn build_table() -> Vec<u8> {
         SYSTEM_LENGTH,
         1,
         &system,
-        &["uemulator", "Virtual Machine", "1", "0", "uemulator", "uemulator"],
+        &[
+            "uemulator",
+            "Virtual Machine",
+            "1",
+            "0",
+            "uemulator",
+            "uemulator",
+        ],
     ));
     table.extend(structure(TYPE_END, END_LENGTH, 2, &[], &[]));
     table
@@ -104,9 +117,15 @@ mod tests {
     #[test]
     fn entry_point_checksums_to_zero() {
         let entry = entry_point(0x1234_5000, 200);
-        assert_eq!(entry.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte)), 0);
+        assert_eq!(
+            entry.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte)),
+            0
+        );
         assert_eq!(&entry[..5], b"_SM3_");
-        assert_eq!(u64::from_le_bytes(entry[16..24].try_into().unwrap()), 0x1234_5000);
+        assert_eq!(
+            u64::from_le_bytes(entry[16..24].try_into().unwrap()),
+            0x1234_5000
+        );
     }
 
     #[test]
@@ -131,6 +150,9 @@ mod tests {
     #[test]
     fn strings_follow_the_formatted_part() {
         let table = build_table();
-        assert_eq!(&table[BIOS_LENGTH as usize..BIOS_LENGTH as usize + 10], b"uemulator\0");
+        assert_eq!(
+            &table[BIOS_LENGTH as usize..BIOS_LENGTH as usize + 10],
+            b"uemulator\0"
+        );
     }
 }

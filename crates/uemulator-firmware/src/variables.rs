@@ -33,15 +33,29 @@ pub fn init() {
     variables.set_internal("SetupMode", &global, visible, &[1]);
     variables.set_internal("AuditMode", &global, visible, &[0]);
     variables.set_internal("DeployedMode", &global, visible, &[0]);
-    variables.set_internal("OsIndicationsSupported", &global, visible, &OS_INDICATIONS_SUPPORTED.to_le_bytes());
-    variables.set_internal("BootOptionSupport", &global, visible, &BOOT_OPTION_SUPPORT.to_le_bytes());
+    variables.set_internal(
+        "OsIndicationsSupported",
+        &global,
+        visible,
+        &OS_INDICATIONS_SUPPORTED.to_le_bytes(),
+    );
+    variables.set_internal(
+        "BootOptionSupport",
+        &global,
+        visible,
+        &BOOT_OPTION_SUPPORT.to_le_bytes(),
+    );
     variables.set_internal("PlatformLangCodes", &global, visible, PLATFORM_LANGUAGES);
 }
 
 /// For the boot manager and others inside the firmware.
 pub fn read(name: &str, guid: &Guid) -> Option<Vec<u8>> {
     let units: Vec<u16> = name.encode_utf16().collect();
-    VARIABLES.get().get(&units, guid, false).ok().map(|(_, data)| data)
+    VARIABLES
+        .get()
+        .get(&units, guid, false)
+        .ok()
+        .map(|(_, data)| data)
 }
 
 pub fn write(name: &str, guid: &Guid, attributes: u32, data: &[u8]) {
@@ -75,10 +89,11 @@ extern "efiapi" fn get_variable(
     }
     let name = unsafe { text::to_units(name) };
     let guid = unsafe { guid.read_unaligned() };
-    let (stored_attributes, value) = match VARIABLES.get().get(&name, &guid, memory::in_runtime_mode()) {
-        Ok(found) => found,
-        Err(error) => return status_of(error),
-    };
+    let (stored_attributes, value) =
+        match VARIABLES.get().get(&name, &guid, memory::in_runtime_mode()) {
+            Ok(found) => found,
+            Err(error) => return status_of(error),
+        };
     unsafe {
         if !attributes.is_null() {
             attributes.write_unaligned(stored_attributes);
@@ -116,13 +131,20 @@ extern "efiapi" fn set_variable(
     } else {
         unsafe { core::slice::from_raw_parts(data.cast(), size) }
     };
-    match VARIABLES.get().set(&name, &guid, attributes, data, memory::in_runtime_mode()) {
+    match VARIABLES
+        .get()
+        .set(&name, &guid, attributes, data, memory::in_runtime_mode())
+    {
         Ok(()) => SUCCESS,
         Err(error) => status_of(error),
     }
 }
 
-extern "efiapi" fn get_next_variable_name(size: *mut usize, name: *mut u16, guid: *mut Guid) -> Status {
+extern "efiapi" fn get_next_variable_name(
+    size: *mut usize,
+    name: *mut u16,
+    guid: *mut Guid,
+) -> Status {
     memory::rewind_runtime_arena();
     if size.is_null() || name.is_null() || guid.is_null() {
         return INVALID_PARAMETER;
@@ -141,10 +163,14 @@ extern "efiapi" fn get_next_variable_name(size: *mut usize, name: *mut u16, guid
         previous.push(unit);
     }
     let previous_guid = unsafe { guid.read_unaligned() };
-    let (next, next_guid) = match VARIABLES.get().next(&previous, &previous_guid, memory::in_runtime_mode()) {
-        Ok(found) => found,
-        Err(error) => return status_of(error),
-    };
+    let (next, next_guid) =
+        match VARIABLES
+            .get()
+            .next(&previous, &previous_guid, memory::in_runtime_mode())
+        {
+            Ok(found) => found,
+            Err(error) => return status_of(error),
+        };
     let needed = (next.len() + 1) * 2;
     unsafe {
         size.write_unaligned(needed);

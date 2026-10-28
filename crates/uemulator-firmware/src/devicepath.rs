@@ -78,7 +78,8 @@ impl DevicePath {
         self.0.truncate(self.0.len() - END_NODE.len());
         self.0.push(kind);
         self.0.push(subtype);
-        self.0.extend_from_slice(&((NODE_HEADER_BYTES + payload.len()) as u16).to_le_bytes());
+        self.0
+            .extend_from_slice(&((NODE_HEADER_BYTES + payload.len()) as u16).to_le_bytes());
         self.0.extend_from_slice(payload);
         self.0.extend_from_slice(&END_NODE);
         self
@@ -138,7 +139,8 @@ impl DevicePath {
     /// The nodes of `self` after `prefix`, as a path of their own.
     pub fn strip_prefix(&self, prefix: &DevicePath) -> Option<DevicePath> {
         let length = prefix.0.len() - END_NODE.len();
-        self.starts_with(prefix).then(|| Self(self.0[length..].to_vec()))
+        self.starts_with(prefix)
+            .then(|| Self(self.0[length..].to_vec()))
     }
 
     /// The hard-drive node's partition, if the path has one: (number, first block, blocks).
@@ -240,12 +242,18 @@ pub fn to_text(path: &[u8]) -> String {
                     );
                 } else {
                     let signature = u32::from_le_bytes(p[20..24].try_into().unwrap());
-                    let _ = write!(text, "HD({number},MBR,{signature:#010x},{start:#x},{size:#x})");
+                    let _ = write!(
+                        text,
+                        "HD({number},MBR,{signature:#010x},{start:#x},{size:#x})"
+                    );
                 }
             }
             (TYPE_MEDIA, SUBTYPE_FILE_PATH) => text.push_str(&file_node_text(p)),
-            (TYPE_MEDIA, SUBTYPE_VENDOR_MEDIA) | (TYPE_HARDWARE, SUBTYPE_VENDOR_HARDWARE)
-            | (TYPE_MESSAGING, SUBTYPE_VENDOR_MESSAGING) if p.len() >= 16 => {
+            (TYPE_MEDIA, SUBTYPE_VENDOR_MEDIA)
+            | (TYPE_HARDWARE, SUBTYPE_VENDOR_HARDWARE)
+            | (TYPE_MESSAGING, SUBTYPE_VENDOR_MESSAGING)
+                if p.len() >= 16 =>
+            {
                 let guid = Guid::from_bytes(&p[..16]);
                 let _ = write!(
                     text,
@@ -386,7 +394,10 @@ pub mod protocol {
         core::ptr::null_mut()
     }
 
-    extern "efiapi" fn next_instance(_: *mut *mut DevicePathNode, _: *mut usize) -> *mut DevicePathNode {
+    extern "efiapi" fn next_instance(
+        _: *mut *mut DevicePathNode,
+        _: *mut usize,
+    ) -> *mut DevicePathNode {
         core::ptr::null_mut()
     }
 
@@ -418,14 +429,24 @@ mod tests {
     fn builds_and_prints_a_boot_path() {
         let guid = Guid::new(0x11223344, 0x5566, 0x7788, [1, 2, 3, 4, 5, 6, 7, 8]);
         let path = disk_path()
-            .hard_drive(1, 0x800, 0x40000, guid.to_bytes(), PARTITION_FORMAT_GPT, SIGNATURE_GUID)
+            .hard_drive(
+                1,
+                0x800,
+                0x40000,
+                guid.to_bytes(),
+                PARTITION_FORMAT_GPT,
+                SIGNATURE_GUID,
+            )
             .file_path("\\EFI\\BOOT\\BOOTX64.EFI");
         assert_eq!(
             path.text(),
             "PciRoot(0x0)/Pci(0x3,0x0)/HD(1,GPT,11223344-5566-7788-0102-030405060708,0x800,0x40000)/\\EFI\\BOOT\\BOOTX64.EFI"
         );
         assert_eq!(path.partition(), Some((1, 0x800, 0x40000)));
-        assert_eq!(path.file_name().as_deref(), Some("\\EFI\\BOOT\\BOOTX64.EFI"));
+        assert_eq!(
+            path.file_name().as_deref(),
+            Some("\\EFI\\BOOT\\BOOTX64.EFI")
+        );
         assert_eq!(&path.as_bytes()[path.as_bytes().len() - 4..], &END_NODE);
     }
 
@@ -433,8 +454,12 @@ mod tests {
     fn mbr_partitions_print_their_signature() {
         let mut signature = [0u8; 16];
         signature[..4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
-        let path = disk_path().hard_drive(2, 100, 200, signature, PARTITION_FORMAT_MBR, SIGNATURE_MBR);
-        assert_eq!(path.text(), "PciRoot(0x0)/Pci(0x3,0x0)/HD(2,MBR,0xdeadbeef,0x64,0xc8)");
+        let path =
+            disk_path().hard_drive(2, 100, 200, signature, PARTITION_FORMAT_MBR, SIGNATURE_MBR);
+        assert_eq!(
+            path.text(),
+            "PciRoot(0x0)/Pci(0x3,0x0)/HD(2,MBR,0xdeadbeef,0x64,0xc8)"
+        );
     }
 
     #[test]
@@ -455,7 +480,10 @@ mod tests {
         assert_eq!(copy, Some(path));
         assert_eq!(unsafe { DevicePath::from_raw(core::ptr::null()) }, None);
         let zero_length_node = [TYPE_HARDWARE, 1, 0, 0, 0, 0, 0, 0];
-        assert_eq!(unsafe { DevicePath::from_raw(zero_length_node.as_ptr()) }, None);
+        assert_eq!(
+            unsafe { DevicePath::from_raw(zero_length_node.as_ptr()) },
+            None
+        );
     }
 
     #[test]

@@ -38,7 +38,11 @@ pub fn init(handoff: &Handoff) {
     }
     // An all-zero state is the one fixed point of the generator.
     state[0] |= 1;
-    let _ = protocols::install(core::ptr::null_mut(), guids::RNG, PROTOCOL.get() as *mut Rng as *mut c_void);
+    let _ = protocols::install(
+        core::ptr::null_mut(),
+        guids::RNG,
+        PROTOCOL.get() as *mut Rng as *mut c_void,
+    );
 }
 
 extern "efiapi" fn get_info(_: *mut Rng, size: *mut usize, list: *mut Guid) -> Status {
@@ -60,7 +64,12 @@ extern "efiapi" fn get_info(_: *mut Rng, size: *mut usize, list: *mut Guid) -> S
     SUCCESS
 }
 
-extern "efiapi" fn get_rng(_: *mut Rng, algorithm: *const Guid, length: usize, value: *mut u8) -> Status {
+extern "efiapi" fn get_rng(
+    _: *mut Rng,
+    algorithm: *const Guid,
+    length: usize,
+    value: *mut u8,
+) -> Status {
     if value.is_null() {
         return INVALID_PARAMETER;
     }

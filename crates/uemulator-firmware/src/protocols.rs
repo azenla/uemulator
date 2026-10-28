@@ -73,20 +73,32 @@ pub fn handles_with(guid: &Guid) -> Vec<Handle> {
         .handles
         .iter()
         .copied()
-        .filter(|&handle| unsafe { (*handle).protocols.iter().any(|protocol| protocol.guid == *guid) })
+        .filter(|&handle| unsafe {
+            (*handle)
+                .protocols
+                .iter()
+                .any(|protocol| protocol.guid == *guid)
+        })
         .map(|handle| handle.cast())
         .collect()
 }
 
 pub fn all_handles() -> Vec<Handle> {
-    DATABASE.get().handles.iter().map(|&handle| handle.cast()).collect()
+    DATABASE
+        .get()
+        .handles
+        .iter()
+        .map(|&handle| handle.cast())
+        .collect()
 }
 
 /// Installs `interface` on `handle`, or on a new handle when it is null.
 pub fn install(handle: Handle, guid: Guid, interface: *mut c_void) -> Result<Handle, Status> {
     let database = DATABASE.get();
     let handle = if handle.is_null() {
-        let created = Box::into_raw(Box::new(HandleData { protocols: Vec::new() }));
+        let created = Box::into_raw(Box::new(HandleData {
+            protocols: Vec::new(),
+        }));
         database.handles.push(created);
         created.cast()
     } else if known(handle) {
@@ -94,7 +106,11 @@ pub fn install(handle: Handle, guid: Guid, interface: *mut c_void) -> Result<Han
     } else {
         return Err(INVALID_PARAMETER);
     };
-    if data(handle).protocols.iter().any(|protocol| protocol.guid == guid) {
+    if data(handle)
+        .protocols
+        .iter()
+        .any(|protocol| protocol.guid == guid)
+    {
         return Err(INVALID_PARAMETER);
     }
     data(handle).protocols.push(Protocol {
@@ -102,7 +118,11 @@ pub fn install(handle: Handle, guid: Guid, interface: *mut c_void) -> Result<Han
         interface,
         opens: Vec::new(),
     });
-    for registration in database.registrations.iter_mut().filter(|registration| registration.guid == guid) {
+    for registration in database
+        .registrations
+        .iter_mut()
+        .filter(|registration| registration.guid == guid)
+    {
         registration.newly_installed.push(handle);
         events::signal(registration.event);
     }
@@ -182,15 +202,30 @@ extern "efiapi" fn reinstall_protocol_interface(
     }
 }
 
-extern "efiapi" fn uninstall_protocol_interface(handle: Handle, guid: *const Guid, interface: *mut c_void) -> Status {
+extern "efiapi" fn uninstall_protocol_interface(
+    handle: Handle,
+    guid: *const Guid,
+    interface: *mut c_void,
+) -> Status {
     match unsafe { guid_arg(guid) } {
         Some(guid) => uninstall(handle, &guid, interface),
         None => INVALID_PARAMETER,
     }
 }
 
-extern "efiapi" fn handle_protocol(handle: Handle, guid: *const Guid, interface: *mut *mut c_void) -> Status {
-    open_protocol(handle, guid, interface, ptr::null_mut(), ptr::null_mut(), OPEN_PROTOCOL_BY_HANDLE_PROTOCOL)
+extern "efiapi" fn handle_protocol(
+    handle: Handle,
+    guid: *const Guid,
+    interface: *mut *mut c_void,
+) -> Status {
+    open_protocol(
+        handle,
+        guid,
+        interface,
+        ptr::null_mut(),
+        ptr::null_mut(),
+        OPEN_PROTOCOL_BY_HANDLE_PROTOCOL,
+    )
 }
 
 extern "efiapi" fn open_protocol(
@@ -211,7 +246,11 @@ extern "efiapi" fn open_protocol(
     if interface.is_null() && !test {
         return INVALID_PARAMETER;
     }
-    let Some(protocol) = data(handle).protocols.iter_mut().find(|protocol| protocol.guid == guid) else {
+    let Some(protocol) = data(handle)
+        .protocols
+        .iter_mut()
+        .find(|protocol| protocol.guid == guid)
+    else {
         if !interface.is_null() {
             unsafe { interface.write(ptr::null_mut()) };
         }
@@ -222,31 +261,48 @@ extern "efiapi" fn open_protocol(
     }
     // The usage records matter to drivers deciding whom to bind; applications only need the
     // interface, so GET/BY_HANDLE are not recorded.
-    if attributes & (OPEN_PROTOCOL_BY_DRIVER | OPEN_PROTOCOL_EXCLUSIVE | OPEN_PROTOCOL_BY_CHILD_CONTROLLER) != 0 {
-        match protocol
-            .opens
-            .iter_mut()
-            .find(|open| open.agent == agent && open.controller == controller && open.attributes == attributes)
-        {
+    if attributes
+        & (OPEN_PROTOCOL_BY_DRIVER | OPEN_PROTOCOL_EXCLUSIVE | OPEN_PROTOCOL_BY_CHILD_CONTROLLER)
+        != 0
+    {
+        match protocol.opens.iter_mut().find(|open| {
+            open.agent == agent && open.controller == controller && open.attributes == attributes
+        }) {
             Some(open) => open.count += 1,
-            None => protocol.opens.push(OpenRecord { agent, controller, attributes, count: 1 }),
+            None => protocol.opens.push(OpenRecord {
+                agent,
+                controller,
+                attributes,
+                count: 1,
+            }),
         }
     }
     SUCCESS
 }
 
-extern "efiapi" fn close_protocol(handle: Handle, guid: *const Guid, agent: Handle, controller: Handle) -> Status {
+extern "efiapi" fn close_protocol(
+    handle: Handle,
+    guid: *const Guid,
+    agent: Handle,
+    controller: Handle,
+) -> Status {
     let Some(guid) = (unsafe { guid_arg(guid) }) else {
         return INVALID_PARAMETER;
     };
     if !known(handle) {
         return INVALID_PARAMETER;
     }
-    let Some(protocol) = data(handle).protocols.iter_mut().find(|protocol| protocol.guid == guid) else {
+    let Some(protocol) = data(handle)
+        .protocols
+        .iter_mut()
+        .find(|protocol| protocol.guid == guid)
+    else {
         return NOT_FOUND;
     };
     // Handles opened without a record (plain GET/BY_HANDLE) close successfully too.
-    protocol.opens.retain(|open| !(open.agent == agent && open.controller == controller));
+    protocol
+        .opens
+        .retain(|open| !(open.agent == agent && open.controller == controller));
     SUCCESS
 }
 
@@ -262,7 +318,11 @@ extern "efiapi" fn open_protocol_information(
     if !known(handle) || buffer.is_null() || count.is_null() {
         return INVALID_PARAMETER;
     }
-    let Some(protocol) = data(handle).protocols.iter().find(|protocol| protocol.guid == guid) else {
+    let Some(protocol) = data(handle)
+        .protocols
+        .iter()
+        .find(|protocol| protocol.guid == guid)
+    else {
         return NOT_FOUND;
     };
     let size = protocol.opens.len() * core::mem::size_of::<OpenProtocolInformation>();
@@ -272,12 +332,15 @@ extern "efiapi" fn open_protocol_information(
     }
     for (index, open) in protocol.opens.iter().enumerate() {
         unsafe {
-            array.cast::<OpenProtocolInformation>().add(index).write(OpenProtocolInformation {
-                agent_handle: open.agent,
-                controller_handle: open.controller,
-                attributes: open.attributes,
-                open_count: open.count,
-            });
+            array
+                .cast::<OpenProtocolInformation>()
+                .add(index)
+                .write(OpenProtocolInformation {
+                    agent_handle: open.agent,
+                    controller_handle: open.controller,
+                    attributes: open.attributes,
+                    open_count: open.count,
+                });
         }
     }
     unsafe {
@@ -287,7 +350,11 @@ extern "efiapi" fn open_protocol_information(
     SUCCESS
 }
 
-extern "efiapi" fn protocols_per_handle(handle: Handle, buffer: *mut *mut *mut Guid, count: *mut usize) -> Status {
+extern "efiapi" fn protocols_per_handle(
+    handle: Handle,
+    buffer: *mut *mut *mut Guid,
+    count: *mut usize,
+) -> Status {
     if !known(handle) || buffer.is_null() || count.is_null() {
         return INVALID_PARAMETER;
     }
@@ -319,7 +386,12 @@ fn search(search_type: u32, guid: *const Guid, key: *mut c_void) -> Result<Vec<H
                 .get()
                 .registrations
                 .iter_mut()
-                .find(|registration| ptr::eq(&***registration as *const Registration as *const c_void, key))
+                .find(|registration| {
+                    ptr::eq(
+                        &***registration as *const Registration as *const c_void,
+                        key,
+                    )
+                })
                 .ok_or(INVALID_PARAMETER)?;
             Ok(core::mem::take(&mut registration.newly_installed))
         }
@@ -397,7 +469,11 @@ extern "efiapi" fn locate_handle_buffer(
     SUCCESS
 }
 
-extern "efiapi" fn locate_protocol(guid: *const Guid, registration: *mut c_void, interface: *mut *mut c_void) -> Status {
+extern "efiapi" fn locate_protocol(
+    guid: *const Guid,
+    registration: *mut c_void,
+    interface: *mut *mut c_void,
+) -> Status {
     let Some(guid) = (unsafe { guid_arg(guid) }) else {
         return INVALID_PARAMETER;
     };
@@ -413,7 +489,10 @@ extern "efiapi" fn locate_protocol(guid: *const Guid, registration: *mut c_void,
         }
     };
     handles.retain(|&handle| interface_of(handle, &guid).is_some());
-    match handles.first().and_then(|&handle| interface_of(handle, &guid)) {
+    match handles
+        .first()
+        .and_then(|&handle| interface_of(handle, &guid))
+    {
         Some(found) => {
             unsafe { interface.write(found) };
             SUCCESS
@@ -459,14 +538,22 @@ extern "efiapi" fn locate_device_path(
     SUCCESS
 }
 
-extern "efiapi" fn register_protocol_notify(guid: *const Guid, event: Event, registration: *mut *mut c_void) -> Status {
+extern "efiapi" fn register_protocol_notify(
+    guid: *const Guid,
+    event: Event,
+    registration: *mut *mut c_void,
+) -> Status {
     let Some(guid) = (unsafe { guid_arg(guid) }) else {
         return INVALID_PARAMETER;
     };
     if event.is_null() || registration.is_null() {
         return INVALID_PARAMETER;
     }
-    let entry = Box::new(Registration { guid, event, newly_installed: Vec::new() });
+    let entry = Box::new(Registration {
+        guid,
+        event,
+        newly_installed: Vec::new(),
+    });
     unsafe { registration.write((&*entry as *const Registration).cast_mut().cast()) };
     DATABASE.get().registrations.push(entry);
     SUCCESS
@@ -481,23 +568,42 @@ const MULTIPLE_PAIRS: usize = 8;
 #[allow(clippy::too_many_arguments)]
 extern "efiapi" fn install_multiple(
     handle: *mut Handle,
-    g0: *const Guid, i0: *mut c_void,
-    g1: *const Guid, i1: *mut c_void,
-    g2: *const Guid, i2: *mut c_void,
-    g3: *const Guid, i3: *mut c_void,
-    g4: *const Guid, i4: *mut c_void,
-    g5: *const Guid, i5: *mut c_void,
-    g6: *const Guid, i6: *mut c_void,
-    g7: *const Guid, i7: *mut c_void,
+    g0: *const Guid,
+    i0: *mut c_void,
+    g1: *const Guid,
+    i1: *mut c_void,
+    g2: *const Guid,
+    i2: *mut c_void,
+    g3: *const Guid,
+    i3: *mut c_void,
+    g4: *const Guid,
+    i4: *mut c_void,
+    g5: *const Guid,
+    i5: *mut c_void,
+    g6: *const Guid,
+    i6: *mut c_void,
+    g7: *const Guid,
+    i7: *mut c_void,
 ) -> Status {
-    let pairs = [(g0, i0), (g1, i1), (g2, i2), (g3, i3), (g4, i4), (g5, i5), (g6, i6), (g7, i7)];
+    let pairs = [
+        (g0, i0),
+        (g1, i1),
+        (g2, i2),
+        (g3, i3),
+        (g4, i4),
+        (g5, i5),
+        (g6, i6),
+        (g7, i7),
+    ];
     debug_assert_eq!(pairs.len(), MULTIPLE_PAIRS);
     if handle.is_null() {
         return INVALID_PARAMETER;
     }
     let mut done: Vec<(Guid, *mut c_void)> = Vec::new();
     for (guid, interface) in pairs {
-        let Some(guid) = (unsafe { guid_arg(guid) }) else { break };
+        let Some(guid) = (unsafe { guid_arg(guid) }) else {
+            break;
+        };
         match install(unsafe { handle.read() }, guid, interface) {
             Ok(installed) => {
                 unsafe { handle.write(installed) };
@@ -517,18 +623,37 @@ extern "efiapi" fn install_multiple(
 #[allow(clippy::too_many_arguments)]
 extern "efiapi" fn uninstall_multiple(
     handle: Handle,
-    g0: *const Guid, i0: *mut c_void,
-    g1: *const Guid, i1: *mut c_void,
-    g2: *const Guid, i2: *mut c_void,
-    g3: *const Guid, i3: *mut c_void,
-    g4: *const Guid, i4: *mut c_void,
-    g5: *const Guid, i5: *mut c_void,
-    g6: *const Guid, i6: *mut c_void,
-    g7: *const Guid, i7: *mut c_void,
+    g0: *const Guid,
+    i0: *mut c_void,
+    g1: *const Guid,
+    i1: *mut c_void,
+    g2: *const Guid,
+    i2: *mut c_void,
+    g3: *const Guid,
+    i3: *mut c_void,
+    g4: *const Guid,
+    i4: *mut c_void,
+    g5: *const Guid,
+    i5: *mut c_void,
+    g6: *const Guid,
+    i6: *mut c_void,
+    g7: *const Guid,
+    i7: *mut c_void,
 ) -> Status {
-    let pairs = [(g0, i0), (g1, i1), (g2, i2), (g3, i3), (g4, i4), (g5, i5), (g6, i6), (g7, i7)];
+    let pairs = [
+        (g0, i0),
+        (g1, i1),
+        (g2, i2),
+        (g3, i3),
+        (g4, i4),
+        (g5, i5),
+        (g6, i6),
+        (g7, i7),
+    ];
     for (guid, interface) in pairs {
-        let Some(guid) = (unsafe { guid_arg(guid) }) else { break };
+        let Some(guid) = (unsafe { guid_arg(guid) }) else {
+            break;
+        };
         let status = uninstall(handle, &guid, interface);
         if status != SUCCESS {
             return status;
@@ -539,7 +664,12 @@ extern "efiapi" fn uninstall_multiple(
 
 /// No drivers exist to connect, which the specification reports as `NOT_FOUND`; loaders call it
 /// on every handle and ignore the answer.
-extern "efiapi" fn connect_controller(_: Handle, _: *mut Handle, _: *mut DevicePathNode, _: u8) -> Status {
+extern "efiapi" fn connect_controller(
+    _: Handle,
+    _: *mut Handle,
+    _: *mut DevicePathNode,
+    _: u8,
+) -> Status {
     NOT_FOUND
 }
 

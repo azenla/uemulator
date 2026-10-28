@@ -104,7 +104,9 @@ unsafe fn write64(base: *mut u8, offset: usize, value: u64) {
 pub fn probe_all() -> Vec<Box<VirtioBlk>> {
     pci::scan()
         .into_iter()
-        .filter(|function| function.vendor == VENDOR_VIRTIO && function.device_id == DEVICE_ID_BLOCK)
+        .filter(|function| {
+            function.vendor == VENDOR_VIRTIO && function.device_id == DEVICE_ID_BLOCK
+        })
         .filter_map(VirtioBlk::new)
         .map(Box::new)
         .collect()
@@ -114,14 +116,20 @@ impl VirtioBlk {
     fn new(function: Function) -> Option<Self> {
         let (device, number) = (function.device, function.function);
         let command = pci::read32(device, number, pci::REGISTER_COMMAND);
-        pci::write32(device, number, pci::REGISTER_COMMAND, command | pci::COMMAND_MEMORY_SPACE | pci::COMMAND_BUS_MASTER);
+        pci::write32(
+            device,
+            number,
+            pci::REGISTER_COMMAND,
+            command | pci::COMMAND_MEMORY_SPACE | pci::COMMAND_BUS_MASTER,
+        );
         // The machine has no firmware to assign BARs, so the library preassigned BAR0 and every
         // region the capabilities describe lives in it.
         let bar0 = (pci::read32(device, number, pci::REGISTER_BAR0) & !0xf) as usize;
         if bar0 == 0 {
             return None;
         }
-        let (mut common, mut notify, mut device_config, mut multiplier) = (0usize, 0usize, 0usize, 0u32);
+        let (mut common, mut notify, mut device_config, mut multiplier) =
+            (0usize, 0usize, 0usize, 0u32);
         let mut capability = pci::read8(device, number, pci::REGISTER_CAPABILITIES) as usize;
         for _ in 0..16 {
             if capability == 0 {
@@ -147,11 +155,18 @@ impl VirtioBlk {
         if common == 0 || notify == 0 || device_config == 0 {
             return None;
         }
-        let (common, notify, device_config) = (common as *mut u8, notify as *mut u8, device_config as *mut u8);
+        let (common, notify, device_config) = (
+            common as *mut u8,
+            notify as *mut u8,
+            device_config as *mut u8,
+        );
         let ring = memory::allocate_zeroed_pages(BOOT_SERVICES_DATA, RING_PAGES)?;
         unsafe {
             write_volatile(common.add(COMMON_DEVICE_STATUS), 0);
-            write_volatile(common.add(COMMON_DEVICE_STATUS), STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+            write_volatile(
+                common.add(COMMON_DEVICE_STATUS),
+                STATUS_ACKNOWLEDGE | STATUS_DRIVER,
+            );
             write32(common, COMMON_DEVICE_FEATURE_SELECT, 0);
             let low = read_volatile(common.add(COMMON_DEVICE_FEATURE).cast::<u32>());
             write32(common, COMMON_DEVICE_FEATURE_SELECT, 1);
@@ -185,7 +200,8 @@ impl VirtioBlk {
                 common.add(COMMON_DEVICE_STATUS),
                 STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
             );
-            let sector_count = read_volatile(device_config.add(DEVICE_CONFIG_CAPACITY).cast::<u64>());
+            let sector_count =
+                read_volatile(device_config.add(DEVICE_CONFIG_CAPACITY).cast::<u64>());
             Some(Self {
                 function,
                 common,
@@ -206,7 +222,14 @@ impl VirtioBlk {
 
     /// One request: header, optional data buffer, status byte. `device_writes` says whether the
     /// device fills the buffer (a read) or only reads it (a write).
-    fn submit(&mut self, kind: u32, sector: u64, data: *mut u8, length: usize, device_writes: bool) -> bool {
+    fn submit(
+        &mut self,
+        kind: u32,
+        sector: u64,
+        data: *mut u8,
+        length: usize,
+        device_writes: bool,
+    ) -> bool {
         unsafe {
             let scratch = self.ring.add(SCRATCH_PAGE + SCRATCH_OFFSET);
             scratch.cast::<u32>().write(kind);
@@ -222,7 +245,13 @@ impl VirtioBlk {
                 at.add(14).cast::<u16>().write(next);
             };
             let header_flags = DESC_F_NEXT;
-            descriptor(0, scratch as u64, HEADER_BYTES as u32, header_flags, if length > 0 { 1 } else { 2 });
+            descriptor(
+                0,
+                scratch as u64,
+                HEADER_BYTES as u32,
+                header_flags,
+                if length > 0 { 1 } else { 2 },
+            );
             if length > 0 {
                 let flags = DESC_F_NEXT | if device_writes { DESC_F_WRITE } else { 0 };
                 descriptor(1, data as u64, length as u32, flags, 2);
@@ -247,7 +276,9 @@ impl VirtioBlk {
     }
 
     pub fn read(&mut self, first_sector: u64, buffer: &mut [u8]) -> bool {
-        if buffer.len() % SECTOR_BYTES != 0 || first_sector + (buffer.len() / SECTOR_BYTES) as u64 > self.sector_count {
+        if buffer.len() % SECTOR_BYTES != 0
+            || first_sector + (buffer.len() / SECTOR_BYTES) as u64 > self.sector_count
+        {
             return false;
         }
         let mut sector = first_sector;
@@ -269,7 +300,13 @@ impl VirtioBlk {
         }
         let mut sector = first_sector;
         for chunk in buffer.chunks(MAX_REQUEST_BYTES) {
-            if !self.submit(REQUEST_OUT, sector, chunk.as_ptr().cast_mut(), chunk.len(), false) {
+            if !self.submit(
+                REQUEST_OUT,
+                sector,
+                chunk.as_ptr().cast_mut(),
+                chunk.len(),
+                false,
+            ) {
                 return false;
             }
             sector += (chunk.len() / SECTOR_BYTES) as u64;

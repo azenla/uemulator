@@ -74,7 +74,13 @@ pub fn get_time() -> Time {
         core::hint::spin_loop();
     }
     let status = cmos(RTC_STATUS_B);
-    let convert = |value: u8| if status & STATUS_B_BINARY != 0 { value } else { from_bcd(value) };
+    let convert = |value: u8| {
+        if status & STATUS_B_BINARY != 0 {
+            value
+        } else {
+            from_bcd(value)
+        }
+    };
     let mut hour = cmos(RTC_HOURS);
     let pm = hour & HOUR_PM != 0 && status & STATUS_B_24_HOUR == 0;
     hour = convert(hour & !HOUR_PM);
@@ -84,7 +90,11 @@ pub fn get_time() -> Time {
     let century = convert(cmos(RTC_CENTURY)) as u16;
     let year = convert(cmos(RTC_YEAR)) as u16;
     Time {
-        year: if century == 0 { 2000 + year } else { century * 100 + year },
+        year: if century == 0 {
+            2000 + year
+        } else {
+            century * 100 + year
+        },
         month: convert(cmos(RTC_MONTH)).max(1),
         day: convert(cmos(RTC_DAY)).max(1),
         hour,

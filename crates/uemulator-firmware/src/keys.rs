@@ -150,7 +150,12 @@ mod tests {
     fn function_keys() {
         assert_eq!(
             keys(b"\x1bOP\x1b[15~\x1b[17~\x1b[21~"),
-            [(SCAN_F1, 0), (SCAN_F1 + 4, 0), (SCAN_F1 + 5, 0), (SCAN_F1 + 9, 0)]
+            [
+                (SCAN_F1, 0),
+                (SCAN_F1 + 4, 0),
+                (SCAN_F1 + 5, 0),
+                (SCAN_F1 + 9, 0)
+            ]
         );
     }
 

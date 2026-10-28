@@ -62,7 +62,10 @@ pub fn create(
 ) -> Result<Event, Status> {
     let signal = kind & EVT_NOTIFY_SIGNAL != 0;
     let wait = kind & EVT_NOTIFY_WAIT != 0;
-    if signal && wait || (signal || wait) && (notify.is_none() || !(TPL_APPLICATION..=TPL_HIGH_LEVEL).contains(&tpl)) {
+    if signal && wait
+        || (signal || wait)
+            && (notify.is_none() || !(TPL_APPLICATION..=TPL_HIGH_LEVEL).contains(&tpl))
+    {
         return Err(INVALID_PARAMETER);
     }
     let group = match kind {
@@ -205,8 +208,13 @@ extern "efiapi" fn set_timer(event: Event, kind: u32, trigger: u64) -> Status {
     let delay = trigger.saturating_mul(TIMER_UNIT_NS);
     data(event).timer = match kind {
         TIMER_CANCEL => Timer::Off,
-        TIMER_RELATIVE => Timer::Once { deadline: now.saturating_add(delay) },
-        TIMER_PERIODIC => Timer::Periodic { deadline: now.saturating_add(delay), period: delay },
+        TIMER_RELATIVE => Timer::Once {
+            deadline: now.saturating_add(delay),
+        },
+        TIMER_PERIODIC => Timer::Periodic {
+            deadline: now.saturating_add(delay),
+            period: delay,
+        },
         _ => return INVALID_PARAMETER,
     };
     SUCCESS
@@ -222,7 +230,10 @@ extern "efiapi" fn signal_event(event: Event) -> Status {
 
 extern "efiapi" fn close_event(event: Event) -> Status {
     let events = &mut STATE.get().events;
-    let Some(position) = events.iter().position(|&candidate| candidate == event.cast()) else {
+    let Some(position) = events
+        .iter()
+        .position(|&candidate| candidate == event.cast())
+    else {
         return INVALID_PARAMETER;
     };
     events.swap_remove(position);
@@ -259,7 +270,10 @@ extern "efiapi" fn wait_for_event(count: usize, events: *mut Event, index: *mut 
         return UNSUPPORTED;
     }
     let list = unsafe { core::slice::from_raw_parts(events, count) };
-    if list.iter().any(|&event| !valid(event) || data(event).kind & EVT_NOTIFY_SIGNAL != 0) {
+    if list
+        .iter()
+        .any(|&event| !valid(event) || data(event).kind & EVT_NOTIFY_SIGNAL != 0)
+    {
         return INVALID_PARAMETER;
     }
     loop {

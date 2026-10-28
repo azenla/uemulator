@@ -128,11 +128,18 @@ fn resolve(node: &FileNode, path: &str) -> Result<(DirEntry, bool), Status> {
     } else {
         (node.entry.clone(), node.is_root)
     };
-    for part in path.split(['\\', '/']).filter(|part| !part.is_empty() && *part != ".") {
+    for part in path
+        .split(['\\', '/'])
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
         if !current.is_directory() {
             return Err(NOT_FOUND);
         }
-        let directory = if is_root { volume.root() } else { current.first_cluster };
+        let directory = if is_root {
+            volume.root()
+        } else {
+            current.first_cluster
+        };
         if part == ".." {
             if is_root {
                 continue;
@@ -211,10 +218,17 @@ fn file_info(entry: &DirEntry) -> Vec<u8> {
     bytes.extend_from_slice(&(size as u64).to_le_bytes());
     bytes.extend_from_slice(&(entry.size as u64).to_le_bytes());
     bytes.extend_from_slice(&(entry.size as u64).to_le_bytes());
-    let times = [fat_time(entry.created), fat_time((entry.accessed, 0)), fat_time(entry.modified)];
+    let times = [
+        fat_time(entry.created),
+        fat_time((entry.accessed, 0)),
+        fat_time(entry.modified),
+    ];
     for time in &times {
         bytes.extend_from_slice(unsafe {
-            core::slice::from_raw_parts((time as *const Time).cast::<u8>(), core::mem::size_of::<Time>())
+            core::slice::from_raw_parts(
+                (time as *const Time).cast::<u8>(),
+                core::mem::size_of::<Time>(),
+            )
         });
     }
     bytes.extend_from_slice(&((entry.attributes & FAT_ATTRIBUTE_VOLUME_MASK) as u64).to_le_bytes());
@@ -238,13 +252,17 @@ unsafe fn deliver(bytes: &[u8], size: *mut usize, buffer: *mut c_void) -> Status
 }
 
 extern "efiapi" fn file_read(this: *mut FileNode, size: *mut usize, buffer: *mut c_void) -> Status {
-    if this.is_null() || size.is_null() || (buffer.is_null() && unsafe { size.read_unaligned() } != 0) {
+    if this.is_null()
+        || size.is_null()
+        || (buffer.is_null() && unsafe { size.read_unaligned() } != 0)
+    {
         return INVALID_PARAMETER;
     }
     let node = unsafe { &mut *this };
     let requested = unsafe { size.read_unaligned() };
     if !node.entry.is_directory() {
-        let destination = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), requested) };
+        let destination =
+            unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), requested) };
         let volume = volume_of(node);
         return match volume.read(&mut node.cursor, node.position, destination) {
             Ok(count) => {
@@ -256,7 +274,11 @@ extern "efiapi" fn file_read(this: *mut FileNode, size: *mut usize, buffer: *mut
         };
     }
     if node.listing.is_none() {
-        let directory = if node.is_root { 0 } else { node.entry.first_cluster };
+        let directory = if node.is_root {
+            0
+        } else {
+            node.entry.first_cluster
+        };
         match volume_of(node).list(directory) {
             Ok(entries) => node.listing = Some(entries),
             Err(_) => return DEVICE_ERROR,
@@ -306,7 +328,11 @@ extern "efiapi" fn set_position(this: *mut FileNode, position: u64) -> Status {
         node.position = 0;
         return SUCCESS;
     }
-    node.position = if position == u64::MAX { node.entry.size as u64 } else { position };
+    node.position = if position == u64::MAX {
+        node.entry.size as u64
+    } else {
+        position
+    };
     SUCCESS
 }
 
@@ -339,7 +365,10 @@ extern "efiapi" fn get_info(
         }
         bytes
     } else if kind == guids::FILE_SYSTEM_VOLUME_LABEL {
-        text::to_utf16_nul(&volume.label).iter().flat_map(|unit| unit.to_le_bytes()).collect()
+        text::to_utf16_nul(&volume.label)
+            .iter()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect()
     } else {
         return UNSUPPORTED;
     };
@@ -349,7 +378,12 @@ extern "efiapi" fn get_info(
     unsafe { deliver(&bytes, size, buffer) }
 }
 
-extern "efiapi" fn set_info(_: *mut FileNode, _: *const Guid, _: usize, _: *const c_void) -> Status {
+extern "efiapi" fn set_info(
+    _: *mut FileNode,
+    _: *const Guid,
+    _: usize,
+    _: *const c_void,
+) -> Status {
     WRITE_PROTECTED
 }
 
@@ -371,7 +405,9 @@ pub fn read_file(volume: *mut SimpleFileSystem, path: &str) -> Result<Vec<u8>, S
         }
         let mut file = unsafe { &mut *root }.clone_for(&entry);
         let mut data = alloc::vec![0u8; entry.size as usize];
-        let count = volume_of(&file).read(&mut file.cursor, 0, &mut data).map_err(|_| DEVICE_ERROR)?;
+        let count = volume_of(&file)
+            .read(&mut file.cursor, 0, &mut data)
+            .map_err(|_| DEVICE_ERROR)?;
         data.truncate(count);
         Ok(data)
     })();

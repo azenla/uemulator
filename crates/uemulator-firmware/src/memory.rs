@@ -16,9 +16,9 @@ use crate::sync::Global;
 use crate::uefi::memory_attribute::{RUNTIME, UNCACHEABLE, WRITE_BACK};
 use crate::uefi::memory_type::*;
 use crate::uefi::{
-    ALLOCATE_ADDRESS, ALLOCATE_ANY_PAGES, ALLOCATE_MAX_ADDRESS, INVALID_PARAMETER, MEMORY_DESCRIPTOR_STRIDE,
-    MEMORY_DESCRIPTOR_VERSION, MemoryDescriptor, NOT_FOUND, OUT_OF_RESOURCES, SUCCESS, Status,
-    BUFFER_TOO_SMALL,
+    ALLOCATE_ADDRESS, ALLOCATE_ANY_PAGES, ALLOCATE_MAX_ADDRESS, BUFFER_TOO_SMALL,
+    INVALID_PARAMETER, MEMORY_DESCRIPTOR_STRIDE, MEMORY_DESCRIPTOR_VERSION, MemoryDescriptor,
+    NOT_FOUND, OUT_OF_RESOURCES, SUCCESS, Status,
 };
 
 static MAP: Global<MemoryMap> = Global::new(MemoryMap::new());
@@ -90,7 +90,12 @@ pub fn init(handoff: &Handoff) {
     };
     // Page zero stays unmapped-looking: a null pointer must not look like valid memory.
     mark(0, PAGE_SIZE, RESERVED, 0);
-    mark(LOW_PAGES_FIRST, LOW_PAGES_END - LOW_PAGES_FIRST, BOOT_SERVICES_DATA, WRITE_BACK);
+    mark(
+        LOW_PAGES_FIRST,
+        LOW_PAGES_END - LOW_PAGES_FIRST,
+        BOOT_SERVICES_DATA,
+        WRITE_BACK,
+    );
     // Code and data of the firmware are one runtime region: the OS maps a runtime region as a
     // whole at a new virtual address, so the code must find its data at the same offset.
     mark(
@@ -100,7 +105,12 @@ pub fn init(handoff: &Handoff) {
         WRITE_BACK | RUNTIME,
     );
     if handoff.acpi_size != 0 {
-        mark(handoff.acpi_base, handoff.acpi_size, ACPI_RECLAIM, WRITE_BACK);
+        mark(
+            handoff.acpi_base,
+            handoff.acpi_size,
+            ACPI_RECLAIM,
+            WRITE_BACK,
+        );
     }
     for &(base, size) in &handoff.mmio_regions {
         mark(base, size, MEMORY_MAPPED_IO, UNCACHEABLE | RUNTIME);
@@ -114,11 +124,15 @@ pub fn map_key() -> usize {
 }
 
 pub fn allocate_any(kind: u32, pages: u64) -> Option<u64> {
-    MAP.get().allocate_any(pages, u64::MAX, PAGE_SIZE, kind).ok()
+    MAP.get()
+        .allocate_any(pages, u64::MAX, PAGE_SIZE, kind)
+        .ok()
 }
 
 pub fn allocate_aligned(kind: u32, pages: u64, alignment: u64) -> Option<u64> {
-    MAP.get().allocate_any(pages, u64::MAX, alignment, kind).ok()
+    MAP.get()
+        .allocate_any(pages, u64::MAX, alignment, kind)
+        .ok()
 }
 
 /// A zeroed, page-aligned block for a device's rings and the like. Freed with `free_pages`.
@@ -225,10 +239,18 @@ pub fn pool_allocate(kind: u32, size: usize) -> *mut u8 {
                         let rest = block.cast::<u8>().add(needed).cast::<FreeBlock>();
                         (*rest).size = leftover;
                         (*rest).next = (*block).next;
-                        if previous.is_null() { *head = rest } else { (*previous).next = rest }
+                        if previous.is_null() {
+                            *head = rest
+                        } else {
+                            (*previous).next = rest
+                        }
                         needed
                     } else {
-                        if previous.is_null() { *head = (*block).next } else { (*previous).next = (*block).next }
+                        if previous.is_null() {
+                            *head = (*block).next
+                        } else {
+                            (*previous).next = (*block).next
+                        }
                         (*block).size
                     };
                     let header = block.cast::<usize>();
@@ -278,11 +300,16 @@ extern "efiapi" fn allocate_pool(kind: u32, size: usize, buffer: *mut *mut c_voi
 }
 
 extern "efiapi" fn free_pool(buffer: *mut c_void) -> Status {
-    if pool_free(buffer.cast()) { SUCCESS } else { INVALID_PARAMETER }
+    if pool_free(buffer.cast()) {
+        SUCCESS
+    } else {
+        INVALID_PARAMETER
+    }
 }
 
 extern "efiapi" fn allocate_pages(mode: u32, kind: u32, pages: usize, address: *mut u64) -> Status {
-    if address.is_null() || pages == 0 || kind >= MAX && kind < 0x8000_0000 || kind == CONVENTIONAL {
+    if address.is_null() || pages == 0 || kind >= MAX && kind < 0x8000_0000 || kind == CONVENTIONAL
+    {
         return INVALID_PARAMETER;
     }
     let map = MAP.get();
@@ -291,9 +318,9 @@ extern "efiapi" fn allocate_pages(mode: u32, kind: u32, pages: usize, address: *
     let result = match mode {
         ALLOCATE_ANY_PAGES => map.allocate_any(pages, u64::MAX, PAGE_SIZE, kind),
         ALLOCATE_MAX_ADDRESS => map.allocate_any(pages, requested, PAGE_SIZE, kind),
-        ALLOCATE_ADDRESS if requested % PAGE_SIZE == 0 => map
-            .allocate_at(requested, pages, kind)
-            .map(|()| requested),
+        ALLOCATE_ADDRESS if requested % PAGE_SIZE == 0 => {
+            map.allocate_at(requested, pages, kind).map(|()| requested)
+        }
         _ => return INVALID_PARAMETER,
     };
     match result {
@@ -309,7 +336,11 @@ extern "efiapi" fn free_pages_service(address: u64, pages: usize) -> Status {
     if address % PAGE_SIZE != 0 || pages == 0 {
         return INVALID_PARAMETER;
     }
-    if free_pages(address, pages as u64) { SUCCESS } else { NOT_FOUND }
+    if free_pages(address, pages as u64) {
+        SUCCESS
+    } else {
+        NOT_FOUND
+    }
 }
 
 extern "efiapi" fn get_memory_map(
@@ -340,16 +371,19 @@ extern "efiapi" fn get_memory_map(
             return INVALID_PARAMETER;
         }
         for (index, region) in map.regions().iter().enumerate() {
-            let at = descriptors.cast::<u8>().add(index * MEMORY_DESCRIPTOR_STRIDE);
+            let at = descriptors
+                .cast::<u8>()
+                .add(index * MEMORY_DESCRIPTOR_STRIDE);
             ptr::write_bytes(at, 0, MEMORY_DESCRIPTOR_STRIDE);
-            at.cast::<MemoryDescriptor>().write_unaligned(MemoryDescriptor {
-                kind: region.kind,
-                pad: 0,
-                physical_start: region.start,
-                virtual_start: 0,
-                number_of_pages: region.pages,
-                attribute: region.attribute,
-            });
+            at.cast::<MemoryDescriptor>()
+                .write_unaligned(MemoryDescriptor {
+                    kind: region.kind,
+                    pad: 0,
+                    physical_start: region.start,
+                    virtual_start: 0,
+                    number_of_pages: region.pages,
+                    attribute: region.attribute,
+                });
         }
         key.write(map.key());
     }
@@ -374,7 +408,10 @@ unsafe impl GlobalAlloc for Heap {
         if !MAP_READY.load(Ordering::SeqCst) {
             let arena = BOOTSTRAP.get();
             let base = arena.0.as_ptr() as usize;
-            let start = round_up(base + BOOTSTRAP_USED.load(Ordering::SeqCst), layout.align().max(POOL_ALIGNMENT)) - base;
+            let start = round_up(
+                base + BOOTSTRAP_USED.load(Ordering::SeqCst),
+                layout.align().max(POOL_ALIGNMENT),
+            ) - base;
             let end = start + layout.size();
             if end > BOOTSTRAP_BYTES {
                 return ptr::null_mut();
@@ -385,8 +422,10 @@ unsafe impl GlobalAlloc for Heap {
         if in_runtime_mode() {
             let arena = RUNTIME_ARENA.get();
             let align = layout.align().max(POOL_ALIGNMENT);
-            let start = round_up(RUNTIME_USED.load(Ordering::SeqCst) + arena.0.as_ptr() as usize, align)
-                - arena.0.as_ptr() as usize;
+            let start = round_up(
+                RUNTIME_USED.load(Ordering::SeqCst) + arena.0.as_ptr() as usize,
+                align,
+            ) - arena.0.as_ptr() as usize;
             let end = start + layout.size();
             if end > RUNTIME_ARENA_BYTES {
                 return ptr::null_mut();

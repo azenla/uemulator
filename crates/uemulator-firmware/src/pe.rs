@@ -104,7 +104,8 @@ impl Image {
             && optional_size
                 >= OPT_DIRECTORIES + (DATA_DIRECTORY_BASE_RELOCATION + 1) * DATA_DIRECTORY_BYTES
         {
-            let at = optional + OPT_DIRECTORIES + DATA_DIRECTORY_BASE_RELOCATION * DATA_DIRECTORY_BYTES;
+            let at =
+                optional + OPT_DIRECTORIES + DATA_DIRECTORY_BASE_RELOCATION * DATA_DIRECTORY_BYTES;
             (u32_at(file, at)?, u32_at(file, at + 4)?)
         } else {
             (0, 0)
@@ -142,8 +143,8 @@ impl Image {
             return Err(PeError::Corrupt);
         }
         for section in &self.sections {
-            let in_image = section.virtual_address as u64
-                + section.virtual_size.max(section.raw_size) as u64;
+            let in_image =
+                section.virtual_address as u64 + section.virtual_size.max(section.raw_size) as u64;
             let in_file = section.raw_offset as u64 + section.raw_size as u64;
             if in_image > size || in_file > file_len as u64 {
                 return Err(PeError::Corrupt);
@@ -171,7 +172,9 @@ impl Image {
             let raw = &file[section.raw_offset as usize..][..section.raw_size as usize];
             // The part of the virtual size beyond the raw data is zero-initialised, which the
             // caller's zeroed memory already provides.
-            let copied = raw.len().min(section.virtual_size.max(section.raw_size) as usize);
+            let copied = raw
+                .len()
+                .min(section.virtual_size.max(section.raw_size) as usize);
             memory[start..start + copied].copy_from_slice(&raw[..copied]);
         }
         self.relocate(memory, load_address)
@@ -195,7 +198,9 @@ impl Image {
                 let entry = u16_at(memory, entry)?;
                 let target = page + (entry & RELOCATION_OFFSET_MASK) as usize;
                 let patch = |memory: &mut [u8], width: usize, apply: &dyn Fn(u64) -> u64| {
-                    let bytes = memory.get_mut(target..target + width).ok_or(PeError::Corrupt)?;
+                    let bytes = memory
+                        .get_mut(target..target + width)
+                        .ok_or(PeError::Corrupt)?;
                     let mut value = [0u8; 8];
                     value[..width].copy_from_slice(bytes);
                     let patched = apply(u64::from_le_bytes(value)).to_le_bytes();
@@ -249,7 +254,8 @@ mod tests {
         file[opt + OPT_SIZE_OF_HEADERS..][..4].copy_from_slice(&(FILE_ALIGN as u32).to_le_bytes());
         file[opt + OPT_SUBSYSTEM..][..2].copy_from_slice(&SUBSYSTEM_EFI_APPLICATION.to_le_bytes());
         file[opt + OPT_NUMBER_OF_DIRECTORIES..][..4].copy_from_slice(&16u32.to_le_bytes());
-        let directory = opt + OPT_DIRECTORIES + DATA_DIRECTORY_BASE_RELOCATION * DATA_DIRECTORY_BYTES;
+        let directory =
+            opt + OPT_DIRECTORIES + DATA_DIRECTORY_BASE_RELOCATION * DATA_DIRECTORY_BYTES;
         file[directory..directory + 4].copy_from_slice(&RELOC_RVA.to_le_bytes());
         file[directory + 4..directory + 8].copy_from_slice(&12u32.to_le_bytes());
         let sections = opt + OPTIONAL_SIZE;
@@ -296,7 +302,10 @@ mod tests {
             u64::from_le_bytes(memory[0x1008..0x1010].try_into().unwrap()),
             IMAGE_BASE + TEXT_RVA as u64
         );
-        assert!(memory[0x1200..0x1800].iter().all(|&byte| byte == 0), "virtual size beyond the raw data is zero");
+        assert!(
+            memory[0x1200..0x1800].iter().all(|&byte| byte == 0),
+            "virtual size beyond the raw data is zero"
+        );
     }
 
     #[test]
@@ -311,8 +320,14 @@ mod tests {
 
     #[test]
     fn rejects_what_it_cannot_run() {
-        assert_eq!(Image::parse(b"not a pe file at all").unwrap_err(), PeError::NotPe);
-        assert_eq!(Image::parse(&build(0x14c)).unwrap_err(), PeError::Unsupported);
+        assert_eq!(
+            Image::parse(b"not a pe file at all").unwrap_err(),
+            PeError::NotPe
+        );
+        assert_eq!(
+            Image::parse(&build(0x14c)).unwrap_err(),
+            PeError::Unsupported
+        );
         let mut truncated = build(MACHINE_AMD64);
         truncated.truncate(0x300);
         assert_eq!(Image::parse(&truncated).unwrap_err(), PeError::Corrupt);

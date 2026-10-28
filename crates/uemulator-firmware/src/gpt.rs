@@ -139,7 +139,10 @@ pub fn partitions(disk: &mut impl Blocks) -> Option<Vec<Partition>> {
             (entry[4], u32_at(entry, 8) as u64, u32_at(entry, 12) as u64)
         })
         .collect();
-    if entries.iter().any(|(kind, ..)| *kind == MBR_TYPE_PROTECTIVE) {
+    if entries
+        .iter()
+        .any(|(kind, ..)| *kind == MBR_TYPE_PROTECTIVE)
+    {
         let backup = disk.block_count().checked_sub(1);
         return gpt_at(disk, 1).or_else(|| gpt_at(disk, backup?));
     }
@@ -227,7 +230,10 @@ pub mod testing {
         let crc = crc32(&header);
         header[16..20].copy_from_slice(&crc.to_le_bytes());
         bytes[512..512 + 92].copy_from_slice(&header);
-        Ram { bytes, block: BLOCK }
+        Ram {
+            bytes,
+            block: BLOCK,
+        }
     }
 }
 
@@ -236,11 +242,20 @@ mod tests {
     use super::testing::*;
     use super::*;
 
-    const LINUX_DATA: Guid = Guid::new(0x0fc63daf, 0x8483, 0x4772, [0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4]);
+    const LINUX_DATA: Guid = Guid::new(
+        0x0fc63daf,
+        0x8483,
+        0x4772,
+        [0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4],
+    );
 
     #[test]
     fn gpt_lists_used_slots_with_their_numbers() {
-        let mut disk = gpt_disk(&[(ESP_TYPE, 64, 256), (Guid::default(), 0, 1), (LINUX_DATA, 512, 1024)]);
+        let mut disk = gpt_disk(&[
+            (ESP_TYPE, 64, 256),
+            (Guid::default(), 0, 1),
+            (LINUX_DATA, 512, 1024),
+        ]);
         // The unused middle slot is encoded as a zero entry: clear what the helper wrote.
         let start = 2 * 512 + 128;
         disk.bytes[start..start + 128].fill(0);
@@ -253,7 +268,10 @@ mod tests {
         disk.bytes[512 + 16..512 + 20].copy_from_slice(&crc.to_le_bytes());
         let found = partitions(&mut disk).unwrap();
         assert_eq!(found.len(), 2);
-        assert_eq!((found[0].number, found[0].first_block, found[0].block_count), (1, 64, 256));
+        assert_eq!(
+            (found[0].number, found[0].first_block, found[0].block_count),
+            (1, 64, 256)
+        );
         assert!(found[0].is_esp());
         assert_eq!((found[1].number, found[1].first_block), (3, 512));
         assert!(!found[1].is_esp());
@@ -290,8 +308,12 @@ mod tests {
             block: BLOCK,
         };
         disk.bytes[510..512].copy_from_slice(&MBR_SIGNATURE);
-        disk.bytes[MBR_DISK_SIGNATURE..MBR_DISK_SIGNATURE + 4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
-        for (slot, (kind, first, count)) in [(0x83u8, 100u32, 100u32), (0x0c, 300, 400)].iter().enumerate() {
+        disk.bytes[MBR_DISK_SIGNATURE..MBR_DISK_SIGNATURE + 4]
+            .copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        for (slot, (kind, first, count)) in [(0x83u8, 100u32, 100u32), (0x0c, 300, 400)]
+            .iter()
+            .enumerate()
+        {
             let entry = MBR_PARTITION_TABLE + slot * MBR_ENTRY_BYTES;
             disk.bytes[entry + 4] = *kind;
             disk.bytes[entry + 8..entry + 12].copy_from_slice(&first.to_le_bytes());
@@ -300,7 +322,13 @@ mod tests {
         let found = partitions(&mut disk).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].number, 2);
-        assert_eq!(found[0].scheme, Scheme::Mbr { kind: 0x0c, disk_signature: 0xdead_beef });
+        assert_eq!(
+            found[0].scheme,
+            Scheme::Mbr {
+                kind: 0x0c,
+                disk_signature: 0xdead_beef
+            }
+        );
     }
 
     #[test]

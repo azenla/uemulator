@@ -18,7 +18,10 @@ pub struct Candidate {
 }
 
 pub fn u16_list(bytes: &[u8]) -> Vec<u16> {
-    bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect()
+    bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect()
 }
 
 /// Parses an `EFI_LOAD_OPTION`; `None` for inactive or malformed ones.
@@ -42,7 +45,6 @@ pub fn parse(bytes: &[u8], number: u16) -> Option<Candidate> {
         number: Some(number),
     })
 }
-
 
 #[cfg(test)]
 mod tests {

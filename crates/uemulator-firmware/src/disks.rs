@@ -102,7 +102,11 @@ impl Blocks for BlockStorage {
     }
 
     fn read_blocks(&mut self, first: u64, buffer: &mut [u8]) -> bool {
-        read_bytes(unsafe { &mut *self.device }, first * SECTOR_BYTES as u64, buffer)
+        read_bytes(
+            unsafe { &mut *self.device },
+            first * SECTOR_BYTES as u64,
+            buffer,
+        )
     }
 }
 
@@ -111,7 +115,13 @@ extern "efiapi" fn reset(_: *mut BlockDevice, _: u8) -> Status {
 }
 
 /// `Err` carries the status to return, `SUCCESS` for a transfer of nothing.
-fn check_transfer(device: &BlockDevice, media_id: u32, lba: u64, size: usize, buffer: *const c_void) -> Result<(), Status> {
+fn check_transfer(
+    device: &BlockDevice,
+    media_id: u32,
+    lba: u64,
+    size: usize,
+    buffer: *const c_void,
+) -> Result<(), Status> {
     if media_id != MEDIA_ID {
         return Err(MEDIA_CHANGED);
     }
@@ -121,13 +131,22 @@ fn check_transfer(device: &BlockDevice, media_id: u32, lba: u64, size: usize, bu
     if size == 0 {
         return Err(SUCCESS);
     }
-    if buffer.is_null() || lba >= device.block_count || (size / SECTOR_BYTES) as u64 > device.block_count - lba {
+    if buffer.is_null()
+        || lba >= device.block_count
+        || (size / SECTOR_BYTES) as u64 > device.block_count - lba
+    {
         return Err(INVALID_PARAMETER);
     }
     Ok(())
 }
 
-extern "efiapi" fn read_blocks(this: *mut BlockDevice, media_id: u32, lba: u64, size: usize, buffer: *mut c_void) -> Status {
+extern "efiapi" fn read_blocks(
+    this: *mut BlockDevice,
+    media_id: u32,
+    lba: u64,
+    size: usize,
+    buffer: *mut c_void,
+) -> Status {
     let device = unsafe { &mut *this };
     if let Err(status) = check_transfer(device, media_id, lba, size, buffer) {
         return status;
@@ -140,7 +159,13 @@ extern "efiapi" fn read_blocks(this: *mut BlockDevice, media_id: u32, lba: u64, 
     }
 }
 
-extern "efiapi" fn write_blocks(this: *mut BlockDevice, media_id: u32, lba: u64, size: usize, buffer: *const c_void) -> Status {
+extern "efiapi" fn write_blocks(
+    this: *mut BlockDevice,
+    media_id: u32,
+    lba: u64,
+    size: usize,
+    buffer: *const c_void,
+) -> Status {
     let device = unsafe { &mut *this };
     if device.media_data.read_only != 0 {
         return WRITE_PROTECTED;
@@ -157,10 +182,20 @@ extern "efiapi" fn write_blocks(this: *mut BlockDevice, media_id: u32, lba: u64,
 }
 
 extern "efiapi" fn flush_blocks(this: *mut BlockDevice) -> Status {
-    if unsafe { &mut *(*this).disk }.flush() { SUCCESS } else { DEVICE_ERROR }
+    if unsafe { &mut *(*this).disk }.flush() {
+        SUCCESS
+    } else {
+        DEVICE_ERROR
+    }
 }
 
-extern "efiapi" fn read_disk(this: *mut DiskIo, media_id: u32, offset: u64, size: usize, buffer: *mut c_void) -> Status {
+extern "efiapi" fn read_disk(
+    this: *mut DiskIo,
+    media_id: u32,
+    offset: u64,
+    size: usize,
+    buffer: *mut c_void,
+) -> Status {
     let device = unsafe { &mut *(*this).device };
     if media_id != MEDIA_ID {
         return MEDIA_CHANGED;
@@ -172,10 +207,20 @@ extern "efiapi" fn read_disk(this: *mut DiskIo, media_id: u32, offset: u64, size
         return INVALID_PARAMETER;
     }
     let destination = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), size) };
-    if read_bytes(device, offset, destination) { SUCCESS } else { DEVICE_ERROR }
+    if read_bytes(device, offset, destination) {
+        SUCCESS
+    } else {
+        DEVICE_ERROR
+    }
 }
 
-extern "efiapi" fn write_disk(this: *mut DiskIo, media_id: u32, offset: u64, size: usize, buffer: *const c_void) -> Status {
+extern "efiapi" fn write_disk(
+    this: *mut DiskIo,
+    media_id: u32,
+    offset: u64,
+    size: usize,
+    buffer: *const c_void,
+) -> Status {
     let device = unsafe { &mut *(*this).device };
     if media_id != MEDIA_ID {
         return MEDIA_CHANGED;
@@ -199,11 +244,21 @@ extern "efiapi" fn write_disk(this: *mut DiskIo, media_id: u32, offset: u64, siz
         return DEVICE_ERROR;
     }
     let skip = (offset - first * block) as usize;
-    bounce[skip..skip + size].copy_from_slice(unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), size) });
-    if disk.write(device.first_block + first, &bounce) { SUCCESS } else { DEVICE_ERROR }
+    bounce[skip..skip + size]
+        .copy_from_slice(unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), size) });
+    if disk.write(device.first_block + first, &bounce) {
+        SUCCESS
+    } else {
+        DEVICE_ERROR
+    }
 }
 
-fn new_device(disk: *mut VirtioBlk, first_block: u64, block_count: u64, logical_partition: bool) -> *mut BlockDevice {
+fn new_device(
+    disk: *mut VirtioBlk,
+    first_block: u64,
+    block_count: u64,
+    logical_partition: bool,
+) -> *mut BlockDevice {
     let read_only = unsafe { (*disk).read_only } as u8;
     let device = Box::into_raw(Box::new(BlockDevice {
         revision: BLOCK_IO_REVISION,
@@ -235,7 +290,9 @@ fn new_device(disk: *mut VirtioBlk, first_block: u64, block_count: u64, logical_
 }
 
 fn leak_path(path: &DevicePath) -> *mut c_void {
-    Box::leak(path.as_bytes().to_vec().into_boxed_slice()).as_mut_ptr().cast()
+    Box::leak(path.as_bytes().to_vec().into_boxed_slice())
+        .as_mut_ptr()
+        .cast()
 }
 
 /// Publishes one block device: handle, path, `BlockIO`, `DiskIO` and, if it holds FAT, a file
@@ -250,7 +307,11 @@ fn publish(device: *mut BlockDevice, path: &DevicePath, with_file_system: bool) 
         device,
     }));
     let _ = protocols::install(handle, guids::DISK_IO, disk_io.cast());
-    let volume = if with_file_system { files::create_volume(BlockStorage { device }) } else { None };
+    let volume = if with_file_system {
+        files::create_volume(BlockStorage { device })
+    } else {
+        None
+    };
     crate::serial::trace!("  {}: file system {}", path.text(), volume.is_some());
     if let Some(volume) = volume {
         let _ = protocols::install(handle, guids::SIMPLE_FILE_SYSTEM, volume.cast());
@@ -260,14 +321,29 @@ fn publish(device: *mut BlockDevice, path: &DevicePath, with_file_system: bool) 
 
 fn partition_path(disk_path: &DevicePath, partition: &Partition) -> DevicePath {
     let (signature, format, signature_type) = match &partition.scheme {
-        Scheme::Gpt { unique_guid, .. } => (unique_guid.to_bytes(), devicepath::PARTITION_FORMAT_GPT, devicepath::SIGNATURE_GUID),
+        Scheme::Gpt { unique_guid, .. } => (
+            unique_guid.to_bytes(),
+            devicepath::PARTITION_FORMAT_GPT,
+            devicepath::SIGNATURE_GUID,
+        ),
         Scheme::Mbr { disk_signature, .. } => {
             let mut signature = [0u8; 16];
             signature[..4].copy_from_slice(&disk_signature.to_le_bytes());
-            (signature, devicepath::PARTITION_FORMAT_MBR, devicepath::SIGNATURE_MBR)
+            (
+                signature,
+                devicepath::PARTITION_FORMAT_MBR,
+                devicepath::SIGNATURE_MBR,
+            )
         }
     };
-    disk_path.clone().hard_drive(partition.number, partition.first_block, partition.block_count, signature, format, signature_type)
+    disk_path.clone().hard_drive(
+        partition.number,
+        partition.first_block,
+        partition.block_count,
+        signature,
+        format,
+        signature_type,
+    )
 }
 
 pub fn init() {
@@ -279,7 +355,9 @@ pub fn init() {
         let raw = &mut *disk as *mut VirtioBlk;
         DISKS.get().push(raw);
         core::mem::forget(disk);
-        let disk_path = DevicePath::new().acpi_pci_root().pci(function.device, function.function);
+        let disk_path = DevicePath::new()
+            .acpi_pci_root()
+            .pci(function.device, function.function);
         let whole = new_device(raw, 0, unsafe { (*raw).sector_count }, false);
         if cfg!(feature = "trace") {
             let mut sector = [0u8; 512];
@@ -287,7 +365,12 @@ pub fn init() {
             crate::serial::trace!("read sector 1: {ok} {:02x?}", &sector[..16]);
         }
         let partitions = gpt::partitions(&mut BlockStorage { device: whole });
-        crate::serial::trace!("disk {}: {} sectors, {} partitions", function.device, unsafe { (*raw).sector_count }, partitions.as_ref().map_or(0, |found| found.len()));
+        crate::serial::trace!(
+            "disk {}: {} sectors, {} partitions",
+            function.device,
+            unsafe { (*raw).sector_count },
+            partitions.as_ref().map_or(0, |found| found.len())
+        );
         // A disk that has partitions does not also offer a file system spanning them.
         publish(whole, &disk_path, partitions.is_none());
         for partition in partitions.unwrap_or_default() {

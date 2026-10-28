@@ -59,7 +59,10 @@ pub fn set_boot_entry(
     loader: &str,
     options: &str,
 ) -> Result<(), KeyValueError> {
-    store.set(&variable_key("Boot0000"), &variable_value(&load_option(loader, options)))?;
+    store.set(
+        &variable_key("Boot0000"),
+        &variable_value(&load_option(loader, options)),
+    )?;
     let order_key = variable_key("BootOrder");
     let mut order = vec![0u8, 0];
     if let Some(existing) = store.get(&order_key) {
@@ -93,7 +96,10 @@ mod tests {
         let path = &option[6 + description.len()..][..path_length];
         assert_eq!(&path[..2], &[4, 4]);
         assert_eq!(&path[path.len() - 4..], &END_DEVICE_PATH);
-        assert_eq!(&option[6 + description.len() + path_length..], utf16_nul("a b").as_slice());
+        assert_eq!(
+            &option[6 + description.len() + path_length..],
+            utf16_nul("a b").as_slice()
+        );
     }
 
     #[test]
@@ -107,7 +113,10 @@ mod tests {
         assert_eq!(&order[4..], &[0, 0, 1, 0, 2, 0]);
         // Setting it again does not duplicate it.
         set_boot_entry(&mut store, "\\y.efi", "").unwrap();
-        assert_eq!(&store.get(&variable_key("BootOrder")).unwrap()[4..], &[0, 0, 1, 0, 2, 0]);
+        assert_eq!(
+            &store.get(&variable_key("BootOrder")).unwrap()[4..],
+            &[0, 0, 1, 0, 2, 0]
+        );
         assert!(store.get(&variable_key("Boot0000")).is_some());
     }
 }

@@ -13,14 +13,24 @@ fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let firmware_dir = manifest_dir.join("../uemulator-firmware");
     for watched in ["src", "Cargo.toml", "link.ld", "build.rs"] {
-        println!("cargo:rerun-if-changed={}", firmware_dir.join(watched).display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            firmware_dir.join(watched).display()
+        );
     }
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_dir = out_dir.join("firmware-target");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let mut build = Command::new(cargo);
     build
-        .args(["build", "--release", "-p", FIRMWARE_PACKAGE, "--target", FIRMWARE_TARGET])
+        .args([
+            "build",
+            "--release",
+            "-p",
+            FIRMWARE_PACKAGE,
+            "--target",
+            FIRMWARE_TARGET,
+        ])
         .arg("--target-dir")
         .arg(&target_dir)
         .current_dir(&manifest_dir)
@@ -43,10 +53,14 @@ fn main() {
         );
         std::process::exit(1);
     }
-    let image = target_dir.join(FIRMWARE_TARGET).join("release").join(FIRMWARE_PACKAGE);
+    let image = target_dir
+        .join(FIRMWARE_TARGET)
+        .join("release")
+        .join(FIRMWARE_PACKAGE);
     copy(&image, &out_dir.join("uemulator-firmware.bin"));
 }
 
 fn copy(from: &Path, to: &Path) {
-    std::fs::copy(from, to).unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), to.display()));
+    std::fs::copy(from, to)
+        .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), to.display()));
 }

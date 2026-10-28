@@ -55,7 +55,10 @@ mod tests {
         assert_eq!(*units.last().unwrap(), 0);
         assert_eq!(to_string(&units[..units.len() - 1]), "EFI\\BOOT é");
         assert_eq!(unsafe { length(units.as_ptr()) }, units.len() - 1);
-        assert_eq!(unsafe { to_units(units.as_ptr()) }, &units[..units.len() - 1]);
+        assert_eq!(
+            unsafe { to_units(units.as_ptr()) },
+            &units[..units.len() - 1]
+        );
     }
 
     #[test]

@@ -88,8 +88,10 @@ impl RamStore {
             let slot = self.slots[index];
             let length = slot.key_length as usize + slot.value_length as usize;
             // Keys and values are stored back to back, key first.
-            self.arena
-                .copy_within(slot.key_offset as usize..slot.key_offset as usize + length, at);
+            self.arena.copy_within(
+                slot.key_offset as usize..slot.key_offset as usize + length,
+                at,
+            );
             self.slots[index].key_offset = at as u32;
             self.slots[index].value_offset = (at + slot.key_length as usize) as u32;
             at += length;
@@ -191,7 +193,10 @@ pub fn split_key(key: &[u8]) -> Option<(Vec<u16>, Guid)> {
 }
 
 fn split_value(value: &[u8]) -> Option<(u32, &[u8])> {
-    Some((u32::from_le_bytes(value.get(..4)?.try_into().ok()?), &value[4..]))
+    Some((
+        u32::from_le_bytes(value.get(..4)?.try_into().ok()?),
+        &value[4..],
+    ))
 }
 
 impl<P: Store> Variables<P> {
@@ -226,7 +231,9 @@ impl<P: Store> Variables<P> {
         if name.is_empty() {
             return Err(VariableError::InvalidParameter);
         }
-        let (_, value) = self.load(&key_for(name, guid)).ok_or(VariableError::NotFound)?;
+        let (_, value) = self
+            .load(&key_for(name, guid))
+            .ok_or(VariableError::NotFound)?;
         let (attributes, data) = split_value(&value).ok_or(VariableError::DeviceError)?;
         if !Self::visible(attributes, runtime) {
             return Err(VariableError::NotFound);
@@ -341,7 +348,11 @@ impl<P: Store> Variables<P> {
         guid: &Guid,
         runtime: bool,
     ) -> Result<(Vec<u16>, Guid), VariableError> {
-        let mut after = if name.is_empty() { Vec::new() } else { key_for(name, guid) };
+        let mut after = if name.is_empty() {
+            Vec::new()
+        } else {
+            key_for(name, guid)
+        };
         let mut in_ram = true;
         if !name.is_empty() {
             match self.load(&after) {
@@ -360,7 +371,9 @@ impl<P: Store> Variables<P> {
                     }
                 }
             } else {
-                self.persistent.as_mut().and_then(|store| store.next_key(&after))
+                self.persistent
+                    .as_mut()
+                    .and_then(|store| store.next_key(&after))
             };
             let key = candidate.ok_or(VariableError::NotFound)?;
             let visible = self
@@ -383,14 +396,22 @@ impl<P: Store> Variables<P> {
                 let next = if in_ram {
                     self.ram.next_key(&after)
                 } else {
-                    self.persistent.as_mut().and_then(|store| store.next_key(&after))
+                    self.persistent
+                        .as_mut()
+                        .and_then(|store| store.next_key(&after))
                 };
                 let Some(key) = next else { break };
-                used += self.load(&key).map_or(0, |(_, value)| (key.len() + value.len()) as u64);
+                used += self
+                    .load(&key)
+                    .map_or(0, |(_, value)| (key.len() + value.len()) as u64);
                 after = key;
             }
         }
-        (STORAGE_BYTES, STORAGE_BYTES.saturating_sub(used), MAX_VARIABLE_BYTES as u64)
+        (
+            STORAGE_BYTES,
+            STORAGE_BYTES.saturating_sub(used),
+            MAX_VARIABLE_BYTES as u64,
+        )
     }
 }
 
@@ -447,8 +468,18 @@ mod tests {
     #[test]
     fn nonvolatile_variables_go_to_the_persistent_store() {
         let mut variables = variables();
-        variables.set(&name("BootOrder"), &guids::GLOBAL_VARIABLE, NV_BS_RT, &[1, 0], false).unwrap();
-        let (attributes, data) = variables.get(&name("BootOrder"), &guids::GLOBAL_VARIABLE, false).unwrap();
+        variables
+            .set(
+                &name("BootOrder"),
+                &guids::GLOBAL_VARIABLE,
+                NV_BS_RT,
+                &[1, 0],
+                false,
+            )
+            .unwrap();
+        let (attributes, data) = variables
+            .get(&name("BootOrder"), &guids::GLOBAL_VARIABLE, false)
+            .unwrap();
         assert_eq!((attributes, data), (NV_BS_RT, vec![1, 0]));
         assert_eq!(variables.persistent.as_ref().unwrap().0.len(), 1);
         assert!(variables.ram.next_key(&[]).is_none());
@@ -458,7 +489,9 @@ mod tests {
     fn volatile_variables_stay_in_ram() {
         let mut variables = variables();
         let attributes = BOOTSERVICE_ACCESS | RUNTIME_ACCESS;
-        variables.set(&name("Temp"), &CUSTOM, attributes, b"x", false).unwrap();
+        variables
+            .set(&name("Temp"), &CUSTOM, attributes, b"x", false)
+            .unwrap();
         assert!(variables.persistent.as_ref().unwrap().0.is_empty());
         assert_eq!(variables.get(&name("Temp"), &CUSTOM, true).unwrap().1, b"x");
     }
@@ -466,16 +499,26 @@ mod tests {
     #[test]
     fn nonvolatile_without_a_store_falls_back_to_ram() {
         let mut variables: Box<Variables<Memory>> = Box::new(Variables::new());
-        variables.set(&name("Kept"), &CUSTOM, NV_BS_RT, b"1", false).unwrap();
-        assert_eq!(variables.get(&name("Kept"), &CUSTOM, false).unwrap().1, b"1");
+        variables
+            .set(&name("Kept"), &CUSTOM, NV_BS_RT, b"1", false)
+            .unwrap();
+        assert_eq!(
+            variables.get(&name("Kept"), &CUSTOM, false).unwrap().1,
+            b"1"
+        );
     }
 
     #[test]
     fn boot_service_only_variables_vanish_at_runtime() {
         let mut variables = variables();
-        variables.set(&name("Early"), &CUSTOM, BOOTSERVICE_ACCESS, b"1", false).unwrap();
+        variables
+            .set(&name("Early"), &CUSTOM, BOOTSERVICE_ACCESS, b"1", false)
+            .unwrap();
         assert!(variables.get(&name("Early"), &CUSTOM, false).is_ok());
-        assert_eq!(variables.get(&name("Early"), &CUSTOM, true), Err(VariableError::NotFound));
+        assert_eq!(
+            variables.get(&name("Early"), &CUSTOM, true),
+            Err(VariableError::NotFound)
+        );
         assert_eq!(
             variables.next(&[], &Guid::default(), true),
             Err(VariableError::NotFound)
@@ -488,12 +531,33 @@ mod tests {
         let set = |variables: &mut Variables<Memory>, attributes, data: &[u8], runtime| {
             variables.set(&name("V"), &CUSTOM, attributes, data, runtime)
         };
-        assert_eq!(set(&mut variables, RUNTIME_ACCESS, b"x", false), Err(VariableError::InvalidParameter));
-        assert_eq!(set(&mut variables, NV_BS_RT, b"x", false), Ok(()));
-        assert_eq!(set(&mut variables, BOOTSERVICE_ACCESS, b"x", false), Err(VariableError::InvalidParameter), "attributes cannot change");
-        assert_eq!(set(&mut variables, NON_VOLATILE | BOOTSERVICE_ACCESS, b"x", true), Err(VariableError::InvalidParameter), "no runtime access at runtime");
         assert_eq!(
-            set(&mut variables, NV_BS_RT | TIME_BASED_AUTHENTICATED_WRITE_ACCESS, b"x", false),
+            set(&mut variables, RUNTIME_ACCESS, b"x", false),
+            Err(VariableError::InvalidParameter)
+        );
+        assert_eq!(set(&mut variables, NV_BS_RT, b"x", false), Ok(()));
+        assert_eq!(
+            set(&mut variables, BOOTSERVICE_ACCESS, b"x", false),
+            Err(VariableError::InvalidParameter),
+            "attributes cannot change"
+        );
+        assert_eq!(
+            set(
+                &mut variables,
+                NON_VOLATILE | BOOTSERVICE_ACCESS,
+                b"x",
+                true
+            ),
+            Err(VariableError::InvalidParameter),
+            "no runtime access at runtime"
+        );
+        assert_eq!(
+            set(
+                &mut variables,
+                NV_BS_RT | TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
+                b"x",
+                false
+            ),
             Err(VariableError::SecurityViolation)
         );
         assert_eq!(
@@ -505,36 +569,81 @@ mod tests {
     #[test]
     fn empty_data_deletes() {
         let mut variables = variables();
-        variables.set(&name("V"), &CUSTOM, NV_BS_RT, b"x", false).unwrap();
-        variables.set(&name("V"), &CUSTOM, NV_BS_RT, b"", false).unwrap();
-        assert_eq!(variables.get(&name("V"), &CUSTOM, false), Err(VariableError::NotFound));
-        assert_eq!(variables.set(&name("V"), &CUSTOM, NV_BS_RT, b"", false), Err(VariableError::NotFound));
-        variables.set(&name("W"), &CUSTOM, NV_BS_RT, b"x", false).unwrap();
+        variables
+            .set(&name("V"), &CUSTOM, NV_BS_RT, b"x", false)
+            .unwrap();
+        variables
+            .set(&name("V"), &CUSTOM, NV_BS_RT, b"", false)
+            .unwrap();
+        assert_eq!(
+            variables.get(&name("V"), &CUSTOM, false),
+            Err(VariableError::NotFound)
+        );
+        assert_eq!(
+            variables.set(&name("V"), &CUSTOM, NV_BS_RT, b"", false),
+            Err(VariableError::NotFound)
+        );
+        variables
+            .set(&name("W"), &CUSTOM, NV_BS_RT, b"x", false)
+            .unwrap();
         variables.set(&name("W"), &CUSTOM, 0, b"x", false).unwrap();
-        assert_eq!(variables.get(&name("W"), &CUSTOM, false), Err(VariableError::NotFound));
+        assert_eq!(
+            variables.get(&name("W"), &CUSTOM, false),
+            Err(VariableError::NotFound)
+        );
     }
 
     #[test]
     fn append_extends_the_data() {
         let mut variables = variables();
-        variables.set(&name("V"), &CUSTOM, NV_BS_RT, b"ab", false).unwrap();
-        variables.set(&name("V"), &CUSTOM, NV_BS_RT | APPEND_WRITE, b"cd", false).unwrap();
-        assert_eq!(variables.get(&name("V"), &CUSTOM, false).unwrap().1, b"abcd");
-        variables.set(&name("New"), &CUSTOM, NV_BS_RT | APPEND_WRITE, b"x", false).unwrap();
+        variables
+            .set(&name("V"), &CUSTOM, NV_BS_RT, b"ab", false)
+            .unwrap();
+        variables
+            .set(&name("V"), &CUSTOM, NV_BS_RT | APPEND_WRITE, b"cd", false)
+            .unwrap();
+        assert_eq!(
+            variables.get(&name("V"), &CUSTOM, false).unwrap().1,
+            b"abcd"
+        );
+        variables
+            .set(&name("New"), &CUSTOM, NV_BS_RT | APPEND_WRITE, b"x", false)
+            .unwrap();
         assert_eq!(variables.get(&name("New"), &CUSTOM, false).unwrap().1, b"x");
     }
 
     #[test]
     fn the_firmware_owned_variables_are_read_only() {
         let mut variables = variables();
-        variables.set_internal("SecureBoot", &guids::GLOBAL_VARIABLE, BOOTSERVICE_ACCESS | RUNTIME_ACCESS, &[0]);
-        assert_eq!(variables.get(&name("SecureBoot"), &guids::GLOBAL_VARIABLE, false).unwrap().1, [0]);
+        variables.set_internal(
+            "SecureBoot",
+            &guids::GLOBAL_VARIABLE,
+            BOOTSERVICE_ACCESS | RUNTIME_ACCESS,
+            &[0],
+        );
         assert_eq!(
-            variables.set(&name("SecureBoot"), &guids::GLOBAL_VARIABLE, BOOTSERVICE_ACCESS | RUNTIME_ACCESS, &[1], false),
+            variables
+                .get(&name("SecureBoot"), &guids::GLOBAL_VARIABLE, false)
+                .unwrap()
+                .1,
+            [0]
+        );
+        assert_eq!(
+            variables.set(
+                &name("SecureBoot"),
+                &guids::GLOBAL_VARIABLE,
+                BOOTSERVICE_ACCESS | RUNTIME_ACCESS,
+                &[1],
+                false
+            ),
             Err(VariableError::WriteProtected)
         );
         // The same name under another vendor is an ordinary variable.
-        assert!(variables.set(&name("SecureBoot"), &CUSTOM, NV_BS_RT, &[1], false).is_ok());
+        assert!(
+            variables
+                .set(&name("SecureBoot"), &CUSTOM, NV_BS_RT, &[1], false)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -542,8 +651,12 @@ mod tests {
         let mut variables = variables();
         variables.set_internal("B", &CUSTOM, BOOTSERVICE_ACCESS | RUNTIME_ACCESS, b"1");
         variables.set_internal("A", &CUSTOM, BOOTSERVICE_ACCESS | RUNTIME_ACCESS, b"1");
-        variables.set(&name("Z"), &CUSTOM, NV_BS_RT, b"1", false).unwrap();
-        variables.set(&name("Y"), &CUSTOM, NV_BS_RT, b"1", false).unwrap();
+        variables
+            .set(&name("Z"), &CUSTOM, NV_BS_RT, b"1", false)
+            .unwrap();
+        variables
+            .set(&name("Y"), &CUSTOM, NV_BS_RT, b"1", false)
+            .unwrap();
         let mut seen = Vec::new();
         let (mut current, mut guid) = (Vec::new(), Guid::default());
         while let Ok((next, next_guid)) = variables.next(&current, &guid, false) {
@@ -561,7 +674,9 @@ mod tests {
     fn info_counts_what_is_stored() {
         let mut variables = variables();
         let (total, remaining_empty, maximum) = variables.info();
-        variables.set(&name("V"), &CUSTOM, NV_BS_RT, &[0; 1000], false).unwrap();
+        variables
+            .set(&name("V"), &CUSTOM, NV_BS_RT, &[0; 1000], false)
+            .unwrap();
         let (_, remaining, _) = variables.info();
         assert_eq!(total, STORAGE_BYTES);
         assert!(remaining < remaining_empty - 1000);
@@ -579,7 +694,11 @@ mod tests {
         assert_eq!(store.get(b"var/a").map(|v| v.len()), Some(60_000));
         assert!(store.set(b"var/c", &value));
         assert!(!store.set(b"var/d", &vec![0u8; ARENA_BYTES]), "cannot fit");
-        assert_eq!(store.get(b"var/c").map(|v| v.len()), Some(60_000), "the others survive a refused write");
+        assert_eq!(
+            store.get(b"var/c").map(|v| v.len()),
+            Some(60_000),
+            "the others survive a refused write"
+        );
     }
 
     #[test]

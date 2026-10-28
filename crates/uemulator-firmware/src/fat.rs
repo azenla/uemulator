@@ -171,7 +171,11 @@ impl<S: Storage> Volume<S> {
         } else {
             Kind::Fat32
         };
-        let (label_at, serial_at) = if kind == Kind::Fat32 { (71, 67) } else { (43, 39) };
+        let (label_at, serial_at) = if kind == Kind::Fat32 {
+            (71, 67)
+        } else {
+            (43, 39)
+        };
         let label = String::from_utf8_lossy(&boot[label_at..label_at + 11])
             .trim_end()
             .into();
@@ -231,11 +235,21 @@ impl<S: Storage> Volume<S> {
             Kind::Fat12 => {
                 let at = cluster as u64 * 3 / 2;
                 let pair = self.fat_byte(at)? as u32 | (self.fat_byte(at + 1)? as u32) << 8;
-                (if cluster & 1 == 0 { pair & 0xfff } else { pair >> 4 }, 0xff8)
+                (
+                    if cluster & 1 == 0 {
+                        pair & 0xfff
+                    } else {
+                        pair >> 4
+                    },
+                    0xff8,
+                )
             }
             Kind::Fat16 => {
                 let at = cluster as u64 * 2;
-                (self.fat_byte(at)? as u32 | (self.fat_byte(at + 1)? as u32) << 8, 0xfff8)
+                (
+                    self.fat_byte(at)? as u32 | (self.fat_byte(at + 1)? as u32) << 8,
+                    0xfff8,
+                )
             }
             Kind::Fat32 => {
                 let at = cluster as u64 * 4;
@@ -260,7 +274,11 @@ impl<S: Storage> Volume<S> {
     }
 
     fn read_directory_bytes(&mut self, directory: u32) -> Result<Vec<u8>, FatError> {
-        let directory = if directory == 0 { self.root_cluster } else { directory };
+        let directory = if directory == 0 {
+            self.root_cluster
+        } else {
+            directory
+        };
         if directory == 0 {
             let mut bytes = alloc::vec![0u8; self.root_bytes as usize];
             self.storage.read(self.root_start, &mut bytes)?;
@@ -272,7 +290,8 @@ impl<S: Storage> Volume<S> {
         while let Some(current) = cluster {
             let start = bytes.len();
             bytes.resize(start + self.cluster_bytes as usize, 0);
-            self.storage.read(self.cluster_offset(current), &mut bytes[start..])?;
+            self.storage
+                .read(self.cluster_offset(current), &mut bytes[start..])?;
             guard += 1;
             if guard > self.cluster_count {
                 return Err(FatError::Corrupt);
@@ -329,14 +348,21 @@ impl<S: Storage> Volume<S> {
                 && !long_units.is_empty()
                 && short_name_checksum(raw) == long_checksum;
             let name = if long_name_valid {
-                let end = long_units.iter().position(|&unit| unit == 0).unwrap_or(long_units.len());
+                let end = long_units
+                    .iter()
+                    .position(|&unit| unit == 0)
+                    .unwrap_or(long_units.len());
                 crate::text::to_string(&long_units[..end])
             } else {
                 short_name(raw)
             };
             long_units.clear();
             expected_sequence = 0;
-            let high_cluster = if self.kind == Kind::Fat32 { u16_at(raw, 20) as u32 } else { 0 };
+            let high_cluster = if self.kind == Kind::Fat32 {
+                u16_at(raw, 20) as u32
+            } else {
+                0
+            };
             entries.push(DirEntry {
                 name,
                 attributes,
@@ -422,12 +448,19 @@ fn short_name(raw: &[u8]) -> String {
         name[0] = DELETED;
     }
     let part = |bytes: &[u8], lowercase: bool| -> String {
-        let end = bytes.iter().rposition(|&byte| byte != b' ').map_or(0, |last| last + 1);
+        let end = bytes
+            .iter()
+            .rposition(|&byte| byte != b' ')
+            .map_or(0, |last| last + 1);
         bytes[..end]
             .iter()
             .map(|&byte| {
                 let character = byte as char;
-                if lowercase { character.to_ascii_lowercase() } else { character }
+                if lowercase {
+                    character.to_ascii_lowercase()
+                } else {
+                    character
+                }
             })
             .collect()
     };
@@ -481,7 +514,11 @@ pub mod testing {
                 Size::Fat16 => (Kind::Fat16, 5000, 1, 20),
                 Size::Fat32 => (Kind::Fat32, 66000, 32, 520),
             };
-            let root_sectors = if kind == Kind::Fat32 { 0 } else { ROOT_ENTRIES * 32 / SECTOR };
+            let root_sectors = if kind == Kind::Fat32 {
+                0
+            } else {
+                ROOT_ENTRIES * 32 / SECTOR
+            };
             let data_sector = reserved + 2 * fat_sectors + root_sectors;
             let total = data_sector + clusters;
             let mut image = alloc::vec![0u8; total * SECTOR];
@@ -569,7 +606,10 @@ pub mod testing {
 
         fn link(&mut self, clusters: &[u32]) {
             for (index, cluster) in clusters.iter().enumerate() {
-                let next = clusters.get(index + 1).copied().unwrap_or(self.end_of_chain());
+                let next = clusters
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(self.end_of_chain());
                 self.set_fat(*cluster, next);
             }
         }
@@ -600,7 +640,12 @@ pub mod testing {
             };
             if let Some((own, parent)) = dot {
                 bytes.extend_from_slice(&short_entry(b".          ", ATTRIBUTE_DIRECTORY, own, 0));
-                bytes.extend_from_slice(&short_entry(b"..         ", ATTRIBUTE_DIRECTORY, parent, 0));
+                bytes.extend_from_slice(&short_entry(
+                    b"..         ",
+                    ATTRIBUTE_DIRECTORY,
+                    parent,
+                    0,
+                ));
             }
             for (name, attributes, cluster, size) in entries {
                 short_index += 1;
@@ -610,7 +655,9 @@ pub mod testing {
                 };
                 let fits_short = stem.len() <= 8
                     && extension.len() <= 3
-                    && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.');
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.');
                 let mut short = [b' '; 11];
                 if fits_short {
                     short[..stem.len()].copy_from_slice(stem.as_bytes());
@@ -630,10 +677,17 @@ pub mod testing {
                     }
                     let units: Vec<u16> = name.encode_utf16().collect();
                     let chunks: Vec<&[u16]> = units.chunks(LONG_NAME_CHARS_PER_ENTRY).collect();
-                    let checksum = short.iter().fold(0u8, |sum, &b| sum.rotate_right(1).wrapping_add(b));
+                    let checksum = short
+                        .iter()
+                        .fold(0u8, |sum, &b| sum.rotate_right(1).wrapping_add(b));
                     for (index, chunk) in chunks.iter().enumerate().rev() {
                         let mut raw = [0u8; 32];
-                        raw[0] = (index as u8 + 1) | if index == chunks.len() - 1 { LONG_NAME_LAST } else { 0 };
+                        raw[0] = (index as u8 + 1)
+                            | if index == chunks.len() - 1 {
+                                LONG_NAME_LAST
+                            } else {
+                                0
+                            };
                         raw[11] = ATTRIBUTE_LONG_NAME;
                         raw[13] = checksum;
                         for (slot, offset) in LONG_NAME_OFFSETS.iter().enumerate() {
@@ -741,7 +795,9 @@ mod tests {
         let mut data = Vec::new();
         let mut buffer = alloc::vec![0u8; chunk];
         loop {
-            let count = volume.read(&mut cursor, data.len() as u64, &mut buffer).unwrap();
+            let count = volume
+                .read(&mut cursor, data.len() as u64, &mut buffer)
+                .unwrap();
             if count == 0 {
                 return data;
             }
@@ -761,15 +817,23 @@ mod tests {
         let boot = volume.lookup(efi.first_cluster, "BOOT").unwrap();
         let listing = volume.list(boot.first_cluster).unwrap();
         let names: Vec<&str> = listing.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, [".", "..", "BOOTX64.EFI", "grub.cfg", "A long file name.txt"]);
+        assert_eq!(
+            names,
+            [".", "..", "BOOTX64.EFI", "grub.cfg", "A long file name.txt"]
+        );
         let loader = volume.lookup(boot.first_cluster, "bootx64.efi").unwrap();
         assert_eq!(read_all(&mut volume, &loader, 4096), kernel);
         assert_eq!(read_all(&mut volume, &loader, 100), kernel);
         let config = volume.lookup(boot.first_cluster, "GRUB.CFG").unwrap();
         assert_eq!(read_all(&mut volume, &config, 700), fragmented);
-        let long = volume.lookup(boot.first_cluster, "a LONG file name.TXT").unwrap();
+        let long = volume
+            .lookup(boot.first_cluster, "a LONG file name.TXT")
+            .unwrap();
         assert_eq!(long.size, 0);
-        assert_eq!(volume.lookup(boot.first_cluster, "missing"), Err(FatError::NotFound));
+        assert_eq!(
+            volume.lookup(boot.first_cluster, "missing"),
+            Err(FatError::NotFound)
+        );
     }
 
     #[test]
@@ -807,7 +871,10 @@ mod tests {
 
     #[test]
     fn a_non_fat_disk_is_rejected() {
-        assert_eq!(Volume::open(Image(alloc::vec![0; 4096])).err(), Some(FatError::Corrupt));
+        assert_eq!(
+            Volume::open(Image(alloc::vec![0; 4096])).err(),
+            Some(FatError::Corrupt)
+        );
         let mut broken = Builder::new(Size::Fat16).finish();
         broken.0[13] = 3;
         assert_eq!(Volume::open(broken).err(), Some(FatError::Corrupt));

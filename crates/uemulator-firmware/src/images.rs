@@ -22,7 +22,14 @@ global_asm!(
     // returns here from any depth by restoring that stack pointer (`exit_image`).
     ".global call_image",
     "call_image:",
-    "push rbx", "push rbp", "push rdi", "push rsi", "push r12", "push r13", "push r14", "push r15",
+    "push rbx",
+    "push rbp",
+    "push rdi",
+    "push rsi",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
     "mov [r9], rsp",
     // 32 bytes of shadow space plus 8 to keep the stack 16-byte aligned at the call.
     "sub rsp, 40",
@@ -32,7 +39,14 @@ global_asm!(
     "call rax",
     "add rsp, 40",
     "call_image_restore:",
-    "pop r15", "pop r14", "pop r13", "pop r12", "pop rsi", "pop rdi", "pop rbp", "pop rbx",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rsi",
+    "pop rdi",
+    "pop rbp",
+    "pop rbx",
     "ret",
     // fn exit_image(saved_rsp, status) -> !
     ".global exit_image",
@@ -43,7 +57,12 @@ global_asm!(
 );
 
 unsafe extern "win64" {
-    fn call_image(entry: usize, handle: Handle, system_table: *mut SystemTable, saved_rsp: *mut usize) -> Status;
+    fn call_image(
+        entry: usize,
+        handle: Handle,
+        system_table: *mut SystemTable,
+        saved_rsp: *mut usize,
+    ) -> Status;
     fn exit_image(saved_rsp: usize, status: Status) -> !;
 }
 
@@ -64,11 +83,17 @@ struct Record {
 static IMAGES: Global<Vec<Box<Record>>> = Global::new(Vec::new());
 
 fn record_for(handle: Handle) -> Option<&'static mut Record> {
-    IMAGES.get().iter_mut().map(|record| &mut **record).find(|record| record.handle == handle)
+    IMAGES
+        .get()
+        .iter_mut()
+        .map(|record| &mut **record)
+        .find(|record| record.handle == handle)
 }
 
 fn leak_path(path: &DevicePath) -> *mut DevicePathNode {
-    Box::leak(path.as_bytes().to_vec().into_boxed_slice()).as_mut_ptr().cast()
+    Box::leak(path.as_bytes().to_vec().into_boxed_slice())
+        .as_mut_ptr()
+        .cast()
 }
 
 /// Reads the file a device path names. The path is a device path to a file system handle followed by
@@ -88,11 +113,14 @@ fn read_file_of(path: &DevicePath) -> Result<(Vec<u8>, Handle), Status> {
     let tail = unsafe { DevicePath::from_raw(remaining.cast()) }.ok_or(INVALID_PARAMETER)?;
     let name = tail.file_name().ok_or(NOT_FOUND)?;
     if found {
-        let volume = protocols::interface_of(device, &guids::SIMPLE_FILE_SYSTEM).ok_or(NOT_FOUND)?;
+        let volume =
+            protocols::interface_of(device, &guids::SIMPLE_FILE_SYSTEM).ok_or(NOT_FOUND)?;
         return files::read_file(volume.cast(), &name).map(|bytes| (bytes, device));
     }
     for handle in protocols::handles_with(&guids::SIMPLE_FILE_SYSTEM) {
-        let Some(volume) = protocols::interface_of(handle, &guids::SIMPLE_FILE_SYSTEM) else { continue };
+        let Some(volume) = protocols::interface_of(handle, &guids::SIMPLE_FILE_SYSTEM) else {
+            continue;
+        };
         if files::exists(volume.cast(), &name) {
             return files::read_file(volume.cast(), &name).map(|bytes| (bytes, handle));
         }
@@ -174,7 +202,9 @@ pub fn load(
 
 /// `LoadOptions` for the next `StartImage`: what the boot manager copies from a load option.
 pub fn set_load_options(handle: Handle, options: &[u8]) {
-    let Some(record) = record_for(handle) else { return };
+    let Some(record) = record_for(handle) else {
+        return;
+    };
     let copy = Box::leak(options.to_vec().into_boxed_slice());
     record.loaded.load_options = copy.as_mut_ptr().cast();
     record.loaded.load_options_size = options.len() as u32;
@@ -193,7 +223,9 @@ extern "efiapi" fn load_image(
     }
     let path = unsafe { DevicePath::from_raw(device_path.cast()) };
     let result = if source.is_null() {
-        let Some(path) = &path else { return INVALID_PARAMETER };
+        let Some(path) = &path else {
+            return INVALID_PARAMETER;
+        };
         read_file_of(path).and_then(|(bytes, device)| load(&bytes, parent, device, Some(path)))
     } else {
         let bytes = unsafe { core::slice::from_raw_parts(source.cast::<u8>(), source_size) };
@@ -233,7 +265,11 @@ extern "efiapi" fn unload_image(handle: Handle) -> Status {
     }
 }
 
-extern "efiapi" fn start_image(handle: Handle, exit_data_size: *mut usize, exit_data: *mut *mut u16) -> Status {
+extern "efiapi" fn start_image(
+    handle: Handle,
+    exit_data_size: *mut usize,
+    exit_data: *mut *mut u16,
+) -> Status {
     let Some(record) = record_for(handle) else {
         return INVALID_PARAMETER;
     };
@@ -257,14 +293,20 @@ extern "efiapi" fn start_image(handle: Handle, exit_data_size: *mut usize, exit_
         unsafe { exit_data.write(data) };
     }
     // An application that has returned is finished; a driver stays resident when it succeeded.
-    let finished_app = record_for(handle).is_some_and(|record| record.subsystem == pe::SUBSYSTEM_EFI_APPLICATION);
+    let finished_app =
+        record_for(handle).is_some_and(|record| record.subsystem == pe::SUBSYSTEM_EFI_APPLICATION);
     if finished_app || is_error(status) {
         unload(handle);
     }
     status
 }
 
-extern "efiapi" fn exit(handle: Handle, status: Status, data_size: usize, data: *mut u16) -> Status {
+extern "efiapi" fn exit(
+    handle: Handle,
+    status: Status,
+    data_size: usize,
+    data: *mut u16,
+) -> Status {
     let Some(record) = record_for(handle) else {
         return INVALID_PARAMETER;
     };

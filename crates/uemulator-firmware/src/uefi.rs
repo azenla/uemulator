@@ -369,11 +369,13 @@ pub struct BootServices {
     pub open_protocol:
         extern "efiapi" fn(Handle, *const Guid, *mut *mut c_void, Handle, Handle, u32) -> Status,
     pub close_protocol: extern "efiapi" fn(Handle, *const Guid, Handle, Handle) -> Status,
-    pub open_protocol_information:
-        extern "efiapi" fn(Handle, *const Guid, *mut *mut OpenProtocolInformation, *mut usize)
-            -> Status,
-    pub protocols_per_handle:
-        extern "efiapi" fn(Handle, *mut *mut *mut Guid, *mut usize) -> Status,
+    pub open_protocol_information: extern "efiapi" fn(
+        Handle,
+        *const Guid,
+        *mut *mut OpenProtocolInformation,
+        *mut usize,
+    ) -> Status,
+    pub protocols_per_handle: extern "efiapi" fn(Handle, *mut *mut *mut Guid, *mut usize) -> Status,
     pub locate_handle_buffer:
         extern "efiapi" fn(u32, *const Guid, *mut c_void, *mut usize, *mut *mut Handle) -> Status,
     pub locate_protocol: extern "efiapi" fn(*const Guid, *mut c_void, *mut *mut c_void) -> Status,

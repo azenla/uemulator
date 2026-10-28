@@ -22,7 +22,9 @@ fn boot_option(number: u16) -> Option<Candidate> {
 /// `BootNext`, then `BootOrder`, then whatever the media offers.
 fn candidates() -> Vec<Candidate> {
     let mut found = Vec::new();
-    if let Some(next) = variables::read("BootNext", &guids::GLOBAL_VARIABLE).filter(|data| data.len() == 2) {
+    if let Some(next) =
+        variables::read("BootNext", &guids::GLOBAL_VARIABLE).filter(|data| data.len() == 2)
+    {
         // One-shot: gone before it is tried, so a bad entry cannot trap the machine.
         variables::write("BootNext", &guids::GLOBAL_VARIABLE, 0, &[]);
         found.extend(boot_option(u16::from_le_bytes([next[0], next[1]])));
@@ -38,7 +40,9 @@ fn candidates() -> Vec<Candidate> {
         else {
             continue;
         };
-        let Some(volume) = protocols::interface_of(handle, &guids::SIMPLE_FILE_SYSTEM) else { continue };
+        let Some(volume) = protocols::interface_of(handle, &guids::SIMPLE_FILE_SYSTEM) else {
+            continue;
+        };
         if crate::files::exists(volume.cast(), REMOVABLE_MEDIA_PATH) {
             found.push(Candidate {
                 description: alloc::format!("removable media on {}", device.text()),
@@ -55,7 +59,14 @@ fn try_boot(candidate: &Candidate) -> Status {
     let boot = unsafe { BOOT_SERVICES.get().assume_init_ref() };
     let mut path = candidate.path.as_bytes().to_vec();
     let mut image: Handle = ptr::null_mut();
-    let status = (boot.load_image)(1, ptr::null_mut(), path.as_mut_ptr().cast(), ptr::null_mut(), 0, &mut image);
+    let status = (boot.load_image)(
+        1,
+        ptr::null_mut(),
+        path.as_mut_ptr().cast(),
+        ptr::null_mut(),
+        0,
+        &mut image,
+    );
     if status != SUCCESS {
         return status;
     }
@@ -75,8 +86,12 @@ fn try_boot(candidate: &Candidate) -> Status {
 
 pub fn run() -> ! {
     println!("uemulator UEFI firmware");
-        for candidate in candidates() {
-        println!("Booting {} ({})", candidate.description, candidate.path.text());
+    for candidate in candidates() {
+        println!(
+            "Booting {} ({})",
+            candidate.description,
+            candidate.path.text()
+        );
         let status = try_boot(&candidate);
         println!("{} returned with status {status:#x}", candidate.description);
     }

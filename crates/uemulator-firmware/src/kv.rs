@@ -32,7 +32,9 @@ pub fn init(handoff: &Handoff) {
     if handoff.kv_port == 0 {
         return;
     }
-    let port = KvPort { base: handoff.kv_port };
+    let port = KvPort {
+        base: handoff.kv_port,
+    };
     if inl(port.base + REGISTER_IDENT) == IDENT {
         crate::variables::attach_store(port);
     }

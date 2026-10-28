@@ -1,6 +1,8 @@
 //! Named machines, kept under `<home>/machines/<name>/`:
 //!
 //! - `machine.toml`: the distro it installs and its `Settings`
+//! - `nvram.kv`: the UEFI firmware's variables, for a machine whose firmware is `uefi`; created by
+//!   its first boot and removed with the directory
 //! - `artifacts/`: the distro's netboot kernel and initramfs, which `reinstall` throws away and
 //!   `update-artifacts` replaces
 //! - `disk-<n>.img`: the sparse images `--create-disk` made. Disks attached with `--disk` stay
@@ -13,8 +15,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::args::{
-    BootSource, ConsoleArg, DiskSpec, DiskStep, HardwareArgs, LinuxArgs, NetLink, NetModel, Nic,
-    RemoveArgs, Settings, attach_only,
+    BootSource, ConsoleArg, DiskSpec, DiskStep, Firmware, HardwareArgs, LinuxArgs, NetLink,
+    NetModel, Nic, RemoveArgs, Settings, attach_only,
 };
 use crate::quick::{Artifacts, Distro, artifacts_present, ensure_in, write_atomically};
 use crate::run::DEFAULT_MEMORY_MIB;
@@ -22,6 +24,7 @@ use crate::run::DEFAULT_MEMORY_MIB;
 const MACHINES_DIR: &str = "machines";
 const MACHINE_FILE: &str = "machine.toml";
 const ARTIFACTS_DIR: &str = "artifacts";
+const NVRAM_FILE: &str = "nvram.kv";
 /// Where `update-artifacts` downloads to, so a failed update leaves the old kernel and initramfs
 /// together: the Alpine initramfs and its modloop must come from the release of the kernel.
 const STAGING_DIR: &str = "artifacts.new";
@@ -67,6 +70,8 @@ struct MachineFile {
     install: Distro,
     #[serde(default)]
     boot_from: BootSource,
+    #[serde(default)]
+    firmware: Firmware,
     #[serde(flatten)]
     settings: Settings,
 }
@@ -76,12 +81,17 @@ pub struct Machine {
     pub dir: PathBuf,
     pub install: Distro,
     pub boot_from: BootSource,
+    pub firmware: Firmware,
     pub settings: Settings,
 }
 
 impl Machine {
     fn config_path(&self) -> PathBuf {
         self.dir.join(MACHINE_FILE)
+    }
+
+    pub fn nvram_path(&self) -> PathBuf {
+        self.dir.join(NVRAM_FILE)
     }
 
     pub fn artifacts_dir(&self) -> PathBuf {
@@ -92,6 +102,7 @@ impl Machine {
         let file = MachineFile {
             install: self.install,
             boot_from: self.boot_from,
+            firmware: self.firmware,
             settings: self.settings.clone(),
         };
         let text =
@@ -119,6 +130,7 @@ pub fn load(home: &Path, name: &str) -> Result<Machine, String> {
         dir,
         install: file.install,
         boot_from: file.boot_from,
+        firmware: file.firmware,
         settings: file.settings,
     })
 }
@@ -190,6 +202,7 @@ pub fn create(
     hardware: &HardwareArgs,
     linux: &LinuxArgs,
     boot_from: Option<BootSource>,
+    firmware: Option<Firmware>,
 ) -> Result<Machine, String> {
     validate_name(name)?;
     let machines = home.join(MACHINES_DIR);
@@ -224,6 +237,7 @@ pub fn create(
             dir: dir.clone(),
             install,
             boot_from: boot_from.unwrap_or_default(),
+            firmware: firmware.unwrap_or_default(),
             settings,
         };
         machine.save()?;
@@ -249,12 +263,14 @@ pub fn edit(
     linux: &LinuxArgs,
     remove: &RemoveArgs,
     boot_from: Option<BootSource>,
+    firmware: Option<Firmware>,
 ) -> Result<Edited, String> {
     let mut machine = load(home, name)?;
     let detached = machine.settings.remove_devices(remove)?;
     let disks = persist_disks(&machine.dir, &hardware.disk_steps)?;
     machine.settings.add(hardware, linux, disks);
     machine.boot_from = boot_from.unwrap_or(machine.boot_from);
+    machine.firmware = firmware.unwrap_or(machine.firmware);
     machine.save()?;
     Ok(Edited { machine, detached })
 }
@@ -266,6 +282,10 @@ pub struct Launch {
     /// Empty for a boot from the disk, whose boot loader brings its own kernel.
     pub kernel: Vec<u8>,
     pub initramfs: Option<Vec<u8>>,
+    /// How a boot from the disk gets going; the installer always boots directly.
+    pub firmware: Firmware,
+    /// The UEFI variable store of a boot from the disk through the UEFI firmware.
+    pub nvram: Option<PathBuf>,
     /// The saved settings with this boot's overrides and the distro's defaults applied.
     pub settings: Settings,
 }
@@ -334,6 +354,8 @@ pub fn prepare_boot(
             source: BootSource::Disk,
             kernel: Vec::new(),
             initramfs: None,
+            firmware: machine.firmware,
+            nvram: (machine.firmware == Firmware::Uefi).then(|| machine.nvram_path()),
             settings,
         });
     }
@@ -342,6 +364,8 @@ pub fn prepare_boot(
         source: BootSource::Installer,
         kernel: read_file(&artifacts.kernel)?,
         initramfs: Some(read_file(&artifacts.initramfs)?),
+        firmware: machine.firmware,
+        nvram: None,
         settings: with_distro_defaults(settings, machine.install),
     })
 }
@@ -462,11 +486,20 @@ pub fn show(machine: &Machine) -> String {
         true => "fetched",
         false => "missing (the next boot downloads them)",
     };
-    format!(
+    let mut out = format!(
         "{}  directory {}\n  artifacts {artifacts}\n",
         describe(machine),
         machine.dir.display()
-    )
+    );
+    if machine.firmware == Firmware::Uefi {
+        let nvram = machine.nvram_path();
+        let state = match nvram.is_file() {
+            true => "present",
+            false => "not created yet (the first boot makes it)",
+        };
+        out.push_str(&format!("  nvram     {} {state}\n", nvram.display()));
+    }
+    out
 }
 
 /// What `delete` removes: the machine's directory, and with it the disk images made in it.
@@ -528,6 +561,7 @@ pub fn describe(machine: &Machine) -> String {
         BootSource::Disk => "disk",
     };
     out.push_str(&format!("  boots     {boot}\n"));
+    out.push_str(&format!("  firmware  {}\n", machine.firmware.name()));
     for (index, disk) in settings.disks.iter().enumerate() {
         let mode = if disk.read_only { "ro" } else { "rw" };
         out.push_str(&format!(
@@ -624,7 +658,7 @@ mod tests {
 
     fn create_machine(home: &Path, extra: &[&str]) -> Machine {
         let (hardware, linux) = create_args(extra);
-        create(home, "m", Distro::Alpine, &hardware, &linux, None).unwrap()
+        create(home, "m", Distro::Alpine, &hardware, &linux, None, None).unwrap()
     }
 
     /// Records every requested URL and writes the URL itself as the file contents.
@@ -786,9 +820,17 @@ mod tests {
         let home = TempDir::new("machines-create-twice");
         create_machine(home.path(), &[]);
         let (hardware, linux) = create_args(&["--memory", "99"]);
-        let error = create(home.path(), "m", Distro::Debian, &hardware, &linux, None)
-            .err()
-            .unwrap();
+        let error = create(
+            home.path(),
+            "m",
+            Distro::Debian,
+            &hardware,
+            &linux,
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
         assert!(error.contains("already exists"), "{error}");
         let kept = load(home.path(), "m").unwrap();
         assert_eq!(kept.install, Distro::Alpine);
@@ -801,9 +843,17 @@ mod tests {
         let missing = home.path().join("missing.img");
         let (hardware, linux) =
             create_args(&["--create-disk", "1", "--disk", &missing.to_string_lossy()]);
-        let error = create(home.path(), "m", Distro::Alpine, &hardware, &linux, None)
-            .err()
-            .unwrap();
+        let error = create(
+            home.path(),
+            "m",
+            Distro::Alpine,
+            &hardware,
+            &linux,
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
         assert!(error.starts_with("disk "), "{error}");
         assert!(!home.path().join("machines/m").exists());
     }
@@ -862,7 +912,7 @@ mod tests {
         let home = TempDir::new("machines-disk-names");
         create_machine(home.path(), &[]);
         let (hardware, linux, remove) = edit_args(&["--remove-disk", "0", "--create-disk", "1"]);
-        let edited = edit(home.path(), "m", &hardware, &linux, &remove, None).unwrap();
+        let edited = edit(home.path(), "m", &hardware, &linux, &remove, None, None).unwrap();
         let dir = home.path().join("machines/m");
         assert_eq!(edited.detached.len(), 1);
         assert_eq!(edited.detached[0].path, dir.join("disk-0.img"));
@@ -895,7 +945,7 @@ mod tests {
             "--create-disk",
             "4",
         ]);
-        let edited = edit(home.path(), "m", &hardware, &linux, &remove, None).unwrap();
+        let edited = edit(home.path(), "m", &hardware, &linux, &remove, None, None).unwrap();
         let reloaded = load(home.path(), "m").unwrap().settings;
         assert_eq!(reloaded, edited.machine.settings);
         assert_eq!(reloaded.memory, Some(256));
@@ -924,7 +974,7 @@ mod tests {
         let before = fs::read_to_string(home.path().join("machines/m/machine.toml")).unwrap();
         let (hardware, linux, remove) =
             edit_args(&["--remove-disk", "5", "--create-disk", "1", "--memory", "99"]);
-        let error = edit(home.path(), "m", &hardware, &linux, &remove, None)
+        let error = edit(home.path(), "m", &hardware, &linux, &remove, None, None)
             .err()
             .unwrap();
         assert_eq!(error, "--remove-disk 5: there is 1 disk, numbered 0");
@@ -944,7 +994,7 @@ mod tests {
         );
         let (hardware, linux, remove) =
             edit_args(&["--disable-jit=false", "--no-reboot=false", "--cmdline", ""]);
-        let settings = edit(home.path(), "m", &hardware, &linux, &remove, None)
+        let settings = edit(home.path(), "m", &hardware, &linux, &remove, None, None)
             .unwrap()
             .machine
             .settings;
@@ -956,7 +1006,7 @@ mod tests {
     fn edit_of_a_missing_machine_says_how_to_create_it() {
         let home = TempDir::new("machines-edit-missing");
         let (hardware, linux, remove) = edit_args(&[]);
-        let error = edit(home.path(), "m", &hardware, &linux, &remove, None)
+        let error = edit(home.path(), "m", &hardware, &linux, &remove, None, None)
             .err()
             .unwrap();
         assert!(error.contains("no machine named m"), "{error}");
@@ -1126,6 +1176,7 @@ mod tests {
             &HardwareArgs::default(),
             &LinuxArgs::default(),
             None,
+            None,
         )
         .unwrap();
         finish_install(&fedora);
@@ -1209,6 +1260,7 @@ mod tests {
             &linux,
             &remove,
             Some(BootSource::Installer),
+            None,
         )
         .unwrap();
         let saved = load(home.path(), "m").unwrap();
@@ -1222,7 +1274,7 @@ mod tests {
             load(home.path(), "m").unwrap().boot_from,
             BootSource::Installer
         );
-        edit(home.path(), "m", &hardware, &linux, &remove, None).unwrap();
+        edit(home.path(), "m", &hardware, &linux, &remove, None, None).unwrap();
         assert_eq!(
             load(home.path(), "m").unwrap().boot_from,
             BootSource::Installer
@@ -1274,6 +1326,7 @@ mod tests {
             &hardware,
             &linux,
             Some(BootSource::Disk),
+            None,
         )
         .unwrap();
         assert_eq!(machine.boot_from, BootSource::Disk);
@@ -1470,7 +1523,16 @@ mod tests {
         let home = TempDir::new("machines-list");
         for name in ["zeta", "alpha"] {
             let (hardware, linux) = create_args(&[]);
-            create(home.path(), name, Distro::Debian, &hardware, &linux, None).unwrap();
+            create(
+                home.path(),
+                name,
+                Distro::Debian,
+                &hardware,
+                &linux,
+                None,
+                None,
+            )
+            .unwrap();
         }
         fs::create_dir_all(home.path().join("machines/stray")).unwrap();
         fs::write(home.path().join("machines/file"), b"x").unwrap();
@@ -1487,7 +1549,16 @@ mod tests {
         let home = TempDir::new("machines-list-broken");
         create_machine(home.path(), &[]);
         let (hardware, linux) = create_args(&[]);
-        create(home.path(), "good", Distro::Fedora, &hardware, &linux, None).unwrap();
+        create(
+            home.path(),
+            "good",
+            Distro::Fedora,
+            &hardware,
+            &linux,
+            None,
+            None,
+        )
+        .unwrap();
         fs::write(home.path().join("machines/m/machine.toml"), "install = 5").unwrap();
         let text = format_list(&list(home.path()).unwrap());
         assert!(text.contains("good  fedora"), "{text}");
@@ -1538,7 +1609,7 @@ mod tests {
         let home = TempDir::new("machines-delete-detached");
         create_machine(home.path(), &[]);
         let (hardware, linux, remove) = edit_args(&["--remove-disk", "0", "--create-disk", "1"]);
-        edit(home.path(), "m", &hardware, &linux, &remove, None).unwrap();
+        edit(home.path(), "m", &hardware, &linux, &remove, None, None).unwrap();
         assert_eq!(removal(home.path(), "m").unwrap().created_disks.len(), 2);
     }
 
@@ -1567,5 +1638,111 @@ mod tests {
         assert!(text.contains("install = \"alpine\""), "{text}");
         assert!(text.contains("memory = 300"), "{text}");
         assert!(text.contains("[[disks]]"), "{text}");
+    }
+
+    #[test]
+    fn firmware_defaults_to_bios_and_old_files_without_it_still_load() {
+        let home = TempDir::new("machines-firmware-serde");
+        let machine = create_machine(home.path(), &[]);
+        assert_eq!(machine.firmware, Firmware::Bios);
+        let path = home.path().join("machines/m/machine.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("firmware = \"bios\""), "{text}");
+        let old: String = text
+            .lines()
+            .filter(|l| !l.starts_with("firmware"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        fs::write(&path, old).unwrap();
+        assert_eq!(load(home.path(), "m").unwrap().firmware, Firmware::Bios);
+    }
+
+    #[test]
+    fn firmware_is_saved_by_create_and_changed_by_edit() {
+        let home = TempDir::new("machines-firmware-edit");
+        let (hardware, linux) = create_args(&["--firmware", "uefi"]);
+        create(
+            home.path(),
+            "m",
+            Distro::Alpine,
+            &hardware,
+            &linux,
+            None,
+            Some(Firmware::Uefi),
+        )
+        .unwrap();
+        let text = fs::read_to_string(home.path().join("machines/m/machine.toml")).unwrap();
+        assert!(text.contains("firmware = \"uefi\""), "{text}");
+        assert_eq!(load(home.path(), "m").unwrap().firmware, Firmware::Uefi);
+        let (hardware, linux, remove) = edit_args(&[]);
+        edit(home.path(), "m", &hardware, &linux, &remove, None, None).unwrap();
+        assert_eq!(load(home.path(), "m").unwrap().firmware, Firmware::Uefi);
+        let edited = edit(
+            home.path(),
+            "m",
+            &hardware,
+            &linux,
+            &remove,
+            None,
+            Some(Firmware::Bios),
+        )
+        .unwrap();
+        assert_eq!(edited.machine.firmware, Firmware::Bios);
+    }
+
+    #[test]
+    fn a_uefi_machine_boots_its_disk_with_its_nvram_and_a_bios_machine_does_not() {
+        let home = TempDir::new("machines-firmware-launch");
+        let mut machine = create_machine(home.path(), &[]);
+        finish_install(&machine);
+        let bios = launch(&machine, None).unwrap();
+        assert_eq!(
+            (bios.source, bios.firmware),
+            (BootSource::Disk, Firmware::Bios)
+        );
+        assert_eq!(bios.nvram, None);
+        machine.firmware = Firmware::Uefi;
+        for choice in [None, Some(BootSource::Disk)] {
+            let uefi = launch(&machine, choice).unwrap();
+            assert_eq!(
+                (uefi.source, uefi.firmware),
+                (BootSource::Disk, Firmware::Uefi)
+            );
+            assert_eq!(uefi.nvram, Some(home.path().join("machines/m/nvram.kv")));
+        }
+        let installer = launch(&machine, Some(BootSource::Installer)).unwrap();
+        assert_eq!(installer.source, BootSource::Installer);
+        assert_eq!(installer.nvram, None);
+    }
+
+    #[test]
+    fn show_lists_the_firmware_and_for_uefi_the_nvram() {
+        let home = TempDir::new("machines-firmware-show");
+        let mut machine = create_machine(home.path(), &[]);
+        let text = show(&machine);
+        assert!(text.contains("firmware  bios"), "{text}");
+        assert!(!text.contains("nvram"), "{text}");
+        machine.firmware = Firmware::Uefi;
+        let nvram = machine.nvram_path();
+        let text = show(&machine);
+        assert!(text.contains("firmware  uefi"), "{text}");
+        assert!(
+            text.contains(&format!("nvram     {} not created yet", nvram.display())),
+            "{text}"
+        );
+        fs::write(&nvram, b"").unwrap();
+        assert!(show(&machine).contains(&format!("{} present", nvram.display())));
+    }
+
+    #[test]
+    fn delete_removes_the_nvram_with_the_directory() {
+        let home = TempDir::new("machines-delete-nvram");
+        let machine = create_machine(home.path(), &[]);
+        fs::write(machine.nvram_path(), b"variables").unwrap();
+        let plan = removal(home.path(), "m").unwrap();
+        assert!(plan.created_disks.iter().all(|d| !d.ends_with("nvram.kv")));
+        delete(&plan).unwrap();
+        assert!(!machine.nvram_path().exists());
+        assert!(!plan.dir.exists());
     }
 }

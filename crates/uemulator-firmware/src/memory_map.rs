@@ -71,7 +71,13 @@ impl MemoryMap {
 
     /// Makes `[start, start + pages)` this type, replacing whatever the range held and
     /// splitting the ranges it cuts into.
-    pub fn set(&mut self, start: u64, pages: u64, kind: u32, attribute: u64) -> Result<(), MapError> {
+    pub fn set(
+        &mut self,
+        start: u64,
+        pages: u64,
+        kind: u32,
+        attribute: u64,
+    ) -> Result<(), MapError> {
         if pages == 0 {
             return Ok(());
         }
@@ -160,9 +166,9 @@ impl MemoryMap {
     /// Whether every page of the range is `CONVENTIONAL`.
     fn is_free(&self, start: u64, pages: u64) -> bool {
         let end = start + pages * PAGE_SIZE;
-        self.regions()
-            .iter()
-            .any(|region| region.kind == CONVENTIONAL && region.start <= start && end <= region.end())
+        self.regions().iter().any(|region| {
+            region.kind == CONVENTIONAL && region.start <= start && end <= region.end()
+        })
     }
 
     /// Takes `pages` of free memory at the highest address that fits, whose last byte is at or
@@ -186,7 +192,12 @@ impl MemoryMap {
             (start >= region.start).then_some(start)
         });
         let start = candidate.ok_or(MapError::NotFound)?;
-        self.set(start, pages, kind, crate::uefi::memory_attribute::WRITE_BACK)?;
+        self.set(
+            start,
+            pages,
+            kind,
+            crate::uefi::memory_attribute::WRITE_BACK,
+        )?;
         Ok(start)
     }
 
@@ -194,7 +205,12 @@ impl MemoryMap {
         if !self.is_free(start, pages) {
             return Err(MapError::NotFound);
         }
-        self.set(start, pages, kind, crate::uefi::memory_attribute::WRITE_BACK)
+        self.set(
+            start,
+            pages,
+            kind,
+            crate::uefi::memory_attribute::WRITE_BACK,
+        )
     }
 
     /// Returns allocated pages to the free pool. Memory that is not allocated memory, or lies
@@ -207,7 +223,12 @@ impl MemoryMap {
         if !allocated {
             return Err(MapError::NotFound);
         }
-        self.set(start, pages, CONVENTIONAL, crate::uefi::memory_attribute::WRITE_BACK)
+        self.set(
+            start,
+            pages,
+            CONVENTIONAL,
+            crate::uefi::memory_attribute::WRITE_BACK,
+        )
     }
 
     /// Total free pages, for `QueryVariableInfo`-style questions and diagnostics.
@@ -231,14 +252,17 @@ mod tests {
     fn map() -> MemoryMap {
         let mut map = MemoryMap::new();
         map.set(0, 16, RESERVED, 0).unwrap();
-        map.set(MIB, 15 * MIB / PAGE_SIZE, CONVENTIONAL, WRITE_BACK).unwrap();
+        map.set(MIB, 15 * MIB / PAGE_SIZE, CONVENTIONAL, WRITE_BACK)
+            .unwrap();
         map
     }
 
     #[test]
     fn allocation_takes_the_highest_fit() {
         let mut map = map();
-        let address = map.allocate_any(4, u64::MAX, PAGE_SIZE, LOADER_DATA).unwrap();
+        let address = map
+            .allocate_any(4, u64::MAX, PAGE_SIZE, LOADER_DATA)
+            .unwrap();
         assert_eq!(address, 16 * MIB - 4 * PAGE_SIZE);
         assert_eq!(map.kind_at(address), Some(LOADER_DATA));
         assert_eq!(map.kind_at(address - 1), Some(CONVENTIONAL));
@@ -269,27 +293,40 @@ mod tests {
     fn allocate_at_needs_free_memory() {
         let mut map = map();
         map.allocate_at(2 * MIB, 8, LOADER_DATA).unwrap();
-        assert_eq!(map.allocate_at(2 * MIB + PAGE_SIZE, 1, LOADER_DATA), Err(MapError::NotFound));
+        assert_eq!(
+            map.allocate_at(2 * MIB + PAGE_SIZE, 1, LOADER_DATA),
+            Err(MapError::NotFound)
+        );
         assert_eq!(map.allocate_at(0, 1, LOADER_DATA), Err(MapError::NotFound));
-        assert_eq!(map.allocate_at(100 * MIB, 1, LOADER_DATA), Err(MapError::NotFound));
+        assert_eq!(
+            map.allocate_at(100 * MIB, 1, LOADER_DATA),
+            Err(MapError::NotFound)
+        );
     }
 
     #[test]
     fn freeing_merges_back_and_rejects_free_memory() {
         let mut map = map();
         let before = map.regions().to_vec();
-        let address = map.allocate_any(3, u64::MAX, PAGE_SIZE, BOOT_SERVICES_DATA).unwrap();
+        let address = map
+            .allocate_any(3, u64::MAX, PAGE_SIZE, BOOT_SERVICES_DATA)
+            .unwrap();
         map.free(address, 3).unwrap();
         assert_eq!(map.regions(), before);
         assert_eq!(map.free(address, 3), Err(MapError::NotFound));
-        assert_eq!(map.free(0, 1), Ok(()), "reserved memory counts as allocated");
+        assert_eq!(
+            map.free(0, 1),
+            Ok(()),
+            "reserved memory counts as allocated"
+        );
     }
 
     #[test]
     fn any_change_moves_the_key() {
         let mut map = map();
         let key = map.key();
-        map.allocate_any(1, u64::MAX, PAGE_SIZE, LOADER_DATA).unwrap();
+        map.allocate_any(1, u64::MAX, PAGE_SIZE, LOADER_DATA)
+            .unwrap();
         assert_ne!(map.key(), key);
     }
 
@@ -306,7 +343,8 @@ mod tests {
     fn setting_across_regions_replaces_them() {
         let mut map = map();
         map.set(2 * MIB, 1, LOADER_DATA, 0).unwrap();
-        map.set(MIB, 15 * MIB / PAGE_SIZE, BOOT_SERVICES_DATA, 0).unwrap();
+        map.set(MIB, 15 * MIB / PAGE_SIZE, BOOT_SERVICES_DATA, 0)
+            .unwrap();
         assert_eq!(map.regions().len(), 2);
     }
 
@@ -314,10 +352,17 @@ mod tests {
     fn a_map_that_would_overflow_is_refused_and_left_alone() {
         let mut map = MemoryMap::new();
         for index in 0..CAPACITY as u64 {
-            let kind = if index % 2 == 0 { RESERVED } else { LOADER_DATA };
+            let kind = if index % 2 == 0 {
+                RESERVED
+            } else {
+                LOADER_DATA
+            };
             map.set(index * PAGE_SIZE, 1, kind, 0).unwrap();
         }
-        assert_eq!(map.set(CAPACITY as u64 * PAGE_SIZE + PAGE_SIZE, 1, RESERVED, 0), Err(MapError::Full));
+        assert_eq!(
+            map.set(CAPACITY as u64 * PAGE_SIZE + PAGE_SIZE, 1, RESERVED, 0),
+            Err(MapError::Full)
+        );
         assert_eq!(map.regions().len(), CAPACITY);
     }
 }

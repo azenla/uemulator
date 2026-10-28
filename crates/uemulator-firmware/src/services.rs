@@ -8,7 +8,10 @@ use crate::devicepath::protocol::{TO_TEXT, UTILITIES};
 use crate::handoff::Handoff;
 use crate::tables::{self, BOOT_SERVICES, RUNTIME_SERVICES, SYSTEM_TABLE};
 use crate::uefi::*;
-use crate::{console, disks, events, images, kv, memory, pci, protocols, rng, runtime, smbios, time, variables};
+use crate::{
+    console, disks, events, images, kv, memory, pci, protocols, rng, runtime, smbios, time,
+    variables,
+};
 
 /// UTF-16, NUL-terminated.
 static FIRMWARE_VENDOR: [u16; 10] = [
@@ -109,8 +112,16 @@ pub fn init(handoff: &Handoff) {
 }
 
 fn install_utility_protocols() {
-    let _ = protocols::install(core::ptr::null_mut(), guids::DEVICE_PATH_TO_TEXT, (&raw const TO_TEXT).cast_mut().cast());
-    let _ = protocols::install(core::ptr::null_mut(), guids::DEVICE_PATH_UTILITIES, (&raw const UTILITIES).cast_mut().cast());
+    let _ = protocols::install(
+        core::ptr::null_mut(),
+        guids::DEVICE_PATH_TO_TEXT,
+        (&raw const TO_TEXT).cast_mut().cast(),
+    );
+    let _ = protocols::install(
+        core::ptr::null_mut(),
+        guids::DEVICE_PATH_UTILITIES,
+        (&raw const UTILITIES).cast_mut().cast(),
+    );
 }
 
 fn install_acpi_and_smbios(handoff: &Handoff) {

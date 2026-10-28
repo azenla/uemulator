@@ -32,7 +32,11 @@ struct VirtualMap {
 }
 
 static VIRTUAL_MAP: Global<VirtualMap> = Global::new(VirtualMap {
-    entries: [Conversion { physical: 0, bytes: 0, virtual_start: 0 }; MAX_VIRTUAL_REGIONS],
+    entries: [Conversion {
+        physical: 0,
+        bytes: 0,
+        virtual_start: 0,
+    }; MAX_VIRTUAL_REGIONS],
     count: 0,
     active: false,
 });
@@ -121,13 +125,20 @@ extern "efiapi" fn set_virtual_address_map(
     if VIRTUAL_MAP.get().active {
         return UNSUPPORTED;
     }
-    if map.is_null() || descriptor_size < core::mem::size_of::<MemoryDescriptor>() || version < MEMORY_DESCRIPTOR_VERSION {
+    if map.is_null()
+        || descriptor_size < core::mem::size_of::<MemoryDescriptor>()
+        || version < MEMORY_DESCRIPTOR_VERSION
+    {
         return INVALID_PARAMETER;
     }
     let virtual_map = VIRTUAL_MAP.get();
     for index in 0..map_size / descriptor_size {
-        let descriptor =
-            unsafe { map.cast::<u8>().add(index * descriptor_size).cast::<MemoryDescriptor>().read_unaligned() };
+        let descriptor = unsafe {
+            map.cast::<u8>()
+                .add(index * descriptor_size)
+                .cast::<MemoryDescriptor>()
+                .read_unaligned()
+        };
         if descriptor.attribute & memory_attribute::RUNTIME == 0 {
             continue;
         }
@@ -168,13 +179,21 @@ fn runtime_function_slots(table: &mut RuntimeServices) -> &mut [usize] {
     let words = (core::mem::size_of::<RuntimeServices>() - header) / core::mem::size_of::<usize>();
     unsafe {
         core::slice::from_raw_parts_mut(
-            (table as *mut RuntimeServices).cast::<u8>().add(header).cast::<usize>(),
+            (table as *mut RuntimeServices)
+                .cast::<u8>()
+                .add(header)
+                .cast::<usize>(),
             words,
         )
     }
 }
 
-extern "efiapi" fn reset_system(kind: u32, _status: Status, _size: usize, _data: *const c_void) -> ! {
+extern "efiapi" fn reset_system(
+    kind: u32,
+    _status: Status,
+    _size: usize,
+    _data: *const c_void,
+) -> ! {
     if kind == RESET_SHUTDOWN {
         // No power controller exists yet: halting with interrupts off is how the library
         // recognises a power-off.
@@ -188,7 +207,12 @@ extern "efiapi" fn update_capsule(_: *mut *mut c_void, _: usize, _: u64) -> Stat
     UNSUPPORTED
 }
 
-extern "efiapi" fn query_capsule_capabilities(_: *mut *mut c_void, _: usize, _: *mut u64, _: *mut u32) -> Status {
+extern "efiapi" fn query_capsule_capabilities(
+    _: *mut *mut c_void,
+    _: usize,
+    _: *mut u64,
+    _: *mut u32,
+) -> Status {
     UNSUPPORTED
 }
 

@@ -180,6 +180,9 @@ mod tests {
     fn region_counts_are_clamped_to_the_page() {
         let mut huge = page();
         huge[RAM_REGION_COUNT..RAM_REGION_COUNT + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(Handoff::parse(&huge).unwrap().ram_regions.len(), MAX_RAM_REGIONS);
+        assert_eq!(
+            Handoff::parse(&huge).unwrap().ram_regions.len(),
+            MAX_RAM_REGIONS
+        );
     }
 }

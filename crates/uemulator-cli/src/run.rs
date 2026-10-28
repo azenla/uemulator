@@ -220,8 +220,8 @@ pub fn run_uefi(
     boot_entry: Option<(&str, &str)>,
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
-    let mut cfg =
-        build_config(Vec::new(), None, settings, runtime, tty)?.uefi_firmware(crate::firmware::IMAGE);
+    let mut cfg = build_config(Vec::new(), None, settings, runtime, tty)?
+        .uefi_firmware(crate::firmware::IMAGE);
     if let Some(path) = nvram {
         let mut store = uemulator::FileKeyValueStore::open(path).map_err(|e| e.to_string())?;
         if let Some((loader, options)) = boot_entry {

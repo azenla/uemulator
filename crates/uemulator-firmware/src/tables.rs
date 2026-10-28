@@ -72,10 +72,16 @@ pub fn seal_all() {
         );
         if !SYSTEM_TABLE.get().boot_services.is_null() {
             let boot = BOOT_SERVICES.get().as_mut_ptr();
-            seal(ptr::addr_of_mut!((*boot).header), core::mem::size_of::<BootServices>());
+            seal(
+                ptr::addr_of_mut!((*boot).header),
+                core::mem::size_of::<BootServices>(),
+            );
         }
         let runtime = RUNTIME_SERVICES.get().as_mut_ptr();
-        seal(ptr::addr_of_mut!((*runtime).header), core::mem::size_of::<RuntimeServices>());
+        seal(
+            ptr::addr_of_mut!((*runtime).header),
+            core::mem::size_of::<RuntimeServices>(),
+        );
     }
 }
 
@@ -83,7 +89,10 @@ pub fn seal_all() {
 pub fn install_configuration(guid: Guid, table: *mut c_void) -> Status {
     let count = CONFIGURATION_COUNT.get();
     let entries = CONFIGURATION.get();
-    match entries[..*count].iter().position(|entry| entry.guid == guid) {
+    match entries[..*count]
+        .iter()
+        .position(|entry| entry.guid == guid)
+    {
         Some(position) if table.is_null() => {
             entries.copy_within(position + 1..*count, position);
             *count -= 1;
@@ -105,7 +114,10 @@ pub fn install_configuration(guid: Guid, table: *mut c_void) -> Status {
     SUCCESS
 }
 
-pub extern "efiapi" fn install_configuration_table(guid: *const Guid, table: *mut c_void) -> Status {
+pub extern "efiapi" fn install_configuration_table(
+    guid: *const Guid,
+    table: *mut c_void,
+) -> Status {
     if guid.is_null() {
         return INVALID_PARAMETER;
     }

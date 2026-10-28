@@ -4,13 +4,13 @@
 use core::ffi::c_void;
 use core::ptr;
 
+use crate::events;
 use crate::keys;
 use crate::protocols;
 use crate::serial;
 use crate::sync::Global;
 use crate::tables::SYSTEM_TABLE;
 use crate::uefi::*;
-use crate::events;
 
 const COLUMNS: usize = 80;
 const ROWS: usize = 25;
@@ -45,8 +45,12 @@ struct SimpleTextInputEx {
     read_key_stroke_ex: extern "efiapi" fn(*mut SimpleTextInputEx, *mut KeyData) -> Status,
     wait_for_key_ex: Event,
     set_state: extern "efiapi" fn(*mut SimpleTextInputEx, *mut u8) -> Status,
-    register_key_notify:
-        extern "efiapi" fn(*mut SimpleTextInputEx, *mut KeyData, *mut c_void, *mut *mut c_void) -> Status,
+    register_key_notify: extern "efiapi" fn(
+        *mut SimpleTextInputEx,
+        *mut KeyData,
+        *mut c_void,
+        *mut *mut c_void,
+    ) -> Status,
     unregister_key_notify: extern "efiapi" fn(*mut SimpleTextInputEx, *mut c_void) -> Status,
 }
 
@@ -159,7 +163,12 @@ extern "efiapi" fn test_string(_: *mut SimpleTextOutput, _: *const u16) -> Statu
     SUCCESS
 }
 
-extern "efiapi" fn query_mode(_: *mut SimpleTextOutput, mode: usize, columns: *mut usize, rows: *mut usize) -> Status {
+extern "efiapi" fn query_mode(
+    _: *mut SimpleTextOutput,
+    mode: usize,
+    columns: *mut usize,
+    rows: *mut usize,
+) -> Status {
     if mode != MODE_80X25 {
         return UNSUPPORTED;
     }
@@ -183,7 +192,8 @@ extern "efiapi" fn set_mode(this: *mut SimpleTextOutput, mode: usize) -> Status 
 extern "efiapi" fn set_attribute(_: *mut SimpleTextOutput, attribute: usize) -> Status {
     let foreground = attribute & FOREGROUND_MASK;
     let background = (attribute >> BACKGROUND_SHIFT) & BACKGROUND_MASK;
-    let ansi_foreground = 30 + ANSI_FROM_EFI[foreground & 7] as usize + if foreground & BRIGHT != 0 { 60 } else { 0 };
+    let ansi_foreground =
+        30 + ANSI_FROM_EFI[foreground & 7] as usize + if foreground & BRIGHT != 0 { 60 } else { 0 };
     let ansi_background = 40 + ANSI_FROM_EFI[background] as usize;
     let mut sequence = alloc::string::String::new();
     use core::fmt::Write;
@@ -202,7 +212,11 @@ extern "efiapi" fn clear_screen(_: *mut SimpleTextOutput) -> Status {
     SUCCESS
 }
 
-extern "efiapi" fn set_cursor_position(_: *mut SimpleTextOutput, column: usize, row: usize) -> Status {
+extern "efiapi" fn set_cursor_position(
+    _: *mut SimpleTextOutput,
+    column: usize,
+    row: usize,
+) -> Status {
     if column >= COLUMNS || row >= ROWS {
         return UNSUPPORTED;
     }
@@ -220,7 +234,11 @@ extern "efiapi" fn set_cursor_position(_: *mut SimpleTextOutput, column: usize, 
 }
 
 extern "efiapi" fn enable_cursor(_: *mut SimpleTextOutput, visible: u8) -> Status {
-    emit(if visible != 0 { "\x1b[?25h" } else { "\x1b[?25l" });
+    emit(if visible != 0 {
+        "\x1b[?25h"
+    } else {
+        "\x1b[?25l"
+    });
     OUTPUT_MODE.get().cursor_visible = (visible != 0) as u8;
     SUCCESS
 }
@@ -277,7 +295,10 @@ extern "efiapi" fn read_key_stroke_ex(_: *mut SimpleTextInputEx, data: *mut KeyD
             unsafe {
                 data.write_unaligned(KeyData {
                     key: pressed,
-                    state: KeyState { shift_state: 0, toggle_state: 0 },
+                    state: KeyState {
+                        shift_state: 0,
+                        toggle_state: 0,
+                    },
                 });
             }
             SUCCESS
@@ -309,14 +330,32 @@ extern "efiapi" fn unregister_key_notify(_: *mut SimpleTextInputEx, _: *mut c_vo
 
 pub fn init() {
     OUTPUT.get().mode = OUTPUT_MODE.get();
-    let wait = events::create(EVT_NOTIFY_WAIT, TPL_CALLBACK, Some(wait_for_key_notify), ptr::null_mut(), None)
-        .expect("console wait event");
+    let wait = events::create(
+        EVT_NOTIFY_WAIT,
+        TPL_CALLBACK,
+        Some(wait_for_key_notify),
+        ptr::null_mut(),
+        None,
+    )
+    .expect("console wait event");
     INPUT.get().wait_for_key = wait;
     INPUT_EX.get().wait_for_key_ex = wait;
-    let handle = protocols::install(ptr::null_mut(), guids::SIMPLE_TEXT_INPUT, (INPUT.get() as *mut SimpleTextInput).cast())
-        .expect("console handle");
-    let _ = protocols::install(handle, guids::SIMPLE_TEXT_INPUT_EX, (INPUT_EX.get() as *mut SimpleTextInputEx).cast());
-    let _ = protocols::install(handle, guids::SIMPLE_TEXT_OUTPUT, (OUTPUT.get() as *mut SimpleTextOutput).cast());
+    let handle = protocols::install(
+        ptr::null_mut(),
+        guids::SIMPLE_TEXT_INPUT,
+        (INPUT.get() as *mut SimpleTextInput).cast(),
+    )
+    .expect("console handle");
+    let _ = protocols::install(
+        handle,
+        guids::SIMPLE_TEXT_INPUT_EX,
+        (INPUT_EX.get() as *mut SimpleTextInputEx).cast(),
+    );
+    let _ = protocols::install(
+        handle,
+        guids::SIMPLE_TEXT_OUTPUT,
+        (OUTPUT.get() as *mut SimpleTextOutput).cast(),
+    );
     let system = SYSTEM_TABLE.get();
     system.console_in_handle = handle;
     system.con_in = INPUT.get();
