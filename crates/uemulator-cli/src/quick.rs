@@ -126,6 +126,14 @@ fn needs_download(path: &Path, update: bool) -> bool {
     update || !cached
 }
 
+/// Whether `ensure_in` would find both of the distro's images already in `dir`.
+pub fn artifacts_present(dir: &Path, distro: Distro) -> bool {
+    let source = distro.source();
+    [source.kernel, source.initramfs]
+        .iter()
+        .all(|image| !needs_download(&dir.join(image.file_name), false))
+}
+
 /// Puts the distro's kernel and initramfs in `dir`, fetching only what is missing unless `update`.
 /// The transfer is injected so the skip logic runs without a network.
 pub fn ensure_in(

@@ -16,7 +16,7 @@ use crate::args::{
     ConsoleArg, DiskSpec, DiskStep, HardwareArgs, LinuxArgs, NetLink, NetModel, Nic, RemoveArgs,
     Settings, attach_only,
 };
-use crate::quick::{Artifacts, Distro, ensure_in, write_atomically};
+use crate::quick::{Artifacts, Distro, artifacts_present, ensure_in, write_atomically};
 
 const MACHINES_DIR: &str = "machines";
 const MACHINE_FILE: &str = "machine.toml";
@@ -340,6 +340,108 @@ pub fn update_artifacts(
     let _ = fs::remove_dir_all(&live);
     fs::rename(&staging, &live).map_err(|e| format!("replace {}: {e}", live.display()))?;
     Ok(machine)
+}
+
+/// A machine's name and either the machine or why it could not be read.
+pub type Listing = (String, Result<Machine, String>);
+
+/// The saved machines by name, each either loaded or with the reason it could not be. A directory
+/// without a `machine.toml` is not a machine and is skipped.
+pub fn list(home: &Path) -> Result<Vec<Listing>, String> {
+    let machines = home.join(MACHINES_DIR);
+    let entries = match fs::read_dir(&machines) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", machines.display())),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read {}: {e}", machines.display()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if validate_name(&name).is_ok() && entry.path().join(MACHINE_FILE).is_file() {
+            let machine = load(home, &name);
+            found.push((name, machine));
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(found)
+}
+
+/// One line per machine, columns aligned.
+pub fn format_list(entries: &[Listing]) -> String {
+    let width = entries
+        .iter()
+        .map(|(name, _)| name.len())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (name, machine) in entries {
+        let line = match machine {
+            Ok(machine) => {
+                let settings = &machine.settings;
+                let memory = settings
+                    .memory
+                    .unwrap_or(machine.install.default_memory_mib());
+                format!(
+                    "{:<8} {memory} MiB, {} disk(s), {} network(s)",
+                    machine.install.name(),
+                    settings.disks.len(),
+                    settings.networks.len()
+                )
+            }
+            Err(error) => format!("unreadable: {error}"),
+        };
+        out.push_str(&format!("{name:<width$}  {line}\n"));
+    }
+    out
+}
+
+/// `describe` plus where the machine lives and whether it can boot without downloading.
+pub fn show(machine: &Machine) -> String {
+    let artifacts = match artifacts_present(&machine.artifacts_dir(), machine.install) {
+        true => "fetched",
+        false => "missing (the next boot downloads them)",
+    };
+    format!(
+        "{}  directory {}\n  artifacts {artifacts}\n",
+        describe(machine),
+        machine.dir.display()
+    )
+}
+
+/// What `delete` removes: the machine's directory, and with it the disk images made in it.
+#[derive(Debug)]
+pub struct Removal {
+    pub dir: PathBuf,
+    pub created_disks: Vec<PathBuf>,
+}
+
+/// Looks at what deleting `name` would remove. Only a directory holding a `machine.toml` counts,
+/// so a name can never point this at some other directory; disks attached with `--disk` live
+/// elsewhere and are never touched.
+pub fn removal(home: &Path, name: &str) -> Result<Removal, String> {
+    validate_name(name)?;
+    let dir = home.join(MACHINES_DIR).join(name);
+    if !dir.join(MACHINE_FILE).is_file() {
+        return Err(format!("no machine named {name}"));
+    }
+    let mut created_disks: Vec<PathBuf> = fs::read_dir(&dir)
+        .map_err(|e| format!("read {}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let file = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+            file.starts_with("disk-") && file.ends_with(".img")
+        })
+        .collect();
+    created_disks.sort();
+    Ok(Removal { dir, created_disks })
+}
+
+pub fn delete(removal: &Removal) -> Result<(), String> {
+    fs::remove_dir_all(&removal.dir).map_err(|e| format!("remove {}: {e}", removal.dir.display()))
 }
 
 /// `vda`, `vdb`, ... for the disk at `index`: the order the guest sees them in.
@@ -1049,6 +1151,107 @@ mod tests {
         assert!(text.contains("console 0 virtio"), "{text}");
         assert!(text.contains("console 1 serial"), "{text}");
         assert!(text.contains("2048 MiB"), "{text}");
+    }
+
+    #[test]
+    fn list_is_empty_without_a_machines_directory() {
+        let home = TempDir::new("machines-list-none");
+        assert!(list(home.path()).unwrap().is_empty());
+        assert_eq!(format_list(&[]), "");
+    }
+
+    #[test]
+    fn list_sorts_by_name_and_skips_what_is_not_a_machine() {
+        let home = TempDir::new("machines-list");
+        for name in ["zeta", "alpha"] {
+            let (hardware, linux) = create_args(&[]);
+            create(home.path(), name, Distro::Debian, &hardware, &linux).unwrap();
+        }
+        fs::create_dir_all(home.path().join("machines/stray")).unwrap();
+        fs::write(home.path().join("machines/file"), b"x").unwrap();
+        let names: Vec<String> = list(home.path())
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn a_broken_machine_is_listed_with_its_error_instead_of_hiding_the_rest() {
+        let home = TempDir::new("machines-list-broken");
+        create_machine(home.path(), &[]);
+        let (hardware, linux) = create_args(&[]);
+        create(home.path(), "good", Distro::Fedora, &hardware, &linux).unwrap();
+        fs::write(home.path().join("machines/m/machine.toml"), "install = 5").unwrap();
+        let text = format_list(&list(home.path()).unwrap());
+        assert!(text.contains("good  fedora"), "{text}");
+        assert!(text.contains("3072 MiB, 1 disk(s), 1 network(s)"), "{text}");
+        assert!(
+            text.lines().any(|l| l.starts_with("m     unreadable: ")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn show_says_where_the_machine_lives_and_whether_it_has_artifacts() {
+        let home = TempDir::new("machines-show");
+        let machine = create_machine(home.path(), &[]);
+        let text = show(&machine);
+        assert!(text.contains("disk 0    vda "), "{text}");
+        assert!(
+            text.contains(&format!("directory {}", machine.dir.display())),
+            "{text}"
+        );
+        assert!(text.contains("artifacts missing"), "{text}");
+        let fetcher = FakeFetcher::new();
+        fetch_artifacts(&machine, |u, d| fetcher.fetch(u, d)).unwrap();
+        assert!(show(&machine).contains("artifacts fetched"));
+    }
+
+    #[test]
+    fn delete_removes_the_directory_and_its_disks_but_not_attached_images() {
+        let home = TempDir::new("machines-delete");
+        let attached = home.path().join("mine.img");
+        fs::write(&attached, b"keep me").unwrap();
+        let attached_arg = attached.to_string_lossy().into_owned();
+        create_machine(
+            home.path(),
+            &["--create-disk", "1", "--disk", &attached_arg],
+        );
+        let plan = removal(home.path(), "m").unwrap();
+        assert_eq!(plan.dir, home.path().join("machines/m"));
+        assert_eq!(plan.created_disks, vec![plan.dir.join("disk-0.img")]);
+        delete(&plan).unwrap();
+        assert!(!plan.dir.exists());
+        assert_eq!(fs::read(&attached).unwrap(), b"keep me");
+        assert!(list(home.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_counts_detached_images_still_in_the_directory() {
+        let home = TempDir::new("machines-delete-detached");
+        create_machine(home.path(), &[]);
+        let (hardware, linux, remove) = edit_args(&["--remove-disk", "0", "--create-disk", "1"]);
+        edit(home.path(), "m", &hardware, &linux, &remove).unwrap();
+        assert_eq!(removal(home.path(), "m").unwrap().created_disks.len(), 2);
+    }
+
+    #[test]
+    fn delete_only_ever_targets_a_machine_directory() {
+        let home = TempDir::new("machines-delete-guard");
+        fs::create_dir_all(home.path().join("machines/stray")).unwrap();
+        fs::write(home.path().join("machines/stray/precious"), b"x").unwrap();
+        assert!(
+            removal(home.path(), "stray")
+                .unwrap_err()
+                .contains("no machine named stray")
+        );
+        assert!(removal(home.path(), "missing").is_err());
+        for bad in ["..", "../machines", "a/b", ""] {
+            assert!(removal(home.path(), bad).is_err(), "{bad:?}");
+        }
+        assert!(home.path().join("machines/stray/precious").exists());
     }
 
     #[test]

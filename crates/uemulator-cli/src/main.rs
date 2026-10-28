@@ -138,6 +138,23 @@ enum QuickCmd {
         /// The machine whose kernel and initramfs to refresh
         name: String,
     },
+    /// List the machines
+    List,
+    /// Show a machine's configuration, numbered the way `edit` and `boot` take indices
+    Show {
+        /// The machine to show
+        name: String,
+    },
+    /// Delete a machine: its directory, including the disk images --create-disk made in it
+    ///
+    /// Disks attached with --disk are not touched.
+    Delete {
+        /// The machine to delete
+        name: String,
+        /// Delete without further ado; required, because the disk images cannot be recovered
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -273,6 +290,33 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
         }
         QuickCmd::UpdateArtifacts { name } => {
             machines::update_artifacts(&home, &name, quick::download)?;
+            Ok(None)
+        }
+        QuickCmd::List => {
+            let entries = machines::list(&home)?;
+            if entries.is_empty() {
+                eprintln!(
+                    "no machines: create one with `uemulator quick create NAME --install DISTRO`"
+                );
+            }
+            print!("{}", machines::format_list(&entries));
+            Ok(None)
+        }
+        QuickCmd::Show { name } => {
+            print!("{}", machines::show(&machines::load(&home, &name)?));
+            Ok(None)
+        }
+        QuickCmd::Delete { name, yes } => {
+            let removal = machines::removal(&home, &name)?;
+            if !yes {
+                return Err(format!(
+                    "this deletes {} and the {} disk image(s) in it; run again with --yes",
+                    removal.dir.display(),
+                    removal.created_disks.len()
+                ));
+            }
+            machines::delete(&removal)?;
+            eprintln!("deleted machine {name}");
             Ok(None)
         }
     }
@@ -570,6 +614,9 @@ mod tests {
             &["quick", "boot", "--help"],
             &["quick", "reinstall", "--help"],
             &["quick", "update-artifacts", "--help"],
+            &["quick", "list", "--help"],
+            &["quick", "show", "--help"],
+            &["quick", "delete", "--help"],
             &["advanced", "--help"],
             &["advanced", "boot", "--help"],
             &["advanced", "boot-firmware", "--help"],
@@ -1201,6 +1248,76 @@ mod tests {
     }
 
     #[test]
+    fn list_show_and_delete_parse() {
+        assert!(matches!(
+            parse(&["quick", "list"]).unwrap().cmd,
+            Cmd::Quick {
+                cmd: QuickCmd::List
+            }
+        ));
+        assert!(matches!(
+            parse(&["quick", "show", "m"]).unwrap().cmd,
+            Cmd::Quick { cmd: QuickCmd::Show { name } } if name == "m"
+        ));
+        for (args, want) in [
+            (&["quick", "delete", "m"][..], false),
+            (&["quick", "delete", "m", "--yes"], true),
+        ] {
+            match parse(args).unwrap().cmd {
+                Cmd::Quick {
+                    cmd: QuickCmd::Delete { name, yes },
+                } => assert_eq!((name.as_str(), yes), ("m", want)),
+                _ => panic!("expected quick delete"),
+            }
+        }
+        assert_eq!(
+            error_kind(&["quick", "show"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            error_kind(&["quick", "delete"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            error_kind(&["quick", "list", "m"]),
+            ErrorKind::UnknownArgument
+        );
+        assert_eq!(
+            error_kind(&["quick", "show", "m", "--memory", "1"]),
+            ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
+    fn delete_without_yes_deletes_nothing_and_says_what_it_would_remove() {
+        let home = crate::test_support::TempDir::new("main-delete");
+        let _env = crate::test_support::EnvGuard::set(&[(
+            "UEMULATOR_HOME",
+            Some(&home.path().to_string_lossy()),
+        )]);
+        let (hardware, linux) = (HardwareArgs::default(), LinuxArgs::default());
+        let machine =
+            machines::create(home.path(), "m", Distro::Alpine, &hardware, &linux).unwrap();
+        let error = quick_command(QuickCmd::Delete {
+            name: "m".into(),
+            yes: false,
+        })
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("--yes") && error.contains("1 disk image"),
+            "{error}"
+        );
+        assert!(machine.dir.exists());
+        quick_command(QuickCmd::Delete {
+            name: "m".into(),
+            yes: true,
+        })
+        .unwrap();
+        assert!(!machine.dir.exists());
+    }
+
+    #[test]
     fn quick_edit_removals_take_zero_based_indices() {
         match parse(&[
             "quick",
@@ -1293,6 +1410,8 @@ mod tests {
             &["quick", "edit"],
             &["quick", "boot"],
             &["quick", "reinstall"],
+            &["quick", "show"],
+            &["quick", "delete"],
             &["advanced", "boot"],
             &["advanced", "boot-firmware"],
         ] {
