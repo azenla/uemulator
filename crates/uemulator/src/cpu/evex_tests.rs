@@ -789,6 +789,78 @@ mod lane_wise {
         assert_eq!(bytes_of(&h.cpu.zmm(0)), want);
     }
 
+    /// vdbpsadbw: the Intrinsics Guide pseudo-code, written byte by byte (immediate 0x93 selects
+    /// dwords 3, 0, 1, 2 of every 128-bit lane of the second source).
+    fn double_block_sad(a: &[u8; 64], b: &[u8; 64], length: usize) -> Vector {
+        const DWORDS_SELECTED: [usize; 4] = [3, 0, 1, 2];
+        let mut shuffled = [0u8; 64];
+        for lane in 0..length / 16 {
+            for (slot, &from) in DWORDS_SELECTED.iter().enumerate() {
+                let source = lane * 16 + from * 4;
+                shuffled[lane * 16 + slot * 4..][..4].copy_from_slice(&b[source..source + 4]);
+            }
+        }
+        let sad = |first: usize, second: usize| -> u64 {
+            (0..4)
+                .map(|k| (a[first + k] as i64 - shuffled[second + k] as i64).unsigned_abs())
+                .sum()
+        };
+        let mut out = [0u128; 4];
+        for qword in 0..length / 8 {
+            let base = qword * 8;
+            let words = [
+                sad(base, base),
+                sad(base, base + 1),
+                sad(base + 4, base + 2),
+                sad(base + 4, base + 3),
+            ];
+            for (k, word) in words.into_iter().enumerate() {
+                set_element(&mut out, 2, qword * 4 + k, word);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn dbpsadbw_sums_absolute_differences_of_shuffled_quadruplets() {
+        let mut rng = Rng(0xdb5a_d001);
+        for trial in 0..4 {
+            let (a, b, old) = (rng.vector(), rng.vector(), rng.vector());
+            let k1 = rng.next() & 0xffff_ffff;
+            for (index, length) in LENGTHS.into_iter().enumerate() {
+                for (shape, codes) in [
+                    ("plain", &VDBPSADBW.p),
+                    ("merge", &VDBPSADBW.k),
+                    ("zero", &VDBPSADBW.kz),
+                    ("memory", &VDBPSADBW.m),
+                    ("memory merge", &VDBPSADBW.mk),
+                ] {
+                    let masked = shape.contains("merge") || shape == "zero";
+                    let h = run(codes[index], |h| {
+                        h.cpu.set_zmm(0, old);
+                        h.cpu.set_zmm(1, a);
+                        h.cpu.set_zmm(2, b);
+                        h.cpu.opmask[1] = k1;
+                        h.write(DATA, &bytes_of(&b));
+                    });
+                    let sads = double_block_sad(&bytes_of(&a), &bytes_of(&b), length);
+                    let want = expected(
+                        length,
+                        2,
+                        masked.then_some((k1, shape == "zero")),
+                        &old,
+                        |k| super::element(&sads, 2, k),
+                    );
+                    assert_eq!(
+                        bytes_of(&h.cpu.zmm(0)),
+                        bytes_of(&want),
+                        "{shape} {length} bytes, trial {trial}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn pabsd_and_sqrt_are_unary() {
         check_elementwise("vpabsd", &VPABSD, unary_spec(4, 4), |_, b| {

@@ -347,6 +347,13 @@ mod element_wise {
         check_elementwise("vpsubsb", &VPSUBSB, spec(1, 0), |a, b| {
             (s(a, 1) - s(b, 1)).clamp(-128, 127) as u64 & 0xff
         });
+        check_elementwise("vpaddsw", &VPADDSW, spec(2, 0), |a, b| {
+            (s(a, 2) + s(b, 2)).clamp(-32768, 32767) as u64 & 0xffff
+        });
+        // EVEX.0F E9 was missing from the lane table, so every vpsubsw with a mask (or zmm) raised #UD
+        check_elementwise("vpsubsw", &VPSUBSW, spec(2, 0), |a, b| {
+            (s(a, 2) - s(b, 2)).clamp(-32768, 32767) as u64 & 0xffff
+        });
         check_elementwise("vpmulhrsw", &VPMULHRSW, spec(2, 0), |a, b| {
             (((s(a, 2) * s(b, 2)) >> 14) + 1) as u64 >> 1 & 0xffff
         });

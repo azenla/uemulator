@@ -9,6 +9,8 @@ const OPCODE_MAP_0F3A: u16 = 3;
 /// IFMA operates on the low 52 bits of each quadword.
 const IFMA_BITS: u32 = 52;
 const IFMA_MASK: u64 = (1 << IFMA_BITS) - 1;
+/// vdbpsadbw adds up the differences of this many bytes per 16-bit result.
+const DBPSADBW_WINDOW: usize = 4;
 impl Cpu {
     pub(super) fn exec_evex_misc(
         &mut self,
@@ -79,6 +81,40 @@ impl Cpu {
                             total.clamp(i32::MIN as i64, i32::MAX as i64) as u64
                         } else {
                             total as u64
+                        }
+                    }))
+                })?;
+            }
+            // vdbpsadbw: the second source is first shuffled by dwords within each 128-bit lane
+            // (imm8 holds four 2-bit selectors), then every quadword yields four 16-bit sums of
+            // absolute differences of 4-byte windows that slide by one byte (SDM VDBPSADBW)
+            (OPCODE_MAP_0F3A, 0x42) if !wide => {
+                let selectors = i.imm as u8;
+                let mut shape = OpShape::elementwise(2).crossing();
+                shape.broadcast = false;
+                self.exec_vector_op(i, next, shape, |_, _, first, second, bytes| {
+                    let shuffled = build(bytes, 4, |k| {
+                        let from = selectors >> (2 * (k % 4)) & 3;
+                        element(second, 4, k / 4 * 4 + from as usize)
+                    });
+                    let sad = |a_start: usize, b_start: usize| -> u64 {
+                        (0..DBPSADBW_WINDOW)
+                            .map(|j| {
+                                element(first, 1, a_start + j).abs_diff(element(
+                                    &shuffled,
+                                    1,
+                                    b_start + j,
+                                ))
+                            })
+                            .sum()
+                    };
+                    Ok(build(bytes, 2, |k| {
+                        let base = k / 4 * 8;
+                        match k % 4 {
+                            0 => sad(base, base),
+                            1 => sad(base, base + 1),
+                            2 => sad(base + DBPSADBW_WINDOW, base + 2),
+                            _ => sad(base + DBPSADBW_WINDOW, base + 3),
                         }
                     }))
                 })?;

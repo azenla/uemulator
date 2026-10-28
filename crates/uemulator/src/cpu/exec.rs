@@ -267,7 +267,7 @@ impl Cpu {
         }
     }
 
-    fn set_edx_eax(&mut self, v: u64) {
+    pub(super) fn set_edx_eax(&mut self, v: u64) {
         self.gpr[GPR_RAX] = v & DWORD_MASK;
         self.gpr[GPR_RDX] = v >> 32;
     }
@@ -1825,6 +1825,8 @@ impl Cpu {
                 let v = self.rdmsr(self.gpr[GPR_RCX] as u32)?;
                 self.set_edx_eax(v);
             }
+            // rdpmc: the stored value of one of the four legacy AMD counters
+            0x133 => self.rdpmc()?,
             // cmovcc: the source is always read (it can fault); a 32-bit cmov that does not move
             // still zero-extends the destination.
             0x140..=0x14f => {
@@ -1961,6 +1963,24 @@ impl Cpu {
                 // rdrand /6 and rdseed /7 take a register
                 if i.md == 3 && matches!(i.reg & 7, 6 | 7) && i.rep == 0 {
                     self.rdrand(i.rm, osz);
+                    self.rip = next;
+                    return Ok(());
+                }
+                // rdpid (F3 0F C7 /7): IA32_TSC_AUX, 64 bits wide in 64-bit mode
+                if i.md == 3 && i.reg & 7 == 7 && i.rep == REP_REPE {
+                    let size = if self.seg[SEG_CS].long() { 8 } else { 4 };
+                    self.write_gpr(i.rm, size, true, self.tsc_aux & 0xffff_ffff);
+                    self.rip = next;
+                    return Ok(());
+                }
+                // xrstors /3, xsavec /4, xsaves /5
+                if i.md != 3 && matches!(i.reg & 7, 3..=5) && i.rep == 0 {
+                    let a = self.linear_address(i, self.effective_address(i, next))?;
+                    match i.reg & 7 {
+                        3 => self.xrstors(a)?,
+                        4 => self.xsavec(a)?,
+                        _ => self.xsaves(a)?,
+                    }
                     self.rip = next;
                     return Ok(());
                 }
@@ -13964,10 +13984,11 @@ mod exec_tests {
         assert_ne!(ecx & LAHF_SAHF, 0, "lahf/sahf work in 64-bit mode");
         // prefetch/prefetchw are executed as hints in sys.rs's `prefetchw_is_a_hint_that_never_faults`
         const PREFETCHW: u64 = 1 << 8;
+        const TOPOEXT: u64 = 1 << 22;
         assert_eq!(
-            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM | PREFETCHW),
+            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM | PREFETCHW | TOPOEXT),
             0,
-            "nothing beyond lahf, svm, abm and prefetchw"
+            "nothing beyond lahf, svm, abm, prefetchw and the topology leaves"
         );
     }
 

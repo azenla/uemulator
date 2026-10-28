@@ -26,6 +26,8 @@ const GPR_RDX: usize = 2;
 /// Opcode maps of `Insn::op` (the high byte) that this file adds to the `0F` map of `sse.rs`.
 const OPCODE_MAP_0F38: u16 = 2;
 const OPCODE_MAP_0F3A: u16 = 3;
+/// `0F 38 F6`: ADCX with a 66 prefix, ADOX with F3 (VEX-encoded, the same opcode is MULX).
+const OPCODE_ADX: u8 = 0xf6;
 
 /// The operation of an instruction, decoded from (map, opcode, prefix).
 #[derive(Clone, Copy)]
@@ -161,6 +163,16 @@ pub(in crate::cpu) fn decode_op(map: u16, opcode: u8, prefix: Prefix) -> Option<
             double: false,
             subtract: true,
         },
+        // SHA extensions: no mandatory prefix, which is also how the MMX forms of the SSSE3 opcodes
+        // around them are spelled, so they must be claimed before `decode_integer_op` rejects
+        // every unprefixed opcode
+        (OPCODE_MAP_0F38, 0xc8, Np) => Op::Binary(crypto::sha1_next_e),
+        (OPCODE_MAP_0F38, 0xc9, Np) => Op::Binary(crypto::sha1_message_1),
+        (OPCODE_MAP_0F38, 0xca, Np) => Op::Binary(crypto::sha1_message_2),
+        (OPCODE_MAP_0F38, 0xcb, Np) => Op::WithMask(crypto::sha256_two_rounds),
+        (OPCODE_MAP_0F38, 0xcc, Np) => Op::Binary(crypto::sha256_message_1),
+        (OPCODE_MAP_0F38, 0xcd, Np) => Op::Binary(crypto::sha256_message_2),
+        (OPCODE_MAP_0F3A, 0xcc, Np) => Op::WithImm(crypto::sha1_four_rounds),
         _ => return decode_integer_op(map, opcode, prefix),
     })
 }
@@ -805,6 +817,40 @@ impl Cpu {
         Ok(())
     }
 
+    /// ADCX (66 0F 38 F6) and ADOX (F3 0F 38 F6): add with carry where the carry chain is CF
+    /// (ADCX) or OF (ADOX) and the other flags stay untouched, so two independent chains can be
+    /// interleaved. 32 bits, or 64 under REX.W; a 32-bit result zero-extends. No SSE enable rules.
+    fn add_with_carry_chain(
+        &mut self,
+        i: &Insn,
+        next: u64,
+        overflow_chain: bool,
+    ) -> ExecResult<()> {
+        let size = if i.opsize == 8 { 8 } else { 4 };
+        let chain_flag = if overflow_chain { OF } else { CF };
+        let source = if i.md == MODRM_MOD_REGISTER {
+            self.read_gpr(i.rm, size, i.rex_present)
+        } else {
+            let addr = self.linear_address(i, self.effective_address(i, next))?;
+            self.read(addr, size)?
+        };
+        let destination = self.read_gpr(i.reg, size, i.rex_present);
+        let flags = self.eflags_full();
+        let carry_in = (flags & chain_flag != 0) as u64;
+        let width_mask = mask(size);
+        let sum = destination.wrapping_add(source).wrapping_add(carry_in) & width_mask;
+        // carry out of the top bit: the sum wrapped, or equals an operand when the carry-in was
+        // absorbed by a full-width operand
+        let carry_out = if carry_in == 0 {
+            sum < destination
+        } else {
+            sum <= destination
+        };
+        self.write_gpr(i.reg, size, i.rex_present, sum);
+        self.set_eflags_arith(flags & !chain_flag | if carry_out { chain_flag } else { 0 });
+        Ok(())
+    }
+
     /// CRC32 (F2 0F 38 F0/F1): accumulates the source operand into the CRC-32C in the low 32 bits
     /// of the destination register. The source is a byte (F0) or 16/32/64 bits by operand size
     /// (F1); the destination is 32 bits, or 64 under REX.W (the upper half is then zero). No SSE
@@ -939,6 +985,14 @@ impl Cpu {
                 Prefix::F2 => self.crc32(i, next).map(|()| true),
                 Prefix::Np | Prefix::P66 => self.movbe(i, next).map(|()| true),
                 Prefix::F3 => Ok(false),
+            };
+        }
+        if map == OPCODE_MAP_0F38 && opcode == OPCODE_ADX {
+            return match prefix {
+                Prefix::P66 | Prefix::F3 => self
+                    .add_with_carry_chain(i, next, prefix == Prefix::F3)
+                    .map(|()| true),
+                _ => Ok(false),
             };
         }
         let Some(op) = decode_op(map, opcode, prefix) else {
@@ -4054,6 +4108,438 @@ mod tests {
         }
     }
 
+    mod sha_instructions {
+        use super::*;
+
+        /// Four words as one register with the first word in bits 31:0 (the SHA-256 message layout).
+        fn vector_low_first(words: [u32; 4]) -> u128 {
+            words
+                .iter()
+                .rev()
+                .fold(0, |vector, &word| vector << 32 | word as u128)
+        }
+
+        /// The same words with the first one in bits 127:96 (SHA-1 messages and every state operand).
+        fn vector_high_first(words: [u32; 4]) -> u128 {
+            words
+                .iter()
+                .fold(0, |vector, &word| vector << 32 | word as u128)
+        }
+
+        fn dwords_high_first(vector: u128) -> [u32; 4] {
+            core::array::from_fn(|k| (vector >> (96 - 32 * k)) as u32)
+        }
+
+        /// The single padded block of the message "abc": big-endian words, bit length in the last.
+        fn abc_block() -> [u32; 16] {
+            let mut words = [0u32; 16];
+            words[0] = 0x6162_6380;
+            words[15] = 24;
+            words
+        }
+
+        fn rounds2(rig: &mut Rig, cdgh: u128, abef: u128, schedule: u128) -> u128 {
+            rig.h.cpu.xmm[2] = cdgh;
+            rig.h.cpu.xmm[1] = abef;
+            rig.h.cpu.xmm[0] = schedule;
+            rig.run_ok("sha256rnds2 xmm2, xmm1, xmm0");
+            rig.h.cpu.xmm[2]
+        }
+
+        /// SHA-256 of one block in the flow of Intel's SHA extensions white paper: the schedule from
+        /// sha256msg1/msg2, then two rounds per sha256rnds2 with the register roles swapped.
+        fn sha256_one_block(rig: &mut Rig, block: [u32; 16]) -> [u32; 8] {
+            const ROUND_CONSTANTS: [u32; 64] = [
+                0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+                0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+                0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+                0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+                0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+                0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+                0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+                0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+                0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+                0xc67178f2,
+            ];
+            const INITIAL: [u32; 8] = [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ];
+            let mut w = [0u32; 64];
+            w[..16].copy_from_slice(&block);
+            let group = |w: &[u32; 64], t: usize| -> u128 {
+                vector_low_first([w[t], w[t + 1], w[t + 2], w[t + 3]])
+            };
+            for t in (16..64).step_by(4) {
+                rig.h.cpu.xmm[0] = group(&w, t - 16);
+                rig.h.cpu.xmm[1] = group(&w, t - 12);
+                rig.run_ok("sha256msg1 xmm0, xmm1");
+                let partial = dwords_high_first(rig.h.cpu.xmm[0]);
+                let seven_back = dwords_high_first(group(&w, t - 7));
+                rig.h.cpu.xmm[0] = vector_high_first(core::array::from_fn(|k| {
+                    partial[k].wrapping_add(seven_back[k])
+                }));
+                rig.h.cpu.xmm[1] = group(&w, t - 4);
+                rig.run_ok("sha256msg2 xmm0, xmm1");
+                let next = dwords_high_first(rig.h.cpu.xmm[0]);
+                for k in 0..4 {
+                    w[t + k] = next[3 - k];
+                }
+            }
+            let [a, b, c, d, e, f, g, h] = INITIAL;
+            let mut abef = vector_high_first([a, b, e, f]);
+            let mut cdgh = vector_high_first([c, d, g, h]);
+            for t in (0..64).step_by(4) {
+                let schedule = vector_low_first(core::array::from_fn(|k| {
+                    w[t + k].wrapping_add(ROUND_CONSTANTS[t + k])
+                }));
+                let after_two = rounds2(rig, cdgh, abef, schedule);
+                abef = rounds2(rig, abef, after_two, schedule >> 64);
+                cdgh = after_two;
+            }
+            let [a, b, e, f] = dwords_high_first(abef);
+            let [c, d, g, h] = dwords_high_first(cdgh);
+            let mut state = [a, b, c, d, e, f, g, h];
+            for (word, initial) in state.iter_mut().zip(INITIAL) {
+                *word = word.wrapping_add(initial);
+            }
+            state
+        }
+
+        #[test]
+        fn sha256_of_abc_matches_fips_180_4() {
+            let mut rig = Rig::new();
+            assert_eq!(
+                sha256_one_block(&mut rig, abc_block()),
+                [
+                    0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223, 0xb00361a3, 0x96177a9c,
+                    0xb410ff61, 0xf20015ad
+                ]
+            );
+        }
+
+        /// SHA-1 of one block with sha1msg1/msg2 for the schedule and sha1rnds4/sha1nexte for the
+        /// rounds: ABCD travels in the destination, E rides in the top dword of the schedule operand.
+        fn sha1_one_block(rig: &mut Rig, block: [u32; 16]) -> [u32; 5] {
+            const INITIAL: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+            const ROUNDS_PER_INSTRUCTION: usize = 4;
+            const ROUNDS_PER_FUNCTION: usize = 20;
+            let mut w = [0u32; 80];
+            w[..16].copy_from_slice(&block);
+            let group = |w: &[u32; 80], t: usize| -> u128 {
+                vector_high_first([w[t], w[t + 1], w[t + 2], w[t + 3]])
+            };
+            for t in (16..80).step_by(4) {
+                rig.h.cpu.xmm[0] = group(&w, t - 16);
+                rig.h.cpu.xmm[1] = group(&w, t - 12);
+                rig.run_ok("sha1msg1 xmm0, xmm1");
+                rig.h.cpu.xmm[0] ^= group(&w, t - 8);
+                rig.h.cpu.xmm[1] = group(&w, t - 4);
+                rig.run_ok("sha1msg2 xmm0, xmm1");
+                w[t..t + 4].copy_from_slice(&dwords_high_first(rig.h.cpu.xmm[0]));
+            }
+            let mut abcd = vector_high_first([INITIAL[0], INITIAL[1], INITIAL[2], INITIAL[3]]);
+            let mut previous = abcd;
+            for t in (0..80).step_by(ROUNDS_PER_INSTRUCTION) {
+                let schedule = group(&w, t);
+                let with_e = if t == 0 {
+                    schedule.wrapping_add((INITIAL[4] as u128) << 96)
+                } else {
+                    rig.h.cpu.xmm[0] = previous;
+                    rig.h.cpu.xmm[1] = schedule;
+                    rig.run_ok("sha1nexte xmm0, xmm1");
+                    rig.h.cpu.xmm[0]
+                };
+                previous = abcd;
+                rig.h.cpu.xmm[0] = abcd;
+                rig.h.cpu.xmm[1] = with_e;
+                let function = (t / ROUNDS_PER_FUNCTION) as u8;
+                let stop = exec_imm(rig, "sha1rnds4 xmm0, xmm1, 0", function);
+                assert_eq!(stop, Stop::Halted);
+                abcd = rig.h.cpu.xmm[0];
+            }
+            let [a, b, c, d] = dwords_high_first(abcd);
+            let e = dwords_high_first(previous)[0].rotate_left(30);
+            let mut state = [a, b, c, d, e];
+            for (word, initial) in state.iter_mut().zip(INITIAL) {
+                *word = word.wrapping_add(initial);
+            }
+            state
+        }
+
+        fn exec_imm(rig: &mut Rig, asm: &str, imm: u8) -> Stop {
+            rig.reset();
+            let mut bytes = code(asm).to_vec();
+            let last = bytes.len() - 2;
+            bytes[last] = imm;
+            rig.exec_bytes(&bytes)
+        }
+
+        #[test]
+        fn sha1_of_abc_matches_fips_180_4() {
+            let mut rig = Rig::new();
+            assert_eq!(
+                sha1_one_block(&mut rig, abc_block()),
+                [0xa9993e36, 0x4706816a, 0xba3e2571, 0x7850c26c, 0x9cd0d89d]
+            );
+        }
+
+        const REGISTER_AND_MEMORY_FORMS: [(&str, &str); 5] = [
+            ("sha1nexte xmm0, xmm1", "sha1nexte xmm0, [rsi]"),
+            ("sha1msg1 xmm0, xmm1", "sha1msg1 xmm0, [rsi]"),
+            ("sha1msg2 xmm0, xmm1", "sha1msg2 xmm0, [rsi]"),
+            ("sha256msg1 xmm0, xmm1", "sha256msg1 xmm0, [rsi]"),
+            ("sha256msg2 xmm0, xmm1", "sha256msg2 xmm0, [rsi]"),
+        ];
+
+        #[test]
+        fn memory_forms_read_the_source_operand_like_register_forms() {
+            let mut rig = Rig::new();
+            let values = vectors();
+            for (register_form, memory_form) in REGISTER_AND_MEMORY_FORMS {
+                for pair in values.windows(2) {
+                    let from_register = rig.op(register_form, pair[0], pair[1]);
+                    assert_eq!(rig.op_mem(memory_form, pair[0], pair[1]), from_register);
+                }
+            }
+            let (state, schedule) = (values[5], values[9]);
+            let from_register = {
+                rig.h.cpu.xmm[2] = state;
+                rig.h.cpu.xmm[1] = schedule;
+                rig.h.cpu.xmm[0] = values[7];
+                rig.run_ok("sha256rnds2 xmm2, xmm1, xmm0");
+                rig.h.cpu.xmm[2]
+            };
+            rig.h.cpu.xmm[2] = state;
+            rig.h.cpu.xmm[0] = values[7];
+            rig.h.write(DATA, &schedule.to_le_bytes());
+            rig.run_ok("sha256rnds2 xmm2, [rsi], xmm0");
+            assert_eq!(rig.h.cpu.xmm[2], from_register);
+            let from_register = op_imm(&mut rig, "sha1rnds4 xmm0, xmm1, 0", 2, state, schedule);
+            let from_memory = op_mem_imm(&mut rig, "sha1rnds4 xmm0, [rsi], 0", 2, state, schedule);
+            assert_eq!(from_memory, from_register);
+        }
+
+        fn op_imm(rig: &mut Rig, asm: &str, imm: u8, dst: u128, src: u128) -> u128 {
+            rig.h.cpu.xmm[0] = dst;
+            rig.h.cpu.xmm[1] = src;
+            assert_eq!(exec_imm(rig, asm, imm), Stop::Halted);
+            rig.h.cpu.xmm[0]
+        }
+
+        fn op_mem_imm(rig: &mut Rig, asm: &str, imm: u8, dst: u128, src: u128) -> u128 {
+            rig.h.cpu.xmm[0] = dst;
+            rig.h.write(DATA, &src.to_le_bytes());
+            assert_eq!(exec_imm(rig, asm, imm), Stop::Halted);
+            rig.h.cpu.xmm[0]
+        }
+
+        #[test]
+        fn sha1rnds4_uses_only_the_low_two_immediate_bits() {
+            let mut rig = Rig::new();
+            let (state, schedule) = (
+                vector_high_first([1, 2, 3, 4]),
+                vector_high_first([5, 6, 7, 8]),
+            );
+            for group in 0..4u8 {
+                let plain = op_imm(&mut rig, "sha1rnds4 xmm0, xmm1, 0", group, state, schedule);
+                let noisy = op_imm(
+                    &mut rig,
+                    "sha1rnds4 xmm0, xmm1, 0",
+                    group | 0xfc,
+                    state,
+                    schedule,
+                );
+                assert_eq!(plain, noisy, "group {group}");
+            }
+            // Groups 1 and 3 share the parity function and differ only in the constant.
+            let one = op_imm(&mut rig, "sha1rnds4 xmm0, xmm1, 0", 1, state, schedule);
+            let three = op_imm(&mut rig, "sha1rnds4 xmm0, xmm1, 0", 3, state, schedule);
+            assert_ne!(one, three);
+        }
+
+        #[test]
+        fn memory_operands_must_be_aligned() {
+            let mut rig = Rig::new();
+            for asm in [
+                "sha1nexte xmm0, [rsi]",
+                "sha1msg1 xmm0, [rsi]",
+                "sha1msg2 xmm0, [rsi]",
+                "sha256msg1 xmm0, [rsi]",
+                "sha256msg2 xmm0, [rsi]",
+                "sha1rnds4 xmm0, [rsi], 0",
+                "sha256rnds2 xmm2, [rsi], xmm0",
+            ] {
+                rig.reset();
+                rig.h.cpu.gpr[RSI] = DATA + 8;
+                assert_eq!(rig.exec(asm), gp0(), "{asm}");
+            }
+        }
+
+        #[test]
+        fn the_66_prefixed_opcodes_are_undefined() {
+            let mut rig = Rig::new();
+            for asm in [
+                ".byte 0x66, 0x0f, 0x38, 0xc8, 0xc1",
+                ".byte 0x66, 0x0f, 0x3a, 0xcc, 0xc1, 0",
+            ] {
+                assert_eq!(rig.run(asm), fault(6), "{asm}");
+            }
+        }
+
+        #[test]
+        fn the_jit_matches_the_interpreter() {
+            let seed = |h: &mut Harness| {
+                h.cpu.cr4 |= CR4_OSFXSR;
+                let mut state = 0x1357_9bdf_u128;
+                for register in 0..3 {
+                    state = state.wrapping_mul(0x2545_f491_4f6c_dd1d_u128 << 32 | 0x9e37_79b9)
+                        ^ state >> 17;
+                    h.cpu.xmm[register] = state;
+                }
+            };
+            for asm in [
+                "sha1nexte xmm0, xmm1",
+                "sha1msg1 xmm0, xmm1",
+                "sha1msg2 xmm0, xmm1",
+                "sha256msg1 xmm0, xmm1",
+                "sha256msg2 xmm0, xmm1",
+                "sha1rnds4 xmm0, xmm1, 0",
+                "sha256rnds2 xmm2, xmm1, xmm0",
+            ] {
+                assert_jit_matches_interpreter(code(asm), seed);
+            }
+        }
+    }
+
+    mod adx {
+        use super::*;
+
+        /// 64-bit add with carry in `u128`, so the carry out is read off bit 64 instead of derived.
+        fn reference(destination: u64, source: u64, carry_in: bool, bits: u32) -> (u64, bool) {
+            let wide = (destination as u128 & ((1 << bits) - 1))
+                + (source as u128 & ((1 << bits) - 1))
+                + carry_in as u128;
+            (wide as u64 & (u64::MAX >> (64 - bits)), wide >> bits != 0)
+        }
+
+        const OPERANDS: [u64; 8] = [
+            0,
+            1,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+
+        #[test]
+        fn adcx_and_adox_add_the_carry_of_their_own_flag_and_leave_the_other_alone() {
+            let mut rig = Rig::new();
+            for (asm, bits, chain, other) in [
+                ("adcx rax, rbx", 64, CF, OF),
+                ("adcx eax, ebx", 32, CF, OF),
+                ("adox rax, rbx", 64, OF, CF),
+                ("adox eax, ebx", 32, OF, CF),
+            ] {
+                for &a in &OPERANDS {
+                    for &b in &OPERANDS {
+                        for flags in [0, chain, other, chain | other, ARITH_FLAGS] {
+                            rig.reset();
+                            rig.h.cpu.gpr[RAX] = a;
+                            rig.h.cpu.gpr[RBX] = b;
+                            rig.h.cpu.set_eflags_arith(flags);
+                            assert_eq!(rig.exec(asm), Stop::Halted);
+                            let (sum, carry) = reference(a, b, flags & chain != 0, bits);
+                            assert_eq!(rig.gpr(RAX), sum, "{asm} {a:#x} {b:#x} {flags:#x}");
+                            let want = flags & !chain | if carry { chain } else { 0 };
+                            assert_eq!(rig.flags(), want, "{asm} {a:#x} {b:#x} {flags:#x}");
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn memory_sources_and_zero_extension() {
+            let mut rig = Rig::new();
+            rig.h.write(DATA, &0x1111_2222_3333_4444u64.to_le_bytes());
+            rig.reset();
+            rig.h.cpu.gpr[RAX] = 0xffff_ffff_0000_0001;
+            rig.h.cpu.set_eflags_arith(OF);
+            assert_eq!(rig.exec("adox rax, [rsi]"), Stop::Halted);
+            assert_eq!(
+                rig.gpr(RAX),
+                0xffff_ffff_0000_0001u64.wrapping_add(0x1111_2222_3333_4444) + 1
+            );
+            rig.reset();
+            rig.h.cpu.gpr[RAX] = 0xffff_ffff_ffff_ffff;
+            rig.h.cpu.set_eflags_arith(OF);
+            assert_eq!(rig.exec("adox eax, [rsi]"), Stop::Halted);
+            assert_eq!(
+                rig.gpr(RAX),
+                0x3333_4444,
+                "a 32-bit result clears the upper half"
+            );
+            assert_eq!(rig.flags() & OF, OF, "carry out of bit 31");
+        }
+
+        #[test]
+        fn two_interleaved_chains_do_not_disturb_each_other() {
+            // The point of the instructions: adcx (CF) and adox (OF) alternate without disturbing
+            // each other, each carrying through its own accumulator.
+            let mut rig = Rig::new();
+            rig.reset();
+            rig.h.cpu.set_eflags_arith(0);
+            let (mut low, mut high) = (u64::MAX, u64::MAX);
+            let mut flags = 0u64;
+            for step in 0..3u64 {
+                for (asm, accumulator, flag) in [
+                    ("adcx rax, rbx", &mut low, CF),
+                    ("adox rax, rbx", &mut high, OF),
+                ] {
+                    rig.h.cpu.gpr[RAX] = *accumulator;
+                    rig.h.cpu.gpr[RBX] = step + 1;
+                    rig.h.cpu.set_eflags_arith(flags);
+                    assert_eq!(rig.exec(asm), Stop::Halted);
+                    *accumulator = rig.gpr(RAX);
+                    flags = rig.flags();
+                    let _ = flag;
+                }
+            }
+            // low: MAX + 1 = 0 carry; 0 + 2 + 1 = 3; 3 + 3 + 0 = 6 (CF cleared by then)
+            // high: MAX + 1 = 0 carry, then OF carries into the next adox: 0 + 2 + 1 = 3, 3 + 3 = 6
+            assert_eq!((low, high), (6, 6));
+        }
+
+        #[test]
+        fn the_unprefixed_opcode_is_undefined_and_the_jit_matches() {
+            let mut rig = Rig::new();
+            assert_eq!(rig.run(".byte 0x0f, 0x38, 0xf6, 0xc3"), ud());
+            for asm in ["adcx rax, rbx", "adox eax, ebx"] {
+                assert_jit_matches_interpreter(code(asm), |h| {
+                    h.cpu.gpr[RAX] = u64::MAX;
+                    h.cpu.gpr[RBX] = 1;
+                    h.cpu.set_eflags_arith(CF | OF);
+                });
+            }
+        }
+
+        #[test]
+        fn clwb_and_clflushopt_are_not_xsaveopt() {
+            let mut rig = Rig::new();
+            for asm in ["clwb [rsi]", "clflushopt [rsi]"] {
+                rig.reset();
+                // 16-byte aligned only: xsaveopt would #GP, and it would scribble over the data
+                rig.h.cpu.gpr[RSI] = DATA + 16;
+                rig.h.write(DATA, &[0x5a; 64]);
+                assert_eq!(rig.exec(asm), Stop::Halted, "{asm}");
+                assert_eq!(rig.h.read(DATA, 64), [0x5a; 64], "{asm} modified memory");
+            }
+        }
+    }
+
     mod movbe {
         use super::*;
 
@@ -4819,6 +5305,61 @@ mod tests {
             ".byte 0xf3, 0x0f, 0x38, 0xf0, 0x06",
             &[0xf3, 0x0f, 0x38, 0xf0, 0x06, 0xf4],
         ),
+        ("sha1nexte xmm0, xmm1", &[0x0f, 0x38, 0xc8, 0xc1, 0xf4]),
+        ("sha1nexte xmm0, [rsi]", &[0x0f, 0x38, 0xc8, 0x06, 0xf4]),
+        ("sha1msg1 xmm0, xmm1", &[0x0f, 0x38, 0xc9, 0xc1, 0xf4]),
+        ("sha1msg1 xmm0, [rsi]", &[0x0f, 0x38, 0xc9, 0x06, 0xf4]),
+        ("sha1msg2 xmm0, xmm1", &[0x0f, 0x38, 0xca, 0xc1, 0xf4]),
+        ("sha1msg2 xmm0, [rsi]", &[0x0f, 0x38, 0xca, 0x06, 0xf4]),
+        ("sha256msg1 xmm0, xmm1", &[0x0f, 0x38, 0xcc, 0xc1, 0xf4]),
+        ("sha256msg1 xmm0, [rsi]", &[0x0f, 0x38, 0xcc, 0x06, 0xf4]),
+        ("sha256msg2 xmm0, xmm1", &[0x0f, 0x38, 0xcd, 0xc1, 0xf4]),
+        ("sha256msg2 xmm0, [rsi]", &[0x0f, 0x38, 0xcd, 0x06, 0xf4]),
+        (
+            "sha1rnds4 xmm0, xmm1, 0",
+            &[0x0f, 0x3a, 0xcc, 0xc1, 0x00, 0xf4],
+        ),
+        (
+            "sha1rnds4 xmm0, [rsi], 0",
+            &[0x0f, 0x3a, 0xcc, 0x06, 0x00, 0xf4],
+        ),
+        (
+            "sha256rnds2 xmm2, xmm1, xmm0",
+            &[0x0f, 0x38, 0xcb, 0xd1, 0xf4],
+        ),
+        (
+            "sha256rnds2 xmm2, [rsi], xmm0",
+            &[0x0f, 0x38, 0xcb, 0x16, 0xf4],
+        ),
+        // the same opcodes under the 66 prefix are not SHA instructions
+        (
+            ".byte 0x66, 0x0f, 0x38, 0xc8, 0xc1",
+            &[0x66, 0x0f, 0x38, 0xc8, 0xc1, 0xf4],
+        ),
+        (
+            ".byte 0x66, 0x0f, 0x3a, 0xcc, 0xc1, 0",
+            &[0x66, 0x0f, 0x3a, 0xcc, 0xc1, 0x00, 0xf4],
+        ),
+        ("adcx rax, rbx", &[0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc3, 0xf4]),
+        ("adcx eax, ebx", &[0x66, 0x0f, 0x38, 0xf6, 0xc3, 0xf4]),
+        ("adox rax, rbx", &[0xf3, 0x48, 0x0f, 0x38, 0xf6, 0xc3, 0xf4]),
+        ("adox eax, ebx", &[0xf3, 0x0f, 0x38, 0xf6, 0xc3, 0xf4]),
+        (
+            "adcx rax, [rsi]",
+            &[0x66, 0x48, 0x0f, 0x38, 0xf6, 0x06, 0xf4],
+        ),
+        (
+            "adox rax, [rsi]",
+            &[0xf3, 0x48, 0x0f, 0x38, 0xf6, 0x06, 0xf4],
+        ),
+        ("adox eax, [rsi]", &[0xf3, 0x0f, 0x38, 0xf6, 0x06, 0xf4]),
+        // no prefix: the opcode is not defined (the VEX form is mulx)
+        (
+            ".byte 0x0f, 0x38, 0xf6, 0xc3",
+            &[0x0f, 0x38, 0xf6, 0xc3, 0xf4],
+        ),
+        ("clwb [rsi]", &[0x66, 0x0f, 0xae, 0x36, 0xf4]),
+        ("clflushopt [rsi]", &[0x66, 0x0f, 0xae, 0x3e, 0xf4]),
         // SNIPPETS-END
     ];
 }

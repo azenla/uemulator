@@ -4,7 +4,7 @@ Status: AVX, AVX2, FMA, F16C, AVX-512 and SVM are implemented (03). VMX below is
 
 ## AVX, AVX2, FMA, F16C
 
-Done: see 03, "AVX, AVX2, FMA, F16C" and "AVX-512". Not done: AVX512_FP16/BF16/VP2INTERSECT, the Xeon Phi sets (PF, ER), AVX-VNNI.
+Done: see 03, "AVX, AVX2, FMA, F16C" and "AVX-512" (including AVX512_BF16, SHA-NI and ADX). Not done: AVX512_FP16/VP2INTERSECT, the Xeon Phi sets (PF, ER), AVX-VNNI.
 
 ## SVM (AMD-V) for nested guests
 
@@ -17,4 +17,4 @@ Not a fit for the AMD identity (`GenuineIntel` would also change Linux's model-s
 ## Other items not done
 
 - ERMS/FSRM: done (03, "ERMS and FSRM").
-- PKU, CET (shadow stacks; the kernel only needs `endbr64`, which is a NOP here), LA57, XSAVEC/XSAVES, x2APIC/APIC.
+- PKU, CET (shadow stacks; the kernel only needs `endbr64`, which is a NOP here), LA57. (XSAVEC/XSAVES and x2APIC/APIC are done, see 03.)

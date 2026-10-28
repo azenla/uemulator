@@ -15,6 +15,7 @@ for n, m, b in [("VSQRTPS", "vsqrtps", 32), ("VSQRTPD", "vsqrtpd", 64), ("VPABSD
 form("VSHUFPS", "vshufps", "bin", 32, 0x1b)
 form("VPSHUFD", "vpshufd", "un", 32, 0x1b)
 form("VPALIGNR", "vpalignr", "bin", 0, 5)
+form("VDBPSADBW", "vdbpsadbw", "bin", 0, 0x93)
 for n, m in [("VMOVDQA32", "vmovdqa32"), ("VMOVDQU32", "vmovdqu32"), ("VMOVDQU64", "vmovdqu64"),
              ("VMOVDQU8", "vmovdqu8"), ("VMOVDQU16", "vmovdqu16"), ("VMOVUPS", "vmovups"),
              ("VMOVAPD", "vmovapd")]:
@@ -101,7 +102,7 @@ for n, m, b in [("VPMINSQ", "vpminsq", 64), ("VPMAXSQ", "vpmaxsq", 64), ("VPMINU
                 ("VPMAXUB", "vpmaxub", 0), ("VPMINSW", "vpminsw", 0), ("VPMULHUW", "vpmulhuw", 0),
                 ("VPMULLW", "vpmullw", 0), ("VPSHUFB_", "vpshufb", 0), ("VPANDND", "vpandnd", 32),
                 ("VPXORD", "vpxord", 32), ("VPORQ", "vporq", 64), ("VPADDUSB", "vpaddusb", 0),
-                ("VPSUBSB", "vpsubsb", 0), ("VPMINUW", "vpminuw", 0), ("VPMAXSB", "vpmaxsb", 0)]:
+                ("VPSUBSB", "vpsubsb", 0), ("VPSUBSW", "vpsubsw", 0), ("VPADDSW", "vpaddsw", 0), ("VPMINUW", "vpminuw", 0), ("VPMAXSB", "vpmaxsb", 0)]:
     form(n, m, "bin", b)
 for n, m, b in [("VPABSQ", "vpabsq", 64), ("VPLZCNTD", "vplzcntd", 32), ("VPLZCNTQ", "vplzcntq", 64),
                 ("VPOPCNTD", "vpopcntd", 32), ("VPOPCNTQ", "vpopcntq", 64), ("VPOPCNTB", "vpopcntb", 0),
@@ -351,3 +352,9 @@ for n, asm in [("VEX_VAESENC_Y", "vaesenc ymm0, ymm1, ymm2"), ("VEX_VAESDECLAST_
 single("VPBROADCASTMB2Q_Z", "vpbroadcastmb2q zmm0, k1")
 single("VPBROADCASTMW2D_Y", "vpbroadcastmw2d ymm0, k1")
 single("VPBROADCASTMW2D_HIGH", "vpbroadcastmw2d zmm20, k1")
+
+# AVX512_BF16
+form("VCVTNE2PS2BF16", "vcvtne2ps2bf16", "bin", 32)
+form("VDPBF16PS", "vdpbf16ps", "bin", 32)
+form("VCVTNEPS2BF16", "vcvtneps2bf16", "cvtnarrow2", 32)
+single("VCVTNEPS2BF16_BROADCAST", "vcvtneps2bf16 ymm0, dword ptr [rsi]{1to16}")
