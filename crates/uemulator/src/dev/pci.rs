@@ -13,9 +13,11 @@ pub(crate) const MMIO_BASE: u64 = 0xc000_0000;
 /// Each virtio function gets one BAR0 of this size, laid out back to back from `MMIO_BASE`.
 /// Four `REGION_SIZE` regions: common cfg, ISR, device cfg, notify.
 const BAR_SIZE: u64 = 4 * REGION_SIZE;
-/// Legacy PIC lines handed out to functions in order. There is no IOAPIC or ACPI, so the
-/// kernel takes `int_line` as the IRQ. Never 0, `mmio_write` uses 0 for "no interrupt".
-const LEGACY_IRQS: [u8; 3] = [9, 10, 11];
+/// Legacy PIC lines handed out to functions in order, wrapping around (functions past the fourth
+/// share a line; `line_asserted` ORs them). There is no IOAPIC or ACPI, so the kernel takes
+/// `int_line` as the IRQ. Never 0, `mmio_write` uses 0 for "no interrupt". 9-11 are the lines
+/// QEMU's PIIX routes PCI interrupts to; 5 is free on a machine without a sound card or LPT.
+const LEGACY_IRQS: [u8; 4] = [9, 10, 11, 5];
 
 /// Config mechanism #1 ports: the address dword at 0xCF8..=0xCFB and the data window at
 /// 0xCFC..=0xCFF. Either may be accessed as a byte, word or dword; the low two bits of the
@@ -33,8 +35,9 @@ const CONFIG_ADDRESS_DEVFN_SHIFT: u32 = 8;
 const CONFIG_ADDRESS_REGISTER_MASK: u32 = 0xfc;
 /// devfn = slot << 3 | function.
 const DEVFN_SLOT_SHIFT: u32 = 3;
-/// Slot 0 is the host bridge, virtio functions start at slot 1.
+/// Slot 0 is the host bridge, virtio functions start at slot 1 and fill slots 1..=31.
 const FIRST_VIRTIO_SLOT: u8 = 1;
+pub(crate) const MAX_VIRTIO_FUNCTIONS: usize = 31;
 const CONFIG_SPACE_SIZE: usize = 256;
 
 /// Standard config header offsets.
@@ -256,15 +259,19 @@ impl PciFunction {
 }
 
 impl PciHost {
-    /// Tears the bus down and returns the disk behind its virtio-blk function, if any.
+    /// Tears the bus down and returns the disks behind its virtio-blk functions, in slot order.
     #[cfg(not(freestanding))]
-    pub fn into_disk(self) -> Option<crate::disk::Disk> {
+    pub fn into_disks(self) -> Vec<crate::disk::Disk> {
         self.funcs
             .into_iter()
-            .find_map(|function| function.transport.dev.into_disk())
+            .filter_map(|function| function.transport.dev.into_disk())
+            .collect()
     }
 
+    /// At most `MAX_VIRTIO_FUNCTIONS` devices (the machine configuration rejects more): slot,
+    /// BAR and interrupt line all follow the position in `devs`.
     pub fn new(devs: Vec<Transport>) -> Self {
+        debug_assert!(devs.len() <= MAX_VIRTIO_FUNCTIONS);
         let funcs = devs
             .into_iter()
             .enumerate()
@@ -286,10 +293,11 @@ impl PciHost {
         self.funcs.is_empty()
     }
 
-    /// True once a virtio-console driver is up; the UART stops taking host input then so
-    /// keystrokes go to hvc0 only.
-    pub fn console_active(&self) -> bool {
-        self.funcs.iter().any(|f| {
+    /// True once the driver of the virtio console at position `index` is up; when the UART shares
+    /// that console's handle it stops taking host input then, so keystrokes go to hvc only.
+    /// False for a position that is not a console function.
+    pub fn console_active(&self, index: usize) -> bool {
+        self.funcs.get(index).is_some_and(|f| {
             f.transport.dev.device_type() == DEVICE_TYPE_CONSOLE && f.transport.driver_ok()
         })
     }
@@ -366,7 +374,7 @@ impl PciHost {
     }
 
     /// IRQ numbers the functions can be wired to.
-    pub fn interrupt_lines() -> [u8; 3] {
+    pub fn interrupt_lines() -> [u8; LEGACY_IRQS.len()] {
         LEGACY_IRQS
     }
 
@@ -1134,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn irq_assignment_wraps_after_three_devices_and_never_uses_zero() {
+    fn irq_assignment_wraps_after_four_devices_and_never_uses_zero() {
         let h = PciHost::new(vec![
             console_transport(),
             console_transport(),
@@ -1142,7 +1150,9 @@ mod tests {
             console_transport(),
         ]);
         let lines: Vec<u8> = h.funcs.iter().map(|f| f.int_line).collect();
-        assert_eq!(lines, vec![9, 10, 11, 9]);
+        assert_eq!(lines, vec![9, 10, 11, 5]);
+        let fifth = PciHost::new((0..5).map(|_| console_transport()).collect());
+        assert_eq!(fifth.funcs[4].int_line, 9);
         assert!(LEGACY_IRQS.iter().all(|&irq| irq != 0));
     }
 
@@ -1296,7 +1306,7 @@ mod tests {
     #[test]
     fn console_is_active_only_after_the_driver_sets_driver_ok() {
         let mut h = host();
-        assert!(!h.console_active());
+        assert!(!h.console_active(0));
         enable_memory_space(&mut h, CONSOLE_SLOT);
         let mut ram = vec![0u8; 0x1000];
         let mut mem = test_mem(&mut ram);
@@ -1306,9 +1316,9 @@ mod tests {
             STATUS_DRIVER_OK,
             &mut mem,
         );
-        assert!(h.console_active());
+        assert!(h.console_active(0));
         h.mmio_write(MMIO_BASE + COMMON_DEVICE_STATUS_OFFSET, 1, 0, &mut mem);
-        assert!(!h.console_active(), "a reset deactivates it");
+        assert!(!h.console_active(0), "a reset deactivates it");
     }
 
     #[test]
@@ -1323,7 +1333,7 @@ mod tests {
             STATUS_DRIVER_OK,
             &mut mem,
         );
-        assert!(!h.console_active());
+        assert!(!h.console_active(0));
     }
 
     fn host_with_pending_config_event() -> (PciHost, ConsoleHandle) {
@@ -1546,6 +1556,57 @@ mod tests {
             !host.line_asserted(line),
             "reading the ISR register releases the line"
         );
+    }
+
+    fn many_functions(count: usize) -> PciHost {
+        PciHost::new((0..count).map(|_| net_transport()).collect())
+    }
+
+    #[test]
+    fn functions_get_distinct_bars_and_slots_and_the_lines_wrap_after_the_fourth() {
+        let host = many_functions(6);
+        let lines: Vec<u8> = host.funcs.iter().map(|f| f.int_line).collect();
+        assert_eq!(lines, [9, 10, 11, 5, 9, 10]);
+        let bars: Vec<u32> = host.funcs.iter().map(|f| f.bar0).collect();
+        for (index, bar) in bars.iter().enumerate() {
+            assert_eq!(*bar as u64, MMIO_BASE + index as u64 * BAR_SIZE);
+        }
+        let devfns: Vec<u8> = host.funcs.iter().map(|f| f.devfn).collect();
+        assert_eq!(devfns, [8, 16, 24, 32, 40, 48]);
+    }
+
+    #[test]
+    fn the_last_slot_holds_the_thirty_first_function() {
+        let mut host = many_functions(MAX_VIRTIO_FUNCTIONS);
+        let slot = MAX_VIRTIO_FUNCTIONS as u32;
+        enable_memory_space(&mut host, slot);
+        assert_eq!(
+            cfg_read32(&mut host, slot, CFG_VENDOR_ID as u32) & 0xffff,
+            VENDOR_VIRTIO as u32
+        );
+        let bar = bar_base(&mut host, slot);
+        assert_eq!(bar, MMIO_BASE + (slot as u64 - 1) * BAR_SIZE);
+        assert!(host.mmio_read(bar + 0x12, 2).is_some());
+        assert_eq!(
+            cfg_read32(&mut host, slot + 1, CFG_VENDOR_ID as u32),
+            NO_DEVICE_DWORD
+        );
+    }
+
+    #[test]
+    fn a_shared_line_stays_asserted_until_every_function_on_it_is_quiet() {
+        let mut host = many_functions(5);
+        assert_eq!(host.funcs[0].int_line, host.funcs[4].int_line);
+        let line = host.funcs[0].int_line;
+        host.funcs[0].transport.isr = 1;
+        host.funcs[4].transport.isr = 1;
+        host.funcs[0].transport.isr = 0;
+        assert!(
+            host.line_asserted(line),
+            "the fifth function still asserts it"
+        );
+        host.funcs[4].transport.isr = 0;
+        assert!(!host.line_asserted(line));
     }
 
     #[test]

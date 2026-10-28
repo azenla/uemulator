@@ -113,15 +113,21 @@ const CMOS_STATUS_B_VALUE: u8 = 0x02;
 /// Status D: battery good (VRT), so the kernel trusts the time.
 const CMOS_STATUS_D_VALUE: u8 = 0x80;
 
-/// What to attach to the PCI bus; every device is optional.
+/// What to attach to the PCI bus; every device is optional and may repeat. Functions take slots
+/// (and legacy IRQ lines) in this order: virtio consoles, disks, nets, each in list order.
 #[derive(Default)]
 pub(crate) struct DevConfig {
     #[cfg(not(freestanding))]
-    pub disk: Option<Disk>,
-    /// MAC address and the host side of the frame channel.
-    pub net: Option<([u8; 6], NetHandle)>,
-    pub virtio_console: bool,
+    pub disks: Vec<Disk>,
+    /// MAC address and the host side of the frame channel, one entry per NIC.
+    pub nets: Vec<([u8; 6], NetHandle)>,
+    /// One virtio-console function per handle. The UART stays on the `Devices::new` console
+    /// handle; when that is one of these (the default), the UART gives way to the virtio driver.
+    pub virtio_consoles: Vec<ConsoleHandle>,
 }
+
+/// Most virtio functions one machine can hold (PCI slots 1..=31).
+pub(crate) const MAX_VIRTIO_FUNCTIONS: usize = pci::MAX_VIRTIO_FUNCTIONS;
 
 /// The whole device bus: legacy port-I/O devices plus the virtio-pci host. Port I/O goes
 /// through `io_in`/`io_out`, physical accesses above RAM through `mmio_read`/`mmio_write`.
@@ -141,6 +147,9 @@ pub(crate) struct Devices {
     ioapic: IoApic,
     /// Virtual time of the last tick or port access, for MMIO accesses that arrive without one.
     now_ns: u64,
+    /// Position of the virtio console that shares the UART's console handle, if any: the UART
+    /// stops taking host input once that console's driver is up.
+    uart_peer_console: Option<usize>,
     /// Set by the reset ports (i8042, 0x92, 0xCF9); the CPU turns it into `ExitReason::Reset`.
     pub reset_requested: bool,
 }
@@ -191,18 +200,20 @@ fn civil(days_since_unix_epoch: i64) -> (i64, u64, u64) {
 
 impl Devices {
     pub fn new(console: ConsoleHandle, cfg: DevConfig) -> Self {
-        // Order decides PCI slot and legacy IRQ: console, disk, net.
+        // Order decides PCI slot and legacy IRQ: consoles, disks, nets.
         let mut virtio_devices = Vec::new();
-        if cfg.virtio_console {
-            virtio_devices.push(Transport::new(Box::new(VirtioConsole::new(
-                console.clone(),
-            ))));
+        let mut uart_peer_console = None;
+        for (position, handle) in cfg.virtio_consoles.into_iter().enumerate() {
+            if uart_peer_console.is_none() && handle.is_same_console(&console) {
+                uart_peer_console = Some(position);
+            }
+            virtio_devices.push(Transport::new(Box::new(VirtioConsole::new(handle))));
         }
         #[cfg(not(freestanding))]
-        if let Some(disk) = cfg.disk {
+        for disk in cfg.disks {
             virtio_devices.push(Transport::new(Box::new(VirtioBlk::new(disk))));
         }
-        if let Some((mac, handle)) = cfg.net {
+        for (mac, handle) in cfg.nets {
             virtio_devices.push(Transport::new(Box::new(VirtioNet::new(mac, handle))));
         }
         #[cfg(not(freestanding))]
@@ -226,16 +237,17 @@ impl Devices {
             lapic: Lapic::new(),
             ioapic: IoApic::new(),
             now_ns: 0,
+            uart_peer_console,
             reset_requested: false,
         }
     }
 
-    /// Consumes the devices and returns the disk, for the machine to attach to the devices it
-    /// builds for the next boot. Everything else (PCI config, virtqueues, UART, PIC, PIT) is
-    /// dropped on purpose: a reboot must not leak state from the previous run.
+    /// Consumes the devices and returns the disks in attach order, for the machine to attach to
+    /// the devices it builds for the next boot. Everything else (PCI config, virtqueues, UART,
+    /// PIC, PIT) is dropped on purpose: a reboot must not leak state from the previous run.
     #[cfg(not(freestanding))]
-    pub fn into_disk(self) -> Option<Disk> {
-        self.pci.into_disk()
+    pub fn into_disks(self) -> Vec<Disk> {
+        self.pci.into_disks()
     }
 
     pub fn state(&self, now: u64) -> String {
@@ -392,8 +404,13 @@ impl Devices {
             self.pic.raise(irq);
         }
         self.update_pci_irqs();
-        // Once the virtio console driver is up, host input belongs to hvc0 and the UART must not also take it.
-        self.uart.set_rx_enabled(!self.pci.console_active());
+        // A UART that shares its console with a virtio console gives way once that driver is up:
+        // host input belongs to hvc and the UART must not also take it. A UART with a console of
+        // its own (`--console serial` next to a virtio one) always listens.
+        let yielded = self
+            .uart_peer_console
+            .is_some_and(|position| self.pci.console_active(position));
+        self.uart.set_rx_enabled(!yielded);
         self.uart.poll();
         self.update_uart_irq();
     }
@@ -584,7 +601,7 @@ mod tests {
         Devices::new(
             console.clone(),
             DevConfig {
-                virtio_console: true,
+                virtio_consoles: vec![console.clone()],
                 ..Default::default()
             },
         )
@@ -1390,9 +1407,9 @@ mod tests {
         let mut dev = Devices::new(
             ConsoleHandle::default(),
             DevConfig {
-                disk: Some(Disk::memory(vec![0; 4096])),
-                net: Some(([2, 0, 0, 0, 0, 1], NetHandle::default())),
-                virtio_console: true,
+                disks: vec![Disk::memory(vec![0; 4096])],
+                nets: vec![([2, 0, 0, 0, 0, 1], NetHandle::default())],
+                virtio_consoles: vec![ConsoleHandle::default()],
             },
         );
         let mut device_ids = Vec::new();
@@ -1408,7 +1425,7 @@ mod tests {
         let mut disk_only = Devices::new(
             ConsoleHandle::default(),
             DevConfig {
-                disk: Some(Disk::memory(vec![0; 4096])),
+                disks: vec![Disk::memory(vec![0; 4096])],
                 ..Default::default()
             },
         );
@@ -1417,7 +1434,7 @@ mod tests {
         let mut net_only = Devices::new(
             ConsoleHandle::default(),
             DevConfig {
-                net: Some(([2, 0, 0, 0, 0, 1], NetHandle::default())),
+                nets: vec![([2, 0, 0, 0, 0, 1], NetHandle::default())],
                 ..Default::default()
             },
         );
@@ -1780,30 +1797,98 @@ mod tests {
         let dev = Devices::new(
             ConsoleHandle::default(),
             DevConfig {
-                disk: Some(Disk::memory(vec![0; 4096])),
-                net: Some(([2, 0, 0, 0, 0, 1], NetHandle::default())),
-                virtio_console: true,
+                disks: vec![Disk::memory(vec![0; 4096])],
+                nets: vec![([2, 0, 0, 0, 0, 1], NetHandle::default())],
+                virtio_consoles: vec![ConsoleHandle::default()],
             },
         );
-        let mut disk = dev.into_disk().expect("a disk was attached");
-        disk.backend.write_at(512, MARKER).unwrap();
+        let mut disks = dev.into_disks();
+        assert_eq!(disks.len(), 1);
+        disks[0].backend.write_at(512, MARKER).unwrap();
         // The next boot's devices are built around the returned disk and give it back again.
         let rebuilt = Devices::new(
             ConsoleHandle::default(),
             DevConfig {
-                disk: Some(disk),
+                disks,
                 ..Default::default()
             },
         );
-        let mut disk = rebuilt.into_disk().unwrap();
+        let mut disks = rebuilt.into_disks();
         let mut read_back = [0u8; MARKER.len()];
-        disk.backend.read_at(512, &mut read_back).unwrap();
+        disks[0].backend.read_at(512, &mut read_back).unwrap();
         assert_eq!(read_back, MARKER);
     }
 
     #[test]
-    fn into_disk_without_a_disk_is_none() {
-        assert!(bus().into_disk().is_none());
-        assert!(bus_with_pci().into_disk().is_none());
+    fn into_disks_without_a_disk_is_empty() {
+        assert!(bus().into_disks().is_empty());
+        assert!(bus_with_pci().into_disks().is_empty());
+    }
+
+    #[test]
+    fn into_disks_returns_every_disk_in_attach_order() {
+        let dev = Devices::new(
+            ConsoleHandle::default(),
+            DevConfig {
+                disks: (0..3u8).map(|n| Disk::memory(vec![n; 4096])).collect(),
+                nets: vec![([2, 0, 0, 0, 0, 1], NetHandle::default())],
+                virtio_consoles: vec![ConsoleHandle::default()],
+            },
+        );
+        let firsts: Vec<u8> = dev
+            .into_disks()
+            .into_iter()
+            .map(|mut disk| {
+                let mut byte = [0u8; 1];
+                disk.backend.read_at(0, &mut byte).unwrap();
+                byte[0]
+            })
+            .collect();
+        assert_eq!(firsts, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn many_devices_take_consecutive_slots_in_console_disk_net_order() {
+        let mut dev = Devices::new(
+            ConsoleHandle::default(),
+            DevConfig {
+                disks: vec![Disk::memory(vec![0; 4096]), Disk::memory(vec![0; 4096])],
+                nets: vec![
+                    ([2, 0, 0, 0, 0, 1], NetHandle::default()),
+                    ([2, 0, 0, 0, 0, 2], NetHandle::default()),
+                ],
+                virtio_consoles: vec![ConsoleHandle::default(), ConsoleHandle::default()],
+            },
+        );
+        let mut device_ids = Vec::new();
+        for slot in 1..=7 {
+            out(&mut dev, PCI_CONFIG_PORT_FIRST, 4, pci_address(slot, 0));
+            device_ids.push(inp(&mut dev, 0xcfc, 4) >> 16);
+        }
+        assert_eq!(
+            device_ids,
+            vec![0x1043, 0x1043, 0x1042, 0x1042, 0x1041, 0x1041, 0xffff]
+        );
+    }
+
+    #[test]
+    fn the_uart_yields_only_to_a_virtio_console_that_shares_its_handle() {
+        let uart_console = ConsoleHandle::default();
+        let separate = Devices::new(
+            uart_console.clone(),
+            DevConfig {
+                virtio_consoles: vec![ConsoleHandle::default()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(separate.uart_peer_console, None);
+        let shared = Devices::new(
+            uart_console.clone(),
+            DevConfig {
+                virtio_consoles: vec![ConsoleHandle::default(), uart_console],
+                ..Default::default()
+            },
+        );
+        assert_eq!(shared.uart_peer_console, Some(1));
     }
 }

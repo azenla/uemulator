@@ -9,7 +9,7 @@ mod usernet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use uemulator::ExitReason;
 
 use quick::Distro;
@@ -89,7 +89,22 @@ enum Cmd {
     },
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+/// clap's flag actions (`SetTrue`, `Count`) record one argument index however often a flag is
+/// repeated, which would lose the interleaving of `--net-user`, `--net-loop` and `--net-udp`. So
+/// those two flags are appending options that take no value on the command line
+/// (`default_missing_value`); every occurrence then has an index of its own.
+const REPEATABLE_FLAG: &str = "on";
+
+/// One `--net-*` flag: what sits on the host side of a NIC.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NetBackend {
+    User,
+    Loop,
+    /// `LOCAL,REMOTE`, unparsed.
+    Udp(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ConsoleArg {
     /// ttyS0 on the 16550; for kernels without a built-in virtio_console driver
     Serial,
@@ -105,25 +120,37 @@ pub struct MachineArgs {
     /// Kernel command line
     #[arg(long)]
     cmdline: Option<String>,
-    /// Raw disk image as a virtio-blk device; append ",ro" for read-only
+    /// Raw disk image as a virtio-blk device; append ",ro" for read-only. Repeat for more disks:
+    /// the guest sees them in command-line order (vda, vdb, ...)
     #[arg(long, value_name = "PATH[,ro]")]
-    disk: Option<String>,
-    /// Attach a virtio-net device with user-mode NAT to the host network (default for `quick`)
-    #[arg(long)]
-    net_user: bool,
+    disk: Vec<String>,
+    /// Attach a virtio-net device with user-mode NAT to the host network (default for `quick`).
+    /// Repeat for more NICs
+    #[arg(long, action = ArgAction::Append, num_args = 0..=1, require_equals = true,
+        default_missing_value = REPEATABLE_FLAG, value_parser = [REPEATABLE_FLAG],
+        hide_possible_values = true, value_name = "")]
+    net_user: Vec<String>,
     /// Append to the kernel command line
     #[arg(long, value_name = "ARGS")]
     append: Option<String>,
     /// Attach a virtio-net device answered by a built-in gateway that only replies to ARP and ICMP
-    /// echo for 10.0.2.2: no DHCP, nothing is forwarded
-    #[arg(long)]
-    net_loop: bool,
-    /// Attach a virtio-net device bridged to a UDP socket pair
+    /// echo for 10.0.2.2: no DHCP, nothing is forwarded. Repeat for more NICs
+    #[arg(long, action = ArgAction::Append, num_args = 0..=1, require_equals = true,
+        default_missing_value = REPEATABLE_FLAG, value_parser = [REPEATABLE_FLAG],
+        hide_possible_values = true, value_name = "")]
+    net_loop: Vec<String>,
+    /// Attach a virtio-net device bridged to a UDP socket pair. Repeat for more NICs
     #[arg(long, value_name = "LOCAL,REMOTE")]
-    net_udp: Option<String>,
-    /// Guest console device
+    net_udp: Vec<String>,
+    /// The NICs in the order the guest sees them: one entry per --net-user, --net-loop and
+    /// --net-udp, in command-line order. `parse_cli` fills it; clap cannot order across flags.
+    #[arg(skip)]
+    nets: Vec<NetBackend>,
+    /// Guest console device. Repeat to add more: the first is the guest's primary console and
+    /// the one the terminal is attached to; the others have no host side (their output is
+    /// dropped). Serial can be given once
     #[arg(long, value_enum, default_value = "virtio")]
-    console: ConsoleArg,
+    console: Vec<ConsoleArg>,
     /// End the run with "machine reset" when the guest resets instead of rebooting it in place
     #[arg(long)]
     no_reboot: bool,
@@ -154,9 +181,9 @@ fn read(path: &PathBuf) -> Result<Vec<u8>, String> {
 /// Quick mode's defaults for everything the user did not choose.
 fn apply_quick_defaults(machine: &mut MachineArgs, distro: Distro) {
     // The installers fetch packages over the network, so default to NAT unless the user picked
-    // another backend.
-    if !machine.net_loop && machine.net_udp.is_none() {
-        machine.net_user = true;
+    // a NIC of their own.
+    if machine.nets.is_empty() {
+        machine.nets.push(NetBackend::User);
     }
     let distro_args = distro.cmdline();
     if !distro_args.is_empty() {
@@ -191,9 +218,9 @@ fn execute(cli: Cli) -> Result<ExitReason, String> {
             let kernel_image = read(&artifacts.kernel)?;
             let initramfs_image = read(&artifacts.initramfs)?;
             apply_quick_defaults(&mut machine, distro);
-            if machine.disk.is_none() {
+            if machine.disk.is_empty() {
                 let disk = quick::ensure_disk(distro, disk_size)?;
-                machine.disk = Some(disk.to_string_lossy().into_owned());
+                machine.disk.push(disk.to_string_lossy().into_owned());
             }
             run::run(kernel_image, Some(initramfs_image), machine)
         }
@@ -210,8 +237,49 @@ fn usage_exit_code(error: &clap::Error) -> i32 {
     }
 }
 
+/// The NICs of one subcommand in command-line order. clap keeps each flag's occurrences apart, so
+/// the interleaving (`--net-udp a,b --net-user --net-udp c,d`) is recovered from the argument
+/// indices; the n-th NIC the guest sees must be the n-th flag the user typed.
+fn net_backends(sub: &ArgMatches) -> Vec<NetBackend> {
+    let mut ordered: Vec<(usize, NetBackend)> = Vec::new();
+    for (id, backend) in [
+        ("net_user", NetBackend::User),
+        ("net_loop", NetBackend::Loop),
+    ] {
+        for index in sub.indices_of(id).into_iter().flatten() {
+            ordered.push((index, backend.clone()));
+        }
+    }
+    if let (Some(indices), Some(specs)) =
+        (sub.indices_of("net_udp"), sub.get_many::<String>("net_udp"))
+    {
+        for (index, spec) in indices.zip(specs) {
+            ordered.push((index, NetBackend::Udp(spec.clone())));
+        }
+    }
+    ordered.sort_by_key(|(index, _)| *index);
+    ordered.into_iter().map(|(_, backend)| backend).collect()
+}
+
+/// `Cli::try_parse_from` plus the part clap's derive cannot do: ordering the NIC flags.
+fn parse_cli<I, T>(argv: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let matches = Cli::command().try_get_matches_from(argv)?;
+    let mut cli = Cli::from_arg_matches(&matches)?;
+    if let Some((_, sub)) = matches.subcommand() {
+        let (Cmd::Boot { machine, .. }
+        | Cmd::Firmware { machine, .. }
+        | Cmd::Quick { machine, .. }) = &mut cli.cmd;
+        machine.nets = net_backends(sub);
+    }
+    Ok(cli)
+}
+
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let cli = match parse_cli(std::env::args_os()) {
         Ok(cli) => cli,
         Err(error) => {
             let _ = error.print();
@@ -237,7 +305,7 @@ mod tests {
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         let mut argv = vec!["uemulator"];
         argv.extend_from_slice(args);
-        Cli::try_parse_from(argv)
+        parse_cli(argv)
     }
 
     fn error_kind(args: &[&str]) -> ErrorKind {
@@ -407,15 +475,14 @@ mod tests {
         assert_eq!(initramfs, None);
         assert_eq!(machine.memory, None);
         assert_eq!(machine.cmdline, None);
-        assert_eq!(machine.disk, None);
+        assert!(machine.disk.is_empty());
         assert_eq!(machine.append, None);
-        assert_eq!(machine.net_udp, None);
+        assert!(machine.net_udp.is_empty() && machine.nets.is_empty());
         assert_eq!(machine.time, None);
         assert_eq!(machine.timeout, None);
-        assert!(matches!(machine.console, ConsoleArg::Virtio));
+        assert_eq!(machine.console, [ConsoleArg::Virtio]);
+        assert!(machine.net_user.is_empty() && machine.net_loop.is_empty());
         for flag in [
-            machine.net_user,
-            machine.net_loop,
             machine.disable_jit,
             machine.verify,
             machine.debug,
@@ -470,13 +537,20 @@ mod tests {
         ]);
         assert_eq!(m.memory, Some(256));
         assert_eq!(m.cmdline.as_deref(), Some("console=ttyS0 root=/dev/vda"));
-        assert_eq!(m.disk.as_deref(), Some("d.img,ro"));
+        assert_eq!(m.disk, ["d.img,ro"]);
         assert_eq!(m.append.as_deref(), Some("quiet"));
-        assert_eq!(m.net_udp.as_deref(), Some("127.0.0.1:1,127.0.0.1:2"));
-        assert!(matches!(m.console, ConsoleArg::Virtio));
+        assert_eq!(m.net_udp, ["127.0.0.1:1,127.0.0.1:2"]);
+        assert_eq!(m.console, [ConsoleArg::Virtio]);
         assert_eq!(m.time, Some(1_700_000_000));
         assert_eq!(m.timeout, Some(30));
-        assert!(m.net_user && m.net_loop && m.disable_jit && m.verify && m.debug && m.realtime);
+        assert!(
+            m.net_user.len() == 1
+                && m.net_loop.len() == 1
+                && m.disable_jit
+                && m.verify
+                && m.debug
+                && m.realtime
+        );
     }
 
     #[test]
@@ -512,14 +586,14 @@ mod tests {
 
     #[test]
     fn console_accepts_only_serial_and_virtio() {
-        assert!(matches!(
+        assert_eq!(
             machine_args(&["--console", "serial"]).console,
-            ConsoleArg::Serial
-        ));
-        assert!(matches!(
+            [ConsoleArg::Serial]
+        );
+        assert_eq!(
             machine_args(&["--console", "virtio"]).console,
-            ConsoleArg::Virtio
-        ));
+            [ConsoleArg::Virtio]
+        );
         for bad in ["hvc0", "Serial", "VIRTIO", ""] {
             assert_eq!(
                 error_kind(&["boot", "--kernel", "k", "--console", bad]),
@@ -560,7 +634,7 @@ mod tests {
         );
         assert_eq!(
             error_kind(&["boot", "--kernel", "k", "--net-user=yes"]),
-            ErrorKind::TooManyValues
+            ErrorKind::InvalidValue
         );
     }
 
@@ -636,7 +710,7 @@ mod tests {
         assert!(update);
         assert_eq!(disk_size, 20);
         assert_eq!(machine.memory, Some(512));
-        assert!(machine.net_loop);
+        assert_eq!(machine.nets, [NetBackend::Loop]);
         assert_eq!(machine.timeout, Some(5));
     }
 
@@ -751,24 +825,89 @@ mod tests {
     fn quick_defaults_pick_user_networking_when_no_backend_was_chosen() {
         let mut machine = machine_args(&[]);
         apply_quick_defaults(&mut machine, Distro::Debian);
-        assert!(machine.net_user);
+        assert_eq!(machine.nets, [NetBackend::User]);
     }
 
     #[test]
     fn quick_defaults_respect_another_network_backend() {
         let mut machine = machine_args(&["--net-loop"]);
         apply_quick_defaults(&mut machine, Distro::Debian);
-        assert!(!machine.net_user);
+        assert_eq!(machine.nets, [NetBackend::Loop]);
         let mut machine = machine_args(&["--net-udp", "a,b"]);
         apply_quick_defaults(&mut machine, Distro::Debian);
-        assert!(!machine.net_user);
+        assert_eq!(machine.nets, [NetBackend::Udp("a,b".into())]);
     }
 
     #[test]
-    fn quick_defaults_keep_an_explicit_net_user() {
+    fn quick_defaults_keep_every_explicit_nic() {
         let mut machine = machine_args(&["--net-user", "--net-loop"]);
         apply_quick_defaults(&mut machine, Distro::Alpine);
-        assert!(machine.net_user && machine.net_loop);
+        assert_eq!(machine.nets, [NetBackend::User, NetBackend::Loop]);
+    }
+
+    #[test]
+    fn console_disk_and_net_flags_repeat() {
+        let m = machine_args(&[
+            "--console",
+            "serial",
+            "--console",
+            "virtio",
+            "--disk",
+            "a.img",
+            "--disk",
+            "b.img,ro",
+        ]);
+        assert_eq!(m.console, [ConsoleArg::Serial, ConsoleArg::Virtio]);
+        assert_eq!(m.disk, ["a.img", "b.img,ro"]);
+    }
+
+    #[test]
+    fn nics_come_in_command_line_order_across_different_flags() {
+        let m = machine_args(&[
+            "--net-udp",
+            "a:1,b:2",
+            "--net-user",
+            "--net-loop",
+            "--net-udp",
+            "c:3,d:4",
+            "--net-user",
+        ]);
+        assert_eq!(
+            m.nets,
+            [
+                NetBackend::Udp("a:1,b:2".into()),
+                NetBackend::User,
+                NetBackend::Loop,
+                NetBackend::Udp("c:3,d:4".into()),
+                NetBackend::User,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repeated_nic_flag_adds_a_nic_each_time() {
+        assert_eq!(
+            machine_args(&["--net-user", "--net-user"]).nets,
+            [NetBackend::User, NetBackend::User]
+        );
+        assert_eq!(
+            machine_args(&["--net-loop", "--net-loop", "--net-loop"]).nets,
+            [NetBackend::Loop, NetBackend::Loop, NetBackend::Loop]
+        );
+    }
+
+    #[test]
+    fn nics_are_ordered_for_quick_and_firmware_too() {
+        let (_, _, _, m) = quick(&["quick", "alpine", "--net-loop", "--net-user"]);
+        assert_eq!(m.nets, [NetBackend::Loop, NetBackend::User]);
+        let Cmd::Firmware { machine, .. } =
+            parse(&["firmware", "bios.bin", "--net-user", "--net-loop"])
+                .unwrap()
+                .cmd
+        else {
+            panic!("expected firmware")
+        };
+        assert_eq!(machine.nets, [NetBackend::User, NetBackend::Loop]);
     }
 
     #[test]
@@ -813,7 +952,7 @@ mod tests {
         let mut machine = machine_args(&["--cmdline", "root=/dev/vda", "--disk", "x.img"]);
         apply_quick_defaults(&mut machine, Distro::Alpine);
         assert_eq!(machine.cmdline.as_deref(), Some("root=/dev/vda"));
-        assert_eq!(machine.disk.as_deref(), Some("x.img"));
+        assert_eq!(machine.disk, ["x.img"]);
     }
 
     #[test]

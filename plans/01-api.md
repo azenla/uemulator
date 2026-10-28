@@ -12,9 +12,9 @@ impl MachineConfig {
     pub fn memory_mib(self, n: usize) -> Self;      // default 512
     pub fn jit(self, mode: JitMode) -> Self;        // Auto (default) | Off | On
     pub fn clock(self, mode: ClockMode) -> Self;    // Virtual (default) | Realtime
-    pub fn disk(self, d: Disk) -> Self;                 // raw image, virtio-blk (optional)
-    pub fn net(self, mac: [u8; 6]) -> Self;             // virtio-net; frames via EmulatedMachine::net() (optional)
-    pub fn console(self, k: ConsoleKind) -> Self;       // Virtio (default, resizable hvc0) | Serial (ttyS0)
+    pub fn disk(self, d: Disk) -> Self;                 // raw image, virtio-blk; call again for more disks (optional)
+    pub fn net(self, mac: [u8; 6]) -> Self;             // virtio-net; frames via EmulatedMachine::nets()/net(); call again for more NICs (optional)
+    pub fn console(self, k: ConsoleKind) -> Self;       // Virtio (default, resizable hvc0, repeatable) | Serial (ttyS0, once); first = primary; handles via EmulatedMachine::consoles()
     pub fn reboot(self, on: bool) -> Self;              // true (default): guest reset restarts the machine in place; false: ExitReason::Reset
     pub fn log(self, f: impl Fn(&str) + Send + 'static) -> Self;
 }

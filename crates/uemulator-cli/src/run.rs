@@ -7,7 +7,7 @@ use uemulator::{
 
 use crate::netgw;
 use crate::term::{stty, term_size};
-use crate::{ConsoleArg, MachineArgs};
+use crate::{ConsoleArg, MachineArgs, NetBackend};
 
 /// QEMU's conventional default NIC MAC (52:54:00 is its locally administered prefix).
 pub(crate) const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -56,8 +56,12 @@ fn console_kind(arg: ConsoleArg) -> ConsoleKind {
     }
 }
 
-fn network_requested(args: &MachineArgs) -> bool {
-    args.net_loop || args.net_user || args.net_udp.is_some()
+/// The MAC of the `index`-th NIC: `GUEST_MAC` with the last byte counted up, so every NIC is
+/// distinct (the library caps a machine at 31 virtio devices, so the byte never wraps).
+fn guest_mac(index: usize) -> [u8; 6] {
+    let mut mac = GUEST_MAC;
+    mac[5] = mac[5].wrapping_add(index as u8);
+    mac
 }
 
 /// Raw mode passes Ctrl-C and friends to the guest, so a chunk holding the escape byte is the
@@ -135,14 +139,16 @@ fn build_config(
     if let Some(extra) = &args.append {
         cfg = cfg.cmdline_append(extra.clone());
     }
-    if let Some(spec) = &args.disk {
+    for spec in &args.disk {
         let (path, read_only) = parse_disk_spec(spec);
         cfg = cfg.disk(Disk::open(path, read_only).map_err(|e| format!("open disk {path}: {e}"))?);
     }
-    if network_requested(args) {
-        cfg = cfg.net(GUEST_MAC);
+    for index in 0..args.nets.len() {
+        cfg = cfg.net(guest_mac(index));
     }
-    cfg = cfg.console(console_kind(args.console));
+    for console in &args.console {
+        cfg = cfg.console(console_kind(*console));
+    }
     if let Some(t) = args.time {
         cfg = cfg.unix_time(t);
     }
@@ -191,15 +197,18 @@ pub fn run_firmware(image: Vec<u8>, args: MachineArgs) -> Result<ExitReason, Str
 fn run_config(cfg: MachineConfig, args: MachineArgs, tty: bool) -> Result<ExitReason, String> {
     let mut machine = EmulatedMachine::new(cfg).map_err(|e| e.to_string())?;
     let console = machine.console();
-    if let Some(net) = machine.net() {
-        if let Some(spec) = &args.net_udp {
-            spawn_udp(net.clone(), spec)?;
-        }
-        if args.net_loop {
-            spawn_gateway(net.clone());
-        }
-        if args.net_user {
-            crate::usernet::spawn(net);
+    if machine.consoles().len() > 1 {
+        eprintln!(
+            "note: the terminal is attached to the first --console; the other {} have no host side",
+            machine.consoles().len() - 1
+        );
+    }
+    // `build_config` made one NIC per backend, in this order.
+    for (net, backend) in machine.nets().into_iter().zip(&args.nets) {
+        match backend {
+            NetBackend::Udp(spec) => spawn_udp(net, spec)?,
+            NetBackend::Loop => spawn_gateway(net),
+            NetBackend::User => crate::usernet::spawn(net),
         }
     }
     if let Some((cols, rows)) = term_size() {
@@ -272,11 +281,9 @@ fn host_random_seed() -> u64 {
 mod tests {
     use std::cell::RefCell;
 
-    use clap::Parser;
-
     use super::*;
+    use crate::Cmd;
     use crate::test_support::TempDir;
-    use crate::{Cli, Cmd};
 
     const SAVED_SETTINGS: &str = "4500:5:bf:8a3b:3:1c:7f:15:4:0:1:0:11:13:1a:0:12:f:17:16:0:0";
     const MIN_MEMORY_MIB: usize = 64;
@@ -285,7 +292,7 @@ mod tests {
     fn boot_args(extra: &[&str]) -> MachineArgs {
         let mut argv = vec!["uemulator", "boot", "--kernel", "k"];
         argv.extend_from_slice(extra);
-        match Cli::try_parse_from(argv).unwrap().cmd {
+        match crate::parse_cli(argv).unwrap().cmd {
             Cmd::Boot { machine, .. } => machine,
             Cmd::Quick { .. } | Cmd::Firmware { .. } => unreachable!(),
         }
@@ -459,12 +466,74 @@ mod tests {
     }
 
     #[test]
-    fn network_is_requested_by_any_backend_flag() {
-        assert!(!network_requested(&boot_args(&[])));
-        assert!(network_requested(&boot_args(&["--net-loop"])));
-        assert!(network_requested(&boot_args(&["--net-user"])));
-        assert!(network_requested(&boot_args(&["--net-udp", "a,b"])));
-        assert!(network_requested(&boot_args(&["--net-loop", "--net-user"])));
+    fn every_backend_flag_adds_a_nic() {
+        for (flags, count) in [
+            (&[][..], 0),
+            (&["--net-loop"], 1),
+            (&["--net-user"], 1),
+            (&["--net-udp", "a,b"], 1),
+            (&["--net-loop", "--net-user"], 2),
+            (&["--net-user", "--net-user", "--net-udp", "a,b"], 3),
+        ] {
+            assert_eq!(boot_args(flags).nets.len(), count, "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn every_nic_gets_its_own_mac_counted_up_from_the_guest_mac() {
+        assert_eq!(guest_mac(0), GUEST_MAC);
+        let macs: Vec<[u8; 6]> = (0..31).map(guest_mac).collect();
+        for (index, mac) in macs.iter().enumerate() {
+            assert_eq!(mac[..5], GUEST_MAC[..5]);
+            assert_eq!(mac[5], GUEST_MAC[5] + index as u8);
+            assert_eq!(mac[0] & 0x01, 0, "unicast");
+        }
+        let mut unique = macs.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), macs.len());
+    }
+
+    #[test]
+    fn repeated_disks_nics_and_consoles_build_one_machine() {
+        let dir = TempDir::new("run-multi");
+        let (first, second) = (dir.path().join("a.img"), dir.path().join("b.img"));
+        std::fs::write(&first, vec![0u8; 4096]).unwrap();
+        std::fs::write(&second, vec![0u8; 4096]).unwrap();
+        let (first, second) = (first.to_str().unwrap(), second.to_str().unwrap());
+        let cfg = build_config(
+            vec![],
+            None,
+            &boot_args(&[
+                "--disk",
+                first,
+                "--disk",
+                &format!("{second},ro"),
+                "--net-loop",
+                "--net-user",
+                "--console",
+                "serial",
+                "--console",
+                "virtio",
+            ]),
+            false,
+        )
+        .unwrap();
+        // The empty kernel fails only after the configuration (device count, console rules)
+        // was accepted.
+        assert!(!machine_error(cfg).contains("virtio devices"));
+    }
+
+    #[test]
+    fn two_serial_consoles_are_rejected_by_the_library() {
+        let cfg = build_config(
+            vec![],
+            None,
+            &boot_args(&["--console", "serial", "--console", "serial"]),
+            false,
+        )
+        .unwrap();
+        assert!(machine_error(cfg).contains("only once"));
     }
 
     #[test]
