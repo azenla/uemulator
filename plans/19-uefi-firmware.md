@@ -8,7 +8,7 @@ The image is a flat binary linked at 1 MiB (`link.ld`). Header (little endian): 
 
 The firmware's first instructions enable SSE (CR4.OSFXSR; loaded applications use it), install an IDT that prints exceptions to the 16550, and remap the PIC so a PIT one-shot can wake `hlt` (idle waits cost no host time).
 
-## Handoff page (0x7000, 0x308 bytes, version 1)
+## Handoff page (0x7000, 0x338 bytes, version 1)
 
 | offset | field |
 |---|---|
@@ -24,6 +24,9 @@ The firmware's first instructions enable SSE (CR4.OSFXSR; loaded applications us
 | 0x80 | up to 16 RAM regions: base u64, size u64, e820 type u32, pad (24 bytes) |
 | 0x200 | up to 16 MMIO regions: base u64, size u64 (virtio BARs, IOAPIC, LAPIC) |
 | 0x300 | TSC frequency in Hz (the guest TSC counts nanoseconds) |
+| 0x308 / 0x310 | kernel base / size u64 (0 size: no kernel was given) |
+| 0x318 / 0x320 | initramfs base / size u64 (0 size: none) |
+| 0x328 / 0x330 | kernel command line base / size u64 (UTF-8, no NUL) |
 
 `crates/uemulator/src/boot/uefi.rs` writes it, `crates/uemulator-firmware/src/handoff.rs` reads it; both have tests. Other agents fill `rsdp`/ACPI region through `FirmwareParams` when ACPI tables exist.
 
@@ -41,7 +44,8 @@ Variables: key `var/<guid>/<name utf8>`, value = attributes u32 + data. Non-vola
 - Runtime services: GetTime (CMOS RTC), SetTime/wakeup/capsules unsupported, variables with NV/BS/RT attributes and append, SecureBoot=0 / SetupMode=1 / AuditMode / DeployedMode / PlatformLangCodes / OsIndicationsSupported / BootOptionSupport read-only, QueryVariableInfo, ResetSystem (0xCF9; shutdown halts with IF clear), SetVirtualAddressMap with ConvertPointer (table pointers are rewritten; the whole firmware is one runtime-code region so code finds its data), GetNextHighMonotonicCount. After ExitBootServices allocations come from a 1 MiB arena in the image that each runtime call rewinds.
 - Protocols: LoadedImage, LoadedImageDevicePath, DevicePath, DevicePathToText, DevicePathUtilities (instances unsupported), SimpleTextInput/InputEx/Output on the 16550 (ANSI cursor/clear/colour, key decoding for arrows, Home/End, F-keys, one 80x25 mode), BlockIO and DiskIO for every virtio-blk disk and GPT/MBR partition, SimpleFileSystem (read-only FAT12/16/32 with long names; writes return `WRITE_PROTECTED`), RNG.
 - Tables: ACPI 2.0/1.0 (when the handoff has an RSDP), SMBIOS 3.0 (BIOS and system information). Memory types: runtime code (the image), BS data, ACPI reclaim, MMIO for BARs/IOAPIC/LAPIC.
-- Boot manager: `BootNext`, then `BootOrder`/`Boot####` (device path to a file, partial paths searched on every volume, optional data = load options), then `\EFI\BOOT\BOOTX64.EFI` on every file system; `BootCurrent` is set.
+- Kernel payload (`kernel_boot.rs`): when the library was given a kernel (`MachineConfig::kernel` with `uefi_firmware`, CLI `--firmware uefi`, the default), it copies kernel, initramfs and command line to the top of RAM (initramfs highest, each page aligned) and fills the handoff fields above; `memory::init` keeps those ranges allocated as boot services data. The boot manager tries that kernel before anything else, like OVMF's QemuKernelLoader: `LoadImage` from the buffer (it must be an EFI-stub bzImage; the library refuses others up front with a hint to use `firmware none`), the command line as UTF-16 load options, the initramfs behind a `LoadFile2` protocol on a handle with the `LINUX_EFI_INITRD_MEDIA_GUID` vendor-media device path, which the Linux stub reads. If it fails or returns the firmware halts: a requested kernel never falls through to a disk. A guest reset places the payload again.
+- Boot manager (no kernel given): `BootNext`, then `BootOrder`/`Boot####` (device path to a file, partial paths searched on every volume, optional data = load options), then `\EFI\BOOT\BOOTX64.EFI` on every file system; `BootCurrent` is set.
 
 Not implemented: Graphics Output, USB/network/PCI I/O protocols, file writes, Secure Boot and authenticated variables, EFI_MEMORY_ATTRIBUTES_TABLE, SetTime, multi-instance device paths, key-notify callbacks. Verified: the Linux EFI stub, Debian GRUB 2.12, Alpine GRUB 2.14 booting Xen 4.21 through `multiboot2` (see 18) and Xen's `xen.efi` started by the boot manager (it reads its `xen.cfg`, kernel and initramfs from the ESP). Known failing: `xen.efi` started by GRUB's `chainloader` (`Couldn't obtain the File System Protocol Interface`, the `DeviceHandle` GRUB sets). Fedora's shim 16.1 and GRUB 2.12 boot through `\EFI\BOOT\BOOTX64.EFI` (shim reads `LoadedImage.FilePath` as text and expects the file nodes only, without the device nodes; the firmware strips them, `LoadedImageDevicePath` keeps the full path) and the `fbx64`/`BOOTX64.CSV` fallback creates the boot entry. Secure Boot is off, so the ShimLock/MOK enrolment paths are still not exercised.
 
