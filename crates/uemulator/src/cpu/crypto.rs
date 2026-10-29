@@ -188,12 +188,58 @@ pub(super) fn aes_key_generation_assist(source: u128, round_constant: u8) -> u12
 }
 
 /// pclmulqdq's multiplication: the 128-bit carry-less (GF(2)[x]) product of two 64-bit values.
+/// Guests run CRC32 and GHASH over this one instruction (the kernel's crc32 on a Zen 4 CPU model
+/// does it on 512-bit vectors), so it uses the host's own carry-less multiply where there is one.
 pub(super) fn carry_less_multiply(a: u64, b: u64) -> u128 {
-    let mut product = 0u128;
-    for bit in 0..u64::BITS {
-        if (b >> bit) & 1 != 0 {
-            product ^= (a as u128) << bit;
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // `pmull` is part of the `aes` feature, which Apple Silicon targets enable by default.
+        // SAFETY: the feature the intrinsic needs is enabled for the whole build.
+        return unsafe { core::arch::aarch64::vmull_p64(a, b) };
+    }
+    #[cfg(all(target_arch = "x86_64", not(freestanding)))]
+    {
+        if std::arch::is_x86_feature_detected!("pclmulqdq") {
+            // SAFETY: the CPU has the instruction, just checked.
+            return unsafe { carry_less_multiply_pclmulqdq(a, b) };
         }
+    }
+    #[allow(unreachable_code)]
+    carry_less_multiply_portable(a, b)
+}
+
+#[cfg(all(target_arch = "x86_64", not(freestanding)))]
+#[target_feature(enable = "pclmulqdq", enable = "sse2")]
+unsafe fn carry_less_multiply_pclmulqdq(a: u64, b: u64) -> u128 {
+    use core::arch::x86_64::{_mm_clmulepi64_si128, _mm_cvtsi64_si128, _mm_storeu_si128};
+    let mut bytes = [0u8; 16];
+    // SAFETY: the caller checked for pclmulqdq; `bytes` holds the 16 bytes the store writes.
+    unsafe {
+        let product =
+            _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(a as i64), _mm_cvtsi64_si128(b as i64));
+        _mm_storeu_si128(bytes.as_mut_ptr().cast(), product);
+    }
+    u128::from_le_bytes(bytes)
+}
+
+/// Bits of `b` consumed per step of the portable multiply.
+const CLMUL_WINDOW_BITS: u32 = 4;
+
+/// The multiply for hosts without a carry-less multiply instruction: `a * k` for every 4-bit `k`
+/// is tabulated once, then each nibble of `b` adds one table entry, shifted into place.
+pub(super) fn carry_less_multiply_portable(a: u64, b: u64) -> u128 {
+    const WINDOW_VALUES: usize = 1 << CLMUL_WINDOW_BITS;
+    let mut table = [0u128; WINDOW_VALUES];
+    for window in 1..WINDOW_VALUES {
+        // Each entry is the entry for the window without its lowest set bit, plus `a` shifted by
+        // that bit's position.
+        let lowest = window.trailing_zeros();
+        table[window] = table[window & (window - 1)] ^ ((a as u128) << lowest);
+    }
+    let mut product = 0u128;
+    for step in 0..u64::BITS / CLMUL_WINDOW_BITS {
+        let window = (b >> (step * CLMUL_WINDOW_BITS)) as usize & (WINDOW_VALUES - 1);
+        product ^= table[window] << (step * CLMUL_WINDOW_BITS);
     }
     product
 }
@@ -378,4 +424,71 @@ pub(super) fn sha256_message_2(partial: u128, latest: u128) -> u128 {
     let w18 = dword_from_top(partial, 1).wrapping_add(sha256_small_sigma1(w16));
     let w19 = dword_from_top(partial, 0).wrapping_add(sha256_small_sigma1(w17));
     vector_from_dwords([w19, w18, w17, w16])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The definition: one shifted copy of `a` per set bit of `b`.
+    fn reference(a: u64, b: u64) -> u128 {
+        (0..u64::BITS)
+            .filter(|bit| (b >> bit) & 1 != 0)
+            .fold(0, |product, bit| product ^ ((a as u128) << bit))
+    }
+
+    /// Edge values and a deterministic spread of the rest.
+    fn operands() -> Vec<u64> {
+        let mut values = vec![
+            0,
+            1,
+            2,
+            3,
+            0x1b,
+            u64::MAX,
+            1 << 63,
+            (1 << 63) | 1,
+            0x5555_5555_5555_5555,
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..40 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push(state);
+        }
+        values
+    }
+
+    #[test]
+    fn the_portable_multiply_is_the_definition() {
+        for &a in &operands() {
+            for &b in &operands() {
+                assert_eq!(
+                    carry_less_multiply_portable(a, b),
+                    reference(a, b),
+                    "{a:#x} {b:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_multiply_the_cpu_uses_is_the_definition() {
+        for &a in &operands() {
+            for &b in &operands() {
+                assert_eq!(carry_less_multiply(a, b), reference(a, b), "{a:#x} {b:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn carry_less_multiplication_known_products() {
+        assert_eq!(carry_less_multiply(3, 3), 5, "(x+1)^2 = x^2 + 1");
+        assert_eq!(
+            carry_less_multiply(u64::MAX, u64::MAX),
+            0x5555_5555_5555_5555_5555_5555_5555_5555
+        );
+        assert_eq!(carry_less_multiply(1 << 63, 1 << 63), 1 << 126);
+    }
 }
