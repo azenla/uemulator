@@ -119,4 +119,126 @@ mod tests {
         );
         assert!(store.get(&variable_key("Boot0000")).is_some());
     }
+
+    use uemulator::{EmulatedMachine, ExitReason, MachineConfig};
+
+    const DOS_HEADER_BYTES: usize = 0x40;
+    const OPTIONAL_HEADER_BYTES: usize = 0xf0;
+    const HEADERS_BYTES: usize = 0x200;
+    const CODE_RVA: usize = 0x1000;
+    const IMAGE_BYTES: usize = 0x2000;
+    const SUBSYSTEM_EFI_APPLICATION: u16 = 10;
+    /// Written with `hack/asm.sh`. An EFI application that echoes its load options to the 16550,
+    /// then asks the `LINUX_EFI_INITRD_MEDIA_GUID` `LoadFile2` for the initramfs size and echoes
+    /// the low two bytes of it, then halts with interrupts off.
+    const ECHO_LOAD_OPTIONS_AND_INITRD_SIZE: [u8; 160] = [
+        0x48, 0x83, 0xec, 0x48, 0x48, 0x8b, 0x5a, 0x60, 0x48, 0x8d, 0x15, 0x71, 0x00, 0x00, 0x00,
+        0x4c, 0x8d, 0x44, 0x24, 0x20, 0xff, 0x93, 0x98, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x44, 0x24,
+        0x20, 0x8b, 0x48, 0x30, 0x48, 0x8b, 0x70, 0x38, 0x66, 0xba, 0xf8, 0x03, 0xfc, 0x85, 0xc9,
+        0x74, 0x06, 0xac, 0xee, 0xff, 0xc9, 0xeb, 0xf6, 0x48, 0x8d, 0x0d, 0x54, 0x00, 0x00, 0x00,
+        0x31, 0xd2, 0x4c, 0x8d, 0x44, 0x24, 0x20, 0xff, 0x93, 0x40, 0x01, 0x00, 0x00, 0x48, 0x8b,
+        0x4c, 0x24, 0x20, 0x48, 0x8b, 0x01, 0x31, 0xd2, 0x45, 0x31, 0xc0, 0x4c, 0x8d, 0x4c, 0x24,
+        0x28, 0x48, 0xc7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00, 0x48, 0xc7, 0x44, 0x24, 0x20,
+        0x00, 0x00, 0x00, 0x00, 0xff, 0xd0, 0x48, 0x8b, 0x44, 0x24, 0x28, 0x66, 0xba, 0xf8, 0x03,
+        0xee, 0x48, 0xc1, 0xe8, 0x08, 0xee, 0xfa, 0xf4, 0xa1, 0x31, 0x1b, 0x5b, 0x62, 0x95, 0xd2,
+        0x11, 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b, 0xc1, 0xc0, 0x06, 0x40, 0xb3, 0xfc,
+        0x3e, 0x40, 0x99, 0x6d, 0x4a, 0x6c, 0x87, 0x24, 0xe0, 0x6d,
+    ];
+
+    fn put(bytes: &mut [u8], at: usize, value: &[u8]) {
+        bytes[at..at + value.len()].copy_from_slice(value);
+    }
+
+    /// A one-section PE32+ x86-64 EFI application whose entry point is `code`, which is all the
+    /// firmware's loader needs of a Linux EFI-stub kernel.
+    fn efi_application(code: &[u8]) -> Vec<u8> {
+        let mut image = vec![0u8; HEADERS_BYTES + 0x200];
+        let coff = DOS_HEADER_BYTES + 4;
+        let optional = coff + 20;
+        let section = optional + OPTIONAL_HEADER_BYTES;
+        put(&mut image, 0, b"MZ");
+        put(&mut image, 0x3c, &(DOS_HEADER_BYTES as u32).to_le_bytes());
+        put(&mut image, DOS_HEADER_BYTES, b"PE\0\0");
+        put(&mut image, coff, &0x8664u16.to_le_bytes());
+        put(&mut image, coff + 2, &1u16.to_le_bytes());
+        put(
+            &mut image,
+            coff + 16,
+            &(OPTIONAL_HEADER_BYTES as u16).to_le_bytes(),
+        );
+        put(&mut image, optional, &0x20bu16.to_le_bytes());
+        put(&mut image, optional + 16, &(CODE_RVA as u32).to_le_bytes());
+        put(&mut image, optional + 32, &0x1000u32.to_le_bytes());
+        put(&mut image, optional + 36, &0x200u32.to_le_bytes());
+        put(
+            &mut image,
+            optional + 56,
+            &(IMAGE_BYTES as u32).to_le_bytes(),
+        );
+        put(
+            &mut image,
+            optional + 60,
+            &(HEADERS_BYTES as u32).to_le_bytes(),
+        );
+        put(
+            &mut image,
+            optional + 68,
+            &SUBSYSTEM_EFI_APPLICATION.to_le_bytes(),
+        );
+        put(&mut image, optional + 108, &16u32.to_le_bytes());
+        put(&mut image, section + 8, &(code.len() as u32).to_le_bytes());
+        put(&mut image, section + 12, &(CODE_RVA as u32).to_le_bytes());
+        put(&mut image, section + 16, &0x200u32.to_le_bytes());
+        put(
+            &mut image,
+            section + 20,
+            &(HEADERS_BYTES as u32).to_le_bytes(),
+        );
+        image[HEADERS_BYTES..HEADERS_BYTES + code.len()].copy_from_slice(code);
+        image
+    }
+
+    fn utf16_bytes(text: &str) -> Vec<u8> {
+        utf16_nul(text)
+    }
+
+    #[test]
+    fn the_firmware_boots_the_kernel_it_is_given_with_its_command_line_and_initramfs() {
+        const INITRD_BYTES: usize = 0x1234;
+        let cmdline = "console=hvc0 uefi-test";
+        let mut machine = EmulatedMachine::new(
+            MachineConfig::new()
+                .uefi_firmware(IMAGE)
+                .kernel(efi_application(&ECHO_LOAD_OPTIONS_AND_INITRD_SIZE))
+                .initrd(vec![0x49; INITRD_BYTES])
+                .cmdline(cmdline)
+                .memory_mib(64)
+                .reboot(false),
+        )
+        .expect("config is valid");
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = output.clone();
+        machine
+            .console()
+            .on_output(move |bytes| sink.lock().unwrap().extend_from_slice(bytes));
+        let stop = machine.stop_handle();
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            stop.stop();
+        });
+        machine.start().expect("machine starts");
+        let exit = machine.wait();
+        drop(watchdog);
+        let output = output.lock().unwrap().clone();
+        let mut expected = utf16_bytes(cmdline);
+        expected.extend_from_slice(&(INITRD_BYTES as u16).to_le_bytes());
+        assert!(
+            output
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "load options and initramfs size not echoed: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(exit, ExitReason::Shutdown);
+    }
 }
