@@ -74,6 +74,15 @@ const host = {
       Atomics.wait(control, CTRL.HEAD, head, IDLE_WAIT_MS);
     }
   },
+  host_random(ptr, len) {
+    // getRandomValues takes at most 65536 bytes per call and refuses a view on shared memory.
+    const MAX_BYTES = 65536;
+    for (let offset = 0; offset < len; offset += MAX_BYTES) {
+      const piece = new Uint8Array(Math.min(MAX_BYTES, len - offset));
+      crypto.getRandomValues(piece);
+      memoryBytes(ptr + offset, piece.length).set(piece);
+    }
+  },
   host_now_ms() {
     return performance.now();
   },

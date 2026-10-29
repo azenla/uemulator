@@ -133,6 +133,11 @@ pub struct HardwareArgs {
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
         value_name = "BOOL")]
     pub disable_jit: Option<bool>,
+    /// Leave out the virtio-rng device that feeds the guest's entropy pool from the host;
+    /// `--disable-rng=false` turns it back on
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
+        value_name = "BOOL")]
+    pub disable_rng: Option<bool>,
     /// Add an AMD IOMMU (AMD-Vi): DMA of every PCI function and interrupts through the I/O APIC
     /// and MSI go through it once the guest enables it; `--iommu=false` turns it back off
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
@@ -274,6 +279,7 @@ pub struct Settings {
     pub append: Option<String>,
     pub no_reboot: bool,
     pub disable_jit: bool,
+    pub disable_rng: bool,
     pub iommu: bool,
     // The arrays come last: TOML wants every plain value before the first table.
     pub consoles: Vec<ConsoleArg>,
@@ -364,6 +370,9 @@ impl Settings {
         }
         if let Some(disable_jit) = hardware.disable_jit {
             self.disable_jit = disable_jit;
+        }
+        if let Some(disable_rng) = hardware.disable_rng {
+            self.disable_rng = disable_rng;
         }
         if let Some(iommu) = hardware.iommu {
             self.iommu = iommu;
@@ -624,6 +633,7 @@ mod tests {
         assert_eq!(settings.memory, Some(1024));
         assert_eq!(settings.cmdline.as_deref(), Some("quiet"));
         assert!(settings.disable_jit);
+        assert!(!settings.disable_rng, "untouched");
         assert_eq!(settings.disks.len(), 4);
         assert_eq!(settings.disks[3], disk("d", false));
         assert_eq!(settings.networks.len(), 3);
@@ -668,6 +678,7 @@ mod tests {
             append: None,
             no_reboot: true,
             disable_jit: false,
+            disable_rng: true,
             iommu: true,
             consoles: vec![ConsoleArg::Virtio, ConsoleArg::Serial],
             disks: vec![disk("/x/disk-0.img", false), disk("/y.iso", true)],

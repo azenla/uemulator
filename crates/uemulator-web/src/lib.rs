@@ -45,6 +45,8 @@ unsafe extern "C" {
     fn host_idle();
     /// Milliseconds on a monotonic clock (`performance.now()`), fractional.
     fn host_now_ms() -> f64;
+    /// Fills `ptr..ptr+len` with cryptographically random bytes (`crypto.getRandomValues`).
+    fn host_random(ptr: *mut u8, len: usize);
     /// Emulator diagnostics (the library's `log` hook).
     fn host_log(ptr: *const u8, len: usize);
 }
@@ -122,6 +124,8 @@ pub unsafe extern "C" fn uw_create(
         .host_clock(|| (unsafe { host_now_ms() } * NS_PER_MS) as u64)
         .unix_time(unix_time as u64)
         .log(|message| unsafe { host_log(message.as_ptr(), message.len()) })
+        // virtio-rng feeds the guest's entropy pool from the browser's.
+        .entropy(|bytes| unsafe { host_random(bytes.as_mut_ptr(), bytes.len()) })
         .poll(poll);
     if initrd_len != 0 {
         config = config.initrd(initrd);

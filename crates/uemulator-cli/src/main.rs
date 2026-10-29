@@ -1003,6 +1003,9 @@ mod tests {
         assert_eq!(hardware(&["--disable-jit"]).disable_jit, Some(true));
         assert_eq!(hardware(&["--disable-jit=true"]).disable_jit, Some(true));
         assert_eq!(hardware(&["--disable-jit=false"]).disable_jit, Some(false));
+        assert_eq!(hardware(&[]).disable_rng, None);
+        assert_eq!(hardware(&["--disable-rng"]).disable_rng, Some(true));
+        assert_eq!(hardware(&["--disable-rng=false"]).disable_rng, Some(false));
         assert_eq!(hardware(&[]).iommu, None);
         assert_eq!(hardware(&["--iommu"]).iommu, Some(true));
         assert_eq!(hardware(&["--iommu=false"]).iommu, Some(false));

@@ -149,6 +149,7 @@ fn build_config(
         cfg = cfg.unix_time(t);
     }
     cfg = cfg.random_seed(host_random_seed());
+    cfg = cfg.rng(!settings.disable_rng);
     if settings.disable_jit {
         cfg = cfg.jit(JitMode::Off);
     }

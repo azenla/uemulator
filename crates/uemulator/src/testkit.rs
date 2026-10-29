@@ -427,9 +427,11 @@ pub(crate) fn run_machine(
 ) -> MachineRun {
     let config = configure(
         MachineConfig::new()
-            // Tests are deterministic and never wait out a guest timer; one that wants the host
-            // clock asks for it in `configure`.
+            // Tests are deterministic and never wait out a guest timer, and the device layout is
+            // exactly what a test configures; one that wants the host clock or the entropy
+            // device asks for it in `configure`.
             .clock(ClockMode::Virtual)
+            .rng(false)
             .kernel(kernel)
             .memory_mib(64)
             .jit(jit)

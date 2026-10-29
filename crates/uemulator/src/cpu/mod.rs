@@ -32,7 +32,7 @@ mod svm;
 mod sys;
 #[cfg(test)]
 pub(crate) mod test_support;
-mod xsave;
+pub(crate) mod xsave;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

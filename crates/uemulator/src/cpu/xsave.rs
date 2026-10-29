@@ -125,14 +125,20 @@ impl Layout {
     }
 }
 
+/// One step of SplitMix64: the deterministic generator behind rdrand and, under `--verify`,
+/// virtio-rng.
+pub(crate) fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(SPLITMIX_GAMMA);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(SPLITMIX_MULTIPLY_1);
+    z = (z ^ (z >> 27)).wrapping_mul(SPLITMIX_MULTIPLY_2);
+    z ^ (z >> 31)
+}
+
 impl Cpu {
     /// Next value of the rdrand/rdseed generator. Deterministic given `MachineConfig::random_seed`.
     pub(super) fn next_random(&mut self) -> u64 {
-        self.rng_state = self.rng_state.wrapping_add(SPLITMIX_GAMMA);
-        let mut z = self.rng_state;
-        z = (z ^ (z >> 30)).wrapping_mul(SPLITMIX_MULTIPLY_1);
-        z = (z ^ (z >> 27)).wrapping_mul(SPLITMIX_MULTIPLY_2);
-        z ^ (z >> 31)
+        splitmix64(&mut self.rng_state)
     }
 
     /// 0F C7 /6 (rdrand) and /7 (rdseed), register forms only. Always succeeds: CF=1 and the other

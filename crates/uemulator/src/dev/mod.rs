@@ -16,6 +16,7 @@ mod vblk;
 mod vcons;
 mod virtio;
 mod vnet;
+mod vrng;
 
 use crate::console::ConsoleHandle;
 #[cfg(not(freestanding))]
@@ -37,6 +38,8 @@ use vblk::VirtioBlk;
 use vcons::VirtioConsole;
 use virtio::Transport;
 use vnet::VirtioNet;
+use vrng::VirtioRng;
+pub(crate) use vrng::{EntropyFn, RngSource, host_entropy};
 
 /// PIC wiring: IRQ lines used by the legacy devices we model.
 const IRQ_PIT: u8 = 0;
@@ -144,7 +147,7 @@ enum Source {
 }
 
 /// What to attach to the PCI bus; every device is optional and may repeat. Functions take slots
-/// (and legacy IRQ lines) in this order: virtio consoles, disks, nets, each in list order.
+/// (and legacy IRQ lines) in this order: virtio consoles, disks, nets, then the entropy source, each in list order.
 #[derive(Default)]
 pub(crate) struct DevConfig {
     #[cfg(not(freestanding))]
@@ -160,6 +163,8 @@ pub(crate) struct DevConfig {
     pub key_value_store: Option<SharedKeyValueStore>,
     /// How many vCPUs, so how many local APICs; 0 is taken as 1 (the default).
     pub cpus: usize,
+    /// Adds a virtio-rng function, last in slot order, fed by this source.
+    pub rng: Option<RngSource>,
 }
 
 /// Most virtio functions one machine can hold (PCI slots 1..=31).
@@ -253,7 +258,7 @@ fn civil(days_since_unix_epoch: i64) -> (i64, u64, u64) {
 
 impl Devices {
     pub fn new(console: ConsoleHandle, cfg: DevConfig) -> Self {
-        // Order decides PCI slot and legacy IRQ: consoles, disks, nets.
+        // Order decides PCI slot and legacy IRQ: consoles, disks, nets, rng.
         let mut virtio_devices = Vec::new();
         let mut uart_peer_console = None;
         for (position, handle) in cfg.virtio_consoles.into_iter().enumerate() {
@@ -268,6 +273,9 @@ impl Devices {
         }
         for (mac, handle) in cfg.nets {
             virtio_devices.push(Transport::new(Box::new(VirtioNet::new(mac, handle))));
+        }
+        if let Some(source) = cfg.rng {
+            virtio_devices.push(Transport::new(Box::new(VirtioRng::new(source))));
         }
         #[cfg(not(freestanding))]
         let boot_unix = std::time::SystemTime::now()
@@ -1738,6 +1746,27 @@ mod tests {
             "reset control register unchanged"
         );
         assert_eq!(inp(&mut dev, PCI_CONFIG_PORT_FIRST, 4), 0x8000_0400);
+    }
+
+    #[test]
+    fn the_entropy_device_appears_on_the_pci_bus_as_virtio_device_1044() {
+        const PCI_ID_REGISTER: u32 = 0;
+        const ENTROPY_PCI_DEVICE_ID: u32 = 0x1044;
+        let mut dev = Devices::new(
+            ConsoleHandle::default(),
+            DevConfig {
+                rng: Some(RngSource::Seeded(1)),
+                ..Default::default()
+            },
+        );
+        out(
+            &mut dev,
+            PCI_CONFIG_PORT_FIRST,
+            4,
+            PCI_ENABLE | 1 << SLOT_SHIFT | PCI_ID_REGISTER,
+        );
+        let id = inp(&mut dev, PCI_CONFIG_PORT_FIRST + 4, 4);
+        assert_eq!(id, ENTROPY_PCI_DEVICE_ID << 16 | VIRTIO_VENDOR);
     }
 
     #[test]

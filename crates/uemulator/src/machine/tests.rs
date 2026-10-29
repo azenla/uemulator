@@ -814,11 +814,34 @@ mod multiple_devices {
         assert!(message.contains("31"), "{message}");
         let mut config = MachineConfig::new()
             .kernel(fake_bzimage(&[0xf4]))
-            .console(ConsoleKind::Serial);
+            .console(ConsoleKind::Serial)
+            .rng(false);
         for _ in 0..MAX_VIRTIO_FUNCTIONS {
             config = config.net(MAC);
         }
         assert!(EmulatedMachine::new(config).is_ok());
+    }
+
+    #[test]
+    fn the_entropy_device_takes_a_pci_slot_like_any_other() {
+        let full = |rng: bool| {
+            let mut config = MachineConfig::new()
+                .kernel(fake_bzimage(&[0xf4]))
+                .console(ConsoleKind::Serial)
+                .rng(rng)
+                .entropy(|bytes| bytes.fill(1));
+            for _ in 0..MAX_VIRTIO_FUNCTIONS {
+                config = config.net(MAC);
+            }
+            EmulatedMachine::new(config)
+        };
+        assert!(full(false).is_ok());
+        assert!(expect_config_error(full(true)).contains("entropy"));
+    }
+
+    #[test]
+    fn the_entropy_device_is_on_by_default() {
+        assert!(MachineConfig::new().rng);
     }
 }
 

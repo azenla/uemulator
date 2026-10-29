@@ -10,8 +10,9 @@ use crate::boot::{self, BootState};
 use crate::console::ConsoleHandle;
 use crate::cpu::smp::Smp;
 use crate::cpu::{Cpu, DEFAULT_RANDOM_SEED};
+use crate::dev::host_entropy;
 use crate::dev::kv::SharedKeyValueStore;
-use crate::dev::{DevConfig, MAX_VIRTIO_FUNCTIONS};
+use crate::dev::{DevConfig, EntropyFn, MAX_VIRTIO_FUNCTIONS, RngSource};
 #[cfg(not(freestanding))]
 use crate::disk::Disk;
 use crate::kv::{KeyValueStore, MemoryKeyValueStore};
@@ -145,6 +146,8 @@ pub struct MachineConfig {
     log: Option<LogFn>,
     poll: Option<HostPollFn>,
     host_clock: Option<HostClockFn>,
+    rng: bool,
+    entropy: Option<EntropyFn>,
     debug: bool,
     verify: bool,
     unix_time: Option<u64>,
@@ -176,6 +179,8 @@ impl Default for MachineConfig {
             log: None,
             poll: None,
             host_clock: None,
+            rng: true,
+            entropy: None,
             debug: false,
             verify: false,
             unix_time: None,
@@ -407,6 +412,23 @@ impl MachineConfig {
     }
 }
 
+impl MachineConfig {
+    /// Whether the machine has a virtio-rng device (default on), which keeps the guest's entropy
+    /// pool fed from the host. Needs an entropy source: `std` hosts have one, freestanding ones
+    /// (WebAssembly, UEFI) must give `entropy` or the machine goes without the device. Under
+    /// `verify_jit` the device serves a seeded stream so that both CPUs see the same bytes.
+    pub fn rng(mut self, on: bool) -> Self {
+        self.rng = on;
+        self
+    }
+
+    /// Where virtio-rng gets its bytes instead of the host OS: called with the buffer to fill.
+    pub fn entropy(mut self, f: impl Fn(&mut [u8]) + Send + Sync + 'static) -> Self {
+        self.entropy = Some(Arc::new(f));
+        self
+    }
+}
+
 /// Cloneable, thread-safe way to end a running machine. The vCPU polls the flag at its event
 /// ticks and while idle, so `wait()` returns `Stopped` shortly after, not instantly.
 #[derive(Clone)]
@@ -459,6 +481,7 @@ struct RebootImage {
     cpus: usize,
     acpi: Option<AcpiConfig>,
     key_value_store: Option<SharedKeyValueStore>,
+    rng: Option<RngSource>,
     /// Set when the machine boots UEFI firmware: that image and handoff replace the kernel.
     uefi: Option<(Vec<u8>, boot::FirmwareParams)>,
 }
@@ -632,6 +655,8 @@ fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConf
             Arc::new(Mutex::new(store))
         }),
         cpus: main.cpus,
+        // Verification always runs on a seeded stream, so cloning gives the twin the same bytes.
+        rng: main.rng.clone(),
     };
     (devices, twin_uart)
 }
@@ -705,6 +730,7 @@ impl Vcpu {
                 iommu: image.iommu,
                 key_value_store: image.key_value_store.clone(),
                 cpus: image.cpus,
+                rng: image.rng.clone(),
             };
         }
     }
@@ -762,7 +788,8 @@ impl Vcpu {
         // once, so verification always runs on virtual time (a realtime main CPU sleeps in 2 ms
         // slices and reports a bogus pre-step divergence).
         let lockstep = verify_twin.is_some() && cpu.jit.is_some();
-        if self.clock == ClockMode::Realtime && !lockstep {
+        // Verification is the one deterministic mode, with or without generated code to compare.
+        if self.clock == ClockMode::Realtime && !self.verify {
             cpu.wall_clock = self
                 .host_clock
                 .clone()
@@ -879,10 +906,24 @@ impl EmulatedMachine {
             .iter()
             .filter(|kind| **kind == ConsoleKind::Virtio)
             .count();
-        let functions = virtio_console_count + disk_count + cfg.net_macs.len();
+        // Under verify the stream is seeded, so the twin's device repeats it byte for byte.
+        let rng = if !cfg.rng {
+            None
+        } else if cfg.verify {
+            Some(RngSource::Seeded(
+                cfg.random_seed.unwrap_or(DEFAULT_RANDOM_SEED),
+            ))
+        } else {
+            cfg.entropy
+                .clone()
+                .or_else(host_entropy)
+                .map(RngSource::Host)
+        };
+        let functions =
+            virtio_console_count + disk_count + cfg.net_macs.len() + rng.is_some() as usize;
         if functions > MAX_VIRTIO_FUNCTIONS {
             return Err(Error::BadConfig(format!(
-                "{functions} virtio devices configured (consoles, disks and NICs); \
+                "{functions} virtio devices configured (consoles, disks, NICs and the entropy source); \
                  the PCI bus has room for {MAX_VIRTIO_FUNCTIONS}"
             )));
         }
@@ -996,6 +1037,7 @@ impl EmulatedMachine {
             iommu: cfg.iommu,
             key_value_store: cfg.key_value_store.clone(),
             cpus: cfg.cpus,
+            rng: rng.clone(),
         };
         let boot_ram = cfg.verify.then(|| ram.clone());
         // Verification cannot restart (the twin's devices cannot be rebuilt in step), so it keeps
@@ -1012,6 +1054,7 @@ impl EmulatedMachine {
                     cpus: cfg.cpus,
                     acpi,
                     key_value_store: cfg.key_value_store,
+                    rng: devcfg.rng.clone(),
                     uefi,
                 }
             });
