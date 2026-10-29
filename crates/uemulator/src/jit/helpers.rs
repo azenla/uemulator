@@ -326,6 +326,75 @@ pub(crate) fn ends_block(insn: &Insn) -> bool {
     }
 }
 
+/// For each instruction of a block, whether the lazy flags it records must really be stored.
+/// A record is dead when a later instruction overwrites all the arithmetic flags before anything
+/// can look at them, so only runs of register-only ALU instructions are ever skipped. What can
+/// look: a flag reader (jcc, setcc, cmov, adc, inc, a helper-executed instruction, ...), anything
+/// that can fault (an exception pushes the flags), and the end of the block (the successor may
+/// read them). Only the register-only flag writers listed in `writes_all_flags` get `false`;
+/// the answer for every other instruction is `true`, as is the answer for a writer whose
+/// flags are still wanted.
+pub(crate) fn flag_record_needed(insns: &[Insn]) -> Vec<bool> {
+    let mut needed = vec![true; insns.len()];
+    let mut live = true;
+    for (index, insn) in insns.iter().enumerate().rev() {
+        if writes_all_flags(insn) {
+            needed[index] = live;
+            live = false;
+        } else if !leaves_flags_alone(insn) {
+            live = true;
+        }
+    }
+    needed
+}
+
+const ALU_ADC: u16 = 2;
+const ALU_SBB: u16 = 3;
+
+/// Register-only instructions that set every arithmetic flag from their result alone, reading
+/// none: add/or/and/sub/xor/cmp and test with a register or immediate source and a register
+/// destination. adc and sbb read CF; every memory form can fault.
+fn writes_all_flags(insn: &Insn) -> bool {
+    if insn.lock {
+        return false;
+    }
+    let register_form = !insn.has_modrm || insn.md == 3;
+    match insn.op {
+        // add/or/adc/sbb/and/sub/xor/cmp in the forms r/m,r (0, 1), r,r/m (2, 3), al,imm8 (4)
+        // and eax,imm32 (5)
+        0x00..=0x3f if insn.op & 7 < 6 => {
+            register_form && !matches!((insn.op >> 3) & 7, ALU_ADC | ALU_SBB)
+        }
+        // group 1 with an immediate: /2 and /3 are adc and sbb
+        0x80 | 0x81 | 0x83 => register_form && !matches!(insn.reg & 7, 2 | 3),
+        // test r/m,r and test al/eax,imm
+        0x84 | 0x85 | 0xa8 | 0xa9 => register_form,
+        // group 3: /0 and /1 are test r/m,imm
+        0xf6 | 0xf7 => register_form && insn.reg & 7 <= 1,
+        _ => false,
+    }
+}
+
+/// Register-only instructions that neither read nor write flags and cannot fault.
+fn leaves_flags_alone(insn: &Insn) -> bool {
+    if insn.lock || insn.rep != 0 {
+        return false;
+    }
+    match insn.op {
+        // mov r/m,r and r,r/m (register forms), mov r,imm, mov r/m,imm (register form)
+        0x88..=0x8b => insn.md == 3,
+        0xb0..=0xbf => true,
+        0xc6 | 0xc7 => insn.md == 3 && insn.reg & 7 == 0,
+        // lea only computes an address (its register form is #UD)
+        0x8d => insn.md != 3,
+        // movsxd, movzx and movsx from a register
+        0x63 | 0x1b6 | 0x1b7 | 0x1be | 0x1bf => insn.md == 3,
+        // cwde/cdqe and cdq/cqo
+        0x98 | 0x99 => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The block-ending set, the clock-reading set, the exit-code layout and the helper ABI that
@@ -735,6 +804,82 @@ mod tests {
             assert_eq!(std::mem::size_of::<LoadResult>(), 16);
             assert_eq!(std::mem::offset_of!(LoadResult, val), 0);
             assert_eq!(std::mem::offset_of!(LoadResult, status), 8);
+        }
+    }
+
+    mod flag_records {
+        use super::*;
+
+        /// Decodes a block from concatenated instruction encodings.
+        fn decode_all(code: &[u8]) -> Vec<Insn> {
+            let mut insns = Vec::new();
+            let mut offset = 0;
+            while offset < code.len() {
+                let insn = decode::decode(&code[offset..]).expect("valid encoding");
+                offset += insn.len as usize;
+                insns.push(insn);
+            }
+            insns
+        }
+
+        const ADD_RAX_RCX: [u8; 3] = [0x48, 0x01, 0xc8];
+        const ADD_RDX_RSI: [u8; 3] = [0x48, 0x01, 0xf2];
+        const CMP_RAX_RCX: [u8; 3] = [0x48, 0x39, 0xc8];
+        const MOV_RAX_RCX: [u8; 3] = [0x48, 0x89, 0xc8];
+        const LEA_RAX_RBX_8: [u8; 4] = [0x48, 0x8d, 0x43, 0x08];
+        const MOVZX_EAX_CL: [u8; 3] = [0x0f, 0xb6, 0xc1];
+        const MOV_RAX_FROM_RBX: [u8; 3] = [0x48, 0x8b, 0x03];
+        const ADD_TO_RBX_MEMORY: [u8; 3] = [0x48, 0x01, 0x03];
+        const ADC_RDX_RSI: [u8; 3] = [0x48, 0x11, 0xf2];
+        const INC_RAX: [u8; 3] = [0x48, 0xff, 0xc0];
+        const PUSH_RAX: [u8; 1] = [0x50];
+        const JNZ_SELF: [u8; 2] = [0x75, 0xfe];
+        const HLT: [u8; 1] = [0xf4];
+
+        fn needed(parts: &[&[u8]]) -> Vec<bool> {
+            flag_record_needed(&decode_all(&parts.concat()))
+        }
+
+        #[test]
+        fn a_flag_write_overwritten_before_anything_can_look_is_not_needed() {
+            assert_eq!(
+                needed(&[&ADD_RAX_RCX, &ADD_RDX_RSI, &HLT]),
+                [false, true, true]
+            );
+            assert_eq!(
+                needed(&[&ADD_RAX_RCX, &CMP_RAX_RCX, &JNZ_SELF]),
+                [false, true, true]
+            );
+            // Instructions that neither touch flags nor can fault do not end the window.
+            assert_eq!(
+                needed(&[
+                    &ADD_RAX_RCX,
+                    &MOV_RAX_RCX,
+                    &LEA_RAX_RBX_8,
+                    &MOVZX_EAX_CL,
+                    &ADD_RDX_RSI,
+                    &HLT
+                ]),
+                [false, true, true, true, true, true]
+            );
+        }
+
+        #[test]
+        fn the_last_flag_write_of_a_block_is_needed_by_the_next_block() {
+            assert_eq!(needed(&[&ADD_RAX_RCX]), [true]);
+            assert_eq!(needed(&[&ADD_RAX_RCX, &ADD_RDX_RSI]), [false, true]);
+        }
+
+        #[test]
+        fn a_flag_write_stays_needed_when_something_can_look_at_it() {
+            // A reader.
+            assert!(needed(&[&ADD_RAX_RCX, &ADC_RDX_RSI, &HLT])[0]);
+            assert!(needed(&[&ADD_RAX_RCX, &INC_RAX, &ADD_RDX_RSI, &HLT])[0]);
+            assert!(needed(&[&ADD_RAX_RCX, &JNZ_SELF])[0]);
+            // A memory access may fault, and the exception frame holds the flags.
+            assert!(needed(&[&ADD_RAX_RCX, &MOV_RAX_FROM_RBX, &ADD_RDX_RSI, &HLT])[0]);
+            assert!(needed(&[&ADD_RAX_RCX, &PUSH_RAX, &ADD_RDX_RSI, &HLT])[0]);
+            assert!(needed(&[&ADD_RAX_RCX, &ADD_TO_RBX_MEMORY, &HLT])[0]);
         }
     }
 }

@@ -333,6 +333,7 @@ pub(crate) fn compile_block(
         inlined: generator.inlined,
         body_offset: generator.body_offset,
         links: generator.links,
+        flag_records_skipped: generator.flag_records_skipped,
     }
 }
 

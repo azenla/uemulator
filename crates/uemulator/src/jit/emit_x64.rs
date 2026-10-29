@@ -262,6 +262,12 @@ pub(crate) struct Gen<'a> {
     link_entry_miss: Option<Label>,
     /// Patchable slots of exits to fixed addresses in the block's own page.
     pub links: Vec<LinkSite>,
+    /// Per instruction: must the lazy flags it sets be recorded (`helpers::flag_record_needed`).
+    flag_record_needed: Vec<bool>,
+    /// The instruction being lowered has a dead flag record, which `store_lazy_op` leaves out.
+    skip_flag_record: bool,
+    /// Flag records left out, for `JitStats`.
+    pub flag_records_skipped: u32,
 }
 
 /// The register embedded in the low three opcode bits (push/pop/mov r, imm), extended by REX.B.
@@ -296,6 +302,9 @@ impl<'a> Gen<'a> {
             body_offset: 0,
             link_entry_miss: None,
             links: Vec::new(),
+            flag_record_needed: flag_record_needed(insns),
+            skip_flag_record: false,
+            flag_records_skipped: 0,
         }
     }
 
@@ -684,7 +693,13 @@ impl<'a> Gen<'a> {
     /// instruction wrote memory after computing its flags: the probe of that store clobbered
     /// them, so they are no longer live.
     fn store_lazy_op(&mut self, op: LazyFlagsOp, size: u8, stored: bool) {
-        self.store_lazy(op, size);
+        if self.skip_flag_record {
+            // A later instruction of the block overwrites these flags before anything can read
+            // them; the host flags (`live`) still serve a jcc that follows.
+            self.flag_records_skipped += 1;
+        } else {
+            self.store_lazy(op, size);
+        }
         self.live = !stored;
     }
 
@@ -1137,6 +1152,7 @@ impl<'a> Gen<'a> {
     /// translation statistics tests rely on.
     fn try_inline(&mut self, index: usize, rip: u64, next: u64) -> bool {
         let insn: Insn = self.insns[index];
+        self.skip_flag_record = !self.flag_record_needed[index];
         let insn_index = index as u32;
         let retired = insn_index + 1;
         let osz = insn.opsize;

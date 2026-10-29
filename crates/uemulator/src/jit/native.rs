@@ -73,6 +73,8 @@ pub(crate) struct CompiledBlock {
     /// those two callers have already done; a direct link skips the stub and so must do them.
     pub body_offset: u32,
     pub links: Vec<LinkSite>,
+    /// Flag records the block leaves out because a later instruction overwrites them.
+    pub flag_records_skipped: u32,
 }
 
 /// A slot in the code buffer and the block it should jump to: `(rip, phys_addr)` of the
@@ -155,6 +157,8 @@ pub(crate) struct JitStats {
     pub linked: u64,
     /// Slots put back to the chain stub because their destination was invalidated.
     pub unlinked: u64,
+    /// Lazy-flag records left out of compiled blocks as dead.
+    pub flag_records_skipped: u64,
 }
 
 pub(crate) const fn jump_cache_mask() -> u64 {
@@ -384,6 +388,7 @@ impl Jit {
             end_rip,
         );
         self.stats.inlined += compiled.inlined as u64;
+        self.stats.flag_records_skipped += compiled.flag_records_skipped as u64;
         self.stats.total += insns.len() as u64;
         let block_offset = self.used_bytes;
         self.exec_mem.write_bytes(block_offset, &compiled.code);
@@ -1272,6 +1277,25 @@ mod tests {
         ] {
             assert_eq!(inlined_in(&[shift, &[0xf4]].concat()), 0, "{shift:x?}");
         }
+    }
+
+    #[test]
+    fn a_flag_write_that_a_later_instruction_overwrites_is_not_recorded() {
+        let _guard = serialize_jit_tests();
+        let translate = |code: &[u8]| {
+            let mut cpu = cpu_running(code);
+            let mut jit = new_unchained_jit();
+            translate_at_code_base(&mut jit, &mut cpu);
+            jit.stats().flag_records_skipped
+        };
+        // add rax, rcx; add rdx, rsi; hlt
+        assert_eq!(translate(&[0x48, 0x01, 0xc8, 0x48, 0x01, 0xf2, 0xf4]), 1);
+        // adc in between reads the first add's carry, a load in between can fault.
+        assert_eq!(translate(&[0x48, 0x01, 0xc8, 0x48, 0x11, 0xf2, 0xf4]), 0);
+        assert_eq!(
+            translate(&[0x48, 0x01, 0xc8, 0x48, 0x8b, 0x03, 0x48, 0x01, 0xf2, 0xf4]),
+            0
+        );
     }
 
     #[test]

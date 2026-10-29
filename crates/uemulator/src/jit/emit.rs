@@ -388,6 +388,12 @@ pub(crate) struct Gen<'a> {
     link_entry_miss: Option<Label>,
     /// Patchable slots of exits to fixed addresses in the block's own page.
     pub links: Vec<LinkSite>,
+    /// Per instruction: must the lazy flags it sets be recorded (`helpers::flag_record_needed`).
+    flag_record_needed: Vec<bool>,
+    /// The instruction being lowered has a dead flag record, which `store_lazy_op` leaves out.
+    skip_flag_record: bool,
+    /// Flag records left out, for `JitStats`.
+    pub flag_records_skipped: u32,
 }
 
 impl<'a> Gen<'a> {
@@ -405,6 +411,9 @@ impl<'a> Gen<'a> {
             body_offset: 0,
             link_entry_miss: None,
             links: Vec::new(),
+            flag_record_needed: flag_record_needed(insns),
+            skip_flag_record: false,
+            flag_records_skipped: 0,
         }
     }
 
@@ -827,7 +836,13 @@ impl<'a> Gen<'a> {
             FlagKind::Inc => LazyFlagsOp::Inc,
             FlagKind::Dec => LazyFlagsOp::Dec,
         };
-        self.store_lazy(lazy_op, operand_size);
+        if self.skip_flag_record {
+            // A later instruction of the block overwrites these flags before anything can read
+            // them; the host flags (`live`) still serve a jcc that follows.
+            self.flag_records_skipped += 1;
+        } else {
+            self.store_lazy(lazy_op, operand_size);
+        }
         self.live = Some(LiveFlags { kind });
     }
 
@@ -1483,6 +1498,7 @@ impl<'a> Gen<'a> {
     /// partial-register merging and go to the interpreter.
     fn try_inline(&mut self, index: usize, rip: u64, next_rip: u64) -> bool {
         let insn: Insn = self.insns[index];
+        self.skip_flag_record = !self.flag_record_needed[index];
         let insn_index = index as u32;
         let retired = insn_index + 1;
         let operand_size = insn.opsize;

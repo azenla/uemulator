@@ -595,3 +595,84 @@ fn logic_flags_ignore_the_stored_second_operand() {
         }
     }
 }
+
+/// Flag writes the JIT leaves out because a later instruction overwrites them
+/// (`helpers::flag_record_needed`): everything that could have looked at the skipped flags
+/// must still see the right ones.
+mod dead_flag_records {
+    use super::*;
+    use crate::jit::diff_tests::{check, check_stop_with, fault};
+
+    const ADD_RAX_RBX: [u8; 3] = [0x48, 0x01, 0xd8];
+    const ADD_RDX_RCX: [u8; 3] = [0x48, 0x01, 0xca];
+    const SUB_RDX_RCX: [u8; 3] = [0x48, 0x29, 0xca];
+    const MOV_R9_RDX: [u8; 3] = [0x49, 0x89, 0xd1];
+    const MOV_RAX_FROM_RSI: [u8; 3] = [0x48, 0x8b, 0x06];
+    const PUSHFQ_POP_R8: [u8; 3] = [0x9c, 0x41, 0x58];
+    const SETC_AL: [u8; 3] = [0x0f, 0x92, 0xc0];
+    const JMP_NEXT_BLOCK: [u8; 2] = [0xeb, 0x00];
+    const HLT: [u8; 1] = [0xf4];
+    /// An address with no page behind it, so a load from it raises #PF.
+    const UNMAPPED: u64 = 0x1_0000_0000;
+
+    /// rax = -1 and rbx = 1: `add rax, rbx` sets CF, ZF and PF, which the flags from the
+    /// seeded start state do not.
+    fn carry_setup(harness: &mut Harness) {
+        seed_registers_and_memory(harness);
+        harness.cpu.gpr[RAX] = u64::MAX;
+        harness.cpu.gpr[RBX] = 1;
+        harness.cpu.gpr[RCX] = 0;
+        harness.cpu.gpr[RDX] = 5;
+        harness.cpu.gpr[RSI] = UNMAPPED;
+    }
+
+    #[test]
+    fn a_flag_write_before_a_faulting_load_is_in_the_exception_state() {
+        // add rax, rbx; mov rax, [rsi] (faults); add rdx, rcx
+        let code = [&ADD_RAX_RBX[..], &MOV_RAX_FROM_RSI, &ADD_RDX_RCX, &HLT].concat();
+        check_stop_with(&code, carry_setup, fault(14, Some(0)));
+    }
+
+    #[test]
+    fn the_last_flag_write_of_a_block_reaches_the_next_block() {
+        // add rax, rbx; add rdx, rcx; jmp +0; setc al   (CF is the second add's: clear)
+        let code = [
+            &ADD_RAX_RBX[..],
+            &ADD_RDX_RCX,
+            &JMP_NEXT_BLOCK,
+            &SETC_AL,
+            &HLT,
+        ]
+        .concat();
+        check_with_setup(&code);
+        // The same with the writers swapped, so the surviving CF is the set one.
+        let code = [
+            &ADD_RDX_RCX[..],
+            &ADD_RAX_RBX,
+            &JMP_NEXT_BLOCK,
+            &SETC_AL,
+            &HLT,
+        ]
+        .concat();
+        check_with_setup(&code);
+    }
+
+    #[test]
+    fn a_skipped_write_followed_by_pushfq_shows_only_the_later_write() {
+        for (first, second) in [(ADD_RAX_RBX, SUB_RDX_RCX), (SUB_RDX_RCX, ADD_RAX_RBX)] {
+            // first; mov r9, rdx (touches no flags); second; pushfq; pop r8
+            let code = [&first[..], &MOV_R9_RDX, &second, &PUSHFQ_POP_R8, &HLT].concat();
+            check_with_setup(&code);
+        }
+    }
+
+    fn check_with_setup(code: &[u8]) {
+        crate::jit::diff_tests::check_with(code, carry_setup);
+    }
+
+    #[test]
+    fn skipped_flag_records_do_not_change_what_a_plain_run_computes() {
+        // The default seeded state, in case `carry_setup` hides a difference.
+        check(&[&ADD_RAX_RBX[..], &ADD_RDX_RCX, &PUSHFQ_POP_R8, &HLT].concat());
+    }
+}
