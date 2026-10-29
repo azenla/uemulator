@@ -526,6 +526,104 @@ fn sar_by_one_clears_overflow() {
     ]);
 }
 
+/// Operand patterns for the narrow shift tests: the sign bit, an all-ones value, the
+/// bit just under the sign, a single low bit, zero, and noise above the operand (which a
+/// narrow shift must neither read nor disturb).
+const NARROW_SHIFT_VALUES: [u64; 6] = [
+    0x1122_3344_5566_8001,
+    0x1122_3344_5566_ffff,
+    0x1122_3344_5566_4040,
+    0x1122_3344_5566_0001,
+    0,
+    0xffff_ffff_ffff_80ff,
+];
+const SHIFT_REGS: [u8; 3] = [4, 5, 7];
+const OPERAND_SIZE_PREFIX: u8 = 0x66;
+
+/// How a narrow shift gets its count.
+#[derive(Clone, Copy)]
+enum ShiftCount {
+    Immediate(u8),
+    One,
+    Cl(u8),
+}
+
+/// `shl|shr|sar` of `al` or `ax` (`reg` is the ModRM /n) for each of `NARROW_SHIFT_VALUES`,
+/// followed by the flags and the register stored to `[rbx + 16 * n]`.
+fn narrow_shifts(word: bool, reg: u8, count: ShiftCount) -> Vec<u8> {
+    const MOV_RAX_IMM64: [u8; 2] = [0x48, 0xb8];
+    const MOV_CL_IMM8: u8 = 0xb1;
+    const PUSHFQ: u8 = 0x9c;
+    const POP_QWORD_RBX_DISP8: [u8; 2] = [0x8f, 0x43];
+    const MOV_RBX_DISP8_RAX: [u8; 3] = [0x48, 0x89, 0x43];
+    const HLT: u8 = 0xf4;
+    const MODRM_REGISTER_RAX: u8 = 0xc0;
+    let mut code = Vec::new();
+    for (slot, value) in NARROW_SHIFT_VALUES.iter().enumerate() {
+        code.extend_from_slice(&MOV_RAX_IMM64);
+        code.extend_from_slice(&value.to_le_bytes());
+        if let ShiftCount::Cl(count) = count {
+            code.extend_from_slice(&[MOV_CL_IMM8, count]);
+        }
+        if word {
+            code.push(OPERAND_SIZE_PREFIX);
+        }
+        let (byte_opcode, one, by_cl) = (0xc0, 0xd0, 0xd2);
+        let opcode = match count {
+            ShiftCount::Immediate(_) => byte_opcode,
+            ShiftCount::One => one,
+            ShiftCount::Cl(_) => by_cl,
+        } | word as u8;
+        code.extend_from_slice(&[opcode, MODRM_REGISTER_RAX | reg << 3]);
+        if let ShiftCount::Immediate(count) = count {
+            code.push(count);
+        }
+        let flags_offset = (slot * 16) as u8;
+        code.push(PUSHFQ);
+        code.extend_from_slice(&POP_QWORD_RBX_DISP8);
+        code.push(flags_offset);
+        code.extend_from_slice(&MOV_RBX_DISP8_RAX);
+        code.push(flags_offset + 8);
+    }
+    code.push(HLT);
+    code
+}
+
+#[test]
+fn narrow_shifts_by_immediate_match_the_interpreter() {
+    for word in [false, true] {
+        let bits = if word { 16 } else { 8 };
+        // Around the operand width, where the count is still below the 0x1f mask, then a count
+        // the CPU masks down (33 -> 1) and zero.
+        for count in (0..=bits + 1).chain([31, 33]) {
+            for reg in SHIFT_REGS {
+                check(&narrow_shifts(word, reg, ShiftCount::Immediate(count)));
+            }
+        }
+    }
+}
+
+#[test]
+fn narrow_shifts_by_one_match_the_interpreter() {
+    for word in [false, true] {
+        for reg in SHIFT_REGS {
+            check(&narrow_shifts(word, reg, ShiftCount::One));
+        }
+    }
+}
+
+#[test]
+fn narrow_shifts_by_cl_match_the_interpreter() {
+    for word in [false, true] {
+        let bits = if word { 16 } else { 8 };
+        for count in (0..=bits + 1).chain([31, 32, 33, 0xff]) {
+            for reg in SHIFT_REGS {
+                check(&narrow_shifts(word, reg, ShiftCount::Cl(count)));
+            }
+        }
+    }
+}
+
 #[test]
 fn shl_by_one_sets_overflow_from_the_top_two_bits() {
     // mov rax, 0x4000000000000000; shl rax, 1; pushfq; pop rcx

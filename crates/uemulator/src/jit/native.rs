@@ -1236,6 +1236,44 @@ mod tests {
         assert_eq!(jit.link_state_len(), (0, 0));
     }
 
+    /// Instructions of the block at `CODE_BASE` that were lowered inline, not counting the final
+    /// `hlt` (which always goes through the interpreter).
+    fn inlined_in(code: &[u8]) -> u64 {
+        let mut cpu = cpu_running(code);
+        let mut jit = new_unchained_jit();
+        translate_at_code_base(&mut jit, &mut cpu);
+        jit.stats().inlined
+    }
+
+    #[test]
+    fn narrow_shifts_by_a_count_below_the_width_are_lowered_inline() {
+        let _guard = serialize_jit_tests();
+        // shr ax, 5 | shl ax, 1 | sar al, 3 | shr al, cl | shl ax, cl | sar ax, cl
+        for shift in [
+            &[0x66, 0xc1, 0xe8, 0x05][..],
+            &[0x66, 0xd1, 0xe0],
+            &[0xc0, 0xf8, 0x03],
+            &[0xd2, 0xe8],
+            &[0x66, 0xd3, 0xe0],
+            &[0x66, 0xd3, 0xf8],
+        ] {
+            assert_eq!(inlined_in(&[shift, &[0xf4]].concat()), 1, "{shift:x?}");
+        }
+    }
+
+    #[test]
+    fn narrow_shifts_by_a_count_at_or_above_the_width_stay_in_the_interpreter() {
+        let _guard = serialize_jit_tests();
+        // shr ax, 16 | shl al, 8 | shr ax, 0
+        for shift in [
+            &[0x66, 0xc1, 0xe8, 0x10][..],
+            &[0xc0, 0xe0, 0x08],
+            &[0x66, 0xc1, 0xe8, 0x00],
+        ] {
+            assert_eq!(inlined_in(&[shift, &[0xf4]].concat()), 0, "{shift:x?}");
+        }
+    }
+
     #[test]
     fn helper_histogram_counts_the_instructions_that_reach_the_interpreter() {
         let _guard = serialize_jit_tests();

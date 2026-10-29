@@ -130,6 +130,8 @@ const ALU_TEST: u8 = 8;
 
 /// ModRM.reg of the shift group (c0/c1/d0..d3): rol, ror, rcl, rcr, shl, shr, sal (an alias of
 /// shl), sar.
+/// Shift counts of 8-, 16- and 32-bit operands are masked to five bits (SDM, SHL).
+const NARROW_SHIFT_COUNT_MASK: u32 = 0x1f;
 const SHIFT_SHL: u8 = 4;
 const SHIFT_SHR: u8 = 5;
 const SHIFT_SAL_ALIAS: u8 = 6;
@@ -1172,8 +1174,12 @@ impl<'a> Gen<'a> {
         self.store_dst(dst, size, false, insn_index, rip)
     }
 
-    /// `shl`/`shr`/`sar` of a 32- or 64-bit operand by an immediate (`count_register` false;
-    /// the count is `immediate`, already masked and non-zero) or by CL. The flags are recorded
+    /// `shl`/`shr`/`sar` of an 8-, 16-, 32- or 64-bit operand by an immediate (`count_register`
+    /// false; the count is `immediate`, already masked and non-zero) or by CL. Narrow operands
+    /// run in W registers on the zero-extended value (sign-extended for `sar`): CL counts up to
+    /// 31 are not masked by the width, and the W-register shifts give the interpreter's answer
+    /// for counts beyond it (result 0 or the sign, CF 0 past the width) without special cases.
+    /// The caller keeps immediate counts below the width, where the CF position is a fixed bit. The flags are recorded
     /// as `LazyFlagsOp::SzpCfOf` with CF and OF worked out here, the same formulas as
     /// `Cpu::shift_rotate` (OF for every count, not only 1). A CL count of zero changes
     /// neither flags nor value, which is a branch around the flag work; the destination is
@@ -1193,9 +1199,14 @@ impl<'a> Gen<'a> {
         let is64 = size == 8;
         let bits = 8 * size as u32;
         self.load_dst(insn, dst, 0, size, next_rip, insn_index, rip);
-        if size == 4 {
+        match (size, kind) {
             // A register read is raw; a count that is zero after masking still zero-extends.
-            self.asm.uxtw(0, 0);
+            (4, _) => self.asm.uxtw(0, 0),
+            (1, ShiftKind::Sar) => self.asm.sxtb(0, 0, false),
+            (2, ShiftKind::Sar) => self.asm.sxth(0, 0, false),
+            (1, _) => self.asm.uxtb(0, 0),
+            (2, _) => self.asm.uxth(0, 0),
+            _ => {}
         }
         let skip = self.asm.label();
         let (result, flags, scratch) = (SCRATCH_A, 1, SCRATCH_C);
@@ -1229,7 +1240,7 @@ impl<'a> Gen<'a> {
             }
             None => {
                 self.asm.ldr(flags, CPU, GPR_OFFSET + GPR_SIZE * RCX_INDEX);
-                let count_mask = bits as u64 - 1;
+                let count_mask = if is64 { 63 } else { 31 };
                 assert!(self.asm.and_imm(flags, flags, count_mask, true));
                 self.asm.mov(SAVED_EXTRA, flags);
                 self.asm.cbz(SAVED_EXTRA, skip, true);
@@ -1594,8 +1605,40 @@ impl<'a> Gen<'a> {
                     rip,
                 );
             }
-            // shl/shr/sar r/m, imm8 | 1 | cl at 32 and 64 bits (/6 is the alias of /4). Rotates,
-            // the byte and word sizes and a zero immediate count go to the interpreter.
+            // shl/shr/sar r/m8 and r/m16 by imm8 | 1 | cl. An immediate count of zero or at least
+            // the width goes to the interpreter: it is rare, and CF there is not a fixed bit.
+            0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xd2 | 0xd3
+                if plain
+                    && matches!(insn.reg & 7, SHIFT_SHL..=SHIFT_SAR)
+                    && (insn.op & 1 == 0 || (insn.p66 && operand_size == 2)) =>
+            {
+                let size = if insn.op & 1 == 0 { 1 } else { 2 };
+                let count = match insn.op {
+                    0xc0 | 0xc1 => Some(insn.imm as u32 & NARROW_SHIFT_COUNT_MASK),
+                    0xd0 | 0xd1 => Some(1),
+                    _ => None,
+                };
+                if count.is_some_and(|count| count == 0 || count >= 8 * size as u32) {
+                    return false;
+                }
+                let kind = match insn.reg & 7 {
+                    SHIFT_SHL | SHIFT_SAL_ALIAS => ShiftKind::Shl,
+                    SHIFT_SHR => ShiftKind::Shr,
+                    _ => ShiftKind::Sar,
+                };
+                is_store = self.shift(
+                    &insn,
+                    kind,
+                    Self::rm_dst(&insn, size),
+                    count,
+                    size,
+                    next_rip,
+                    insn_index,
+                    rip,
+                );
+            }
+            // shl/shr/sar r/m, imm8 | 1 | cl at 32 and 64 bits (/6 is the alias of /4). Rotates
+            // and a zero immediate count go to the interpreter.
             0xc1 | 0xd1 | 0xd3 if wide_operand && matches!(insn.reg & 7, SHIFT_SHL..=SHIFT_SAR) => {
                 let kind = match insn.reg & 7 {
                     SHIFT_SHL | SHIFT_SAL_ALIAS => ShiftKind::Shl,
