@@ -14,6 +14,8 @@ Boot: `uemulator advanced boot --kernel ~/.uemulator/machines/test/artifacts/vml
 
 `hack/perf/unpack.sh` (Task 0) reproduces the wall-time measurement; record each project's result in the table at the end of this file.
 
+**Status (2026-10-28):** project 1 done on both backends; project 2 done for the instructions the histogram ranked highest, the tail is left; project 3 done as S1 plus two cheap fixes. The step lists below are the plan as written; the Results section at the end says what was built, in what order and why, and what is left.
+
 ## Global Constraints
 
 - The library never touches stdio, never panics on guest behavior, holds no global mutable state.
@@ -189,10 +191,25 @@ Only if the unpack is still well over 2x slower than the target after S1-S3: wri
 
 ## Results
 
-| step | `unpack` seconds (median of 3) | notes |
-|------|-------------------------------|-------|
-| baseline | 22.1 (20.1, 22.1, 23.7) | aarch64 host, another emulator job running alongside, so noisy |
-| direct chaining | | |
-| inline integer ops | | |
-| pclmulqdq helper | | |
-| AVX-512 fast path | | |
+`hack/perf/unpack.sh`, median of three on an aarch64 host with another emulator job running alongside (so absolute numbers are noisy; the runs within one row agree to 0.1 s).
+
+| step | unpack seconds | commit |
+|------|---------------:|--------|
+| baseline | 22.1 | |
+| direct chaining (aarch64) | 18.8 | 5c669ca |
+| shl/shr/sar of 8- and 16-bit operands | 16.8 | 0c4fac1 |
+| pclmulqdq on the host's carry-less multiply | 15.7 | 78025cb |
+| dead lazy-flag records | 15.5 | b3b972a |
+| shlx/shrx/sarx, bzhi, andn, blsr group | 15.05 | 6d3c054 |
+| adc/sbb | 14.87 | b4febc2 |
+| unmasked EVEX commit by lane | 14.73 | 032a018 |
+
+Total: 22.1 s -> 14.7 s, about 1.5x. The x86_64 backend has every lowering except adc/sbb into memory (checked under Rosetta; not timed).
+
+## What changed from the plan, and what is left
+
+- Project 2 was reordered by the `--debug` histogram, not by the plan's guesses: 16-bit shifts (two thirds of all interpreter calls at the start), then BMI, then adc/sbb. Left in the interpreter: mul (`f7 /4`, 9M calls in 19 s), leave (4M), tzcnt/lzcnt/bsf/bsr, bt*, cmpxchg, pushf, cli/sti, shld, pshufd/pxor/movdqa and the other legacy SSE integer ops, and `vpclmulqdq`/`vpternlogq` (17M calls).
+- Project 3 stopped at S1 plus two cheap fixes. The SIMD helpers were 25% of the emulator thread's time because `pclmulqdq` was a 64-iteration bit loop; with the hardware multiply and the lane copy they are a few percent, which does not pay for a dedicated vector fast path (S2) or NEON lowering (S3). S4 (hiding CPUID bits) was not needed and was not done.
+- Measured but not built: dropping the link entry's two checks would save about 3% (they could stay only on exits that follow a store); keeping `icount` in a host register across blocks removes a store-to-load chain per block.
+- What bounds the rest: guest registers live in `Cpu` memory, so every instruction loads and stores them, and every block pays an `icount` read-modify-write, a link-entry check and a TLB probe per access. Roughly two thirds of the host instructions in a hot block were that bookkeeping. Getting to the next factor means pinning hot guest registers in host registers across blocks (with spills at helper calls and exits) and `icount` in a register: a redesign of the emitters, not another lowering.
+- Seen on the way: the CLI's terminal-size polling thread wakes about every millisecond (an `ioctl` each time); it is off the emulator thread, so it does not slow the guest, but it burns a core fraction. A workspace `cargo build --release` fails in `uemulator-web` on a macOS host (the crate is wasm32-only; not looked into, `-p uemulator-cli` builds).
