@@ -40,6 +40,8 @@ mod files;
 #[cfg(target_os = "none")]
 mod images;
 #[cfg(target_os = "none")]
+mod kernel_boot;
+#[cfg(target_os = "none")]
 mod kv;
 #[cfg(target_os = "none")]
 mod memory;
@@ -120,7 +122,7 @@ extern "C" fn firmware_main(handoff: *const u8) -> ! {
     time::init(&handoff);
     services::init(&handoff);
     serial::trace!("services ready");
-    boot::run()
+    boot::run(handoff.payload.as_ref())
 }
 
 #[cfg(target_os = "none")]

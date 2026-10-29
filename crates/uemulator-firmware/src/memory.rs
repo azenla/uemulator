@@ -115,6 +115,14 @@ pub fn init(handoff: &Handoff) {
     for &(base, size) in &handoff.mmio_regions {
         mark(base, size, MEMORY_MAPPED_IO, UNCACHEABLE | RUNTIME);
     }
+    // The kernel, initramfs and command line the library left in RAM stay allocated until the
+    // OS reclaims them as boot services data.
+    if let Some(payload) = &handoff.payload {
+        let ranges = [Some(payload.kernel), payload.initrd, Some(payload.cmdline)];
+        for (base, size) in ranges.into_iter().flatten() {
+            mark(base, size, BOOT_SERVICES_DATA, WRITE_BACK);
+        }
+    }
     debug_assert!(handoff.firmware_base >= ONE_MIB);
     MAP_READY.store(true, Ordering::SeqCst);
 }

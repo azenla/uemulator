@@ -200,6 +200,20 @@ pub mod guids {
         0x11d3,
         [0x9a, 0x35, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
     );
+    /// `5568e427-68fc-4f3d-ac74-ca555231cc68`: the vendor-media device path node under which the
+    /// Linux EFI stub looks for its initramfs.
+    pub const LINUX_EFI_INITRD_MEDIA: Guid = Guid::new(
+        0x5568e427,
+        0x68fc,
+        0x4f3d,
+        [0xac, 0x74, 0xca, 0x55, 0x52, 0x31, 0xcc, 0x68],
+    );
+    pub const LOAD_FILE2: Guid = Guid::new(
+        0x4006c0c1,
+        0xfcb3,
+        0x403e,
+        [0x99, 0x6d, 0x4a, 0x6c, 0x87, 0x24, 0xe0, 0x6d],
+    );
     pub const RNG: Guid = Guid::new(
         0x3152bca5,
         0xeade,

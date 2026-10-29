@@ -3,7 +3,7 @@
 
 use alloc::vec::Vec;
 
-pub const SIZE: usize = 0x308;
+pub const SIZE: usize = 0x338;
 const MAGIC: &[u8; 8] = b"UEMUHAND";
 const VERSION: u32 = 1;
 
@@ -30,6 +30,12 @@ const MMIO_REGIONS: usize = 0x200;
 const MMIO_REGION_BYTES: usize = 16;
 const MAX_MMIO_REGIONS: usize = 16;
 const TSC_HZ: usize = 0x300;
+const KERNEL_BASE: usize = 0x308;
+const KERNEL_SIZE: usize = 0x310;
+const INITRD_BASE: usize = 0x318;
+const INITRD_SIZE: usize = 0x320;
+const CMDLINE_BASE: usize = 0x328;
+const CMDLINE_SIZE: usize = 0x330;
 
 /// e820 type 1; everything else in the list is reserved.
 pub const RAM_USABLE: u32 = 1;
@@ -39,6 +45,15 @@ pub struct RamRegion {
     pub base: u64,
     pub size: u64,
     pub kind: u32,
+}
+
+/// A kernel the library put in RAM for the firmware to boot, as (base, size) byte ranges. The
+/// command line is UTF-8 without a NUL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Payload {
+    pub kernel: (u64, u64),
+    pub initrd: Option<(u64, u64)>,
+    pub cmdline: (u64, u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +76,8 @@ pub struct Handoff {
     /// (base, size) of device MMIO.
     pub mmio_regions: Vec<(u64, u64)>,
     pub tsc_hz: u64,
+    /// Present when the machine was given a kernel to boot, which comes before any disk.
+    pub payload: Option<Payload>,
 }
 
 impl Handoff {
@@ -91,6 +108,12 @@ impl Handoff {
         }
         let ram_count = (u32_at(RAM_REGION_COUNT) as usize).min(MAX_RAM_REGIONS);
         let mmio_count = (u32_at(MMIO_REGION_COUNT) as usize).min(MAX_MMIO_REGIONS);
+        let range = |base: usize, size: usize| (u64_at(base), u64_at(size));
+        let payload = (u64_at(KERNEL_SIZE) != 0).then(|| Payload {
+            kernel: range(KERNEL_BASE, KERNEL_SIZE),
+            initrd: (u64_at(INITRD_SIZE) != 0).then(|| range(INITRD_BASE, INITRD_SIZE)),
+            cmdline: range(CMDLINE_BASE, CMDLINE_SIZE),
+        });
         Some(Self {
             firmware_base: u64_at(FIRMWARE_BASE),
             firmware_size: u64_at(FIRMWARE_SIZE),
@@ -123,6 +146,7 @@ impl Handoff {
                 })
                 .collect(),
             tsc_hz: u64_at(TSC_HZ),
+            payload,
         })
     }
 }
@@ -163,6 +187,43 @@ mod tests {
         );
         assert_eq!(handoff.mmio_regions, [(0xc000_0000, 0)]);
         assert_eq!(handoff.tsc_hz, 1_000_000_000);
+    }
+
+    fn put(page: &mut [u8], at: usize, value: u64) {
+        page[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn parses_a_payload() {
+        let mut with_kernel = page();
+        put(&mut with_kernel, KERNEL_BASE, 0x400_0000);
+        put(&mut with_kernel, KERNEL_SIZE, 0x1000);
+        put(&mut with_kernel, INITRD_BASE, 0x500_0000);
+        put(&mut with_kernel, INITRD_SIZE, 0x2000);
+        put(&mut with_kernel, CMDLINE_BASE, 0x3ff_0000);
+        put(&mut with_kernel, CMDLINE_SIZE, 12);
+        assert_eq!(
+            Handoff::parse(&with_kernel).unwrap().payload,
+            Some(Payload {
+                kernel: (0x400_0000, 0x1000),
+                initrd: Some((0x500_0000, 0x2000)),
+                cmdline: (0x3ff_0000, 12),
+            })
+        );
+        put(&mut with_kernel, INITRD_SIZE, 0);
+        assert_eq!(
+            Handoff::parse(&with_kernel)
+                .unwrap()
+                .payload
+                .unwrap()
+                .initrd,
+            None
+        );
+    }
+
+    #[test]
+    fn no_kernel_means_no_payload() {
+        assert_eq!(Handoff::parse(&page()).unwrap().payload, None);
     }
 
     #[test]

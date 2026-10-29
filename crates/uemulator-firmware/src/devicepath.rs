@@ -113,6 +113,11 @@ impl DevicePath {
         self.push_node(TYPE_MEDIA, SUBTYPE_HARD_DRIVE, &payload)
     }
 
+    /// A vendor-defined media node: `guid` and no vendor data.
+    pub fn vendor_media(self, guid: Guid) -> Self {
+        self.push_node(TYPE_MEDIA, SUBTYPE_VENDOR_MEDIA, &guid.to_bytes())
+    }
+
     pub fn file_path(self, path: &str) -> Self {
         let payload: Vec<u8> = path
             .encode_utf16()

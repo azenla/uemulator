@@ -5,6 +5,8 @@ use alloc::vec::Vec;
 use core::ptr;
 
 use crate::devicepath::DevicePath;
+use crate::handoff::Payload;
+use crate::kernel_boot;
 use crate::load_option::{Candidate, parse, u16_list};
 use crate::serial::println;
 use crate::tables::BOOT_SERVICES;
@@ -84,8 +86,16 @@ fn try_boot(candidate: &Candidate) -> Status {
     (boot.start_image)(image, ptr::null_mut(), ptr::null_mut())
 }
 
-pub fn run() -> ! {
+pub fn run(payload: Option<&Payload>) -> ! {
     println!("uemulator UEFI firmware");
+    if let Some(payload) = payload {
+        // A kernel the machine was given is the whole boot: failing to start it must not turn
+        // into a boot from some disk the caller did not ask for.
+        println!("Booting the supplied kernel");
+        let status = kernel_boot::run(payload);
+        println!("the supplied kernel returned with status {status:#x}");
+        cpu::halt_forever()
+    }
     for candidate in candidates() {
         println!(
             "Booting {} ({})",
