@@ -25,7 +25,7 @@ use std::mem::{offset_of, size_of};
 use super::helpers::*;
 use super::native::LinkSite;
 use super::x64::*;
-use crate::cpu::decode::{Insn, NO_REG};
+use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
 use crate::cpu::flags::{LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT, SZP_CF_OF_SRC_OF_BIT};
 use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TlbEntry};
 
@@ -150,6 +150,15 @@ const ALU_TEST: u8 = 8;
 const NARROW_SHIFT_COUNT_MASK: u32 = 0x1f;
 /// Width of the host shift a narrow operand is widened to.
 const HOST_SHIFT_BITS: u8 = 32;
+/// `Insn::op` of the VEX map-2 (0f38) BMI opcodes: bextr/shlx/sarx/shrx, bzhi/pdep/pext, andn,
+/// and the blsr/blsmsk/blsi group (`cpu/bmi.rs`).
+const VEX_BMI_SHIFT_OR_BEXTR: u16 = VEX_OP_FLAG | 0x2f7;
+const VEX_BMI_BZHI_PEXT_PDEP: u16 = VEX_OP_FLAG | 0x2f5;
+const VEX_BMI_ANDN: u16 = VEX_OP_FLAG | 0x2f2;
+const VEX_BMI_GROUP17: u16 = VEX_OP_FLAG | 0x2f3;
+const BMI_GROUP_BLSR: u8 = 1;
+const BMI_GROUP_BLSMSK: u8 = 2;
+const BMI_GROUP_BLSI: u8 = 3;
 const SHIFT_SHL: u8 = 4;
 const SHIFT_SHR: u8 = 5;
 const SHIFT_SAL_ALIAS: u8 = 6;
@@ -1094,6 +1103,94 @@ impl<'a> Gen<'a> {
         stored
     }
 
+    /// Loads the r/m operand of a VEX BMI instruction into `ACC`, zero-extended. The memory
+    /// operand comes first: its slow path calls a helper that clobbers every scratch register.
+    fn bmi_source(&mut self, insn: &Insn, next: u64, insn_index: u32, rip: u64) {
+        if insn.md == MODRM_MOD_REGISTER {
+            self.read_reg(ACC, insn.rm, false, insn.opsize);
+        } else {
+            self.ea(insn, next);
+            self.mem_load(ACC, insn.opsize, false, insn_index, rip);
+        }
+    }
+
+    /// shlx/shrx/sarx: ModRM.reg = r/m shifted by the count in vvvv, modulo the width, which is
+    /// what the host shift by CL does. No flags.
+    fn bmi_shift(&mut self, insn: &Insn, host_op: u8, next: u64, insn_index: u32, rip: u64) {
+        self.bmi_source(insn, next, insn_index, rip);
+        self.ld_gpr(OPERAND, insn.vex_v);
+        self.a.shift_cl(host_op, ACC, insn.opsize == 8);
+        self.st_gpr(insn.reg, ACC);
+        // The shift clobbered the host flags.
+        self.live = false;
+    }
+
+    /// bzhi: ModRM.reg = r/m with the bits from index (vvvv bits 7:0) up cleared; an index at or
+    /// above the width leaves it whole and sets CF. SF/ZF/PF follow the result, OF and AF clear:
+    /// `LazyFlagsOp::SzpCfOf` with CF in the packed word.
+    fn bzhi(&mut self, insn: &Insn, next: u64, insn_index: u32, rip: u64) {
+        let is64 = insn.opsize == 8;
+        let (mask, all_ones) = (SCRATCH_C, SCRATCH_D);
+        self.bmi_source(insn, next, insn_index, rip);
+        self.ld_gpr(OPERAND, insn.vex_v);
+        self.a.ext_rr(OPERAND, OPERAND, 1, false);
+        // mask = (1 << index) - 1, or all ones when the index is out of range: the host shifts
+        // only by index modulo 64 there, which the compare discards.
+        self.a.mov_imm(mask, 1);
+        self.a.shift_cl(SHL, mask, true);
+        self.a.alu_ri(SUB, mask, 1, true);
+        self.a.mov_imm(all_ones, u64::MAX);
+        self.a.alu_ri(CMP, OPERAND, 8 * insn.opsize as i32, false);
+        self.a.cmov_rr(AE, mask, all_ones, true);
+        // CF, taken from the compare before `and` replaces the host flags.
+        self.a.setcc(AE, OPERAND);
+        self.a.ext_rr(OPERAND, OPERAND, 1, false);
+        self.a.alu_rr(AND, ACC, mask, is64);
+        self.st_gpr(insn.reg, ACC);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
+        self.live = false;
+    }
+
+    /// andn: ModRM.reg = r/m & !vvvv, flags from the result with CF and OF clear.
+    fn andn(&mut self, insn: &Insn, next: u64, insn_index: u32, rip: u64) {
+        self.bmi_source(insn, next, insn_index, rip);
+        self.ld_gpr(OPERAND, insn.vex_v);
+        self.a.not_r(OPERAND, 8);
+        self.a.alu_rr(AND, ACC, OPERAND, insn.opsize == 8);
+        self.st_gpr(insn.reg, ACC);
+        self.a.mov_imm(OPERAND, 0);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
+        self.live = false;
+    }
+
+    /// blsr, blsmsk and blsi (`group` 1, 2 and 3): vvvv = r/m with its lowest set bit cleared,
+    /// the mask up to and including it, or just it. Flags from the result; CF is set when the
+    /// source is zero (blsr, blsmsk) or not zero (blsi).
+    fn lowest_set_bit(&mut self, insn: &Insn, group: u8, next: u64, insn_index: u32, rip: u64) {
+        let is64 = insn.opsize == 8;
+        let scratch = SCRATCH_C;
+        self.bmi_source(insn, next, insn_index, rip);
+        self.a.test_rr(ACC, ACC, is64);
+        self.a
+            .setcc(if group == BMI_GROUP_BLSI { NE } else { E }, OPERAND);
+        self.a.ext_rr(OPERAND, OPERAND, 1, false);
+        if group == BMI_GROUP_BLSI {
+            self.a.mov_rr(scratch, ACC, true);
+            self.a.neg_r(scratch, insn.opsize);
+        } else {
+            self.a.lea(scratch, mem(ACC, -1));
+        }
+        self.a.alu_rr(
+            if group == BMI_GROUP_BLSMSK { XOR } else { AND },
+            ACC,
+            scratch,
+            is64,
+        );
+        self.st_gpr(insn.vex_v, ACC);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
+        self.live = false;
+    }
+
     /// `imul r, r/m` and the three-operand `imul r, r/m, imm`, at 32 and 64 bits. The host
     /// `imul` sets CF = OF when the full product does not fit, which is what the interpreter
     /// computes; SF/ZF/PF are undefined on the host, so they come from the truncated result
@@ -1508,6 +1605,38 @@ impl<'a> Gen<'a> {
                     self.a.mov_rr(VALUE, VALUE, false);
                 }
                 self.st_gpr(insn.reg, VALUE);
+            }
+            // BMI1/BMI2 (VEX.LZ, map 0f38): shlx/shrx/sarx f7 with 66/F2/F3, bzhi f5, andn f2 and
+            // the blsr/blsmsk/blsi group f3. bextr and the rest go to the interpreter.
+            VEX_BMI_SHIFT_OR_BEXTR | VEX_BMI_BZHI_PEXT_PDEP | VEX_BMI_ANDN | VEX_BMI_GROUP17
+                if insn.vex
+                    && !insn.vex_l
+                    && !insn.lock
+                    && (osz == 4 || osz == 8)
+                    && (!is_mem || plain) =>
+            {
+                match (insn.op, insn.rep, insn.p66) {
+                    (VEX_BMI_SHIFT_OR_BEXTR, 0, true) => {
+                        self.bmi_shift(&insn, SHL, next, insn_index, rip)
+                    }
+                    (VEX_BMI_SHIFT_OR_BEXTR, 2, false) => {
+                        self.bmi_shift(&insn, SHR, next, insn_index, rip)
+                    }
+                    (VEX_BMI_SHIFT_OR_BEXTR, 1, false) => {
+                        self.bmi_shift(&insn, SAR, next, insn_index, rip)
+                    }
+                    (VEX_BMI_BZHI_PEXT_PDEP, 0, false) => self.bzhi(&insn, next, insn_index, rip),
+                    (VEX_BMI_ANDN, 0, false) => self.andn(&insn, next, insn_index, rip),
+                    (VEX_BMI_GROUP17, 0, false)
+                        if matches!(
+                            insn.reg & 7,
+                            BMI_GROUP_BLSR | BMI_GROUP_BLSMSK | BMI_GROUP_BLSI
+                        ) =>
+                    {
+                        self.lowest_set_bit(&insn, insn.reg & 7, next, insn_index, rip)
+                    }
+                    _ => return false,
+                }
             }
             // push r64. rsp is updated only after the store succeeded, and the register is read
             // after the new rsp is computed but before it is stored, so `push rsp` pushes the

@@ -1267,6 +1267,27 @@ mod tests {
     }
 
     #[test]
+    fn bmi_shifts_bzhi_andn_and_the_blsr_group_are_lowered_inline() {
+        let _guard = serialize_jit_tests();
+        for code in [
+            // shlx rax, rcx, rbx | shrx eax, ecx, ebx | sarx rax, [rsi], rbx
+            &[0xc4, 0xe2, 0xe1, 0xf7, 0xc1][..],
+            &[0xc4, 0xe2, 0x63, 0xf7, 0xc1],
+            &[0xc4, 0xe2, 0xe2, 0xf7, 0x06],
+            // bzhi rax, rcx, rbx | bzhi eax, [rsi], ebx
+            &[0xc4, 0xe2, 0xe0, 0xf5, 0xc1],
+            &[0xc4, 0xe2, 0x60, 0xf5, 0x06],
+            // andn rax, rbx, rcx | blsr rax, rcx | blsmsk eax, ecx | blsi rax, [rsi]
+            &[0xc4, 0xe2, 0xe0, 0xf2, 0xc1],
+            &[0xc4, 0xe2, 0xf8, 0xf3, 0xc9],
+            &[0xc4, 0xe2, 0x78, 0xf3, 0xd1],
+            &[0xc4, 0xe2, 0xf8, 0xf3, 0x1e],
+        ] {
+            assert_eq!(inlined_in(&[code, &[0xf4]].concat()), 1, "{code:x?}");
+        }
+    }
+
+    #[test]
     fn narrow_shifts_by_a_count_at_or_above_the_width_stay_in_the_interpreter() {
         let _guard = serialize_jit_tests();
         // shr ax, 16 | shl al, 8 | shr ax, 0

@@ -43,7 +43,7 @@ use std::mem::{offset_of, size_of};
 use super::a64::*;
 use super::helpers::*;
 use super::native::LinkSite;
-use crate::cpu::decode::{Insn, NO_REG};
+use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
 use crate::cpu::flags::LazyFlagsOp;
 use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TlbEntry};
 
@@ -132,6 +132,15 @@ const ALU_TEST: u8 = 8;
 /// shl), sar.
 /// Shift counts of 8-, 16- and 32-bit operands are masked to five bits (SDM, SHL).
 const NARROW_SHIFT_COUNT_MASK: u32 = 0x1f;
+/// `Insn::op` of the VEX map-2 (0f38) BMI opcodes: bextr/shlx/sarx/shrx, bzhi/pdep/pext, andn,
+/// and the blsr/blsmsk/blsi group (`cpu/bmi.rs`).
+const VEX_BMI_SHIFT_OR_BEXTR: u16 = VEX_OP_FLAG | 0x2f7;
+const VEX_BMI_BZHI_PEXT_PDEP: u16 = VEX_OP_FLAG | 0x2f5;
+const VEX_BMI_ANDN: u16 = VEX_OP_FLAG | 0x2f2;
+const VEX_BMI_GROUP17: u16 = VEX_OP_FLAG | 0x2f3;
+const BMI_GROUP_BLSR: u8 = 1;
+const BMI_GROUP_BLSMSK: u8 = 2;
+const BMI_GROUP_BLSI: u8 = 3;
 const SHIFT_SHL: u8 = 4;
 const SHIFT_SHR: u8 = 5;
 const SHIFT_SAL_ALIAS: u8 = 6;
@@ -1366,6 +1375,102 @@ impl<'a> Gen<'a> {
         self.live = None;
     }
 
+    /// Loads the r/m operand of a VEX BMI instruction into x0 (a 32-bit operation reads only the
+    /// low half). The memory operand comes first: its slow path calls a helper that clobbers
+    /// every scratch register.
+    fn bmi_source(&mut self, insn: &Insn, next_rip: u64, insn_index: u32, rip: u64) {
+        if insn.md == MODRM_MOD_REGISTER {
+            self.load_gpr(0, insn.rm);
+        } else {
+            self.effective_address(insn, next_rip, ADDRESS);
+            self.mem_load(0, insn.opsize, false, insn_index, rip);
+        }
+    }
+
+    /// shlx/shrx/sarx: ModRM.reg = r/m shifted by the count in vvvv, modulo the width. No flags,
+    /// so the host flags stay as they are.
+    fn bmi_shift(
+        &mut self,
+        insn: &Insn,
+        kind: ShiftKind,
+        next_rip: u64,
+        insn_index: u32,
+        rip: u64,
+    ) {
+        let is64 = insn.opsize == 8;
+        self.bmi_source(insn, next_rip, insn_index, rip);
+        self.load_gpr(1, insn.vex_v);
+        assert!(self.asm.and_imm(1, 1, 8 * insn.opsize as u64 - 1, true));
+        match kind {
+            ShiftKind::Shl => self.asm.lslv(0, 0, 1, is64),
+            ShiftKind::Shr => self.asm.lsrv(0, 0, 1, is64),
+            ShiftKind::Sar => self.asm.asrv(0, 0, 1, is64),
+        }
+        self.store_gpr(insn.reg, 0);
+    }
+
+    /// bzhi: ModRM.reg = r/m with the bits from index (vvvv bits 7:0) up cleared; an index at or
+    /// above the width leaves it whole and sets CF. SF/ZF/PF follow the result, OF and AF clear:
+    /// `LazyFlagsOp::SzpCfOf` with CF in the packed word.
+    fn bzhi(&mut self, insn: &Insn, next_rip: u64, insn_index: u32, rip: u64) {
+        let is64 = insn.opsize == 8;
+        let (mask, all_ones) = (2, 3);
+        self.bmi_source(insn, next_rip, insn_index, rip);
+        self.load_gpr(1, insn.vex_v);
+        self.asm.uxtb(1, 1);
+        // mask = (1 << index) - 1, or all ones when the index is out of range: the host shifts
+        // only by index modulo 64 there, which the compare discards.
+        self.asm.mov_imm(mask, 1);
+        self.asm.lslv(mask, mask, 1, true);
+        self.asm.sub_imm(mask, mask, 1, true);
+        self.asm.cmp_imm(1, 8 * insn.opsize as u32, false);
+        self.asm.mov_imm(all_ones, u64::MAX);
+        self.asm.csel(mask, all_ones, mask, CS);
+        self.asm.and(0, 0, mask, is64);
+        self.asm.cset(1, CS);
+        self.store_gpr(insn.reg, 0);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
+        self.live = None;
+    }
+
+    /// andn: ModRM.reg = r/m & !vvvv, flags from the result with CF and OF clear.
+    fn andn(&mut self, insn: &Insn, next_rip: u64, insn_index: u32, rip: u64) {
+        let is64 = insn.opsize == 8;
+        self.bmi_source(insn, next_rip, insn_index, rip);
+        self.load_gpr(1, insn.vex_v);
+        self.asm.mov_imm(2, u64::MAX);
+        self.asm.eor(1, 1, 2, true);
+        self.asm.and(0, 0, 1, is64);
+        self.store_gpr(insn.reg, 0);
+        self.asm.mov_imm(1, 0);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
+        self.live = None;
+    }
+
+    /// blsr, blsmsk and blsi (`group` 1, 2 and 3): vvvv = r/m with its lowest set bit cleared,
+    /// the mask up to and including it, or just it. Flags from the result; CF is set when the
+    /// source is zero (blsr, blsmsk) or not zero (blsi).
+    fn lowest_set_bit(&mut self, insn: &Insn, group: u8, next_rip: u64, insn_index: u32, rip: u64) {
+        let is64 = insn.opsize == 8;
+        self.bmi_source(insn, next_rip, insn_index, rip);
+        self.asm.cmp_imm(0, 0, is64);
+        self.asm
+            .cset(1, if group == BMI_GROUP_BLSI { NE } else { EQ });
+        if group == BMI_GROUP_BLSI {
+            self.asm.sub(2, XZR, 0, is64);
+        } else {
+            self.asm.sub_imm(2, 0, 1, is64);
+        }
+        if group == BMI_GROUP_BLSMSK {
+            self.asm.eor(0, 0, 2, is64);
+        } else {
+            self.asm.and(0, 0, 2, is64);
+        }
+        self.store_gpr(insn.vex_v, 0);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
+        self.live = None;
+    }
+
     /// `rol`/`ror` of a 32- or 64-bit operand by an immediate or CL. The rotation is inline; CF
     /// and OF are packed (CF in bit 0, OF in bit 1) for `helper_set_rotate_flags`, which merges
     /// them into the guest flags because rotates keep SF/ZF/PF/AF, so the host flags stop
@@ -1902,6 +2007,40 @@ impl<'a> Gen<'a> {
                     self.asm.uxtw(VALUE, VALUE);
                 }
                 self.store_gpr(insn.reg, VALUE);
+            }
+            // BMI1/BMI2 (VEX.LZ, map 0f38): shlx/shrx/sarx f7 with 66/F2/F3, bzhi f5, andn f2 and
+            // the blsr/blsmsk/blsi group f3. bextr and the rest go to the interpreter.
+            VEX_BMI_SHIFT_OR_BEXTR | VEX_BMI_BZHI_PEXT_PDEP | VEX_BMI_ANDN | VEX_BMI_GROUP17
+                if insn.vex
+                    && !insn.vex_l
+                    && !insn.lock
+                    && (operand_size == 4 || operand_size == 8)
+                    && (!is_memory || memory_ok) =>
+            {
+                match (insn.op, insn.rep, insn.p66) {
+                    (VEX_BMI_SHIFT_OR_BEXTR, 0, true) => {
+                        self.bmi_shift(&insn, ShiftKind::Shl, next_rip, insn_index, rip)
+                    }
+                    (VEX_BMI_SHIFT_OR_BEXTR, 2, false) => {
+                        self.bmi_shift(&insn, ShiftKind::Shr, next_rip, insn_index, rip)
+                    }
+                    (VEX_BMI_SHIFT_OR_BEXTR, 1, false) => {
+                        self.bmi_shift(&insn, ShiftKind::Sar, next_rip, insn_index, rip)
+                    }
+                    (VEX_BMI_BZHI_PEXT_PDEP, 0, false) => {
+                        self.bzhi(&insn, next_rip, insn_index, rip)
+                    }
+                    (VEX_BMI_ANDN, 0, false) => self.andn(&insn, next_rip, insn_index, rip),
+                    (VEX_BMI_GROUP17, 0, false)
+                        if matches!(
+                            insn.reg & 7,
+                            BMI_GROUP_BLSR | BMI_GROUP_BLSMSK | BMI_GROUP_BLSI
+                        ) =>
+                    {
+                        self.lowest_set_bit(&insn, insn.reg & 7, next_rip, insn_index, rip)
+                    }
+                    _ => return false,
+                }
             }
             // push r64. rsp is written back only after the store, so a faulting push leaves it
             // unchanged; the value is read from the register file, so `push rsp` pushes the old rsp.
