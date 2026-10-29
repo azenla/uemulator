@@ -3,14 +3,15 @@
 
 use std::mem::offset_of;
 
-use super::a64::{self, Asm};
+use super::a64::{self, Asm, NOP_WORD};
 use super::emit::{
     CALL_TARGET, CPU, Gen, SAVED_ADDRESS, SAVED_INFO, SAVED_LR, SAVED_NZCV, SAVED_OPERAND,
     SAVED_RESULT, TLB_BASE, VALUE,
 };
 use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
 use super::native::{
-    JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET, JUMP_ENTRY_SHIFT, jump_cache_mask,
+    CompiledBlock, JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET, JUMP_ENTRY_SHIFT,
+    jump_cache_mask,
 };
 use crate::cpu::decode::Insn;
 use crate::cpu::{Cpu, TLB_ENTRIES_PER_MODE, TlbEntry};
@@ -317,15 +318,45 @@ pub(crate) fn addrs(prologue: &Prologue, chaining: bool) -> Addrs {
 }
 
 /// Compiles one block to machine code meant to run at `addr` (the encoder bakes in pc-relative
-/// branches to the exit stubs). Returns the code and the number of inlined instructions.
+/// branches to the exit stubs).
 pub(crate) fn compile_block(
     addr: u64,
     addrs: &Addrs,
     insns: &[Insn],
     rips: &[u64],
     end_rip: u64,
-) -> (Vec<u8>, u32) {
+) -> CompiledBlock {
     let mut generator = Gen::new(addr, addrs, insns);
     generator.compile(rips, end_rip);
-    (bytes(&generator.asm.code), generator.inlined)
+    CompiledBlock {
+        code: bytes(&generator.asm.code),
+        inlined: generator.inlined,
+        body_offset: generator.body_offset,
+        links: generator.links,
+    }
+}
+
+const BRANCH_OPCODE: u32 = 0x1400_0000;
+const BRANCH_IMM26_MASK: u32 = 0x03ff_ffff;
+const INSN_BYTES: i64 = 4;
+/// `b` reaches +-2^25 instructions.
+const BRANCH_REACH_INSNS: i64 = 1 << 25;
+
+/// The instruction that makes the slot at `site` jump to `destination`, or `None` when the two
+/// are further apart than a `b` reaches (blocks in different code segments).
+pub(crate) fn link_bytes(site: u64, destination: u64) -> Option<Vec<u8>> {
+    let offset = (destination as i64 - site as i64) / INSN_BYTES;
+    if offset.abs() >= BRANCH_REACH_INSNS {
+        return None;
+    }
+    Some(
+        (BRANCH_OPCODE | (offset as u32 & BRANCH_IMM26_MASK))
+            .to_le_bytes()
+            .to_vec(),
+    )
+}
+
+/// What an unlinked slot holds: a nop, so execution falls into the chain stub sequence after it.
+pub(crate) fn unlink_bytes() -> Vec<u8> {
+    NOP_WORD.to_le_bytes().to_vec()
 }

@@ -8,7 +8,7 @@
 
 #![allow(dead_code)]
 
-const NOP_WORD: u32 = 0xd503_201f;
+pub(crate) const NOP_WORD: u32 = 0xd503_201f;
 
 pub(crate) const XZR: u32 = 31;
 pub(crate) const SP: u32 = 31;
@@ -160,6 +160,11 @@ impl Asm {
             fixes: Vec::new(),
             pool: Vec::new(),
         }
+    }
+
+    /// Address the first instruction is assembled for.
+    pub fn base(&self) -> u64 {
+        self.base
     }
 
     /// Address of the next instruction to be emitted.

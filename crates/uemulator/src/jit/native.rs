@@ -54,6 +54,36 @@ const _: () = assert!(std::mem::size_of::<JumpEntry>().is_power_of_two());
 pub(crate) const JUMP_ENTRY_PHYS_OFFSET: u32 = std::mem::offset_of!(JumpEntry, phys_addr) as u32;
 pub(crate) const JUMP_ENTRY_CODE_OFFSET: u32 = std::mem::offset_of!(JumpEntry, code_addr) as u32;
 
+/// A patchable slot in a compiled block: the exit to the fixed guest address `target_rip` (in the
+/// block's own page) is preceded by a nop of `arch::link_bytes` size that becomes a direct jump to
+/// the successor's `link_addr` once it exists.
+pub(crate) struct LinkSite {
+    /// Offset of the slot inside the block's code.
+    pub code_offset: u32,
+    pub target_rip: u64,
+}
+
+/// What `arch::compile_block` produces.
+pub(crate) struct CompiledBlock {
+    pub code: Vec<u8>,
+    /// Guest instructions lowered inline.
+    pub inlined: u32,
+    /// Offset of the entry the run loop and the chain stub use. Everything before it is the
+    /// `link_addr` entry's checks (`icount` against `next_event`, `block_exit_requested`), which
+    /// those two callers have already done; a direct link skips the stub and so must do them.
+    pub body_offset: u32,
+    pub links: Vec<LinkSite>,
+}
+
+/// A slot in the code buffer and the block it should jump to: `(rip, phys_addr)` of the
+/// destination, the same key as `block_map`.
+#[derive(Clone)]
+struct LinkedSite {
+    /// Offset into `ExecMem`.
+    exec_offset: usize,
+    destination: (u64, u64),
+}
+
 /// One translated block. Blocks are only ever added; an invalidated block keeps its slot (and its
 /// `valid == false` flag) until `Jit::reset`, so indices held in `page_blocks` and the jump cache
 /// stay stable.
@@ -62,7 +92,10 @@ pub(crate) struct Block {
     /// Physical address of the first instruction. Part of the lookup key together with `rip`: the
     /// code embeds rip-relative constants, and a remapped virtual page must not hit a stale block.
     phys_addr: u64,
+    /// The body entry (run loop, chain stub, jump cache).
     code_addr: u64,
+    /// The first byte of the block: the entry direct links jump to.
+    link_addr: u64,
     #[cfg_attr(not(test), allow(dead_code))]
     valid: bool,
     /// Generated code calls `helper_exec` with raw pointers into this slice, so it must outlive the
@@ -94,6 +127,12 @@ pub(crate) struct Jit {
     /// Physical page number -> blocks that decoded bytes from it. A block that crosses a page is
     /// listed under both.
     page_blocks: HashMap<u64, Vec<u32>>,
+    /// Slots patched to jump into a block (by its index), so invalidating the block can put them
+    /// back to falling through to the chain stub.
+    incoming: HashMap<u32, Vec<LinkedSite>>,
+    /// Unpatched slots by the `(rip, phys_addr)` of the block they want: the destination was not
+    /// translated yet, or was invalidated since.
+    pending: HashMap<(u64, u64), Vec<LinkedSite>>,
     /// Offset of the first block, just past the prologue. `reset` rewinds to here.
     blocks_start: usize,
     stats: JitStats,
@@ -112,6 +151,10 @@ pub(crate) struct JitStats {
     pub total: u64,
     /// Times the whole code buffer was flushed because it was full.
     pub resets: u64,
+    /// Block-exit slots patched into a direct jump, including relinks after an invalidation.
+    pub linked: u64,
+    /// Slots put back to the chain stub because their destination was invalidated.
+    pub unlinked: u64,
 }
 
 pub(crate) const fn jump_cache_mask() -> u64 {
@@ -151,6 +194,8 @@ impl Jit {
             block_map: HashMap::new(),
             jump_cache,
             page_blocks: HashMap::new(),
+            incoming: HashMap::new(),
+            pending: HashMap::new(),
             blocks_start,
             stats: JitStats::default(),
         })
@@ -159,6 +204,30 @@ impl Jit {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn stats(&self) -> JitStats {
         self.stats
+    }
+
+    #[cfg(test)]
+    fn link_state_len(&self) -> (usize, usize) {
+        (
+            self.incoming.values().map(Vec::len).sum(),
+            self.pending.values().map(Vec::len).sum(),
+        )
+    }
+
+    /// Points the slot at `destination`'s block, if the jump reaches. Returns whether it did.
+    fn patch_link(&mut self, site: &LinkedSite, destination: u32) -> bool {
+        let site_addr = self.exec_mem.base() + site.exec_offset as u64;
+        let link_addr = self.blocks[destination as usize].link_addr;
+        let Some(jump) = arch::link_bytes(site_addr, link_addr) else {
+            return false;
+        };
+        self.exec_mem.write_bytes(site.exec_offset, &jump);
+        self.incoming
+            .entry(destination)
+            .or_default()
+            .push(site.clone());
+        self.stats.linked += 1;
+        true
     }
 
     /// Called from `Cpu::code_written` when a guest write hits a page that has blocks. The
@@ -174,6 +243,15 @@ impl Jit {
                 if slot.block == index as u64 + 1 {
                     *slot = JumpEntry::default();
                 }
+                // A direct jump into the block would skip every lookup, so it goes back to
+                // falling through to the chain stub, and waits for the block to be translated
+                // again. The invalidated block's own slots stay patched: it never runs again.
+                for site in self.incoming.remove(&index).unwrap_or_default() {
+                    self.exec_mem
+                        .write_bytes(site.exec_offset, &arch::unlink_bytes());
+                    self.stats.unlinked += 1;
+                    self.pending.entry(site.destination).or_default().push(site);
+                }
             }
         }
     }
@@ -184,6 +262,8 @@ impl Jit {
         self.blocks.clear();
         self.block_map.clear();
         self.page_blocks.clear();
+        self.incoming.clear();
+        self.pending.clear();
         self.jump_cache.fill(JumpEntry::default());
         self.used_bytes = self.blocks_start;
         self.stats.resets += 1;
@@ -296,26 +376,53 @@ impl Jit {
         let insns: Box<[Insn]> = insns.into_boxed_slice();
         self.used_bytes = (self.used_bytes + BLOCK_ALIGN - 1) & !(BLOCK_ALIGN - 1);
         let code_addr = self.exec_mem.base() + self.used_bytes as u64;
-        let (code, inlined) = arch::compile_block(
+        let compiled = arch::compile_block(
             code_addr,
             &self.segment_addrs[segment],
             &insns,
             &insn_rips,
             end_rip,
         );
-        self.stats.inlined += inlined as u64;
+        self.stats.inlined += compiled.inlined as u64;
         self.stats.total += insns.len() as u64;
-        self.exec_mem.write_bytes(self.used_bytes, &code);
-        self.used_bytes += code.len();
+        let block_offset = self.used_bytes;
+        self.exec_mem.write_bytes(block_offset, &compiled.code);
+        self.used_bytes += compiled.code.len();
+        let link_addr = code_addr;
+        let code_addr = link_addr + compiled.body_offset as u64;
         let index = self.blocks.len() as u32;
         self.block_map.insert((rip, phys_addr), index);
         self.blocks.push(Block {
             rip,
             phys_addr,
             code_addr,
+            link_addr,
             valid: true,
             _insns: insns,
         });
+        // Blocks waiting for this one, then this block's own exits. Only same-page targets are
+        // linked: the block was entered through a validated mapping of its page, which is all
+        // the chain stub's TLB probe re-establishes, and a page-straddling block's exit is not
+        // in the page its key assumes.
+        for site in self.pending.remove(&(rip, phys_addr)).unwrap_or_default() {
+            self.patch_link(&site, index);
+        }
+        if !crosses_page {
+            let page_base = phys_addr & !PAGE_MASK;
+            for link in compiled.links {
+                let destination = (link.target_rip, page_base | (link.target_rip & PAGE_MASK));
+                let site = LinkedSite {
+                    exec_offset: block_offset + link.code_offset as usize,
+                    destination,
+                };
+                match self.block_map.get(&destination).copied() {
+                    Some(target) => {
+                        self.patch_link(&site, target);
+                    }
+                    None => self.pending.entry(destination).or_default().push(site),
+                }
+            }
+        }
         for page in pages {
             self.page_blocks.entry(page).or_default().push(index);
         }
@@ -468,10 +575,10 @@ mod tests {
         let _guard = serialize_jit_tests();
         let mut cpu = cpu_running(&[&ADD_THEN_JMP_NEXT[..], &nops(8)[..]].concat());
         let mut jit = new_jit();
-        let first = translate_at_code_base(&mut jit, &mut cpu);
-        let second = jit
-            .translate(&mut cpu, CODE_BASE + 5, CODE_BASE + 5)
+        translate_at_code_base(&mut jit, &mut cpu);
+        jit.translate(&mut cpu, CODE_BASE + 5, CODE_BASE + 5)
             .unwrap();
+        let (first, second) = (jit.blocks[0].link_addr, jit.blocks[1].link_addr);
         assert_eq!(first % BLOCK_ALIGN as u64, 0);
         assert_eq!(second % BLOCK_ALIGN as u64, 0);
         assert!(first >= jit.exec_mem.base() + jit.blocks_start as u64);
@@ -753,18 +860,21 @@ mod tests {
         let _guard = serialize_jit_tests();
         let mut cpu = cpu_running(&ADD_THEN_HLT);
         let mut jit = new_jit();
-        let code_addr = translate_at_code_base(&mut jit, &mut cpu);
+        let body_addr = translate_at_code_base(&mut jit, &mut cpu);
         let block = &jit.blocks[0];
+        let code_addr = block.link_addr;
         let rips = [CODE_BASE, CODE_BASE + 3];
-        let (expected, _) = arch::compile_block(
+        let expected = arch::compile_block(
             code_addr,
             &jit.segment_addrs[0],
             &block._insns,
             &rips,
             CODE_BASE + 4,
         );
-        let written = unsafe { std::slice::from_raw_parts(code_addr as *const u8, expected.len()) };
-        assert_eq!(written, expected.as_slice());
+        let written =
+            unsafe { std::slice::from_raw_parts(code_addr as *const u8, expected.code.len()) };
+        assert_eq!(written, expected.code.as_slice());
+        assert_eq!(body_addr, code_addr + expected.body_offset as u64);
         assert_eq!(code_addr, jit.exec_mem.base() + jit.blocks_start as u64);
     }
 
@@ -842,7 +952,10 @@ mod tests {
         );
         assert_eq!(jit.lookup(CODE_BASE, CODE_BASE), None);
         assert_eq!(jit.lookup(second_rip, second_rip), Some(code));
-        assert_eq!(code, jit.exec_mem.base() + jit.blocks_start as u64);
+        assert_eq!(
+            jit.blocks[0].link_addr,
+            jit.exec_mem.base() + jit.blocks_start as u64
+        );
     }
 
     #[test]
@@ -1069,6 +1182,61 @@ mod tests {
     }
 
     #[test]
+    fn same_page_exits_are_linked_directly_once_the_successor_exists() {
+        let _guard = serialize_jit_tests();
+        let mut cpu = cpu_running(&COUNTDOWN_LOOP);
+        cpu.jit = Some(Box::new(new_jit()));
+        cpu.next_event = u64::MAX;
+        steps_to_halt(&mut cpu);
+        assert_eq!(cpu.gpr[1], 0);
+        assert_eq!(cpu.icount, COUNTDOWN_LOOP_INSNS);
+        assert!(cpu.jit.as_ref().unwrap().stats().linked >= 1);
+    }
+
+    #[test]
+    fn an_unchained_jit_never_links() {
+        let _guard = serialize_jit_tests();
+        let mut cpu = cpu_running(&COUNTDOWN_LOOP);
+        cpu.jit = Some(Box::new(new_unchained_jit()));
+        cpu.next_event = u64::MAX;
+        steps_to_halt(&mut cpu);
+        assert_eq!(cpu.jit.as_ref().unwrap().stats().linked, 0);
+    }
+
+    #[test]
+    fn invalidating_the_destination_unlinks_and_a_retranslation_relinks() {
+        let _guard = serialize_jit_tests();
+        let mut cpu = cpu_running(&COUNTDOWN_LOOP);
+        cpu.jit = Some(Box::new(new_jit()));
+        warm_up_loop(&mut cpu);
+        let before = cpu.jit.as_ref().unwrap().stats();
+        assert!(before.linked >= 1);
+        cpu.jit
+            .as_mut()
+            .unwrap()
+            .invalidate_page(CODE_BASE >> PAGE_SHIFT);
+        let invalidated = cpu.jit.as_ref().unwrap().stats();
+        assert_eq!(invalidated.unlinked, before.linked);
+        steps_to_halt(&mut cpu);
+        assert_eq!(cpu.gpr[1], 0);
+        assert_eq!(cpu.icount, COUNTDOWN_LOOP_INSNS);
+        let after = cpu.jit.as_ref().unwrap().stats();
+        assert!(after.linked > before.linked, "{after:?} vs {before:?}");
+    }
+
+    #[test]
+    fn reset_discards_links_and_pending_entries() {
+        let _guard = serialize_jit_tests();
+        let mut cpu = cpu_running(&COUNTDOWN_LOOP);
+        cpu.jit = Some(Box::new(new_jit()));
+        warm_up_loop(&mut cpu);
+        let jit = cpu.jit.as_mut().unwrap();
+        assert_ne!(jit.link_state_len(), (0, 0));
+        jit.reset();
+        assert_eq!(jit.link_state_len(), (0, 0));
+    }
+
+    #[test]
     fn chain_exit_after_an_rdtsc_does_not_charge_the_prepaid_instructions_twice() {
         let _guard = serialize_jit_tests();
         // mov ecx, 3; 1: sub ecx, 1; rdtsc; jnz... rdtsc clobbers eax/edx only, flags survive.
@@ -1090,9 +1258,10 @@ mod tests {
         let second = jit.translate(&mut cpu, second_rip, second_rip).unwrap();
         assert_eq!(jit.stats().resets, 0, "other segments are still free");
         assert_eq!(
-            second,
+            jit.blocks[1].link_addr,
             jit.exec_mem.base() + (SEGMENT_SIZE + jit.blocks_start) as u64
         );
+        assert_eq!(jit.lookup(second_rip, second_rip), Some(second));
         assert_eq!(
             jit.lookup(CODE_BASE, CODE_BASE),
             Some(first),

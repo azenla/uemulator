@@ -2,7 +2,8 @@ pub(crate) use super::emit_x64::Addrs;
 use super::emit_x64::{CPU, FRAME, Gen, TLB_BASE};
 use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
 use super::native::{
-    JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET, JUMP_ENTRY_SHIFT, jump_cache_mask,
+    CompiledBlock, JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET, JUMP_ENTRY_SHIFT,
+    jump_cache_mask,
 };
 use super::x64::*;
 use crate::cpu::decode::Insn;
@@ -168,8 +169,22 @@ pub(crate) fn compile_block(
     insns: &[Insn],
     rips: &[u64],
     end_rip: u64,
-) -> (Vec<u8>, u32) {
+) -> CompiledBlock {
     let mut generator = Gen::new(addr, addrs, insns);
     generator.compile(rips, end_rip);
-    (generator.a.code, generator.inlined)
+    CompiledBlock {
+        code: generator.a.code,
+        inlined: generator.inlined,
+        body_offset: 0,
+        links: Vec::new(),
+    }
+}
+
+/// No direct links on this backend yet: every slot would stay a nop.
+pub(crate) fn link_bytes(_site: u64, _destination: u64) -> Option<Vec<u8>> {
+    None
+}
+
+pub(crate) fn unlink_bytes() -> Vec<u8> {
+    Vec::new()
 }
