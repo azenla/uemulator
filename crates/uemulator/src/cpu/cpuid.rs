@@ -78,6 +78,7 @@ const LEAF_L2_L3_CACHE_TLB: u32 = 0x8000_0006;
 const LEAF_ADVANCED_POWER: u32 = 0x8000_0007;
 const LEAF_ADDRESS_SIZES: u32 = 0x8000_0008;
 const LEAF_SVM: u32 = 0x8000_000a;
+const LEAF_TLB_1G: u32 = 0x8000_0019;
 const LEAF_CACHE_PROPERTIES: u32 = 0x8000_001d;
 const LEAF_EXTENDED_APIC_ID: u32 = 0x8000_001e;
 const LEAF_EXT_FEATURES_2: u32 = 0x8000_0021;
@@ -425,6 +426,16 @@ fn l2_associativity_code(ways: u32) -> u32 {
     }
 }
 
+/// Leaf 0x8000_0019 EAX: the L1 TLBs for 1 GiB pages, data (31:16) then instruction (15:0), each
+/// as associativity code (15:12) and entries (11:0). Zen's L1 TLBs are fully associative and hold
+/// any page size, so these are the same entry counts as leaf 0x8000_0005. EBX would describe the
+/// L2 TLBs for 1 GiB pages; Zen's L2 TLBs do not hold them (a 1 GiB page is cached in L1 only),
+/// so it reads zero.
+fn l1_tlb_1g_descriptor() -> u32 {
+    (L2_FULLY_ASSOCIATIVE << 12 | L1_DATA_TLB_ENTRIES) << 16
+        | (L2_FULLY_ASSOCIATIVE << 12 | L1_INSTRUCTION_TLB_ENTRIES)
+}
+
 /// Leaf 0x8000_0005 ECX or EDX: an L1 cache as size in KiB (31:24), ways (23:16), lines per tag
 /// (15:8) and line size (7:0).
 fn l1_cache_descriptor(bytes: u32, ways: u32) -> u32 {
@@ -699,6 +710,7 @@ impl Cpu {
             ),
             // revision 1, number of ASIDs, features
             LEAF_SVM => (1, super::svm::SVM_ASIDS, 0, super::svm::SVM_FEATURES),
+            LEAF_TLB_1G => (l1_tlb_1g_descriptor(), 0, 0, 0),
             LEAF_CACHE_PROPERTIES => match CACHES.get(subleaf as usize) {
                 Some(cache) => self.cache_properties(cache),
                 None => (0, 0, 0, 0),

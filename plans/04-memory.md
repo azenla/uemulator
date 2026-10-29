@@ -32,3 +32,9 @@ Page fault error code and CR2 are set in `Cpu::page_fault` (`mem.rs`). Walk read
 ## Atomicity
 
 Single vCPU thread. LOCK and cmpxchg are plain RMW in the helper; no host atomics needed. The host console thread talks to the vCPU thread only through queues and `exit_request`/`irq` atomics.
+
+## Huge pages
+
+- **Guest large pages.** 2 MiB and 1 GiB leaves (4 MiB with legacy PSE) walk in one pass. `walk_wide` also remembers each large leaf it resolves in `Cpu::large_pages` (`LargePage`, 8 entries, round robin), so a TLB miss on another 4 KiB page of the same leaf skips the walk, as a hardware large-page TLB would; a guest on transparent huge pages otherwise walks once per 4 KiB. The soft TLB and the JIT's inline probe are unchanged. Permissions are re-checked at each hit (`leaf_denied`: CPL, CR0.WP, SMEP/SMAP move without a flush), a store to a leaf whose Dirty bit is clear walks to set it, and nothing is cached under nested paging. `flush_tlb` and `invlpg` empty it. Legacy 4 MiB leaves are not cached.
+- **CPUID.** Leaf 0x8000_0001 EDX bit 26 (pdpe1gb), 0x8000_0005/6 (2M/4M TLBs) and 0x8000_0019 (1 GiB L1 TLBs; no L2 for them, as on Zen).
+- **Host backing.** On Linux with the `jit` feature (for `libc`), guest RAM gets `madvise(MADV_HUGEPAGE)` before its first touch (`sys::advise_huge_pages`), so the host's THP maps it in 2 MiB pages. Other hosts have no equivalent; a kernel with THP off ignores the advice.

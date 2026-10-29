@@ -213,6 +213,28 @@ pub(crate) fn jit_probe() -> bool {
     false
 }
 
+/// Smallest unit `madvise` takes; the kernel finds the 2 MiB-aligned extents inside by itself.
+#[cfg(target_os = "linux")]
+const ADVISE_ALIGNMENT: usize = 4096;
+
+/// Asks Linux to back `memory` with transparent huge pages, as QEMU does for guest RAM
+/// (`-machine memory-backend` THP, `MADV_HUGEPAGE`): one host TLB entry then covers 2 MiB of
+/// guest RAM, which is what makes guest memory-bound loops cheap. Call it before the first touch,
+/// or the pages already faulted in stay small until khugepaged merges them. Best effort: a kernel
+/// with THP set to `never` refuses and nothing changes. No other host has an equivalent.
+#[cfg(target_os = "linux")]
+pub(crate) fn advise_huge_pages(memory: &mut [u8]) {
+    let start = memory.as_mut_ptr() as usize;
+    let first = start.next_multiple_of(ADVISE_ALIGNMENT);
+    let end = (start + memory.len()) & !(ADVISE_ALIGNMENT - 1);
+    if end <= first {
+        return;
+    }
+    unsafe {
+        libc::madvise(first as *mut libc::c_void, end - first, libc::MADV_HUGEPAGE);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +250,17 @@ mod tests {
 
     fn contents(mem: &ExecMem, offset: usize, len: usize) -> Vec<u8> {
         unsafe { std::slice::from_raw_parts((mem.ptr as *const u8).add(offset), len).to_vec() }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn advising_huge_pages_keeps_the_memory_intact_for_any_slice() {
+        let mut ram = vec![0u8; 8 << 20];
+        advise_huge_pages(&mut ram);
+        ram[12345] = 7;
+        assert_eq!(ram[12345], 7);
+        advise_huge_pages(&mut ram[..0]);
+        advise_huge_pages(&mut ram[1..3]);
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]

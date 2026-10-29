@@ -476,6 +476,14 @@ fn uefi_payload<'a>(
     })
 }
 
+/// Guest RAM on host huge pages where the host has them (Linux, `jit` feature for `libc`).
+fn back_with_huge_pages(ram: &mut [u8]) {
+    #[cfg(all(feature = "jit", target_os = "linux"))]
+    crate::sys::advise_huge_pages(ram);
+    #[cfg(not(all(feature = "jit", target_os = "linux")))]
+    let _ = ram;
+}
+
 /// Wall-clock seconds, or 0 where there is no clock (UEFI keeps its own, see `unix_time`).
 fn host_unix_time() -> u64 {
     #[cfg(not(freestanding))]
@@ -667,6 +675,7 @@ impl Vcpu {
             // Fresh zeroed RAM, not a `fill(0)` of the old one: `boot::load` relies on zeroes,
             // and filling would commit every page the host had lazily left untouched.
             let mut ram = vec![0u8; finished.ram_bytes];
+            back_with_huge_pages(&mut ram);
             let loaded = match &image.uefi {
                 Some((firmware, params)) => boot::load_uefi_firmware(
                     &mut ram,
@@ -846,6 +855,7 @@ impl EmulatedMachine {
             }
         }
         let mut ram = vec![0u8; cfg.memory_mib << BYTES_PER_MIB_SHIFT];
+        back_with_huge_pages(&mut ram);
         let kinds = if cfg.consoles.is_empty() {
             vec![ConsoleKind::Virtio]
         } else {

@@ -517,3 +517,14 @@ fn advertised_instruction_sets_have_the_state_they_need() {
     assert_ne!(cpuid(&mut h, 7, 0)[1] & (1 << 16), 0, "AVX512F");
     assert_ne!(cpuid(&mut h, 0xd, 1)[0] & 0b1010, 0, "XSAVEC and XSAVES");
 }
+
+#[test]
+fn leaf_0x8000_0019_describes_fully_associative_l1_tlbs_for_1gib_pages_and_no_l2() {
+    let mut h = blank();
+    // Data TLB: associativity 0xf (fully), 72 entries; instruction TLB: 0xf, 64 entries.
+    assert_eq!(
+        cpuid(&mut h, 0x8000_0019, 0),
+        [0xf048_f040, 0, 0, 0],
+        "EAX is the L1 pair, EBX the (absent) L2 pair"
+    );
+}

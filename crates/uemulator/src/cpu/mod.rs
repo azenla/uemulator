@@ -260,6 +260,41 @@ pub(crate) struct TlbEntry {
     pub addend: u64,
 }
 
+/// How many large leaves `Cpu::large_pages` remembers. A real core has 32 2 MiB/4 MiB entries;
+/// a miss scans all of them, so this stays small.
+pub(crate) const LARGE_PAGE_CACHE_ENTRIES: usize = 8;
+
+/// A 2 MiB or 1 GiB leaf the page walker has already validated, so a TLB miss on any other 4 KiB
+/// page inside it needs no walk. This is the large-page half of a hardware TLB: the soft TLB
+/// itself caches one 4 KiB page per slot, and a guest on transparent huge pages would otherwise
+/// walk once per 4 KiB it touches. Filled by `walk_wide`, emptied wherever `flush_tlb` and
+/// `invlpg` empty the TLB. Permissions are checked again at each hit (CPL, CR0.WP, SMEP and SMAP
+/// can change without a flush); only the walk is skipped.
+#[derive(Clone, Copy)]
+pub(crate) struct LargePage {
+    /// Linear address of the leaf's first byte (aligned to `1 << shift`).
+    pub linear_base: u64,
+    /// Physical address of the leaf's first byte.
+    pub physical_base: u64,
+    /// log2 of the leaf size; 0 marks an unused entry.
+    pub shift: u32,
+    pub writable: bool,
+    pub user_allowed: bool,
+    pub no_execute: bool,
+    /// The leaf already has Dirty set, so a store needs no walk.
+    pub dirty: bool,
+}
+
+pub(crate) const LARGE_PAGE_EMPTY: LargePage = LargePage {
+    linear_base: 0,
+    physical_base: 0,
+    shift: 0,
+    writable: false,
+    user_allowed: false,
+    no_execute: false,
+    dirty: false,
+};
+
 /// Never equals a page-aligned address, so an empty tag always misses.
 pub(crate) const TLB_TAG_INVALID: u64 = u64::MAX;
 pub(crate) const TLB_EMPTY: TlbEntry = TlbEntry {
@@ -514,6 +549,11 @@ pub(crate) struct Cpu {
     pub code_mark_epoch: u64,
     /// The `code_mark_epoch` this vCPU's TLB is up to date with.
     pub code_mark_seen: u64,
+    /// Large leaves behind the soft TLB (see `LargePage`), replaced round robin from
+    /// `large_page_next`. Last in the struct: generated code never reads it, and the fields it
+    /// does read must stay within their short load offsets.
+    pub large_pages: [LargePage; LARGE_PAGE_CACHE_ENTRIES],
+    pub large_page_next: usize,
 }
 
 /// Size of the line MONITOR arms and the unit of the wait-on-store check.
@@ -746,6 +786,8 @@ impl Cpu {
             pending: None,
             jit: None,
             tlb_active_base: 0,
+            large_pages: [LARGE_PAGE_EMPTY; LARGE_PAGE_CACHE_ENTRIES],
+            large_page_next: 0,
             block_exit_requested: false,
             prepaid_icount: 0,
             slow_access_insn: 0,

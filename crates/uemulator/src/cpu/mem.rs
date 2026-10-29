@@ -256,6 +256,9 @@ impl Cpu {
     /// latched in `pdpte`); 32-bit paging has its own because everything about its entries is
     /// narrower.
     fn walk(&mut self, linear: u64, access: AccessKind, user: bool) -> ExecResult<(u64, u8)> {
+        if let Some(hit) = self.large_page_lookup(linear, access, user) {
+            return Ok(hit);
+        }
         match self.paging_mode() {
             // Linear is guest-physical; a nested-paging guest's addresses still go through nCR3.
             PagingMode::Off => Ok((
@@ -265,6 +268,86 @@ impl Cpu {
             PagingMode::Legacy => self.walk_legacy(linear, access, user),
             mode => self.walk_wide(linear, access, user, mode == PagingMode::Pae),
         }
+    }
+
+    /// The cached large leaf holding `linear`, as `walk` would return it, unless the access must
+    /// walk anyway: it is not allowed (the walk raises the right #PF), or it is a store to a leaf
+    /// that is not dirty yet (the walk sets Dirty).
+    fn large_page_lookup(&self, linear: u64, access: AccessKind, user: bool) -> Option<(u64, u8)> {
+        let cached = self.large_pages.iter().find(|leaf| {
+            leaf.shift != 0 && linear >> leaf.shift == leaf.linear_base >> leaf.shift
+        })?;
+        if (access == AccessKind::Write && !cached.dirty)
+            || self.leaf_denied(
+                access,
+                user,
+                cached.writable,
+                cached.user_allowed,
+                cached.no_execute,
+            )
+        {
+            return None;
+        }
+        let offset_mask = (1u64 << cached.shift) - 1;
+        let page = cached.physical_base | (linear & offset_mask & !PAGE_OFFSET_MASK);
+        let mut flags = 0;
+        if cached.writable {
+            flags |= TLB_FLAG_WRITABLE;
+        }
+        if cached.user_allowed {
+            flags |= TLB_FLAG_USER;
+        }
+        if cached.no_execute {
+            flags |= TLB_FLAG_NO_EXECUTE;
+        }
+        if cached.dirty {
+            flags |= TLB_FLAG_DIRTY;
+        }
+        Some((page, flags))
+    }
+
+    /// Remembers a large leaf `walk_wide` just resolved. With nested paging the host-physical
+    /// page can differ per 4 KiB inside a guest-physical leaf, and a nested fault must exit at
+    /// the access that causes it, so nothing is cached then.
+    #[allow(clippy::too_many_arguments)]
+    fn large_page_insert(
+        &mut self,
+        linear: u64,
+        shift: u32,
+        physical_base: u64,
+        writable: bool,
+        user_allowed: bool,
+        no_execute: bool,
+        dirty: bool,
+    ) {
+        if self
+            .svm
+            .guest
+            .as_ref()
+            .is_some_and(|g| g.nested_cr3.is_some())
+        {
+            return;
+        }
+        let linear_base = linear & !((1u64 << shift) - 1);
+        // The same leaf again (a store re-walking a clean one) takes its old slot.
+        let slot = self
+            .large_pages
+            .iter()
+            .position(|leaf| leaf.shift == shift && leaf.linear_base == linear_base)
+            .unwrap_or_else(|| {
+                let slot = self.large_page_next;
+                self.large_page_next = (slot + 1) % LARGE_PAGE_CACHE_ENTRIES;
+                slot
+            });
+        self.large_pages[slot] = LargePage {
+            linear_base,
+            physical_base,
+            shift,
+            writable,
+            user_allowed,
+            no_execute: no_execute && self.efer & EFER_NXE != 0,
+            dirty,
+        };
     }
 
     fn walk_wide(
@@ -341,6 +424,17 @@ impl Cpu {
                 let leaf_base = pte & PTE_ADDRESS_MASK & !leaf_offset_mask;
                 let guest_page = leaf_base | (linear & leaf_offset_mask & !PAGE_OFFSET_MASK);
                 let page_pa = self.nested_translate(guest_page, access, false)?;
+                if level > 0 {
+                    self.large_page_insert(
+                        linear,
+                        leaf_shift,
+                        leaf_base,
+                        writable,
+                        user_allowed,
+                        no_execute,
+                        pte & PTE_DIRTY != 0,
+                    );
+                }
                 return Ok((
                     page_pa,
                     self.leaf_tlb_flags(writable, user_allowed, no_execute, pte),
@@ -539,10 +633,16 @@ impl Cpu {
         for entry in self.tlb.iter_mut() {
             *entry = TLB_EMPTY;
         }
+        self.large_pages = [LARGE_PAGE_EMPTY; LARGE_PAGE_CACHE_ENTRIES];
     }
 
     /// Empties the page's slot in both halves; whatever other page shares the slot goes too.
     pub fn invlpg(&mut self, linear: u64) {
+        for leaf in self.large_pages.iter_mut() {
+            if leaf.shift != 0 && linear >> leaf.shift == leaf.linear_base >> leaf.shift {
+                *leaf = LARGE_PAGE_EMPTY;
+            }
+        }
         let slot = tlb_slot(linear, false);
         self.tlb[slot] = TLB_EMPTY;
         self.tlb[TLB_ENTRIES_PER_MODE + slot] = TLB_EMPTY;
@@ -2087,6 +2187,178 @@ mod tests {
         }
     }
 
+    mod large_pages {
+        use super::*;
+
+        const LARGE_VA: u64 = 0x0000_5000_0020_0000;
+        const GIGA_VA: u64 = 0x0000_4000_4000_0000;
+        const LARGE_PA: u64 = 0x40_0000;
+        const OTHER_LARGE_PA: u64 = 0x60_0000;
+        const LARGE_2M: u64 = 1 << 21;
+        const FULL: u64 = PTE_PRESENT_WRITABLE_USER;
+
+        fn map_2m(h: &mut Harness, tables: &mut PageTables, flags: u64) -> u64 {
+            tables.map(&mut h.cpu, LARGE_VA, LARGE_PA, &[FULL, FULL, flags])
+        }
+
+        fn translate(h: &mut Harness, linear: u64, access: AccessKind) -> u64 {
+            h.cpu.translate(linear, access, false).unwrap()
+        }
+
+        #[test]
+        fn a_cached_2mib_leaf_serves_the_rest_of_its_pages_without_a_walk() {
+            let (mut h, mut tables) = paged();
+            let leaf = map_2m(&mut h, &mut tables, FULL | PTE_A | PTE_D);
+            assert_eq!(translate(&mut h, LARGE_VA, AccessKind::Read), LARGE_PA);
+            // The guest edits its page table without a flush: real hardware keeps using the
+            // cached large translation, and so must the walker, or it is not caching anything.
+            write_pte(
+                &mut h.cpu,
+                leaf,
+                OTHER_LARGE_PA | FULL | PTE_PS | PTE_A | PTE_D,
+            );
+            assert_eq!(
+                translate(&mut h, LARGE_VA + 0x5000, AccessKind::Read),
+                LARGE_PA + 0x5000
+            );
+            assert_eq!(
+                translate(&mut h, LARGE_VA + LARGE_2M - PAGE, AccessKind::Write),
+                LARGE_PA + LARGE_2M - PAGE
+            );
+        }
+
+        #[test]
+        fn a_cached_1gib_leaf_serves_pages_far_apart() {
+            let (mut h, mut tables) = paged();
+            let leaf = tables.map(&mut h.cpu, GIGA_VA, 0, &[FULL, FULL | PTE_A | PTE_D]);
+            assert_eq!(
+                translate(&mut h, GIGA_VA + 0x1000, AccessKind::Read),
+                0x1000
+            );
+            write_pte(&mut h.cpu, leaf, 0x20_0000 | FULL | PTE_PS | PTE_A | PTE_D);
+            let far = 0x30_0000;
+            assert_eq!(translate(&mut h, GIGA_VA + far, AccessKind::Read), far);
+        }
+
+        #[test]
+        fn invlpg_anywhere_in_the_leaf_drops_the_cached_translation() {
+            let (mut h, mut tables) = paged();
+            let leaf = map_2m(&mut h, &mut tables, FULL | PTE_A | PTE_D);
+            translate(&mut h, LARGE_VA, AccessKind::Read);
+            write_pte(
+                &mut h.cpu,
+                leaf,
+                OTHER_LARGE_PA | FULL | PTE_PS | PTE_A | PTE_D,
+            );
+            h.cpu.invlpg(LARGE_VA + 0x1f_f000);
+            assert_eq!(
+                translate(&mut h, LARGE_VA + 0x3000, AccessKind::Read),
+                OTHER_LARGE_PA + 0x3000
+            );
+        }
+
+        #[test]
+        fn a_full_tlb_flush_drops_the_cached_translation() {
+            let (mut h, mut tables) = paged();
+            let leaf = map_2m(&mut h, &mut tables, FULL | PTE_A | PTE_D);
+            translate(&mut h, LARGE_VA, AccessKind::Read);
+            write_pte(
+                &mut h.cpu,
+                leaf,
+                OTHER_LARGE_PA | FULL | PTE_PS | PTE_A | PTE_D,
+            );
+            h.cpu.flush_tlb();
+            assert_eq!(
+                translate(&mut h, LARGE_VA + 0x3000, AccessKind::Read),
+                OTHER_LARGE_PA + 0x3000
+            );
+        }
+
+        #[test]
+        fn the_first_store_through_a_cached_clean_leaf_still_sets_dirty() {
+            let (mut h, mut tables) = paged();
+            let leaf = map_2m(&mut h, &mut tables, FULL);
+            translate(&mut h, LARGE_VA, AccessKind::Read);
+            assert_eq!(read_pte(&h.cpu, leaf) & PTE_D, 0);
+            translate(&mut h, LARGE_VA + 0x7000, AccessKind::Write);
+            assert_ne!(read_pte(&h.cpu, leaf) & PTE_D, 0);
+        }
+
+        #[test]
+        fn a_cached_supervisor_leaf_still_refuses_user_access() {
+            let (mut h, mut tables) = paged();
+            tables.map(
+                &mut h.cpu,
+                LARGE_VA,
+                LARGE_PA,
+                &[FULL, FULL, SUPERVISOR_ONLY | PTE_A | PTE_D],
+            );
+            translate(&mut h, LARGE_VA, AccessKind::Read);
+            h.cpu.set_cpl(3);
+            let result = h.cpu.translate(LARGE_VA + 0x2000, AccessKind::Read, false);
+            assert_eq!(fault_of(result), (VECTOR_PAGE_FAULT, Some(PF_P | PF_U)));
+        }
+
+        #[test]
+        fn a_cached_read_only_leaf_still_refuses_a_user_store() {
+            let (mut h, mut tables) = paged();
+            tables.map(
+                &mut h.cpu,
+                LARGE_VA,
+                LARGE_PA,
+                &[FULL, FULL, READ_ONLY_USER | PTE_A | PTE_D],
+            );
+            h.cpu.set_cpl(3);
+            translate(&mut h, LARGE_VA, AccessKind::Read);
+            let result = h.cpu.translate(LARGE_VA + 0x2000, AccessKind::Write, false);
+            assert_eq!(
+                fault_of(result),
+                (VECTOR_PAGE_FAULT, Some(PF_P | PF_W | PF_U))
+            );
+        }
+
+        #[test]
+        fn a_neighbouring_leaf_is_not_served_from_the_cache() {
+            let (mut h, mut tables) = paged();
+            map_2m(&mut h, &mut tables, FULL | PTE_A | PTE_D);
+            translate(&mut h, LARGE_VA, AccessKind::Read);
+            tables.map(
+                &mut h.cpu,
+                LARGE_VA + LARGE_2M,
+                OTHER_LARGE_PA,
+                &[FULL, FULL, FULL | PTE_A | PTE_D],
+            );
+            assert_eq!(
+                translate(&mut h, LARGE_VA + LARGE_2M + 0x1000, AccessKind::Read),
+                OTHER_LARGE_PA + 0x1000
+            );
+        }
+
+        #[test]
+        fn many_leaves_beyond_the_cache_capacity_all_translate_correctly() {
+            let (mut h, mut tables) = paged();
+            let leaves = LARGE_PAGE_CACHE_ENTRIES as u64 * 3;
+            for i in 0..leaves {
+                let leaf_flags = FULL | PTE_A | PTE_D;
+                tables.map(
+                    &mut h.cpu,
+                    LARGE_VA + i * LARGE_2M,
+                    LARGE_PA,
+                    &[FULL, FULL, leaf_flags],
+                );
+            }
+            for round in 0..2 {
+                for i in 0..leaves {
+                    let linear = LARGE_VA + i * LARGE_2M + 0x2000 * (round + 1);
+                    assert_eq!(
+                        translate(&mut h, linear, AccessKind::Read),
+                        LARGE_PA + 0x2000 * (round + 1)
+                    );
+                }
+            }
+        }
+    }
+
     mod canonical_addresses {
         use super::*;
 
@@ -3144,6 +3416,47 @@ mod tests {
                 }
             );
             assert_jit_matches_interpreter(&code, |_| {});
+        }
+    }
+
+    mod large_pages_on_both_engines {
+        use super::*;
+        use crate::testkit::{SCRATCH, Stop, assert_jit_matches_interpreter, run_both};
+
+        const ALIAS: u64 = 0x0000_5000_0000_0000;
+        const FULL: u64 = PTE_PRESENT_WRITABLE_USER;
+
+        /// Identity-maps RAM with one 1 GiB leaf and puts a 2 MiB leaf over the scratch page at
+        /// `ALIAS`; neither leaf starts out dirty.
+        fn map_with_large_pages(h: &mut Harness) {
+            let mut tables = PageTables::new(&mut h.cpu);
+            tables.map(&mut h.cpu, 0, 0, &[FULL, FULL]);
+            tables.map(
+                &mut h.cpu,
+                ALIAS,
+                SCRATCH & !(TWO_MIB - 1),
+                &[FULL, FULL, FULL],
+            );
+        }
+
+        #[test]
+        fn stores_and_loads_across_a_2mib_leaf_agree() {
+            // mov rbx, ALIAS + (SCRATCH offset in its 2 MiB page); mov rax, 0x1234
+            // mov [rbx], rax; mov [rbx+0x1000], rax; mov rcx, [rbx+0x100000]; mov rdx, [rbx+0x1000]
+            let offset = SCRATCH & (TWO_MIB - 1);
+            let mut code = vec![0x48, 0xbb];
+            code.extend((ALIAS + offset).to_le_bytes());
+            code.extend([0x48, 0xc7, 0xc0, 0x34, 0x12, 0x00, 0x00]);
+            code.extend([0x48, 0x89, 0x03]);
+            code.extend([0x48, 0x89, 0x83, 0x00, 0x10, 0x00, 0x00]);
+            code.extend([0x48, 0x8b, 0x8b, 0x00, 0x00, 0x10, 0x00]);
+            code.extend([0x48, 0x8b, 0x93, 0x00, 0x10, 0x00, 0x00]);
+            code.push(HLT);
+            let outcome = run_both(&code, map_with_large_pages);
+            assert_eq!(outcome.interpreter_stop, Stop::Halted);
+            // gpr[2] is rdx.
+            assert_eq!(outcome.interpreter.cpu.gpr[2], 0x1234);
+            assert_jit_matches_interpreter(&code, map_with_large_pages);
         }
     }
 
