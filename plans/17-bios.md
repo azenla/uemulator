@@ -32,7 +32,7 @@ Not provided: VGA text memory (B8000 is plain RAM), ACPI/SMBIOS/MP tables (the k
 
 ## Verification
 
-`cpu/bios.rs` has unit tests for every service (including the failure statuses) and `machine/tests.rs` boots tiny boot sectors on a full machine, one of them waiting for the PIT's IRQ0 to reach the BIOS tick. Not a test, needs a disk you supply: an Alpine `setup-alpine` install (syslinux 6.04 MBR, `ldlinux.sys`, `menu.c32`) boots through the MBR, the menu countdown, the kernel and initramfs load (INT 13h, INT 15h), the kernel's real-mode setup and the 32-bit entry to `alpine login:` on hvc0 and ttyS0 (`quick boot` on a machine whose disk the installer wrote). With a non-terminal stdin the clock is virtual and the menu's busy-poll takes about 40 s of host time for its 1-second countdown; `--realtime` (implied by a terminal) makes it one second.
+`cpu/bios.rs` has unit tests for every service (including the failure statuses) and `machine/tests.rs` boots tiny boot sectors on a full machine, one of them waiting for the PIT's IRQ0 to reach the BIOS tick. Not a test, needs a disk you supply: an Alpine `setup-alpine` install (syslinux 6.04 MBR, `ldlinux.sys`, `menu.c32`) boots through the MBR, the menu countdown, the kernel and initramfs load (INT 13h, INT 15h), the kernel's real-mode setup and the 32-bit entry to `alpine login:` on hvc0 and ttyS0 (`quick boot` on a machine whose disk the installer wrote). The clock follows the host (`--verify` alone makes it virtual), so the menu's 1-second countdown takes one second.
 
 ## Open questions
 

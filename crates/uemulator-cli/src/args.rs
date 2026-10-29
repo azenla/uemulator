@@ -253,9 +253,6 @@ pub struct RuntimeArgs {
     /// Fix the guest RTC to this Unix time
     #[arg(long, value_name = "UNIX")]
     pub time: Option<u64>,
-    /// Pace guest time to the wall clock even when stdin is not a terminal
-    #[arg(long)]
-    pub realtime: bool,
     /// Stop the machine after this many seconds
     #[arg(long, value_name = "SECS")]
     pub timeout: Option<u64>,

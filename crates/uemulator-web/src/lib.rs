@@ -11,7 +11,9 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use uemulator::{EmulatedMachine, ExitReason, JitMode, MachineConfig, StopHandle};
+use uemulator::{ClockMode, EmulatedMachine, ExitReason, JitMode, MachineConfig, StopHandle};
+
+const NS_PER_MS: f64 = 1_000_000.0;
 
 /// The vCPU calls the poll hook every few thousand instructions; crossing into JavaScript on each
 /// one costs more than it saves, so busy guests are asked for input only every this-many polls.
@@ -41,6 +43,8 @@ unsafe extern "C" {
     fn host_should_stop() -> i32;
     /// The guest is halted with nothing scheduled: JavaScript may sleep for a moment.
     fn host_idle();
+    /// Milliseconds on a monotonic clock (`performance.now()`), fractional.
+    fn host_now_ms() -> f64;
     /// Emulator diagnostics (the library's `log` hook).
     fn host_log(ptr: *const u8, len: usize);
 }
@@ -112,6 +116,10 @@ pub unsafe extern "C" fn uw_create(
         .memory_mib(memory_mib as usize)
         // There is no JIT for WebAssembly.
         .jit(JitMode::Off)
+        // Guest time follows the page's clock. A virtual clock jumps over every idle wait and
+        // otherwise crawls at one nanosecond per interpreted instruction.
+        .clock(ClockMode::Realtime)
+        .host_clock(|| (unsafe { host_now_ms() } * NS_PER_MS) as u64)
         .unix_time(unix_time as u64)
         .log(|message| unsafe { host_log(message.as_ptr(), message.len()) })
         .poll(poll);

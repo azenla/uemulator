@@ -9,7 +9,7 @@
 
 ## Library changes
 
-`target_os = "uefi"` became `cfg(freestanding)`, set by `crates/uemulator/build.rs` for UEFI and for any `wasm32` target. Freestanding means `no_std`, no threads, no clock and no `std::fs`: the vCPU runs on the caller's thread inside `EmulatedMachine::wait` and the host is reached through `MachineConfig::poll`, exactly as in 12-uefi.md. `libm` is a dependency on the same targets. The RTC starts at `unix_time`, which the page passes from `Date.now()`; guest time is virtual.
+`target_os = "uefi"` became `cfg(freestanding)`, set by `crates/uemulator/build.rs` for UEFI and for any `wasm32` target. Freestanding means `no_std`, no threads, no clock and no `std::fs`: the vCPU runs on the caller's thread inside `EmulatedMachine::wait` and the host is reached through `MachineConfig::poll`, exactly as in 12-uefi.md. `libm` is a dependency on the same targets. The RTC starts at `unix_time`, which the page passes from `Date.now()`; guest time follows `performance.now()` through `MachineConfig::host_clock` (`ClockMode::Realtime`): a virtual clock crawls at one nanosecond per interpreted instruction, far slower than the wall, then jumps over every idle wait. A halted guest waits in the poll hook's `host_idle` (1 ms), so a due timer fires at most that late.
 
 ## Shape of the port
 

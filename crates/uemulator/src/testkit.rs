@@ -16,7 +16,7 @@ use crate::console::ConsoleHandle;
 use crate::cpu::Cpu;
 use crate::cpu::exception::Exception;
 use crate::dev::DevConfig;
-use crate::machine::{EmulatedMachine, ExitReason, JitMode, MachineConfig};
+use crate::machine::{ClockMode, EmulatedMachine, ExitReason, JitMode, MachineConfig};
 
 pub(crate) const RAX: usize = 0;
 pub(crate) const RCX: usize = 1;
@@ -427,6 +427,9 @@ pub(crate) fn run_machine(
 ) -> MachineRun {
     let config = configure(
         MachineConfig::new()
+            // Tests are deterministic and never wait out a guest timer; one that wants the host
+            // clock asks for it in `configure`.
+            .clock(ClockMode::Virtual)
             .kernel(kernel)
             .memory_mib(64)
             .jit(jit)

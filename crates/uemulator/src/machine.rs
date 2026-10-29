@@ -57,14 +57,15 @@ pub enum JitMode {
 pub enum ClockMode {
     /// Guest time is the instruction count (one nanosecond each) plus the time skipped while
     /// halted: with a timer pending the clock jumps straight to its deadline, with none it stands
-    /// still while the host naps 1 ms per idle poll. Runs are deterministic.
-    #[default]
+    /// still while the host naps 1 ms per idle poll. Runs are deterministic, which tests and `verify_jit` need.
     Virtual,
-    /// While halted with a timer pending the host really sleeps (up to 2 ms per wait) and guest
-    /// time advances by exactly what was slept, so a 20 ms guest timeout takes at least 20 ms of
-    /// wall time. Running code is not paced: guest time still counts instructions, so this is not
-    /// the `max(virtual, wall)` clock `plans/07-devices.md` describes and only approximates wall
-    /// time. Ignored on UEFI, where the clock stays virtual, and under `verify_jit`.
+    /// Guest time is the host's monotonic clock, as in QEMU without `-icount`: the TSC, the
+    /// timers and the RTC advance with the wall clock whatever the emulation speed, and a halted
+    /// guest really waits (up to 2 ms per sleep, so the stop flag and host console stay
+    /// responsive; a freestanding host's poll hook does the waiting). Not deterministic. Ignored
+    /// on UEFI, and on a freestanding host without `MachineConfig::host_clock`, where the clock
+    /// stays virtual, and under `verify_jit`.
+    #[default]
     Realtime,
 }
 
@@ -117,6 +118,8 @@ pub(crate) type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 /// The poll hook as the CPU sees it: the console is already bound, the flag means "guest is
 /// halted with nothing scheduled, the host may wait".
 pub(crate) type PollFn = Arc<dyn Fn(bool) + Send + Sync>;
+/// Monotonic host nanoseconds from any fixed starting point (`MachineConfig::host_clock`).
+pub(crate) type HostClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// The embedder-facing poll hook of `MachineConfig::poll`, which receives the console itself.
 type HostPollFn = Arc<dyn Fn(&ConsoleHandle, bool) + Send + Sync>;
 
@@ -141,6 +144,7 @@ pub struct MachineConfig {
     clock: ClockMode,
     log: Option<LogFn>,
     poll: Option<HostPollFn>,
+    host_clock: Option<HostClockFn>,
     debug: bool,
     verify: bool,
     unix_time: Option<u64>,
@@ -168,9 +172,10 @@ impl Default for MachineConfig {
             iommu: false,
             acpi: true,
             jit: JitMode::Auto,
-            clock: ClockMode::Virtual,
+            clock: ClockMode::Realtime,
             log: None,
             poll: None,
+            host_clock: None,
             debug: false,
             verify: false,
             unix_time: None,
@@ -392,6 +397,16 @@ impl MachineConfig {
     }
 }
 
+impl MachineConfig {
+    /// The monotonic host clock `ClockMode::Realtime` follows, in nanoseconds from any fixed
+    /// starting point. Hosts with `std` need not set it; freestanding ones (WebAssembly) must,
+    /// or the clock stays virtual.
+    pub fn host_clock(mut self, f: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.host_clock = Some(Arc::new(f));
+        self
+    }
+}
+
 /// Cloneable, thread-safe way to end a running machine. The vCPU polls the flag at its event
 /// ticks and while idle, so `wait()` returns `Stopped` shortly after, not instantly.
 #[derive(Clone)]
@@ -415,6 +430,7 @@ struct Vcpu {
     stop: Arc<AtomicBool>,
     log: Option<LogFn>,
     poll: Option<HostPollFn>,
+    host_clock: Option<HostClockFn>,
     debug: bool,
     jit: JitMode,
     clock: ClockMode,
@@ -615,7 +631,7 @@ fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConf
 /// The interpreter-only oracle for `Cpu::run_verify`. Anything a guest can observe must be
 /// identical to the JIT-enabled CPU, or the first guest read of it shows up as a bogus JIT
 /// divergence: the RTC boot time (the twin would otherwise read the wall clock) and the
-/// device set. Time is always virtual here (`realtime` stays off) because only instruction
+/// device set. Time is always virtual here (no `wall_clock`) because only instruction
 /// counts, which both CPUs share, keep the two clocks equal.
 fn interpreter_twin(
     ram: Vec<u8>,
@@ -627,7 +643,6 @@ fn interpreter_twin(
 ) -> Cpu {
     let mut twin = Cpu::new(ram, boot, uart_console, stop, None, devices);
     twin.dev.set_boot_time(boot_unix);
-    twin.realtime = false;
     twin
 }
 
@@ -738,7 +753,13 @@ impl Vcpu {
         // once, so verification always runs on virtual time (a realtime main CPU sleeps in 2 ms
         // slices and reports a bogus pre-step divergence).
         let lockstep = verify_twin.is_some() && cpu.jit.is_some();
-        cpu.realtime = self.clock == ClockMode::Realtime && !lockstep;
+        if self.clock == ClockMode::Realtime && !lockstep {
+            cpu.wall_clock = self
+                .host_clock
+                .clone()
+                .or_else(crate::cpu::default_host_clock)
+                .map(crate::cpu::WallClock::new);
+        }
         // Lockstep needs generated code to compare; without any (`JitMode::Off`, a host without
         // a backend) `step_block` has nothing to run, so just interpret.
         let mut vcpu_summary = String::new();
@@ -994,6 +1015,7 @@ impl EmulatedMachine {
                 stop: stop.clone(),
                 log: cfg.log,
                 poll: cfg.poll,
+                host_clock: cfg.host_clock,
                 debug: cfg.debug,
                 jit: cfg.jit,
                 clock: cfg.clock,

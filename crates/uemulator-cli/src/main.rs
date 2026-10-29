@@ -802,7 +802,7 @@ mod tests {
         let runtime = &boot.runtime;
         assert_eq!(runtime.time, None);
         assert_eq!(runtime.timeout, None);
-        assert!(!runtime.verify && !runtime.debug && !runtime.realtime);
+        assert!(!runtime.verify && !runtime.debug);
     }
 
     #[test]
@@ -837,7 +837,6 @@ mod tests {
             "--debug",
             "--time",
             "1700000000",
-            "--realtime",
             "--timeout",
             "30",
         ]);
@@ -857,7 +856,7 @@ mod tests {
         assert_eq!(linux.no_reboot, Some(true));
         assert_eq!(runtime.time, Some(1_700_000_000));
         assert_eq!(runtime.timeout, Some(30));
-        assert!(runtime.verify && runtime.debug && runtime.realtime);
+        assert!(runtime.verify && runtime.debug);
     }
 
     #[test]

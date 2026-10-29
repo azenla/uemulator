@@ -5,7 +5,8 @@ import { CTRL, RING_BYTES, RING_OFFSET } from "./protocol.js";
 
 const OUTPUT_FLUSH_MS = 16;
 const OUTPUT_FLUSH_BYTES = 1 << 16;
-const IDLE_WAIT_MS = 4;
+// Also the latency of a guest timer that falls due while the guest is halted.
+const IDLE_WAIT_MS = 1;
 
 let wasm;
 let control;
@@ -72,6 +73,9 @@ const host = {
     if (head === Atomics.load(control, CTRL.TAIL)) {
       Atomics.wait(control, CTRL.HEAD, head, IDLE_WAIT_MS);
     }
+  },
+  host_now_ms() {
+    return performance.now();
   },
   host_log(ptr, len) {
     postMessage({ type: "log", text: decoder.decode(memoryBytes(ptr, len)) });

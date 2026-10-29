@@ -4,7 +4,7 @@ Port I/O only (no MMIO in v1). Unknown ports read all ones, writes ignored. Devi
 
 ## Clock (`clock.rs`)
 
-- `now_ns()` = single virtual time. `ClockMode::Virtual`: `ns = icount * NS_PER_INSN (default 2)`, plus warps. `Realtime`: `max(virtual, wall)`; HLT sleeps on a condvar until the next deadline or console input.
+- `now_ns()` = single virtual time. `ClockMode::Virtual`: `ns = icount * NS_PER_INSN (default 2)`, plus warps. `Realtime`: the host monotonic clock (`MachineConfig::host_clock`, `Instant` by default), read on every `now_ns`, so the TSC, timers and RTC keep wall pace whatever the emulation speed; HLT sleeps up to 2 ms at a time (a freestanding host's poll hook waits instead). Realtime is the default (CLI, web, library); Virtual is for the test kit and `--verify`, which need determinism.
 - TSC = `now_ns * tsc_hz / 1e9` (advertised 1 GHz-ish; kernel calibrates via PIT, so PIT and TSC must share this clock).
 - Timer queue: sorted deadlines from PIT, RTC periodic, (LAPIC timer later). The run loop checks `now >= next_deadline` at TB boundaries and on the icount budget (05).
 - HLT with interrupts enabled in Virtual mode: advance the clock to `next_deadline` immediately (skip idle). With no deadline and no input in Realtime mode: block on the condvar. With no deadline at all in Virtual mode and IF=1 the host naps and polls (host input can still wake the guest).

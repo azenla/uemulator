@@ -42,7 +42,7 @@ use crate::boot::BootState;
 use crate::console::ConsoleHandle;
 use crate::dev::guestmem::GuestMem;
 use crate::dev::{DevConfig, Devices};
-use crate::machine::{ExitReason, LogFn, PollFn};
+use crate::machine::{ExitReason, HostClockFn, LogFn, PollFn};
 
 use decode::Insn;
 use flags::LazyFlagsOp;
@@ -75,6 +75,44 @@ pub(crate) enum Slice {
     Exit(ExitReason),
     Yield,
     Halted,
+}
+
+/// The host clock the guest follows in realtime mode, zeroed when the machine starts so guest
+/// time begins at 0 as the virtual clock does. vCPUs share one reader (and so one timeline).
+#[derive(Clone)]
+pub(crate) struct WallClock {
+    read: HostClockFn,
+    origin_ns: u64,
+}
+
+impl WallClock {
+    pub(crate) fn new(read: HostClockFn) -> Self {
+        let origin_ns = read();
+        WallClock { read, origin_ns }
+    }
+
+    fn elapsed_ns(&self) -> u64 {
+        (self.read)().saturating_sub(self.origin_ns)
+    }
+}
+
+/// `Instant` as a host clock.
+#[cfg(not(freestanding))]
+pub(crate) fn std_host_clock() -> HostClockFn {
+    let origin = std::time::Instant::now();
+    Arc::new(move || origin.elapsed().as_nanos() as u64)
+}
+
+/// The clock realtime mode uses when the embedder gave none: only `std` hosts have one.
+pub(crate) fn default_host_clock() -> Option<HostClockFn> {
+    #[cfg(not(freestanding))]
+    {
+        Some(std_host_clock())
+    }
+    #[cfg(freestanding)]
+    {
+        None
+    }
 }
 
 /// Virtual time per retired instruction. `now_ns`/`tsc` are derived from `icount`, which makes
@@ -418,8 +456,8 @@ pub(crate) struct Cpu {
     /// Instructions retired; guest time is derived from it. `run` adds one before an
     /// instruction executes, so an instruction that faults is counted too.
     pub icount: u64,
-    /// Virtual time added while halted: the clock jumps (or sleeps, when realtime) to the next
-    /// device deadline instead of executing instructions.
+    /// Virtual time added while halted: the clock jumps to the next device deadline instead of
+    /// executing instructions. Stays 0 with a `wall_clock`, which just waits.
     pub idle_skipped_ns: u64,
     /// With several vCPUs the clock is not the raw `icount` (see `smp.rs`): guest time is
     /// `time_base_ns` plus the instructions retired since `slice_base_icount` divided by
@@ -441,8 +479,9 @@ pub(crate) struct Cpu {
     pub logged: alloc::collections::BTreeSet<u64>,
     /// Number of `flush_decode` calls, for `dump`.
     pub flushes: u64,
-    /// Wall-clock mode: halting really sleeps instead of skipping ahead.
-    pub realtime: bool,
+    /// Realtime mode: guest time is this host clock and halting really waits. `None` is the
+    /// deterministic virtual clock.
+    pub wall_clock: Option<WallClock>,
     /// Instructions the last JIT block retired before it exited; `run_verify` replays that many
     /// on the interpreter.
     pub last_block_insns: u64,
@@ -519,7 +558,7 @@ impl Cpu {
         cpu.topology.x2apic_id = index;
         cpu.cpu_count = bsp.cpu_count;
         cpu.multi = true;
-        cpu.realtime = bsp.realtime;
+        cpu.wall_clock = bsp.wall_clock.clone();
         cpu.halted = true;
         cpu.wait_for_sipi = true;
         cpu
@@ -702,7 +741,7 @@ impl Cpu {
             poll: None,
             logged: Default::default(),
             flushes: 0,
-            realtime: false,
+            wall_clock: None,
             last_block_insns: 0,
             pending: None,
             jit: None,
@@ -755,6 +794,11 @@ impl Cpu {
     }
 
     pub fn now_ns(&self) -> u64 {
+        // Not cached per slice: a guest spinning on rdtsc or the PIT must see time pass between
+        // two reads, and the host clock never runs backwards on its own.
+        if let Some(wall) = &self.wall_clock {
+            return wall.elapsed_ns();
+        }
         // A slow-path access from the middle of a JIT block: count the block's earlier
         // instructions that `icount` has not been charged for yet.
         let unpaid = self
@@ -1095,6 +1139,25 @@ impl Cpu {
         }
     }
 
+    /// Lets the host clock run for up to `wait_ns` (realtime idle). A wait may end early, since
+    /// `idle` is called again until the deadline has passed.
+    fn wait_on_host(&mut self, wait_ns: u64) {
+        #[cfg(not(freestanding))]
+        {
+            // Short sleeps keep the stop flag and host console responsive.
+            const MAX_SLEEP_NS: u64 = 2_000_000;
+            std::thread::sleep(std::time::Duration::from_nanos(wait_ns.min(MAX_SLEEP_NS)));
+        }
+        #[cfg(freestanding)]
+        {
+            let _ = wait_ns;
+            // No threads to sleep: the host's idle hook blocks for a moment.
+            if let Some(poll) = &self.poll {
+                poll(true);
+            }
+        }
+    }
+
     /// Handles a halted machine: skips (or sleeps) to the next device deadline so timers can
     /// raise the interrupt that wakes a vCPU. Returns `Some` for stop, reset and power-off.
     /// `may_wake` is whether any vCPU could still be woken by an interrupt (interrupts enabled)
@@ -1123,19 +1186,11 @@ impl Cpu {
         match self.dev.next_deadline(now) {
             Some(deadline) => {
                 if deadline > now {
-                    #[cfg(not(freestanding))]
-                    let advance_ns = if self.realtime {
-                        // Short sleeps keep the stop flag and host console responsive.
-                        const MAX_SLEEP_NS: u64 = 2_000_000;
-                        let sleep_ns = (deadline - now).min(MAX_SLEEP_NS);
-                        std::thread::sleep(std::time::Duration::from_nanos(sleep_ns));
-                        sleep_ns
+                    if self.wall_clock.is_some() {
+                        self.wait_on_host(deadline - now);
                     } else {
-                        deadline - now
-                    };
-                    #[cfg(freestanding)]
-                    let advance_ns = deadline - now;
-                    self.idle_skipped_ns += advance_ns;
+                        self.idle_skipped_ns += deadline - now;
+                    }
                 }
                 self.tick_devices(self.now_ns());
             }
@@ -1501,7 +1556,7 @@ mod cpu_tests {
             assert!(!h.cpu.halted);
             assert!(!h.cpu.interrupt_shadow);
             assert!(!h.cpu.block_exit_requested);
-            assert!(!h.cpu.realtime);
+            assert!(h.cpu.wall_clock.is_none());
             assert_eq!(h.cpu.prepaid_icount, 0);
             assert_eq!(h.cpu.last_block_insns, 0);
             assert!(h.cpu.pending.is_none());
@@ -1612,6 +1667,30 @@ mod cpu_tests {
             assert_eq!(h.cpu.now_ns(), 1000 * NS_PER_INSN);
             h.cpu.idle_skipped_ns = 5_000;
             assert_eq!(h.cpu.now_ns(), 1000 * NS_PER_INSN + 5_000);
+        }
+
+        /// A host clock the test advances by hand.
+        fn manual_clock() -> (Arc<core::sync::atomic::AtomicU64>, HostClockFn) {
+            let now = Arc::new(core::sync::atomic::AtomicU64::new(0));
+            let reader = now.clone();
+            (now, Arc::new(move || reader.load(Ordering::Relaxed)))
+        }
+
+        #[test]
+        fn with_a_host_clock_guest_time_is_wall_time_since_it_started_not_instructions() {
+            const HOST_EPOCH_NS: u64 = 7_000_000_000;
+            const ELAPSED_NS: u64 = 123_456;
+            let mut h = harness();
+            let (host_now, clock) = manual_clock();
+            host_now.store(HOST_EPOCH_NS, Ordering::Relaxed);
+            h.cpu.wall_clock = Some(WallClock::new(clock));
+            assert_eq!(h.cpu.now_ns(), 0);
+            // Instructions do not move the clock; only the host does, and the TSC follows.
+            h.cpu.icount = 1_000_000;
+            assert_eq!(h.cpu.now_ns(), 0);
+            host_now.store(HOST_EPOCH_NS + ELAPSED_NS, Ordering::Relaxed);
+            assert_eq!(h.cpu.now_ns(), ELAPSED_NS);
+            assert_eq!(h.cpu.tsc(), ELAPSED_NS);
         }
 
         #[test]
@@ -1997,30 +2076,39 @@ mod cpu_tests {
         }
 
         #[test]
-        fn realtime_idle_sleeps_for_a_short_deadline_and_advances_by_it() {
+        fn realtime_idle_sleeps_for_a_short_deadline_and_time_is_what_the_host_clock_says() {
             let mut h = with_idt();
             h.cpu.next_event = u64::MAX;
-            h.cpu.realtime = true;
+            h.cpu.wall_clock = Some(WallClock::new(std_host_clock()));
             program_pit_channel0(&mut h.cpu, 100);
             let deadline = h.cpu.dev.next_deadline(0).unwrap();
             h.cpu.halted = true;
             let started = std::time::Instant::now();
             assert!(matches!(h.cpu.before_step(), BeforeStep::Idled));
             assert!(started.elapsed() >= std::time::Duration::from_nanos(deadline));
-            assert_eq!(h.cpu.idle_skipped_ns, deadline);
+            assert!(h.cpu.now_ns() >= deadline);
+            assert_eq!(
+                h.cpu.idle_skipped_ns, 0,
+                "nothing is warped on a host clock"
+            );
         }
 
         #[test]
         fn realtime_idle_never_sleeps_longer_than_two_milliseconds_per_call() {
-            const MAX_SLEEP_NS: u64 = 2_000_000;
+            const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(2);
             let mut h = with_idt();
             h.cpu.next_event = u64::MAX;
-            h.cpu.realtime = true;
+            h.cpu.wall_clock = Some(WallClock::new(std_host_clock()));
             // 65536 ticks of the 1.19 MHz clock is about 55 ms.
             program_pit_channel0(&mut h.cpu, 0);
             h.cpu.halted = true;
+            let started = std::time::Instant::now();
             assert!(matches!(h.cpu.before_step(), BeforeStep::Idled));
-            assert_eq!(h.cpu.idle_skipped_ns, MAX_SLEEP_NS);
+            assert!(
+                started.elapsed() < MAX_SLEEP * 10,
+                "{:?}",
+                started.elapsed()
+            );
         }
 
         #[test]
@@ -2102,7 +2190,7 @@ mod cpu_tests {
             apic_write(&mut h, APIC_TIMER_DIVIDE, DIVIDE_BY_ONE);
             apic_write(&mut h, APIC_TIMER_INITIAL, 1000);
             h.cpu.halted = true;
-            h.cpu.realtime = false;
+            h.cpu.wall_clock = None;
             assert!(matches!(h.cpu.before_step(), BeforeStep::Idled));
             assert!(matches!(h.cpu.before_step(), BeforeStep::Execute));
             assert!(!h.cpu.halted);

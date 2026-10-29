@@ -2,7 +2,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::time::Duration;
 
 use uemulator::{
-    ClockMode, ConsoleKind, Disk, EmulatedMachine, ExitReason, JitMode, MachineConfig, NetHandle,
+    ConsoleKind, Disk, EmulatedMachine, ExitReason, JitMode, MachineConfig, NetHandle,
 };
 
 use crate::args::{ConsoleArg, NetLink, RuntimeArgs, Settings};
@@ -70,12 +70,6 @@ fn contains_escape(chunk: &[u8]) -> bool {
     chunk.contains(&ESCAPE_BYTE)
 }
 
-/// Virtual time skips ahead while the guest idles, which is right for scripted runs but makes an
-/// interactive session race; so pace to the wall clock when someone is typing or asked for it.
-fn wants_realtime_clock(stdin_is_terminal: bool, realtime_flag: bool) -> bool {
-    stdin_is_terminal || realtime_flag
-}
-
 /// Puts the terminal behind `stty` into raw mode. Returns the settings to hand back to `stty` on
 /// exit, or `None` if raw mode was not entered (no `stty`, not a terminal, not unix). Without the
 /// saved settings the terminal could not be restored, so raw mode is not attempted then.
@@ -121,7 +115,6 @@ fn build_config(
     initramfs: Option<Vec<u8>>,
     settings: &Settings,
     runtime: &RuntimeArgs,
-    stdin_is_terminal: bool,
 ) -> Result<MachineConfig, String> {
     let mut cfg = MachineConfig::new()
         .kernel(kernel)
@@ -156,9 +149,6 @@ fn build_config(
         cfg = cfg.unix_time(t);
     }
     cfg = cfg.random_seed(host_random_seed());
-    if wants_realtime_clock(stdin_is_terminal, runtime.realtime) {
-        cfg = cfg.clock(ClockMode::Realtime);
-    }
     if settings.disable_jit {
         cfg = cfg.jit(JitMode::Off);
     }
@@ -190,7 +180,7 @@ pub fn run(
     runtime: &RuntimeArgs,
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
-    let cfg = build_config(kernel, initramfs, settings, runtime, tty)?;
+    let cfg = build_config(kernel, initramfs, settings, runtime)?;
     run_config(cfg, settings, runtime, tty)
 }
 
@@ -198,7 +188,7 @@ pub fn run(
 /// loader loads the system, so there is no kernel, initramfs or command line here.
 pub fn run_disk(settings: &Settings, runtime: &RuntimeArgs) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
-    let cfg = build_config(Vec::new(), None, settings, runtime, tty)?.boot_disk(true);
+    let cfg = build_config(Vec::new(), None, settings, runtime)?.boot_disk(true);
     run_config(cfg, settings, runtime, tty)
 }
 
@@ -209,7 +199,7 @@ pub fn run_firmware(
     runtime: &RuntimeArgs,
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
-    let cfg = build_config(Vec::new(), None, settings, runtime, tty)?.firmware(image);
+    let cfg = build_config(Vec::new(), None, settings, runtime)?.firmware(image);
     run_config(cfg, settings, runtime, tty)
 }
 
@@ -226,8 +216,8 @@ pub fn run_uefi(
     boot_entry: Option<(&str, &str)>,
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
-    let mut cfg = build_config(kernel, initramfs, settings, runtime, tty)?
-        .uefi_firmware(crate::firmware::IMAGE);
+    let mut cfg =
+        build_config(kernel, initramfs, settings, runtime)?.uefi_firmware(crate::firmware::IMAGE);
     if let Some(path) = nvram {
         let mut store = uemulator::FileKeyValueStore::open(path).map_err(|e| e.to_string())?;
         if let Some((loader, options)) = boot_entry {
@@ -358,13 +348,9 @@ mod tests {
         }
     }
 
-    fn build(
-        extra: &[&str],
-        initramfs: Option<Vec<u8>>,
-        tty: bool,
-    ) -> Result<MachineConfig, String> {
+    fn build(extra: &[&str], initramfs: Option<Vec<u8>>) -> Result<MachineConfig, String> {
         let (settings, runtime) = boot_args(extra);
-        build_config(Vec::new(), initramfs, &settings, &runtime, tty)
+        build_config(Vec::new(), initramfs, &settings, &runtime)
     }
 
     /// What the library says about `cfg` before it looks at the kernel. The kernel is empty, so
@@ -592,7 +578,6 @@ mod tests {
                 "virtio",
             ],
             None,
-            false,
         )
         .unwrap();
         // The empty kernel fails only after the configuration (device count, console rules)
@@ -602,7 +587,7 @@ mod tests {
 
     #[test]
     fn two_serial_consoles_are_rejected_by_the_library() {
-        let cfg = build(&["--console", "serial", "--console", "serial"], None, false).unwrap();
+        let cfg = build(&["--console", "serial", "--console", "serial"], None).unwrap();
         assert!(machine_error(cfg).contains("only once"));
     }
 
@@ -626,14 +611,6 @@ mod tests {
         assert!(!contains_escape(b"ls -l\r"));
         assert!(!contains_escape(&[0x03, 0x1c, 0x1e, 0x04]));
         assert!(!contains_escape(&[0xff; STDIN_CHUNK_LEN]));
-    }
-
-    #[test]
-    fn realtime_clock_follows_terminal_or_flag() {
-        assert!(!wants_realtime_clock(false, false));
-        assert!(wants_realtime_clock(true, false));
-        assert!(wants_realtime_clock(false, true));
-        assert!(wants_realtime_clock(true, true));
     }
 
     #[test]
@@ -696,14 +673,14 @@ mod tests {
     #[test]
     fn memory_below_the_library_minimum_is_rejected_by_the_library() {
         let memory = (MIN_MEMORY_MIB - 1).to_string();
-        let cfg = build(&["-m", &memory, "--disable-jit"], None, false).unwrap();
+        let cfg = build(&["-m", &memory, "--disable-jit"], None).unwrap();
         assert!(machine_error(cfg).contains("between 64 and 3072"));
     }
 
     #[test]
     fn memory_above_the_library_maximum_is_rejected_by_the_library() {
         let memory = (MAX_MEMORY_MIB + 1).to_string();
-        let cfg = build(&["--memory", &memory, "--disable-jit"], None, false).unwrap();
+        let cfg = build(&["--memory", &memory, "--disable-jit"], None).unwrap();
         assert!(machine_error(cfg).contains("between 64 and 3072"));
     }
 
@@ -711,7 +688,7 @@ mod tests {
     fn the_minimum_memory_is_accepted_by_the_library() {
         // Only the minimum is probed: acceptance at the maximum would allocate 3 GiB of guest RAM.
         let memory = MIN_MEMORY_MIB.to_string();
-        let cfg = build(&["-m", &memory, "--disable-jit"], None, false).unwrap();
+        let cfg = build(&["-m", &memory, "--disable-jit"], None).unwrap();
         assert!(machine_error(cfg).contains("kernel"));
     }
 
@@ -720,7 +697,7 @@ mod tests {
         let dir = TempDir::new("run-disk");
         let missing = dir.path().join("missing.img");
         let spec = missing.to_string_lossy().into_owned();
-        let err = build(&["--disk", &spec], None, false).err().unwrap();
+        let err = build(&["--disk", &spec], None).err().unwrap();
         assert!(err.starts_with(&format!("open disk {spec}: ")), "{err}");
     }
 
@@ -730,7 +707,7 @@ mod tests {
         let missing = dir.path().join("missing.img");
         let path = missing.to_string_lossy().into_owned();
         let spec = format!("{path},ro");
-        let err = build(&["--disk", &spec], None, false).err().unwrap();
+        let err = build(&["--disk", &spec], None).err().unwrap();
         assert!(err.starts_with(&format!("open disk {path}: ")), "{err}");
     }
 
@@ -741,7 +718,7 @@ mod tests {
         std::fs::write(&image, vec![0u8; 4096]).unwrap();
         let path = image.to_string_lossy().into_owned();
         for spec in [path.clone(), format!("{path},ro")] {
-            assert!(build(&["--disk", &spec], None, false).is_ok(), "{spec}");
+            assert!(build(&["--disk", &spec], None).is_ok(), "{spec}");
         }
     }
 
@@ -754,11 +731,11 @@ mod tests {
             &["--network", "virtio"],
             &["--console", "virtio"],
             &["--console", "serial"],
-            &["--time", "1700000000", "--realtime"],
+            &["--time", "1700000000"],
             &["--debug", "--verify", "--disable-jit"],
             &["--cmdline", "console=ttyS0", "--append", "quiet"],
         ] {
-            assert!(build(flags, Some(vec![1, 2, 3]), true).is_ok(), "{flags:?}");
+            assert!(build(flags, Some(vec![1, 2, 3])).is_ok(), "{flags:?}");
         }
     }
 }

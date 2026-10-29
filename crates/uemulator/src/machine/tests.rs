@@ -255,7 +255,7 @@ mod rtc {
             ConsoleHandle::default(),
         );
         assert!(twin.jit.is_none());
-        assert!(!twin.realtime);
+        assert!(twin.wall_clock.is_none());
         assert!(twin.poll.is_none());
         assert!(twin.log.is_none());
         stop.store(true, Ordering::SeqCst);
@@ -839,7 +839,7 @@ mod config {
         assert!(config.net_macs.is_empty());
         assert!(config.consoles.is_empty());
         assert_eq!(config.jit, JitMode::Auto);
-        assert_eq!(config.clock, ClockMode::Virtual);
+        assert_eq!(config.clock, ClockMode::Realtime);
         assert!(config.log.is_none());
         assert!(config.poll.is_none());
         assert!(!config.debug);
@@ -914,7 +914,7 @@ mod config {
     #[test]
     fn enum_defaults() {
         assert_eq!(JitMode::default(), JitMode::Auto);
-        assert_eq!(ClockMode::default(), ClockMode::Virtual);
+        assert_eq!(ClockMode::default(), ClockMode::Realtime);
         assert_eq!(ConsoleKind::default(), ConsoleKind::Virtio);
     }
 
@@ -1892,7 +1892,9 @@ mod clock {
 
     fn cpu_waiting_for_the_pit(realtime: bool) -> Harness {
         let mut harness = Harness::new(&WAIT_FOR_PIT_IRQ);
-        harness.cpu.realtime = realtime;
+        if realtime {
+            harness.cpu.wall_clock = Some(crate::cpu::WallClock::new(crate::cpu::std_host_clock()));
+        }
         harness
     }
 
@@ -1912,20 +1914,19 @@ mod clock {
     }
 
     #[test]
-    fn realtime_accounts_the_same_guest_time_but_really_sleeps_for_it() {
+    fn realtime_guest_time_covers_the_wait_and_the_host_really_sleeps_for_it() {
         let mut virtual_cpu = cpu_waiting_for_the_pit(false);
         virtual_cpu.cpu.run();
         let mut realtime_cpu = cpu_waiting_for_the_pit(true);
         let started = Instant::now();
         assert_eq!(realtime_cpu.cpu.run(), ExitReason::Reset);
         let slept = started.elapsed();
-        assert_eq!(
-            realtime_cpu.cpu.idle_skipped_ns,
-            virtual_cpu.cpu.idle_skipped_ns
-        );
-        // A sleep never ends early, so the wall time is at least the guest time skipped.
+        // Guest time is the host's: it advanced at least by the wait the guest asked for, and
+        // the wait was really slept.
+        assert_eq!(realtime_cpu.cpu.idle_skipped_ns, 0);
+        assert!(realtime_cpu.cpu.now_ns() >= virtual_cpu.cpu.idle_skipped_ns);
         assert!(
-            slept >= Duration::from_nanos(realtime_cpu.cpu.idle_skipped_ns),
+            slept >= Duration::from_nanos(virtual_cpu.cpu.idle_skipped_ns),
             "{slept:?}"
         );
     }
@@ -1999,7 +2000,7 @@ mod clock {
     fn virtual_clock_is_the_default_and_guest_time_is_the_instruction_count() {
         let mut harness = Harness::new(&[0x90, 0x90, 0x90, 0xf4]);
         harness.run_to_halt();
-        assert!(!harness.cpu.realtime);
+        assert!(harness.cpu.wall_clock.is_none());
         assert_eq!(harness.cpu.idle_skipped_ns, 0);
         assert_eq!(harness.cpu.now_ns(), 4 * crate::cpu::NS_PER_INSN);
     }
