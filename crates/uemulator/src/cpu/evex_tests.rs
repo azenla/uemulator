@@ -1851,3 +1851,34 @@ mod jit_matches_interpreter {
         assert_jit_matches_interpreter(&code, setup);
     }
 }
+
+#[test]
+fn committing_without_a_mask_matches_committing_under_an_all_ones_mask() {
+    let mut cpu = Harness::new(&[0xf4]).cpu;
+    let result: Vector = [
+        0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+        0x1111_2222_3333_4444_5555_6666_7777_8888,
+        0x9999_aaaa_bbbb_cccc_dddd_eeee_ffff_0000,
+        0x0f1e_2d3c_4b5a_6978_8796_a5b4_c3d2_e1f0,
+    ];
+    let unmasked = Insn::default();
+    let all_ones = Insn {
+        evex_mask: 1,
+        ..Default::default()
+    };
+    for bytes in [16, 32, 64] {
+        for element_bytes in [1, 2, 4, 8] {
+            // Stale content everywhere, so what the commit leaves above `bytes` shows.
+            cpu.set_zmm(3, [u128::MAX; 4]);
+            cpu.commit_masked(&unmasked, 3, element_bytes, bytes, &result);
+            let without_mask = cpu.zmm(3);
+            cpu.set_zmm(3, [u128::MAX; 4]);
+            cpu.opmask[1] = u64::MAX;
+            cpu.commit_masked(&all_ones, 3, element_bytes, bytes, &result);
+            assert_eq!(without_mask, cpu.zmm(3), "{bytes} bytes of {element_bytes}");
+            let mut expected = [0u128; 4];
+            expected[..bytes / 16].copy_from_slice(&result[..bytes / 16]);
+            assert_eq!(without_mask, expected, "{bytes} bytes of {element_bytes}");
+        }
+    }
+}

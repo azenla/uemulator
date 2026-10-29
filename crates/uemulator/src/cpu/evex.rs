@@ -365,6 +365,14 @@ impl Cpu {
         result: &Vector,
     ) {
         let masked = i.evex_mask != 0;
+        if !masked && bytes.is_multiple_of(LANE_BYTES) {
+            // Every element takes the new value: copy whole lanes. This is nearly every vector
+            // instruction a guest runs, and the element loop below costs several calls per byte.
+            let mut out = [0u128; LANES];
+            out[..bytes / LANE_BYTES].copy_from_slice(&result[..bytes / LANE_BYTES]);
+            self.set_zmm(dest, out);
+            return;
+        }
         let mask = self.write_mask(i);
         let old = if masked && !i.evex_zeroing {
             self.zmm(dest)
