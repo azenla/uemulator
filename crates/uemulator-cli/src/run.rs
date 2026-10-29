@@ -213,17 +213,20 @@ pub fn run_firmware(
     run_config(cfg, settings, runtime, tty)
 }
 
-/// Like `run`, for the machine's disks booted through the built-in UEFI firmware. `nvram` keeps
+/// Like `run`, through the built-in UEFI firmware. An empty `kernel` boots the machine's disks;
+/// otherwise the firmware boots that kernel (an EFI-stub bzImage) with `initramfs`. `nvram` keeps
 /// the firmware's variables in a file; `boot_entry` (loader path, load options) is written into
 /// it first so that a boot goes where the caller asked.
 pub fn run_uefi(
+    kernel: Vec<u8>,
+    initramfs: Option<Vec<u8>>,
     settings: &Settings,
     runtime: &RuntimeArgs,
     nvram: Option<&std::path::Path>,
     boot_entry: Option<(&str, &str)>,
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
-    let mut cfg = build_config(Vec::new(), None, settings, runtime, tty)?
+    let mut cfg = build_config(kernel, initramfs, settings, runtime, tty)?
         .uefi_firmware(crate::firmware::IMAGE);
     if let Some(path) = nvram {
         let mut store = uemulator::FileKeyValueStore::open(path).map_err(|e| e.to_string())?;

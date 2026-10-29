@@ -195,36 +195,42 @@ pub enum BootSource {
     Auto,
     /// The distro's netboot kernel and initramfs, which run its installer
     Installer,
-    /// The first disk, through the machine's firmware (`--firmware`, a BIOS by default): the boot
+    /// The first disk, through the machine's firmware (`--firmware`, UEFI by default): the boot
     /// loader the installer put there loads the system, so kernel arguments come from that boot
     /// loader and `--cmdline` and `--append` do not apply
     Disk,
 }
 
-/// What boots the machine's disk.
+/// The firmware a machine starts with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Firmware {
-    /// The library's BIOS: the disk's boot sector runs in real mode
+    /// The built-in UEFI firmware: it boots a kernel given to it first (like QEMU's `-kernel`
+    /// under OVMF; the kernel needs an EFI stub), else the disk's EFI system partition loader.
+    /// Its variables live in the machine's `nvram.kv`
     #[default]
-    Bios,
-    /// The built-in UEFI firmware, which starts the disk's EFI system partition loader; its
-    /// variables live in the machine's `nvram.kv`
     Uefi,
+    /// The library's BIOS: the disk's boot sector runs in real mode. A kernel is not booted
+    /// through it: a machine with this firmware runs its installer directly
+    Bios,
+    /// No firmware: the kernel is entered directly in 64-bit mode (the boot protocol), which is
+    /// the way to run a kernel without an EFI stub. A disk cannot be booted this way
+    None,
 }
 
 impl Firmware {
     pub fn name(self) -> &'static str {
         match self {
-            Firmware::Bios => "bios",
             Firmware::Uefi => "uefi",
+            Firmware::Bios => "bios",
+            Firmware::None => "none",
         }
     }
 }
 
 #[derive(Args, Default)]
 pub struct FirmwareArgs {
-    /// What boots the disk [default: bios]
+    /// What starts the machine [default: uefi]
     #[arg(long, value_enum, value_name = "FIRMWARE")]
     pub firmware: Option<Firmware>,
 }

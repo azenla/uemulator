@@ -282,9 +282,10 @@ pub struct Launch {
     /// Empty for a boot from the disk, whose boot loader brings its own kernel.
     pub kernel: Vec<u8>,
     pub initramfs: Option<Vec<u8>>,
-    /// How a boot from the disk gets going; the installer always boots directly.
+    /// What starts the machine. The installer boots through it only when it is UEFI; the BIOS
+    /// cannot boot a kernel, so a `bios` machine runs its installer directly.
     pub firmware: Firmware,
-    /// The UEFI variable store of a boot from the disk through the UEFI firmware.
+    /// The UEFI variable store of a boot through the UEFI firmware, installer or disk.
     pub nvram: Option<PathBuf>,
     /// The saved settings with this boot's overrides and the distro's defaults applied.
     pub settings: Settings,
@@ -347,6 +348,12 @@ pub fn prepare_boot(
         (BootSource::Disk, None) => return Err("the machine has no disk to boot".into()),
     };
     if installed {
+        if machine.firmware == Firmware::None {
+            return Err(
+                "firmware none cannot boot a disk; edit the machine to --firmware uefi or bios"
+                    .into(),
+            );
+        }
         // The boot loader on the disk decides the kernel and its arguments, and what memory the
         // installer needed is over.
         settings.memory.get_or_insert(DEFAULT_MEMORY_MIB);
@@ -365,7 +372,8 @@ pub fn prepare_boot(
         kernel: read_file(&artifacts.kernel)?,
         initramfs: Some(read_file(&artifacts.initramfs)?),
         firmware: machine.firmware,
-        nvram: None,
+        // The installer writes the boot entries the installed system is found through.
+        nvram: (machine.firmware == Firmware::Uefi).then(|| machine.nvram_path()),
         settings: with_distro_defaults(settings, machine.install),
     })
 }
@@ -1644,20 +1652,24 @@ mod tests {
     }
 
     #[test]
-    fn firmware_defaults_to_bios_and_old_files_without_it_still_load() {
+    fn firmware_defaults_to_uefi_and_old_files_without_it_load_as_uefi() {
         let home = TempDir::new("machines-firmware-serde");
         let machine = create_machine(home.path(), &[]);
-        assert_eq!(machine.firmware, Firmware::Bios);
+        assert_eq!(machine.firmware, Firmware::Uefi);
         let path = home.path().join("machines/m/machine.toml");
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("firmware = \"bios\""), "{text}");
-        let old: String = text
+        assert!(text.contains("firmware = \"uefi\""), "{text}");
+        let without_key: String = text
             .lines()
             .filter(|l| !l.starts_with("firmware"))
             .map(|l| format!("{l}\n"))
             .collect();
-        fs::write(&path, old).unwrap();
-        assert_eq!(load(home.path(), "m").unwrap().firmware, Firmware::Bios);
+        fs::write(&path, &without_key).unwrap();
+        assert_eq!(load(home.path(), "m").unwrap().firmware, Firmware::Uefi);
+        for (written, want) in [("bios", Firmware::Bios), ("none", Firmware::None)] {
+            fs::write(&path, format!("firmware = \"{written}\"\n{without_key}")).unwrap();
+            assert_eq!(load(home.path(), "m").unwrap().firmware, want);
+        }
     }
 
     #[test]
@@ -1694,17 +1706,10 @@ mod tests {
     }
 
     #[test]
-    fn a_uefi_machine_boots_its_disk_with_its_nvram_and_a_bios_machine_does_not() {
+    fn a_uefi_machine_boots_its_disk_with_its_nvram() {
         let home = TempDir::new("machines-firmware-launch");
-        let mut machine = create_machine(home.path(), &[]);
+        let machine = create_machine(home.path(), &[]);
         finish_install(&machine);
-        let bios = launch(&machine, None).unwrap();
-        assert_eq!(
-            (bios.source, bios.firmware),
-            (BootSource::Disk, Firmware::Bios)
-        );
-        assert_eq!(bios.nvram, None);
-        machine.firmware = Firmware::Uefi;
         for choice in [None, Some(BootSource::Disk)] {
             let uefi = launch(&machine, choice).unwrap();
             assert_eq!(
@@ -1713,19 +1718,61 @@ mod tests {
             );
             assert_eq!(uefi.nvram, Some(home.path().join("machines/m/nvram.kv")));
         }
-        let installer = launch(&machine, Some(BootSource::Installer)).unwrap();
+    }
+
+    #[test]
+    fn an_installer_boot_of_a_uefi_machine_keeps_the_nvram() {
+        // grub-install and efibootmgr write Boot#### through efivarfs; the installed system
+        // finds its loader through them.
+        let home = TempDir::new("machines-firmware-installer");
+        let machine = create_machine(home.path(), &[]);
+        let installer = launch(&machine, None).unwrap();
+        assert_eq!(
+            (installer.source, installer.firmware),
+            (BootSource::Installer, Firmware::Uefi)
+        );
+        assert!(!installer.kernel.is_empty());
+        assert_eq!(installer.nvram, Some(machine.nvram_path()));
+    }
+
+    #[test]
+    fn a_bios_machine_still_boots_its_installed_disk_through_the_bios() {
+        let home = TempDir::new("machines-firmware-bios");
+        let mut machine = create_machine(home.path(), &[]);
+        machine.firmware = Firmware::Bios;
+        let installer = launch(&machine, None).unwrap();
         assert_eq!(installer.source, BootSource::Installer);
         assert_eq!(installer.nvram, None);
+        finish_install(&machine);
+        let bios = launch(&machine, None).unwrap();
+        assert_eq!(
+            (bios.source, bios.firmware, bios.nvram),
+            (BootSource::Disk, Firmware::Bios, None)
+        );
+    }
+
+    #[test]
+    fn none_cannot_boot_an_installed_disk() {
+        let home = TempDir::new("machines-firmware-none");
+        let mut machine = create_machine(home.path(), &[]);
+        machine.firmware = Firmware::None;
+        let installer = launch(&machine, None).unwrap();
+        assert_eq!(
+            (installer.source, installer.nvram),
+            (BootSource::Installer, None)
+        );
+        finish_install(&machine);
+        let error = launch(&machine, None).err().expect("must be refused");
+        assert!(
+            error.contains("firmware none cannot boot a disk"),
+            "{error}"
+        );
     }
 
     #[test]
     fn show_lists_the_firmware_and_for_uefi_the_nvram() {
         let home = TempDir::new("machines-firmware-show");
         let mut machine = create_machine(home.path(), &[]);
-        let text = show(&machine);
-        assert!(text.contains("firmware  bios"), "{text}");
-        assert!(!text.contains("nvram"), "{text}");
-        machine.firmware = Firmware::Uefi;
         let nvram = machine.nvram_path();
         let text = show(&machine);
         assert!(text.contains("firmware  uefi"), "{text}");
@@ -1735,6 +1782,10 @@ mod tests {
         );
         fs::write(&nvram, b"").unwrap();
         assert!(show(&machine).contains(&format!("{} present", nvram.display())));
+        machine.firmware = Firmware::Bios;
+        let text = show(&machine);
+        assert!(text.contains("firmware  bios"), "{text}");
+        assert!(!text.contains("nvram"), "{text}");
     }
 
     #[test]

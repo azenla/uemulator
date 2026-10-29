@@ -174,6 +174,9 @@ enum QuickCmd {
 #[derive(Subcommand)]
 enum AdvancedCmd {
     /// Boot a kernel (bzImage) and optional initramfs
+    ///
+    /// The UEFI firmware boots them, which needs a kernel with an EFI stub; `--firmware none`
+    /// enters any bzImage directly.
     Boot {
         /// Linux bzImage
         #[arg(long)]
@@ -185,6 +188,8 @@ enum AdvancedCmd {
         hardware: HardwareArgs,
         #[command(flatten)]
         linux: LinuxArgs,
+        #[command(flatten)]
+        firmware: FirmwareArgs,
         #[command(flatten)]
         runtime: RuntimeArgs,
     },
@@ -261,15 +266,34 @@ fn boot_launch(launch: machines::Launch, runtime: &RuntimeArgs) -> Result<ExitRe
             eprintln!("booting from the disk");
             match launch.firmware {
                 args::Firmware::Bios => run::run_disk(&launch.settings, runtime),
-                args::Firmware::Uefi => {
-                    run::run_uefi(&launch.settings, runtime, launch.nvram.as_deref(), None)
-                }
+                args::Firmware::Uefi => run::run_uefi(
+                    Vec::new(),
+                    None,
+                    &launch.settings,
+                    runtime,
+                    launch.nvram.as_deref(),
+                    None,
+                ),
+                args::Firmware::None => Err("firmware none cannot boot a disk".into()),
             }
         }
-        _ => {
-            eprintln!("booting the installer");
-            run::run(launch.kernel, launch.initramfs, &launch.settings, runtime)
-        }
+        _ => match launch.firmware {
+            args::Firmware::Uefi => {
+                eprintln!("booting the installer through the UEFI firmware");
+                run::run_uefi(
+                    launch.kernel,
+                    launch.initramfs,
+                    &launch.settings,
+                    runtime,
+                    launch.nvram.as_deref(),
+                    None,
+                )
+            }
+            args::Firmware::Bios | args::Firmware::None => {
+                eprintln!("booting the installer");
+                run::run(launch.kernel, launch.initramfs, &launch.settings, runtime)
+            }
+        },
     }
 }
 
@@ -409,12 +433,28 @@ fn advanced_command(cmd: AdvancedCmd) -> Result<ExitReason, String> {
             initramfs,
             hardware,
             linux,
+            firmware,
             runtime,
         } => {
             let kernel_image = read(&kernel)?;
             let initramfs_image = initramfs.as_ref().map(read).transpose()?;
             let settings = settings_of(&hardware, &linux)?;
-            run::run(kernel_image, initramfs_image, &settings, &runtime)
+            match firmware.firmware.unwrap_or_default() {
+                args::Firmware::Uefi => run::run_uefi(
+                    kernel_image,
+                    initramfs_image,
+                    &settings,
+                    &runtime,
+                    None,
+                    None,
+                ),
+                args::Firmware::None => {
+                    run::run(kernel_image, initramfs_image, &settings, &runtime)
+                }
+                args::Firmware::Bios => {
+                    Err("--firmware bios boots a disk, not a kernel; use uefi or none".into())
+                }
+            }
         }
         AdvancedCmd::BootFirmware {
             firmware,
@@ -434,6 +474,8 @@ fn advanced_command(cmd: AdvancedCmd) -> Result<ExitReason, String> {
         } => {
             let settings = settings_of(&hardware, &LinuxArgs::default())?;
             run::run_uefi(
+                Vec::new(),
+                None,
                 &settings,
                 &runtime,
                 nvram.as_deref(),
@@ -538,6 +580,7 @@ mod tests {
                         initramfs,
                         hardware,
                         linux,
+                        firmware: _,
                         runtime,
                     },
             } => Advanced {
@@ -1367,7 +1410,11 @@ mod tests {
             _ => panic!("no firmware"),
         };
         assert_eq!(from(&["quick", "edit", "m"]), None);
-        for (value, want) in [("bios", Firmware::Bios), ("uefi", Firmware::Uefi)] {
+        for (value, want) in [
+            ("bios", Firmware::Bios),
+            ("uefi", Firmware::Uefi),
+            ("none", Firmware::None),
+        ] {
             assert_eq!(
                 from(&["quick", "edit", "m", "--firmware", value]),
                 Some(want)
@@ -1387,6 +1434,25 @@ mod tests {
         }
         assert!(parse(&["quick", "edit", "m", "--firmware", "coreboot"]).is_err());
         assert!(parse(&["quick", "boot", "m", "--firmware", "uefi"]).is_err());
+    }
+
+    #[test]
+    fn advanced_boot_takes_a_firmware_and_defaults_to_uefi() {
+        use crate::args::Firmware;
+        let from = |extra: &[&str]| {
+            let mut args = vec!["advanced", "boot", "--kernel", "k"];
+            args.extend_from_slice(extra);
+            match parse(&args).unwrap().cmd {
+                Cmd::Advanced {
+                    cmd: AdvancedCmd::Boot { firmware, .. },
+                } => firmware.firmware,
+                _ => panic!("expected advanced boot"),
+            }
+        };
+        assert_eq!(from(&[]), None);
+        assert_eq!(from(&["--firmware", "none"]), Some(Firmware::None));
+        assert_eq!(from(&["--firmware", "uefi"]), Some(Firmware::Uefi));
+        assert!(Firmware::default() == Firmware::Uefi);
     }
 
     #[test]
