@@ -87,9 +87,12 @@ pub fn run(payload: &Payload) -> Status {
     let image = match images::load(kernel, ptr::null_mut(), ptr::null_mut(), Some(&path)) {
         Ok(image) => image,
         Err(status) => {
-            crate::serial::println!(
-                "the kernel is not an EFI-stub image (status {status:#x}); boot it with --firmware none"
-            );
+            match status {
+                UNSUPPORTED | LOAD_ERROR => crate::serial::println!(
+                    "the kernel is not an EFI-stub image (status {status:#x}); boot it with --firmware none"
+                ),
+                _ => crate::serial::println!("could not load the kernel (status {status:#x})"),
+            }
             return status;
         }
     };

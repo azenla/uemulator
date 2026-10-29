@@ -64,6 +64,11 @@ const HANDOFF_CMDLINE_BASE: usize = 0x328;
 const HANDOFF_CMDLINE_SIZE: usize = 0x330;
 /// Each payload piece starts on its own page: the firmware reserves them page by page.
 const PAYLOAD_ALIGNMENT: u64 = 0x1000;
+/// Free RAM the firmware and the kernel's EFI stub still need after the payload is placed, on top
+/// of a second copy of the initramfs (the stub reads it through `LoadFile2` into its own buffer):
+/// the firmware's pools, the kernel image the firmware loads from its buffer, the decompressed
+/// kernel.
+const PAYLOAD_HEADROOM_BYTES: u64 = 16 << 20;
 /// `rdtsc` ticks per second: the guest clock is in nanoseconds (`Cpu::tsc`).
 const TSC_HZ: u64 = 1_000_000_000;
 
@@ -170,6 +175,9 @@ fn place_payload(
     };
     let kernel = place(payload.kernel)?;
     let cmdline = place(payload.cmdline.as_bytes())?;
+    if top - floor < initrd.1 + PAYLOAD_HEADROOM_BYTES {
+        return Err(too_big());
+    }
     Ok(PlacedPayload {
         kernel,
         initrd,
@@ -411,6 +419,16 @@ mod tests {
         let ram = load_payload(&[1; 100], None, "x", RAM_BYTES).unwrap();
         assert_eq!(range_at(&ram, HANDOFF_INITRD_BASE).1, 0);
         assert_ne!(range_at(&ram, HANDOFF_KERNEL_BASE).1, 0);
+    }
+
+    #[test]
+    fn a_payload_that_leaves_the_firmware_no_room_to_work_is_refused() {
+        // The firmware loads the kernel image and the Linux stub copies the initramfs again, so
+        // fitting once is not enough.
+        let initrd = vec![0u8; 40 << 20];
+        let error = load_payload(&[1; 100], Some(&initrd), "", RAM_BYTES).unwrap_err();
+        assert!(error.to_string().contains("do not fit"), "{error}");
+        assert!(load_payload(&[1; 100], Some(&vec![0u8; 8 << 20]), "", RAM_BYTES).is_ok());
     }
 
     #[test]

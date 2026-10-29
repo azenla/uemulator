@@ -11,7 +11,7 @@ bin="${UEMULATOR_BIN:-$root/target/release/uemulator}"
 log="$(mktemp)"
 trap 'kill "$pid" 2>/dev/null || true; rm -f "$log"' EXIT
 start=$(python3 -c 'import time; print(time.time())')
-"$bin" advanced boot --kernel "$kernel" --initramfs "$initramfs" --console serial >"$log" 2>&1 </dev/null &
+"$bin" advanced boot --firmware none --kernel "$kernel" --initramfs "$initramfs" --console serial >"$log" 2>&1 </dev/null &
 pid=$!
 until grep -q "Freeing initrd memory" "$log"; do
     kill -0 "$pid" 2>/dev/null || { echo "emulator exited before the unpack finished" >&2; exit 1; }

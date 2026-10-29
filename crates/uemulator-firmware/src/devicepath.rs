@@ -520,4 +520,17 @@ mod tests {
         let path = DevicePath::new().push_node(9, 9, &[0xab]);
         assert_eq!(path.text(), "Path(9,9,ab)");
     }
+
+    #[test]
+    fn the_initramfs_path_is_the_vendor_media_node_the_linux_stub_looks_for() {
+        // drivers/firmware/efi/libstub/efi-stub-helper.c: efi_initrd_device_path.
+        let mut linux = vec![TYPE_MEDIA, SUBTYPE_VENDOR_MEDIA, 20, 0];
+        linux.extend_from_slice(&[
+            0x27, 0xe4, 0x68, 0x55, 0xfc, 0x68, 0x3d, 0x4f, 0xac, 0x74, 0xca, 0x55, 0x52, 0x31,
+            0xcc, 0x68,
+        ]);
+        linux.extend_from_slice(&[TYPE_END, SUBTYPE_END_ENTIRE, 4, 0]);
+        let ours = DevicePath::new().vendor_media(crate::uefi::guids::LINUX_EFI_INITRD_MEDIA);
+        assert_eq!(ours.as_bytes(), linux.as_slice());
+    }
 }

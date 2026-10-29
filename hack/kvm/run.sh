@@ -53,5 +53,5 @@ chmod +x extra/init2 extra/kvmtest
 cat "$cache/initramfs-virt" extra.cpio.gz >initramfs-kvm
 
 (sleep "${KVM_TEST_SECONDS:-90}") | timeout "${KVM_TEST_SECONDS:-90}" \
-    "$root/target/release/uemulator" advanced boot --kernel "$cache/vmlinuz-virt" --initramfs initramfs-kvm \
+    "$root/target/release/uemulator" advanced boot --firmware none --kernel "$cache/vmlinuz-virt" --initramfs initramfs-kvm \
     --console serial -m 512 --cmdline "console=ttyS0 rdinit=/init2" 2>&1 | grep -a "kvm_amd\|KVMTEST"

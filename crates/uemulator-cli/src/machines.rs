@@ -350,7 +350,7 @@ pub fn prepare_boot(
     if installed {
         if machine.firmware == Firmware::None {
             return Err(
-                "firmware none cannot boot a disk; edit the machine to --firmware uefi or bios"
+                "firmware none cannot boot a disk; edit the machine to --firmware bios (a disk installed with none was installed without UEFI) or uefi"
                     .into(),
             );
         }

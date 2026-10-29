@@ -38,7 +38,7 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 - Fixing a bug: write the failing test first.
 - Under Rosetta (`--target x86_64-apple-darwin`) tests that run generated code take turns through `jit::serialize_jit_tests`; Rosetta's translation cache goes stale when one thread frees a code buffer and another maps one at the same address. `testkit::Harness::enable_jit` holds it for you; take it yourself when you use `Jit::new` directly.
 - Real-kernel lockstep check (not a test, needs a kernel you supply): `--verify` on the CLI.
-- Real boot loader check (not a test, needs a disk an installer wrote): `quick boot NAME --realtime` on an installed Alpine machine; run it after touching `cpu/bios.rs`.
+- Real boot loader check (not a test, needs a disk an installer wrote): `quick boot NAME --realtime` on an installed Alpine machine with `--firmware bios` (new machines are `uefi`); run it after touching `cpu/bios.rs`.
 
 ## Debugging
 
