@@ -123,7 +123,20 @@ Candidates, from the profile (`shift_rotate`, `flags::compute`, `load_operand`, 
 
 - [ ] **Step 1: Failing test** `helper_histogram_counts_non_inlined_ops`: run `adc eax, ebx` three times under the JIT with counting on, expect the `adc` opcode to have count 3.
 - [ ] **Step 2: Implement, run, expect PASS.**
-- [ ] **Step 3: Boot the unpack with `--jit-stats`; paste the top 25 into this file under Project 2 and pick the lowerings by count. Commit** `JIT: --jit-stats prints the instructions that still go through helper_exec`.
+- [x] **Step 3: Boot the unpack with `--debug --timeout 19` (the histogram is part of the `--debug` exit dump, not a new flag or API); the top rows are in the table below.**
+
+#### Measured (after direct chaining; first 19 s of the Fedora netboot boot, `--debug --timeout 19`): 329M instructions through the interpreter
+
+| count | instruction |
+|------:|-------------|
+| 218M | `66 C1 /5 ib` shr r/m16, imm8 (LZMA probability update) |
+| 22.7M | `F2 0F38 F7` shrx; 18.8M `0F38 F5` bzhi; 12.1M `66 0F38 F7` shlx; 1.3M shlx r32 |
+| 18.1M | `19 /r` sbb r/m32, r32; 2.7M `83 /3` sbb r/m64, imm8 |
+| 10.9M | EVEX `66 0F3A 44` vpclmulqdq; 5.6M EVEX `66 0F3A 25` vpternlogq |
+| 1.6M / 1.1M | `F3 0F BC` tzcnt / `F3 0F BD` lzcnt |
+| ~1M each | pushf (9C), leave (C9), cmpxchg (0F B1), cli (FA), sti (FB), bt/bts/btr (0F BA /4../6, 0F A3/AB/B3), bzhi/bextr variants |
+
+Order of lowering follows from this: **16-bit (and 8-bit) shifts** first (two thirds of all helper calls), then **BMI1/2 shifts and bzhi/bextr/andn/blsr** (vex GPR ops), then **adc/sbb**, then tzcnt/lzcnt/bsf/bsr, then the rest; the SIMD ones belong to Project 3.
 
 ### Task 6..N: one lowering per instruction family, in descending count
 

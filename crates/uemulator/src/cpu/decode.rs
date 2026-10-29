@@ -113,6 +113,63 @@ pub(crate) const VEX_OP_FLAG: u16 = 0x1000;
 /// Set in `Insn::op` for EVEX-encoded instructions; see `Insn::evex`.
 pub(crate) const EVEX_OP_FLAG: u16 = 0x2000;
 
+/// Opcodes whose ModRM.reg field selects the operation (shift group, `f7` group, `0f ba`, ...):
+/// `Insn::histogram_key` keeps the selector for these only.
+const GROUP_OPCODES: &[u16] = &[
+    0x080, 0x081, 0x083, 0x08f, 0x0c0, 0x0c1, 0x0c6, 0x0c7, 0x0d0, 0x0d1, 0x0d2, 0x0d3, 0x0f6,
+    0x0f7, 0x0fe, 0x0ff, 0x101, 0x118, 0x171, 0x172, 0x173, 0x1ae, 0x1ba, 0x1c7,
+];
+const HISTOGRAM_GROUP_SHIFT: u32 = 16;
+const HISTOGRAM_REP_SHIFT: u32 = 20;
+const HISTOGRAM_P66_SHIFT: u32 = 22;
+const HISTOGRAM_VEX_SHIFT: u32 = 23;
+const HISTOGRAM_OPSIZE_SHIFT: u32 = 24;
+const GROUP_SELECTOR_MASK: u8 = 7;
+
+impl Insn {
+    /// What kind of instruction this is, for counting how often each reaches the interpreter:
+    /// opcode (EVEX flag included), group selector, repeat prefix, `66`, VEX/EVEX and operand size,
+    /// but not registers, addresses or immediates. `histogram_label` turns it back into text.
+    pub(crate) fn histogram_key(&self) -> u64 {
+        let group = if self.has_modrm && GROUP_OPCODES.contains(&(self.op & 0x1fff)) {
+            (self.reg & GROUP_SELECTOR_MASK) as u64 + 1
+        } else {
+            0
+        };
+        self.op as u64
+            | group << HISTOGRAM_GROUP_SHIFT
+            | (self.rep as u64) << HISTOGRAM_REP_SHIFT
+            | (self.p66 as u64) << HISTOGRAM_P66_SHIFT
+            | ((self.vex || self.evex) as u64) << HISTOGRAM_VEX_SHIFT
+            | (self.opsize as u64) << HISTOGRAM_OPSIZE_SHIFT
+    }
+}
+
+/// `Insn::histogram_key` as text: `op=0x1ba/4 rep=1 p66 vex size=4`.
+pub(crate) fn histogram_label(key: u64) -> alloc::string::String {
+    use alloc::format;
+    let op = key & 0xffff;
+    let group = (key >> HISTOGRAM_GROUP_SHIFT) & 0xf;
+    let mut label = format!("op={:#05x}", op & 0x1fff);
+    if op & EVEX_OP_FLAG as u64 != 0 {
+        label += " evex";
+    }
+    if group != 0 {
+        label += &format!("/{}", group - 1);
+    }
+    match (key >> HISTOGRAM_REP_SHIFT) & 3 {
+        0 => {}
+        rep => label += &format!(" rep={rep}"),
+    }
+    if (key >> HISTOGRAM_P66_SHIFT) & 1 != 0 {
+        label += " p66";
+    }
+    if (key >> HISTOGRAM_VEX_SHIFT) & 1 != 0 {
+        label += " vex";
+    }
+    label + &format!(" size={}", key >> HISTOGRAM_OPSIZE_SHIFT)
+}
+
 /// Marks an absent `base`/`index` register.
 pub(crate) const NO_REG: u8 = 0xff;
 /// No segment-override prefix.

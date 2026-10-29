@@ -42,6 +42,9 @@ pub(crate) struct LoadResult {
 /// leaves `cpu.rip` at the next instruction (or the branch target), so the caller stores nothing.
 pub(crate) extern "C" fn helper_exec(cpu: &mut Cpu, insn: &Insn, rip: u64) -> u64 {
     cpu.rip = rip;
+    if let Some(histogram) = cpu.helper_histogram.as_mut() {
+        *histogram.entry(insn.histogram_key()).or_default() += 1;
+    }
     match cpu.exec(insn) {
         Ok(()) => {
             if cpu.block_exit_requested {

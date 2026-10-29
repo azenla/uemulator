@@ -1237,6 +1237,36 @@ mod tests {
     }
 
     #[test]
+    fn helper_histogram_counts_the_instructions_that_reach_the_interpreter() {
+        let _guard = serialize_jit_tests();
+        // adc eax, ebx three times (no inline lowering), then hlt.
+        let adc = [0x13, 0xc3];
+        let code = [adc, adc, adc, [0xf4, 0xf4]].concat();
+        let mut cpu = cpu_running(&code);
+        cpu.jit = Some(Box::new(new_jit()));
+        cpu.helper_histogram = Some(Default::default());
+        cpu.next_event = u64::MAX;
+        steps_to_halt(&mut cpu);
+        let histogram = cpu.helper_histogram.as_ref().unwrap();
+        let adc_key = decode::decode(&adc).unwrap().histogram_key();
+        assert_eq!(histogram.get(&adc_key), Some(&3));
+        let add_key = decode::decode(&[0x01, 0xd8]).unwrap().histogram_key();
+        assert_eq!(histogram.get(&add_key), None, "add is lowered inline");
+    }
+
+    #[test]
+    fn the_histogram_key_tells_group_opcodes_apart_but_not_unrelated_registers() {
+        // shl eax, 1 and rol eax, 1 are both d1 /n.
+        let shl = decode::decode(&[0xd1, 0xe0]).unwrap().histogram_key();
+        let rol = decode::decode(&[0xd1, 0xc0]).unwrap().histogram_key();
+        assert_ne!(shl, rol);
+        // mov eax, ebx and mov ecx, ebx are one instruction as far as the histogram goes.
+        let mov_a = decode::decode(&[0x89, 0xd8]).unwrap().histogram_key();
+        let mov_c = decode::decode(&[0x89, 0xd9]).unwrap().histogram_key();
+        assert_eq!(mov_a, mov_c);
+    }
+
+    #[test]
     fn chain_exit_after_an_rdtsc_does_not_charge_the_prepaid_instructions_twice() {
         let _guard = serialize_jit_tests();
         // mov ecx, 3; 1: sub ecx, 1; rdtsc; jnz... rdtsc clobbers eax/edx only, flags survive.

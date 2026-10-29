@@ -258,6 +258,8 @@ pub(crate) const DECODE_CACHE_ENTRIES: usize = 1 << 16;
 const TRACE_CAPACITY: usize = 64;
 /// How many of the newest `trace` entries `dump` prints.
 const TRACE_DUMP_ENTRIES: usize = 16;
+/// Rows of the interpreter-instruction histogram in `Cpu::dump`.
+const HISTOGRAM_DUMP_ENTRIES: usize = 25;
 /// Registers per line in the register dumps.
 const GPRS_PER_DUMP_LINE: usize = 4;
 
@@ -450,6 +452,9 @@ pub(crate) struct Cpu {
     pub jit: Option<Box<crate::jit::Jit>>,
     /// Most recent instruction addresses, recorded only when debugging.
     pub trace: Option<alloc::collections::VecDeque<u64>>,
+    /// How many times each kind of instruction went through `helper_exec` (see
+    /// `jit::helpers::histogram_key`), counted only when debugging: what is left to lower.
+    pub helper_histogram: Option<alloc::collections::BTreeMap<u64, u64>>,
     /// This vCPU's number, which is also the APIC id it starts with, and how many there are.
     pub cpu_index: u32,
     pub cpu_count: u32,
@@ -706,6 +711,7 @@ impl Cpu {
             prepaid_icount: 0,
             slow_access_insn: 0,
             trace: None,
+            helper_histogram: None,
             cpu_index: 0,
             cpu_count,
             multi: cpu_count > 1,
@@ -1244,6 +1250,15 @@ impl Cpu {
             s += &format!("--- ram match at {start:#x}\n{text}\n");
             found += 1;
             search_from = start + BANNER.len();
+        }
+        if let Some(histogram) = &self.helper_histogram {
+            let mut counts: Vec<_> = histogram.iter().collect();
+            counts.sort_by_key(|&(_, count)| core::cmp::Reverse(*count));
+            let total: u64 = counts.iter().map(|&(_, count)| *count).sum();
+            s += &format!("instructions through the interpreter: {total}\n");
+            for (key, count) in counts.into_iter().take(HISTOGRAM_DUMP_ENTRIES) {
+                s += &format!("  {count:>12}  {}\n", decode::histogram_label(*key));
+            }
         }
         if let Some(trace) = &self.trace {
             s += "last rips:";
