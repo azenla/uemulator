@@ -29,10 +29,11 @@ pub const ARGS: [u8; 4] = [RCX, RDX, R8, R9];
 pub const ARGS: [u8; 4] = [RDI, RSI, RDX, RCX];
 
 /// Group-1 ALU operation numbers. They are both the ModRM.reg opcode extension of the immediate
-/// forms (`0x81`/`0x83`) and bits 5:3 of the `op r/m, r` opcodes (`0x01`, `0x09`, ...). ADC (2)
-/// and SBB (3) fill the gaps and are not used.
+/// forms (`0x81`/`0x83`) and bits 5:3 of the `op r/m, r` opcodes (`0x01`, `0x09`, ...).
 pub const ADD: u8 = 0;
 pub const OR: u8 = 1;
+pub const ADC: u8 = 2;
+pub const SBB: u8 = 3;
 pub const AND: u8 = 4;
 pub const SUB: u8 = 5;
 pub const XOR: u8 = 6;

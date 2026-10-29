@@ -64,6 +64,7 @@ const LAZY_OP_OFFSET: u32 = offset_of!(Cpu, lazy_op) as u32;
 const LAZY_SIZE_SHIFT: u32 = 8;
 const LAZY_DST_OFFSET: u32 = offset_of!(Cpu, lazy_dst) as u32;
 const LAZY_SRC_OFFSET: u32 = offset_of!(Cpu, lazy_src) as u32;
+const LAZY_SRC2_OFFSET: u32 = offset_of!(Cpu, lazy_src2) as u32;
 const RCX_INDEX: u32 = 1;
 const SEG_BASE_OFFSET: u32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as u32;
 const SEG_STRIDE: u32 = size_of::<Seg>() as u32;
@@ -162,6 +163,11 @@ const IMM12_LIMIT_I64: i64 = IMM12_LIMIT as i64;
 enum FlagKind {
     Add,
     Sub,
+    /// `adc`/`sbb`: the host `adcs`/`sbcs` leave NZCV exactly as `adds`/`subs` would for the same
+    /// result, so conditions map as for `Add`/`Sub`; only the lazy record differs (it carries the
+    /// carry-in, see `Gen::alu`).
+    Adc,
+    Sbb,
     Logic,
     /// `inc`/`dec`: N, Z and V of the host flags are right but C is not (x86 leaves CF alone),
     /// so conditions that read CF cannot use them.
@@ -250,7 +256,7 @@ fn cond_map(kind: FlagKind, condition: u8) -> Option<CondMap> {
     let c = |cond| Some(Cond(cond));
     let index = condition as usize & 15;
     match kind {
-        FlagKind::Sub => [
+        FlagKind::Sub | FlagKind::Sbb => [
             c(VS),
             c(VC),
             c(CC),
@@ -269,7 +275,7 @@ fn cond_map(kind: FlagKind, condition: u8) -> Option<CondMap> {
             c(GT),
         ][index]
             .take(),
-        FlagKind::Add => [
+        FlagKind::Add | FlagKind::Adc => [
             c(VS),
             c(VC),
             c(CS),
@@ -841,6 +847,8 @@ impl<'a> Gen<'a> {
         let lazy_op = match kind {
             FlagKind::Add => LazyFlagsOp::Add,
             FlagKind::Sub => LazyFlagsOp::Sub,
+            FlagKind::Adc => LazyFlagsOp::Adc,
+            FlagKind::Sbb => LazyFlagsOp::Sbb,
             FlagKind::Logic => LazyFlagsOp::Logic,
             FlagKind::Inc => LazyFlagsOp::Inc,
             FlagKind::Dec => LazyFlagsOp::Dec,
@@ -851,6 +859,10 @@ impl<'a> Gen<'a> {
             self.flag_records_skipped += 1;
         } else {
             self.store_lazy(lazy_op, operand_size);
+            if matches!(kind, FlagKind::Adc | FlagKind::Sbb) {
+                // The carry-in, which `Gen::alu` parked in `SAVED_EXTRA`.
+                self.asm.str(SAVED_EXTRA, CPU, LAZY_SRC2_OFFSET);
+            }
         }
         self.live = Some(LiveFlags { kind });
     }
@@ -1015,6 +1027,19 @@ impl<'a> Gen<'a> {
         insn_index: u32,
         rip: u64,
     ) -> bool {
+        // adc and sbb (32- and 64-bit only: a narrow add runs on operands shifted to the top of
+        // the word, where the carry-in would have to enter below them) take the guest CF as
+        // their carry-in. With no host flags to read it from, the interpreter's
+        // `condition_holds` computes it, and that call comes before the operands are loaded
+        // because it clobbers every scratch register.
+        let carry_in = matches!(alu_op, ALU_ADC | ALU_SBB);
+        debug_assert!(!carry_in || size >= 4);
+        if carry_in && self.live.is_none() {
+            self.asm.mov(0, CPU);
+            self.asm.mov_imm(1, CONDITION_BELOW);
+            self.call(self.addrs.cond);
+            self.asm.mov(SAVED_EXTRA, 0);
+        }
         match (dst, src) {
             (Dst::Mem, Src::Reg(reg, high)) => {
                 self.load_dst(insn, dst, 0, size, next_rip, insn_index, rip);
@@ -1048,6 +1073,18 @@ impl<'a> Gen<'a> {
         } else {
             (0, 1, 0)
         };
+        if carry_in {
+            // Inline memory accesses preserve the host flags, so a live carry is still there.
+            if let Some(live) = self.live {
+                self.carry_from_live_flags(SAVED_EXTRA, live);
+            }
+            // Host C = the carry-in for `adcs`, its complement for `sbcs`.
+            if alu_op == ALU_ADC {
+                self.asm.cmp_imm(SAVED_EXTRA, 1, true);
+            } else {
+                self.asm.subs(XZR, XZR, SAVED_EXTRA, true);
+            }
+        }
         // `orr` and `eor` do not set flags, so a flag-setting `ands` of the result follows.
         let kind = match alu_op {
             ALU_ADD => {
@@ -1062,6 +1099,14 @@ impl<'a> Gen<'a> {
             ALU_AND | ALU_TEST => {
                 self.asm.ands(a, a, b, is64);
                 FlagKind::Logic
+            }
+            ALU_ADC => {
+                self.asm.adcs(a, a, b, is64);
+                FlagKind::Adc
+            }
+            ALU_SBB => {
+                self.asm.sbcs(a, a, b, is64);
+                FlagKind::Sbb
             }
             ALU_SUB | ALU_CMP => {
                 self.asm.subs(a, a, b, is64);
@@ -1091,8 +1136,8 @@ impl<'a> Gen<'a> {
     /// leave CF alone, so after one the carry is the one they recorded in `lazy_src`.
     fn carry_from_live_flags(&mut self, rd: u32, live: LiveFlags) {
         match live.kind {
-            FlagKind::Add => self.asm.cset(rd, CS),
-            FlagKind::Sub => self.asm.cset(rd, CC),
+            FlagKind::Add | FlagKind::Adc => self.asm.cset(rd, CS),
+            FlagKind::Sub | FlagKind::Sbb => self.asm.cset(rd, CC),
             FlagKind::Logic => self.asm.mov_imm(rd, 0),
             FlagKind::Inc | FlagKind::Dec => self.asm.ldr(rd, CPU, LAZY_SRC_OFFSET),
         }
@@ -1618,15 +1663,14 @@ impl<'a> Gen<'a> {
         let mut is_store = false;
         match insn.op {
             // add/or/adc/sbb/and/sub/xor/cmp: r/m8,r8 (0), r/m,r (1), r8,r/m8 (2), r,r/m (3),
-            // al,imm8 (4) and eax,imm32 (5). adc and sbb need the carry-in and go to the
-            // interpreter.
+            // al,imm8 (4) and eax,imm32 (5). adc and sbb below 32 bits go to the interpreter.
             0x00..=0x3f if insn.op & 7 < 6 && plain => {
                 let alu_op = ((insn.op >> 3) & 7) as u8;
-                if alu_op == ALU_ADC || alu_op == ALU_SBB {
-                    return false;
-                }
                 let form = insn.op & 7;
                 let size = if form & 1 == 0 { 1 } else { operand_size };
+                if matches!(alu_op, ALU_ADC | ALU_SBB) && size < 4 {
+                    return false;
+                }
                 let (dst, src) = match form {
                     0 | 1 => (Self::rm_dst(&insn, size), Self::reg_src(&insn, size)),
                     2 | 3 => (Self::reg_dst(&insn, size), Self::rm_src(&insn, size)),
@@ -1640,10 +1684,10 @@ impl<'a> Gen<'a> {
             // group 1: add/or/.../cmp r/m, imm
             0x80 | 0x81 | 0x83 if plain => {
                 let alu_op = insn.reg & 7;
-                if alu_op == ALU_ADC || alu_op == ALU_SBB {
+                let size = if insn.op == 0x80 { 1 } else { operand_size };
+                if matches!(alu_op, ALU_ADC | ALU_SBB) && size < 4 {
                     return false;
                 }
-                let size = if insn.op == 0x80 { 1 } else { operand_size };
                 let immediate = Self::immediate_for(size, insn.imm);
                 is_store = self.alu(
                     &insn,
@@ -2195,6 +2239,7 @@ mod tests {
                 (result, a >= b, ((a ^ b) & (a ^ result)) & sign != 0)
             }
             FlagKind::Logic => ((a & b) & mask, false, false),
+            FlagKind::Adc | FlagKind::Sbb => unreachable!("see nzcv_after_with_carry_in"),
             // The host op is `adds`/`subs` with the immediate 1; the caller passes b = 1.
             FlagKind::Inc => {
                 let result = a.wrapping_add(1) & mask;
@@ -2204,6 +2249,50 @@ mod tests {
                 let result = a.wrapping_sub(1) & mask;
                 (result, false, ((a ^ 1) & (a ^ result)) & sign != 0)
             }
+        };
+        (
+            result,
+            Nzcv {
+                n: result & sign != 0,
+                z: result == 0,
+                c,
+                v,
+            },
+        )
+    }
+
+    /// `nzcv_after` for `adcs` and `sbcs` with the carry-in `carry` (0 or 1).
+    fn nzcv_after_with_carry_in(
+        kind: FlagKind,
+        size: u8,
+        a: u64,
+        b: u64,
+        carry: u64,
+    ) -> (u64, Nzcv) {
+        let bits = size_in_bits(size);
+        let mask = flags::mask(size);
+        let sign = 1u64 << (bits - 1);
+        let (a, b) = (a & mask, b & mask);
+        let (result, c, v) = match kind {
+            FlagKind::Adc => {
+                let sum = a as u128 + b as u128 + carry as u128;
+                let result = (sum as u64) & mask;
+                (
+                    result,
+                    sum >> bits != 0,
+                    (!(a ^ b) & (a ^ result)) & sign != 0,
+                )
+            }
+            FlagKind::Sbb => {
+                let result = a.wrapping_sub(b).wrapping_sub(carry) & mask;
+                // aarch64 carry is "no borrow"
+                (
+                    result,
+                    a as u128 >= b as u128 + carry as u128,
+                    ((a ^ b) & (a ^ result)) & sign != 0,
+                )
+            }
+            _ => unreachable!(),
         };
         (
             result,
@@ -2284,9 +2373,39 @@ mod tests {
         match kind {
             FlagKind::Add => LazyFlagsOp::Add,
             FlagKind::Sub => LazyFlagsOp::Sub,
+            FlagKind::Adc => LazyFlagsOp::Adc,
+            FlagKind::Sbb => LazyFlagsOp::Sbb,
             FlagKind::Logic => LazyFlagsOp::Logic,
             FlagKind::Inc => LazyFlagsOp::Inc,
             FlagKind::Dec => LazyFlagsOp::Dec,
+        }
+    }
+
+    /// The conditions offered after `adcs`/`sbcs` are the `Add`/`Sub` ones; they must hold for
+    /// either carry-in, as the x86 flags of the same `adc`/`sbb` say.
+    #[test]
+    fn adc_and_sbb_conditions_match_the_x86_flags_for_either_carry_in() {
+        for kind in [FlagKind::Adc, FlagKind::Sbb] {
+            for size in [4u8, 8] {
+                for a in OPERAND_VALUES {
+                    for b in OPERAND_VALUES {
+                        for carry in [0, 1] {
+                            let (result, nzcv) = nzcv_after_with_carry_in(kind, size, a, b, carry);
+                            let eflags = flags::compute(lazy_op(kind), size, result, b, carry, 0);
+                            for condition in 0..16u8 {
+                                let expected = x86_condition_holds(condition, eflags);
+                                if let Some(CondMap::Cond(host)) = cond_map(kind, condition) {
+                                    assert_eq!(
+                                        aarch64_condition_holds(host, &nzcv),
+                                        expected,
+                                        "{kind:?} size {size} {a:#x}, {b:#x}, carry {carry}: condition {condition}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

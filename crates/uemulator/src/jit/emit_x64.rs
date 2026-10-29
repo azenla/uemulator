@@ -48,6 +48,7 @@ const LAZY_OP: i32 = offset_of!(Cpu, lazy_op) as i32;
 const LAZY_SIZE_SHIFT: u32 = 8;
 const LAZY_DST: i32 = offset_of!(Cpu, lazy_dst) as i32;
 const LAZY_SRC: i32 = offset_of!(Cpu, lazy_src) as i32;
+const LAZY_SRC2: i32 = offset_of!(Cpu, lazy_src2) as i32;
 // `Seg` is not `repr(C)`; `offset_of!` and `size_of` still report the real layout.
 const SEG_BASE: i32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as i32;
 const SEG_SIZE: i32 = size_of::<Seg>() as i32;
@@ -708,6 +709,9 @@ impl<'a> Gen<'a> {
             self.flag_records_skipped += 1;
         } else {
             self.store_lazy(op, size);
+            if matches!(op, LazyFlagsOp::Adc | LazyFlagsOp::Sbb) {
+                self.a.st(mem(CPU, LAZY_SRC2), SAVED_CONDITION, 8);
+            }
         }
         self.live = !stored;
     }
@@ -855,6 +859,16 @@ impl<'a> Gen<'a> {
         insn_index: u32,
         rip: u64,
     ) -> bool {
+        // adc and sbb take the guest CF as their carry-in: taken from the host flags when they
+        // are live, else from `helper_cond`, before the operands are loaded (which clobbers the
+        // host flags). It waits in `SAVED_CONDITION` until the record of the flags is written.
+        // That register is also where a read-modify-write store parks its result, so adc and
+        // sbb only get here with a register destination (see `try_inline`).
+        let carry_in = matches!(alu_op, ALU_ADC | ALU_SBB);
+        debug_assert!(!carry_in || (size >= 4 && matches!(dst, Dst::Reg(..))));
+        if carry_in {
+            self.condition_to_register(CONDITION_BELOW as u8, SAVED_CONDITION);
+        }
         match (dst, src) {
             (Dst::Mem, Src::Reg(reg, high)) => {
                 self.load_dst(insn, dst, ACC, size, next, insn_index, rip);
@@ -882,11 +896,17 @@ impl<'a> Gen<'a> {
         // cmp and test run as sub and and on the scratch copy: the result feeds the lazy flags
         let (host_op, lazy_op) = match alu_op {
             ALU_ADD => (ADD, LazyFlagsOp::Add),
+            ALU_ADC => (ADC, LazyFlagsOp::Adc),
+            ALU_SBB => (SBB, LazyFlagsOp::Sbb),
             ALU_OR => (OR, LazyFlagsOp::Logic),
             ALU_AND | ALU_TEST => (AND, LazyFlagsOp::Logic),
             ALU_SUB | ALU_CMP => (SUB, LazyFlagsOp::Sub),
             _ => (XOR, LazyFlagsOp::Logic),
         };
+        if carry_in {
+            // Host CF = the carry-in; `bt` leaves the other flags for the instruction to set.
+            self.a.bt_ri(SAVED_CONDITION, 0, false);
+        }
         self.a.alu_rr_sized(host_op, ACC, OPERAND, size);
         let stored = alu_op != ALU_CMP
             && alu_op != ALU_TEST
@@ -1263,13 +1283,10 @@ impl<'a> Gen<'a> {
         let mut store = false;
         match insn.op {
             // add/or/adc/sbb/and/sub/xor/cmp: r/m8,r8 (0), r/m,r (1), r8,r/m8 (2), r,r/m (3),
-            // al,imm8 (4) and eax,imm32 (5). adc and sbb need the carry-in and go to the
+            // al,imm8 (4) and eax,imm32 (5). adc and sbb below 32 bits or into memory go to the
             // interpreter. 6 and 7 are push/pop of segment registers and prefixes.
             0x00..=0x3f if insn.op & 7 < 6 && plain => {
                 let alu_op = ((insn.op >> 3) & 7) as u8;
-                if alu_op == ALU_ADC || alu_op == ALU_SBB {
-                    return false;
-                }
                 let form = insn.op & 7;
                 let size = if form & 1 == 0 { 1 } else { osz };
                 let (dst, src) = match form {
@@ -1280,15 +1297,18 @@ impl<'a> Gen<'a> {
                         Src::Imm(Self::imm_for(size, insn.imm)),
                     ),
                 };
+                if matches!(alu_op, ALU_ADC | ALU_SBB) && (size < 4 || matches!(dst, Dst::Mem)) {
+                    return false;
+                }
                 store = self.alu(&insn, alu_op, dst, src, size, next, insn_index, rip);
             }
             // group 1: add/or/.../cmp r/m, imm8 (80) or imm32/sign-extended imm8 (81, 83)
             0x80 | 0x81 | 0x83 if plain => {
                 let alu_op = insn.reg & 7;
-                if alu_op == ALU_ADC || alu_op == ALU_SBB {
+                let size = if insn.op == 0x80 { 1 } else { osz };
+                if matches!(alu_op, ALU_ADC | ALU_SBB) && (size < 4 || is_mem) {
                     return false;
                 }
-                let size = if insn.op == 0x80 { 1 } else { osz };
                 store = self.alu(
                     &insn,
                     alu_op,

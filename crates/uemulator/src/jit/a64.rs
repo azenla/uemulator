@@ -381,6 +381,14 @@ impl Asm {
     pub fn adds(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
         self.reg3(0x2b00_0000, rd, rn, rm, is64);
     }
+    /// `adcs`: rn + rm + C, setting NZCV.
+    pub fn adcs(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
+        self.reg3(0x3a00_0000, rd, rn, rm, is64);
+    }
+    /// `sbcs`: rn - rm - !C, setting NZCV (C is NOT borrow, as for `subs`).
+    pub fn sbcs(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
+        self.reg3(0x7a00_0000, rd, rn, rm, is64);
+    }
     pub fn sub(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
         self.reg3(0x4b00_0000, rd, rn, rm, is64);
     }
@@ -843,6 +851,10 @@ fn register_arithmetic_and_logic_encodings_match_the_assembler() {
         ("add x5, xzr, x6", |a| { a.add(5, 31, 6, true); }, &[0x8b0603e5]),
         ("add x7, x8, xzr", |a| { a.add(7, 8, 31, true); }, &[0x8b1f0107]),
         ("adds x0, x1, x2", |a| { a.adds(0, 1, 2, true); }, &[0xab020020]),
+        ("adcs x0, x1, x2", |a| { a.adcs(0, 1, 2, true); }, &[0xba020020]),
+        ("adcs w0, w1, w2", |a| { a.adcs(0, 1, 2, false); }, &[0x3a020020]),
+        ("sbcs x0, x1, x2", |a| { a.sbcs(0, 1, 2, true); }, &[0xfa020020]),
+        ("sbcs w3, w4, w5", |a| { a.sbcs(3, 4, 5, false); }, &[0x7a050083]),
         ("adds x28, x29, x30", |a| { a.adds(28, 29, 30, true); }, &[0xab1e03bc]),
         ("adds xzr, x3, x4", |a| { a.adds(31, 3, 4, true); }, &[0xab04007f]),
         ("adds x5, xzr, x6", |a| { a.adds(5, 31, 6, true); }, &[0xab0603e5]),

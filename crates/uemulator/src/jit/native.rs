@@ -1288,6 +1288,27 @@ mod tests {
     }
 
     #[test]
+    fn adc_and_sbb_are_lowered_inline_at_32_and_64_bits_only() {
+        let _guard = serialize_jit_tests();
+        for (code, inlined) in [
+            // adc rax, rcx | sbb eax, ebx | adc rax, 5 | sbb dword ptr [rbx], 1 | adc rax, [rbx]
+            (&[0x48, 0x11, 0xc8][..], 1),
+            (&[0x19, 0xd8], 1),
+            (&[0x48, 0x83, 0xd0, 0x05], 1),
+            // A memory destination: only aarch64 lowers it. On x86_64 the carry waits in the
+            // register a read-modify-write store parks its result in.
+            (&[0x83, 0x1b, 0x01], cfg!(target_arch = "aarch64") as u64),
+            (&[0x48, 0x13, 0x03], 1),
+            // adc ax, cx | sbb al, bl | adc byte ptr [rbx], 1
+            (&[0x66, 0x11, 0xc8], 0),
+            (&[0x18, 0xd8], 0),
+            (&[0x80, 0x13, 0x01], 0),
+        ] {
+            assert_eq!(inlined_in(&[code, &[0xf4]].concat()), inlined, "{code:x?}");
+        }
+    }
+
+    #[test]
     fn narrow_shifts_by_a_count_at_or_above_the_width_stay_in_the_interpreter() {
         let _guard = serialize_jit_tests();
         // shr ax, 16 | shl al, 8 | shr ax, 0
@@ -1322,17 +1343,17 @@ mod tests {
     #[test]
     fn helper_histogram_counts_the_instructions_that_reach_the_interpreter() {
         let _guard = serialize_jit_tests();
-        // adc eax, ebx three times (no inline lowering), then hlt.
-        let adc = [0x13, 0xc3];
-        let code = [adc, adc, adc, [0xf4, 0xf4]].concat();
+        // bsf eax, ebx three times (no inline lowering), then hlt.
+        let bsf = [0x0f, 0xbc, 0xc3];
+        let code = [&bsf[..], &bsf, &bsf, &[0xf4, 0xf4]].concat();
         let mut cpu = cpu_running(&code);
         cpu.jit = Some(Box::new(new_jit()));
         cpu.helper_histogram = Some(Default::default());
         cpu.next_event = u64::MAX;
         steps_to_halt(&mut cpu);
         let histogram = cpu.helper_histogram.as_ref().unwrap();
-        let adc_key = decode::decode(&adc).unwrap().histogram_key();
-        assert_eq!(histogram.get(&adc_key), Some(&3));
+        let bsf_key = decode::decode(&bsf).unwrap().histogram_key();
+        assert_eq!(histogram.get(&bsf_key), Some(&3));
         let add_key = decode::decode(&[0x01, 0xd8]).unwrap().histogram_key();
         assert_eq!(histogram.get(&add_key), None, "add is lowered inline");
     }

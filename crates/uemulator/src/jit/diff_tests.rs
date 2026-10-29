@@ -327,7 +327,7 @@ mod translation {
     }
 
     #[test]
-    fn adc_and_cpuid_are_not_lowered_inline_but_a_byte_move_is() {
+    fn a_16_bit_adc_and_cpuid_are_not_lowered_inline_but_a_byte_move_is() {
         let result = check(&HELPER_ONLY_FORMS);
         let stats = stats_of(&result);
         assert_eq!(stats.translated, 1);
@@ -408,8 +408,8 @@ mod translation {
     // add rax, rcx; cmp rax, rdx; jb 1f; 1: hlt
     const INLINE_ALU_THEN_JCC: [u8; 9] = [0x48, 0x01, 0xc8, 0x48, 0x39, 0xd0, 0x72, 0x00, 0xf4];
 
-    // adc rax, rcx; mov al, bl; cpuid; hlt
-    const HELPER_ONLY_FORMS: [u8; 8] = [0x48, 0x11, 0xc8, 0x88, 0xd8, 0x0f, 0xa2, 0xf4];
+    // adc ax, cx; mov al, bl; cpuid; hlt
+    const HELPER_ONLY_FORMS: [u8; 8] = [0x66, 0x11, 0xc8, 0x88, 0xd8, 0x0f, 0xa2, 0xf4];
 
     // mov ecx, 1000; 1: add rax, rcx; dec rcx; jnz 1b; hlt
     const COUNTED_LOOP_1000: [u8; 14] = [
