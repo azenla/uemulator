@@ -148,6 +148,11 @@ impl Asm {
         self.base + self.code.len() as u64
     }
 
+    /// Address the first byte is assembled for.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
     pub fn label(&mut self) -> Label {
         self.labels.push(None);
         Label(self.labels.len() - 1)

@@ -1,5 +1,5 @@
 pub(crate) use super::emit_x64::Addrs;
-use super::emit_x64::{CPU, FRAME, Gen, TLB_BASE};
+use super::emit_x64::{CPU, FRAME, Gen, LINK_NOP, TLB_BASE};
 use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
 use super::native::{
     CompiledBlock, JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET, JUMP_ENTRY_SHIFT,
@@ -175,16 +175,24 @@ pub(crate) fn compile_block(
     CompiledBlock {
         code: generator.a.code,
         inlined: generator.inlined,
-        body_offset: 0,
-        links: Vec::new(),
+        body_offset: generator.body_offset,
+        links: generator.links,
     }
 }
 
-/// No direct links on this backend yet: every slot would stay a nop.
-pub(crate) fn link_bytes(_site: u64, _destination: u64) -> Option<Vec<u8>> {
-    None
+const JMP_REL32_OPCODE: u8 = 0xe9;
+const JMP_REL32_BYTES: i64 = 5;
+
+/// The `jmp rel32` that makes the slot at `site` jump to `destination`, or `None` when it does
+/// not fit (the buffer is far smaller than 2 GiB, so only a corrupt address).
+pub(crate) fn link_bytes(site: u64, destination: u64) -> Option<Vec<u8>> {
+    let rel = i32::try_from(destination as i64 - (site as i64 + JMP_REL32_BYTES)).ok()?;
+    let mut bytes = vec![JMP_REL32_OPCODE];
+    bytes.extend_from_slice(&rel.to_le_bytes());
+    Some(bytes)
 }
 
+/// What an unlinked slot holds: a nop, so execution falls into the chain stub sequence after it.
 pub(crate) fn unlink_bytes() -> Vec<u8> {
-    Vec::new()
+    LINK_NOP.to_vec()
 }

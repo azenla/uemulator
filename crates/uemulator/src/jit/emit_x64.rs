@@ -23,6 +23,7 @@
 use std::mem::{offset_of, size_of};
 
 use super::helpers::*;
+use super::native::LinkSite;
 use super::x64::*;
 use crate::cpu::decode::{Insn, NO_REG};
 use crate::cpu::flags::{LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT, SZP_CF_OF_SRC_OF_BIT};
@@ -38,6 +39,9 @@ const GPR_SIZE: i32 = size_of::<u64>() as i32;
 const RIP: i32 = offset_of!(Cpu, rip) as i32;
 const ICOUNT: i32 = offset_of!(Cpu, icount) as i32;
 const BLOCK_EXIT_REQUESTED: i32 = offset_of!(Cpu, block_exit_requested) as i32;
+const NEXT_EVENT: i32 = offset_of!(Cpu, next_event) as i32;
+/// `nop dword [rax + rax]`, five bytes: the size of the `jmp rel32` that replaces it.
+pub(crate) const LINK_NOP: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
 const PREPAID_ICOUNT: i32 = offset_of!(Cpu, prepaid_icount) as i32;
 const SLOW_ACCESS_INSN: i32 = offset_of!(Cpu, slow_access_insn) as i32;
 const LAZY_OP: i32 = offset_of!(Cpu, lazy_op) as i32;
@@ -245,6 +249,15 @@ pub(crate) struct Gen<'a> {
     prepaid_insns: u32,
     /// Number of guest instructions lowered inline (not through `helper_exec`), for statistics.
     pub inlined: u32,
+    /// Guest address of the block's first instruction.
+    entry_rip: u64,
+    /// Byte offset of the body entry; the bytes before it are the link entry's checks (none
+    /// without chaining). See `emit.rs`.
+    pub body_offset: u32,
+    /// Label of the link entry's out-of-line exit, bound by `emit_slows`.
+    link_entry_miss: Option<Label>,
+    /// Patchable slots of exits to fixed addresses in the block's own page.
+    pub links: Vec<LinkSite>,
 }
 
 /// The register embedded in the low three opcode bits (push/pop/mov r, imm), extended by REX.B.
@@ -275,6 +288,10 @@ impl<'a> Gen<'a> {
             live: false,
             prepaid_insns: 0,
             inlined: 0,
+            entry_rip: 0,
+            body_offset: 0,
+            link_entry_miss: None,
+            links: Vec::new(),
         }
     }
 
@@ -309,6 +326,11 @@ impl<'a> Gen<'a> {
     /// of a helper, plus that one. Without chaining it stores rip and returns to the run loop.
     /// Clobbers the host flags, so conditional exits call it only after the branch.
     fn chain_exit(&mut self, retired: u32) {
+        self.chain_exit_to(retired, None);
+    }
+
+    /// `chain_exit`; with a fixed `target` the exit also gets a link slot (`link_slot`).
+    fn chain_exit_to(&mut self, retired: u32, target: Option<u64>) {
         if self.addrs.chain == 0 {
             self.a.st(mem(CPU, RIP), OPERAND, 8);
             self.exit_ok(retired);
@@ -323,13 +345,43 @@ impl<'a> Gen<'a> {
             self.a.mov_imm(SCRATCH_D, 0);
             self.a.st(mem(CPU, PREPAID_ICOUNT), SCRATCH_D, 8);
         }
+        if let Some(target) = target {
+            self.link_slot(target);
+        }
         self.a.jmp_abs(self.addrs.chain);
+    }
+
+    /// Emits the 5-byte nop that `Jit::translate` turns into a direct `jmp` to the block at
+    /// `target_rip` once it exists, when `target_rip` is in this block's page; see `emit.rs`.
+    /// It sits right before the `jmp chain`, so the stub path still runs while it is a nop.
+    fn link_slot(&mut self, target_rip: u64) {
+        if self.addrs.chain == 0 || target_rip >> PAGE_SHIFT != self.entry_rip >> PAGE_SHIFT {
+            return;
+        }
+        self.links.push(LinkSite {
+            code_offset: (self.a.here() - self.a.base()) as u32,
+            target_rip,
+        });
+        self.a.code.extend_from_slice(&LINK_NOP);
+    }
+
+    /// The checks `chain_stub` does before it jumps into a block, for a block reached by a direct
+    /// link: see `emit.rs`.
+    fn link_entry(&mut self) {
+        let miss = self.a.label();
+        self.a.ld(ACC, mem(CPU, ICOUNT));
+        self.a.ld(SCRATCH_A, mem(CPU, NEXT_EVENT));
+        self.a.alu_rr(CMP, ACC, SCRATCH_A, true);
+        self.a.jcc(AE, miss);
+        self.a.cmp_m8_imm(mem(CPU, BLOCK_EXIT_REQUESTED), 0);
+        self.a.jcc(NE, miss);
+        self.link_entry_miss = Some(miss);
     }
 
     /// `chain_exit` to a fixed guest address.
     fn chain_to(&mut self, rip: u64, retired: u32) {
         self.a.mov_imm(OPERAND, rip);
-        self.chain_exit(retired);
+        self.chain_exit_to(retired, Some(rip));
     }
 
     /// Leave the block because the status in rax is non-zero; the epilogue wants the failing
@@ -531,6 +583,16 @@ impl<'a> Gen<'a> {
             self.a.bind(label);
             self.set_rip(next);
             self.exit_ok(insn_index + 1);
+        }
+        if let Some(miss) = self.link_entry_miss.take() {
+            // Give back the pre-charge and return to the run loop at this block's first
+            // instruction, as the stub's miss path does.
+            self.a.bind(miss);
+            self.a.ld(ACC, mem(CPU, ICOUNT));
+            self.a.alu_ri(SUB, ACC, 1, true);
+            self.a.st(mem(CPU, ICOUNT), ACC, 8);
+            self.set_rip(self.entry_rip);
+            self.exit_ok(1);
         }
         let slows = std::mem::take(&mut self.slows);
         for slow in slows {
@@ -1453,6 +1515,11 @@ impl<'a> Gen<'a> {
     /// `rips[k]` is the guest rip of instruction `k`; `end_rip` is the rip after the last one.
     pub fn compile(&mut self, rips: &[u64], end_rip: u64) {
         let count = self.insns.len();
+        self.entry_rip = rips[0];
+        if self.addrs.chain != 0 {
+            self.link_entry();
+        }
+        self.body_offset = (self.a.here() - self.a.base()) as u32;
         for index in 0..count {
             let rip = rips[index];
             let next = if index + 1 < count {
