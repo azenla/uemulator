@@ -146,6 +146,10 @@ const ALU_TEST: u8 = 8;
 
 /// ModRM.reg of the shift group (c0/c1/d0..d3): rol, ror, rcl, rcr, shl, shr, sal (an alias of
 /// shl), sar.
+/// Shift counts of 8-, 16- and 32-bit operands are masked to five bits (SDM, SHL).
+const NARROW_SHIFT_COUNT_MASK: u32 = 0x1f;
+/// Width of the host shift a narrow operand is widened to.
+const HOST_SHIFT_BITS: u8 = 32;
 const SHIFT_SHL: u8 = 4;
 const SHIFT_SHR: u8 = 5;
 const SHIFT_SAL_ALIAS: u8 = 6;
@@ -962,10 +966,8 @@ impl<'a> Gen<'a> {
     /// computes it for every count: shl = MSB of the result xor CF, shr = MSB of the original,
     /// sar = 0. For shr the caller has put a copy of the operand from before the shift in
     /// `SCRATCH_D` (the overflow register).
-    fn shift_flags_word(&mut self, kind: ShiftKind, size: u8, extra: i32) {
+    fn shift_flags_word(&mut self, kind: ShiftKind, is64: bool, top_bit: u8, extra: i32) {
         let (carry, overflow) = (SCRATCH_C, SCRATCH_D);
-        let is64 = size == 8;
-        let top_bit = 8 * size - 1;
         // setcc leaves the rest of the register alone, so clear it with a zero-extending move.
         self.a.setcc(B, carry);
         self.a.ext_rr(carry, carry, 1, false);
@@ -987,8 +989,11 @@ impl<'a> Gen<'a> {
         );
     }
 
-    /// `shl`/`shr`/`sar` of a 32- or 64-bit operand by an immediate (`count` is Some: already
-    /// masked and non-zero) or by CL. The flags are recorded as `LazyFlagsOp::SzpCfOf` with CF
+    /// `shl`/`shr`/`sar` of an 8-, 16-, 32- or 64-bit operand by an immediate (`count` is Some:
+    /// already masked and non-zero) or by CL. A narrow operand runs as a 32-bit shift so the host
+    /// CF is still the last bit out: `shl` first moves the operand to the top of the register
+    /// (and back afterwards), `sar` sign-extends it, `shr` needs nothing as loads zero-extend.
+    /// Counts of 17..31 then give the interpreter's answer (0 or the sign, CF 0) by themselves. The flags are recorded as `LazyFlagsOp::SzpCfOf` with CF
     /// and OF worked out by `shift_flags_word`. A CL count of zero changes neither flags nor
     /// value, which is a branch around the flag work; the destination is still written, as the
     /// interpreter does (a 32-bit destination zero-extends, which the zero-extending load did).
@@ -1011,20 +1016,35 @@ impl<'a> Gen<'a> {
             ShiftKind::Sar => SAR,
         };
         let (carry, overflow) = (SCRATCH_C, SCRATCH_D);
+        let narrow = size < 4;
+        let operand_bits = 8 * size;
+        let top_align = HOST_SHIFT_BITS - operand_bits.min(HOST_SHIFT_BITS);
+        // The bit the overflow flag reads: the top of the (aligned) result for shl, the top of
+        // the original operand for shr.
+        let overflow_bit = match (narrow, kind) {
+            (true, ShiftKind::Shl) => HOST_SHIFT_BITS - 1,
+            _ => operand_bits - 1,
+        };
         self.load_dst(insn, dst, ACC, size, next, insn_index, rip);
+        if narrow && kind == ShiftKind::Sar {
+            self.a.ext_rr(ACC, ACC, size, true);
+        }
+        if narrow && kind == ShiftKind::Shl {
+            self.a.shift_ri(SHL, ACC, top_align, false);
+        }
         match count {
             Some(count) => {
                 if kind == ShiftKind::Shr {
                     self.a.mov_rr(overflow, ACC, true);
                 }
                 self.a.shift_ri(host_op, ACC, count as u8, is64);
-                self.shift_flags_word(kind, size, 0);
+                self.shift_flags_word(kind, is64, overflow_bit, 0);
             }
             None => {
                 self.a
                     .ld(OPERAND, mem(CPU, GPR + GPR_SIZE * GUEST_RCX as i32));
                 self.a.mov_rr(carry, OPERAND, false);
-                self.a.alu_ri(AND, carry, (8 * size - 1) as i32, false);
+                self.a.alu_ri(AND, carry, if is64 { 63 } else { 31 }, false);
                 let zero_count = self.a.label();
                 let merge = self.a.label();
                 self.a.jcc(E, zero_count);
@@ -1032,12 +1052,15 @@ impl<'a> Gen<'a> {
                     self.a.mov_rr(overflow, ACC, true);
                 }
                 self.a.shift_cl(host_op, ACC, is64);
-                self.shift_flags_word(kind, size, SHIFT_APPLIED);
+                self.shift_flags_word(kind, is64, overflow_bit, SHIFT_APPLIED);
                 self.a.jmp(merge);
                 self.a.bind(zero_count);
                 self.a.alu_rr(XOR, OPERAND, OPERAND, false);
                 self.a.bind(merge);
             }
+        }
+        if narrow && kind == ShiftKind::Shl {
+            self.a.shift_ri(SHR, ACC, top_align, false);
         }
         let stored = self.store_dst(dst, size, true, insn_index, rip);
         if count.is_none() {
@@ -1209,8 +1232,40 @@ impl<'a> Gen<'a> {
                     rip,
                 );
             }
-            // shl/shr/sar r/m, imm8 | 1 | cl at 32 and 64 bits (/6 is the alias of /4). Rotates,
-            // the byte and word sizes and a zero immediate count go to the interpreter.
+            // shl/shr/sar r/m8 and r/m16 by imm8 | 1 | cl. An immediate count of zero or at least
+            // the width goes to the interpreter: it is rare, and CF there is not a fixed bit.
+            0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xd2 | 0xd3
+                if plain
+                    && matches!(insn.reg & 7, SHIFT_SHL..=SHIFT_SAR)
+                    && (insn.op & 1 == 0 || (insn.p66 && osz == 2)) =>
+            {
+                let size = if insn.op & 1 == 0 { 1 } else { 2 };
+                let count = match insn.op {
+                    0xc0 | 0xc1 => Some(insn.imm as u32 & NARROW_SHIFT_COUNT_MASK),
+                    0xd0 | 0xd1 => Some(1),
+                    _ => None,
+                };
+                if count.is_some_and(|count| count == 0 || count >= 8 * size as u32) {
+                    return false;
+                }
+                let kind = match insn.reg & 7 {
+                    SHIFT_SHL | SHIFT_SAL_ALIAS => ShiftKind::Shl,
+                    SHIFT_SHR => ShiftKind::Shr,
+                    _ => ShiftKind::Sar,
+                };
+                store = self.shift(
+                    &insn,
+                    kind,
+                    Self::rm_dst(&insn, size),
+                    count,
+                    size,
+                    next,
+                    insn_index,
+                    rip,
+                );
+            }
+            // shl/shr/sar r/m, imm8 | 1 | cl at 32 and 64 bits (/6 is the alias of /4). Rotates
+            // and a zero immediate count go to the interpreter.
             0xc1 | 0xd1 | 0xd3 if wide && matches!(insn.reg & 7, SHIFT_SHL..=SHIFT_SAR) => {
                 let kind = match insn.reg & 7 {
                     SHIFT_SHL | SHIFT_SAL_ALIAS => ShiftKind::Shl,
