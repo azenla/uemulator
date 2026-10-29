@@ -113,6 +113,7 @@ pub(crate) const VEX_OP_FLAG: u16 = 0x1000;
 /// Set in `Insn::op` for EVEX-encoded instructions; see `Insn::evex`.
 pub(crate) const EVEX_OP_FLAG: u16 = 0x2000;
 
+#[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
 /// Opcodes whose ModRM.reg field selects the operation (shift group, `f7` group, `0f ba`, ...):
 /// `Insn::histogram_key` keeps the selector for these only.
 const GROUP_OPCODES: &[u16] = &[
@@ -124,8 +125,10 @@ const HISTOGRAM_REP_SHIFT: u32 = 20;
 const HISTOGRAM_P66_SHIFT: u32 = 22;
 const HISTOGRAM_VEX_SHIFT: u32 = 23;
 const HISTOGRAM_OPSIZE_SHIFT: u32 = 24;
+#[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
 const GROUP_SELECTOR_MASK: u8 = 7;
 
+#[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
 impl Insn {
     /// What kind of instruction this is, for counting how often each reaches the interpreter:
     /// opcode (EVEX flag included), group selector, repeat prefix, `66`, VEX/EVEX and operand size,
