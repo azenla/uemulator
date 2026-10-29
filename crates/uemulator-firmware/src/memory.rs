@@ -119,7 +119,7 @@ pub fn init(handoff: &Handoff) {
     // OS reclaims them as boot services data.
     if let Some(payload) = &handoff.payload {
         let ranges = [Some(payload.kernel), payload.initrd, Some(payload.cmdline)];
-        for (base, size) in ranges.into_iter().flatten() {
+        for (base, size) in ranges.into_iter().flatten().filter(|range| range.1 != 0) {
             mark(base, size, BOOT_SERVICES_DATA, WRITE_BACK);
         }
     }

@@ -27,7 +27,7 @@ const MAX_FOOTPRINT: u64 = 64 << 20;
 
 const HANDOFF_MAGIC: &[u8; 8] = b"UEMUHAND";
 const HANDOFF_VERSION: u32 = 1;
-pub(crate) const HANDOFF_SIZE: usize = 0x308;
+pub(crate) const HANDOFF_SIZE: usize = 0x338;
 
 const HANDOFF_VERSION_OFFSET: usize = 0x08;
 const HANDOFF_SIZE_OFFSET: usize = 0x0c;
@@ -56,6 +56,14 @@ const HANDOFF_MMIO_REGIONS: usize = 0x200;
 const MMIO_REGION_BYTES: usize = 16;
 const MAX_MMIO_REGIONS: usize = 16;
 const HANDOFF_TSC_HZ: usize = 0x300;
+const HANDOFF_KERNEL_BASE: usize = 0x308;
+const HANDOFF_KERNEL_SIZE: usize = 0x310;
+const HANDOFF_INITRD_BASE: usize = 0x318;
+const HANDOFF_INITRD_SIZE: usize = 0x320;
+const HANDOFF_CMDLINE_BASE: usize = 0x328;
+const HANDOFF_CMDLINE_SIZE: usize = 0x330;
+/// Each payload piece starts on its own page: the firmware reserves them page by page.
+const PAYLOAD_ALIGNMENT: u64 = 0x1000;
 /// `rdtsc` ticks per second: the guest clock is in nanoseconds (`Cpu::tsc`).
 const TSC_HZ: u64 = 1_000_000_000;
 
@@ -82,6 +90,14 @@ pub(crate) struct FirmwareParams {
     pub acpi_region: (u64, u64),
 }
 
+/// What the firmware boots instead of looking at the disks: placed at the top of RAM, with the
+/// initramfs highest, then the kernel, then the command line.
+pub(crate) struct UefiPayload<'a> {
+    pub kernel: &'a [u8],
+    pub initrd: Option<&'a [u8]>,
+    pub cmdline: &'a str,
+}
+
 struct Handoff(Vec<u8>);
 
 impl Handoff {
@@ -104,6 +120,63 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+const DOS_MAGIC: &[u8; 2] = b"MZ";
+const PE_MAGIC: &[u8; 4] = b"PE\0\0";
+/// Offset of the u32 that points at the PE header in the DOS header.
+const PE_POINTER_OFFSET: usize = 0x3c;
+
+/// Whether `kernel` starts with the DOS and PE headers of an EFI-stub kernel, which the firmware
+/// loads as an ordinary EFI application.
+pub(crate) fn has_efi_header(kernel: &[u8]) -> bool {
+    let pe_offset = kernel
+        .get(PE_POINTER_OFFSET..PE_POINTER_OFFSET + 4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as usize);
+    kernel.starts_with(DOS_MAGIC)
+        && pe_offset
+            .and_then(|offset| kernel.get(offset..offset.checked_add(PE_MAGIC.len())?))
+            .is_some_and(|bytes| bytes == PE_MAGIC)
+}
+
+struct PlacedPayload {
+    kernel: (u64, u64),
+    /// Size 0 when there is no initramfs.
+    initrd: (u64, u64),
+    cmdline: (u64, u64),
+}
+
+/// Copies the payload into the top of RAM, above `floor` (the end of the firmware's footprint).
+/// The firmware reserves exactly these ranges (`memory::init`), so they must not overlap each
+/// other or anything the library wrote.
+fn place_payload(
+    ram: &mut [u8],
+    payload: &UefiPayload,
+    floor: u64,
+) -> Result<PlacedPayload, Error> {
+    let too_big = || Error::BadConfig("kernel and initramfs do not fit in guest memory".into());
+    let mut top = ram.len() as u64 & !(PAYLOAD_ALIGNMENT - 1);
+    let mut place = |data: &[u8]| -> Result<(u64, u64), Error> {
+        let size = data.len() as u64;
+        let base = top
+            .checked_sub(size.next_multiple_of(PAYLOAD_ALIGNMENT))
+            .filter(|base| *base >= floor)
+            .ok_or_else(too_big)?;
+        put(ram, base, data)?;
+        top = base;
+        Ok((base, size))
+    };
+    let initrd = match payload.initrd {
+        Some(data) if !data.is_empty() => place(data)?,
+        _ => (0, 0),
+    };
+    let kernel = place(payload.kernel)?;
+    let cmdline = place(payload.cmdline.as_bytes())?;
+    Ok(PlacedPayload {
+        kernel,
+        initrd,
+        cmdline,
+    })
+}
+
 /// Places the firmware image at `FIRMWARE_BASE`, the handoff page and the boot GDT and
 /// identity-mapped page tables, and returns the 64-bit entry state (`rdi` = handoff).
 pub(crate) fn load_uefi_firmware(
@@ -111,6 +184,7 @@ pub(crate) fn load_uefi_firmware(
     image: &[u8],
     params: &FirmwareParams,
     acpi: Option<&crate::acpi::AcpiConfig>,
+    payload: Option<&UefiPayload>,
 ) -> Result<BootState, Error> {
     let mut params = params.clone();
     if let Some(config) = acpi {
@@ -142,6 +216,10 @@ pub(crate) fn load_uefi_firmware(
         ));
     }
     put(ram, FIRMWARE_BASE, image)?;
+    let placed = match payload {
+        Some(payload) => Some(place_payload(ram, payload, FIRMWARE_BASE + footprint)?),
+        None => None,
+    };
 
     let mut handoff = vec![0u8; HANDOFF_SIZE];
     handoff[..8].copy_from_slice(HANDOFF_MAGIC);
@@ -179,6 +257,16 @@ pub(crate) fn load_uefi_firmware(
         },
     );
     handoff.put_u64(HANDOFF_TSC_HZ, TSC_HZ);
+    if let Some(placed) = placed {
+        for (base_at, size_at, (base, size)) in [
+            (HANDOFF_KERNEL_BASE, HANDOFF_KERNEL_SIZE, placed.kernel),
+            (HANDOFF_INITRD_BASE, HANDOFF_INITRD_SIZE, placed.initrd),
+            (HANDOFF_CMDLINE_BASE, HANDOFF_CMDLINE_SIZE, placed.cmdline),
+        ] {
+            handoff.put_u64(base_at, base);
+            handoff.put_u64(size_at, size);
+        }
+    }
     let mut seed_state = params.random_seed;
     for chunk in 0..RANDOM_SEED_BYTES / 8 {
         handoff.put_u64(HANDOFF_RANDOM_SEED + chunk * 8, splitmix64(&mut seed_state));
@@ -249,7 +337,87 @@ mod tests {
 
     fn load(image: &[u8], params: &FirmwareParams) -> Result<(BootState, Vec<u8>), Error> {
         let mut ram = vec![0u8; RAM_BYTES];
-        load_uefi_firmware(&mut ram, image, params, None).map(|state| (state, ram))
+        load_uefi_firmware(&mut ram, image, params, None, None).map(|state| (state, ram))
+    }
+
+    fn load_payload(
+        kernel: &[u8],
+        initrd: Option<&[u8]>,
+        cmdline: &str,
+        ram_bytes: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let mut ram = vec![0u8; ram_bytes];
+        let payload = UefiPayload {
+            kernel,
+            initrd,
+            cmdline,
+        };
+        load_uefi_firmware(
+            &mut ram,
+            &image(ENTRY, 0x2000),
+            &params(),
+            None,
+            Some(&payload),
+        )
+        .map(|_| ram)
+    }
+
+    fn range_at(ram: &[u8], base_offset: usize) -> (u64, u64) {
+        let at = HANDOFF_ADDR + base_offset as u64;
+        (u64_at(ram, at), u64_at(ram, at + 8))
+    }
+
+    #[test]
+    fn the_payload_is_placed_at_the_top_of_ram_and_described_in_the_handoff() {
+        let kernel = vec![0x4b; 5000];
+        let initrd = vec![0x49; 9000];
+        let ram = load_payload(&kernel, Some(&initrd), "console=hvc0 quiet", RAM_BYTES).unwrap();
+        let kernel_range = range_at(&ram, HANDOFF_KERNEL_BASE);
+        let initrd_range = range_at(&ram, HANDOFF_INITRD_BASE);
+        let cmdline_range = range_at(&ram, HANDOFF_CMDLINE_BASE);
+        let bytes = |(base, size): (u64, u64)| ram[base as usize..(base + size) as usize].to_vec();
+        assert_eq!(bytes(kernel_range), kernel);
+        assert_eq!(bytes(initrd_range), initrd);
+        assert_eq!(bytes(cmdline_range), b"console=hvc0 quiet");
+        let mut ranges = [kernel_range, initrd_range, cmdline_range];
+        ranges.sort();
+        for pair in ranges.windows(2) {
+            assert!(pair[0].0 + pair[0].1 <= pair[1].0, "{ranges:x?} overlap");
+        }
+        for (base, size) in ranges {
+            assert_eq!(base % PAYLOAD_ALIGNMENT, 0);
+            assert!(base + size <= RAM_BYTES as u64);
+            assert!(
+                base >= FIRMWARE_BASE + 0x2000,
+                "below the firmware's footprint"
+            );
+        }
+        assert!(
+            initrd_range.0 > kernel_range.0,
+            "the initramfs sits at the very top"
+        );
+    }
+
+    #[test]
+    fn no_payload_leaves_the_handoff_fields_zero() {
+        let (_, ram) = load(&image(ENTRY, 0x2000), &params()).unwrap();
+        assert_eq!(range_at(&ram, HANDOFF_KERNEL_BASE), (0, 0));
+        assert_eq!(range_at(&ram, HANDOFF_INITRD_BASE), (0, 0));
+        assert_eq!(range_at(&ram, HANDOFF_CMDLINE_BASE), (0, 0));
+    }
+
+    #[test]
+    fn a_kernel_without_an_initramfs_leaves_that_range_empty() {
+        let ram = load_payload(&[1; 100], None, "x", RAM_BYTES).unwrap();
+        assert_eq!(range_at(&ram, HANDOFF_INITRD_BASE).1, 0);
+        assert_ne!(range_at(&ram, HANDOFF_KERNEL_BASE).1, 0);
+    }
+
+    #[test]
+    fn a_payload_that_does_not_fit_is_refused() {
+        let huge = vec![0u8; RAM_BYTES];
+        assert!(load_payload(&huge, None, "", RAM_BYTES).is_err());
+        assert!(load_payload(&[1; 100], Some(&huge), "", RAM_BYTES).is_err());
     }
 
     #[test]

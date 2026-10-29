@@ -2504,10 +2504,13 @@ mod uefi_firmware {
     #[test]
     fn uefi_firmware_excludes_the_other_boot_paths() {
         let firmware = image(&[0xf4]);
-        let with_kernel = MachineConfig::new()
+        // A kernel is the firmware's to boot now, but only one with an EFI stub.
+        let with_plain_kernel = MachineConfig::new()
             .kernel(fake_bzimage(&SPIN))
             .uefi_firmware(firmware.clone());
-        assert!(expect_config_error(EmulatedMachine::new(with_kernel)).contains("uefi_firmware"));
+        assert!(
+            expect_config_error(EmulatedMachine::new(with_plain_kernel)).contains("firmware none")
+        );
         let with_bios = MachineConfig::new()
             .firmware(vec![0xf4])
             .uefi_firmware(firmware.clone());
@@ -2668,5 +2671,90 @@ mod cpus {
             run.exit
         );
         assert!(reboots.load(Ordering::SeqCst) >= 1);
+    }
+}
+
+mod uefi_kernel {
+    use super::*;
+
+    const KERNEL_BYTES: usize = 0x80;
+    const PE_HEADER_OFFSET: usize = 0x40;
+    const FIRMWARE_ENTRY_OFFSET: usize = 0x40;
+    // mov al, [rdi + 0x310] (the low byte of the kernel's size in the handoff page);
+    // mov dx, 0x3f8; out dx, al; mov dx, 0xcf9; mov al, 6; out dx, al; hlt
+    const REPORT_KERNEL_SIZE_THEN_RESET: [u8; 19] = [
+        0x8a, 0x87, 0x10, 0x03, 0x00, 0x00, 0x66, 0xba, 0xf8, 0x03, 0xee, 0x66, 0xba, 0xf9, 0x0c,
+        0xb0, 0x06, 0xee, 0xf4,
+    ];
+
+    /// The smallest flat image the library accepts, running `code` at its entry.
+    fn firmware_image(code: &[u8]) -> Vec<u8> {
+        let mut image = vec![0u8; FIRMWARE_ENTRY_OFFSET + code.len()];
+        image[..8].copy_from_slice(b"UEMUFW64");
+        image[8..12].copy_from_slice(&1u32.to_le_bytes());
+        image[12..16].copy_from_slice(&(FIRMWARE_ENTRY_OFFSET as u32).to_le_bytes());
+        image[16..24].copy_from_slice(&0x2000u64.to_le_bytes());
+        image[FIRMWARE_ENTRY_OFFSET..].copy_from_slice(code);
+        image
+    }
+
+    fn efi_kernel() -> Vec<u8> {
+        let mut kernel = vec![0u8; KERNEL_BYTES];
+        kernel[..2].copy_from_slice(b"MZ");
+        kernel[0x3c..0x40].copy_from_slice(&(PE_HEADER_OFFSET as u32).to_le_bytes());
+        kernel[PE_HEADER_OFFSET..PE_HEADER_OFFSET + 4].copy_from_slice(b"PE\0\0");
+        kernel
+    }
+
+    #[test]
+    fn a_kernel_with_an_efi_header_is_accepted_together_with_the_firmware() {
+        let config = MachineConfig::new()
+            .uefi_firmware(firmware_image(&REPORT_KERNEL_SIZE_THEN_RESET))
+            .kernel(efi_kernel())
+            .initrd(vec![1, 2, 3])
+            .memory_mib(64);
+        assert!(EmulatedMachine::new(config).is_ok());
+    }
+
+    #[test]
+    fn a_kernel_without_an_efi_stub_is_refused_with_the_firmware_none_hint() {
+        let config = MachineConfig::new()
+            .uefi_firmware(firmware_image(&REPORT_KERNEL_SIZE_THEN_RESET))
+            .kernel(FakeKernel::new(&HELLO_RESET).build())
+            .memory_mib(64);
+        let error = EmulatedMachine::new(config).err().expect("must be refused");
+        assert!(error.to_string().contains("firmware none"), "{error}");
+    }
+
+    #[test]
+    fn a_firmware_image_still_cannot_be_combined_with_boot_disk() {
+        let config = MachineConfig::new()
+            .uefi_firmware(firmware_image(&REPORT_KERNEL_SIZE_THEN_RESET))
+            .boot_disk(true)
+            .memory_mib(64);
+        assert!(EmulatedMachine::new(config).is_err());
+    }
+
+    #[test]
+    fn a_guest_reset_places_the_payload_again() {
+        let run = run_machine(
+            efi_kernel(),
+            JitMode::Off,
+            Duration::from_millis(500),
+            |config| {
+                config
+                    .uefi_firmware(firmware_image(&REPORT_KERNEL_SIZE_THEN_RESET))
+                    .reboot(true)
+            },
+        );
+        let reported = run
+            .console_output
+            .iter()
+            .filter(|byte| **byte == KERNEL_BYTES as u8)
+            .count();
+        assert!(
+            reported >= 2,
+            "the kernel size was reported {reported} times"
+        );
     }
 }

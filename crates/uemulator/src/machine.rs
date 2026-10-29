@@ -202,8 +202,13 @@ impl MachineConfig {
     /// CPU starts at the image's entry in 64-bit mode with the low 4 GiB identity-mapped,
     /// interrupts off and `rdi` pointing at a handoff page that describes the machine
     /// (`plans/19-uefi-firmware.md`); the firmware finds the disks and boots from them. A guest
-    /// reset runs the firmware again. Needs a disk to be useful, replaces the kernel, and cannot
-    /// be combined with `firmware` or `boot_disk`.
+    /// reset runs the firmware again. Needs a disk or a kernel to be useful and cannot be
+    /// combined with `firmware` or `boot_disk`.
+    ///
+    /// With a `kernel` (and `initrd`, `cmdline`) the firmware boots that kernel first, as an EFI
+    /// application with the command line as its load options and the initramfs behind
+    /// `LINUX_EFI_INITRD_MEDIA_GUID`, the way OVMF boots QEMU's `-kernel`; it never falls
+    /// through to the disks. The kernel must be an EFI-stub bzImage, else `new` fails.
     pub fn uefi_firmware(mut self, image: impl Into<Vec<u8>>) -> Self {
         self.uefi_firmware = Some(image.into());
         self
@@ -442,6 +447,19 @@ struct RebootImage {
     uefi: Option<(Vec<u8>, boot::FirmwareParams)>,
 }
 
+/// The kernel the UEFI firmware is to boot, if the machine was given one.
+fn uefi_payload<'a>(
+    kernel: &'a [u8],
+    initrd: Option<&'a [u8]>,
+    cmdline: &'a str,
+) -> Option<boot::UefiPayload<'a>> {
+    (!kernel.is_empty()).then_some(boot::UefiPayload {
+        kernel,
+        initrd,
+        cmdline,
+    })
+}
+
 /// Wall-clock seconds, or 0 where there is no clock (UEFI keeps its own, see `unix_time`).
 fn host_unix_time() -> u64 {
     #[cfg(not(freestanding))]
@@ -635,9 +653,13 @@ impl Vcpu {
             // and filling would commit every page the host had lazily left untouched.
             let mut ram = vec![0u8; finished.ram_bytes];
             let loaded = match &image.uefi {
-                Some((firmware, params)) => {
-                    boot::load_uefi_firmware(&mut ram, firmware, params, image.acpi.as_ref())
-                }
+                Some((firmware, params)) => boot::load_uefi_firmware(
+                    &mut ram,
+                    firmware,
+                    params,
+                    image.acpi.as_ref(),
+                    uefi_payload(&image.kernel, image.initrd.as_deref(), &image.cmdline).as_ref(),
+                ),
                 None => boot::load_with_acpi(
                     &mut ram,
                     &image.kernel,
@@ -851,14 +873,19 @@ impl EmulatedMachine {
             cmdline.push(' ');
             cmdline.push_str(extra);
         }
-        if cfg.uefi_firmware.is_some()
-            && (cfg.firmware.is_some() || cfg.boot_disk || !cfg.kernel.is_empty())
-        {
-            return Err(Error::BadConfig(
-                "uefi_firmware boots its own firmware: it cannot be combined with a kernel, a \
-                 firmware image or boot_disk"
-                    .into(),
-            ));
+        if cfg.uefi_firmware.is_some() {
+            if cfg.firmware.is_some() || cfg.boot_disk {
+                return Err(Error::BadConfig(
+                    "uefi_firmware boots its own firmware: it cannot be combined with a \
+                     firmware image or boot_disk"
+                        .into(),
+                ));
+            }
+            if !cfg.kernel.is_empty() && !boot::has_efi_header(&cfg.kernel) {
+                return Err(Error::BadConfig(
+                    "kernel has no EFI stub; boot it with firmware none".into(),
+                ));
+            }
         }
         if cfg.boot_disk {
             if cfg.firmware.is_some() || !cfg.kernel.is_empty() {
@@ -896,7 +923,13 @@ impl EmulatedMachine {
             _ if cfg.boot_disk => boot::load_bios(),
             _ if uefi.is_some() => {
                 let (image, params) = uefi.as_ref().unwrap();
-                boot::load_uefi_firmware(&mut ram, image, params, acpi.as_ref())?
+                boot::load_uefi_firmware(
+                    &mut ram,
+                    image,
+                    params,
+                    acpi.as_ref(),
+                    uefi_payload(&cfg.kernel, cfg.initrd.as_deref(), &cmdline).as_ref(),
+                )?
             }
             Some(image) => boot::load_firmware(&mut ram, image)?,
             None => boot::load_with_acpi(
