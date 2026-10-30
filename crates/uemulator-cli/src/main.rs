@@ -1663,7 +1663,10 @@ mod tests {
     fn memory_help_states_the_range_the_library_enforces() {
         use crate::run::DEFAULT_MEMORY_MIB;
         let help = help_of(&["advanced", "boot"]);
-        assert!(help.contains("64 to 3072"), "{help}");
+        assert!(
+            help.contains(&format!("64 to {}", uemulator::MAX_MEMORY_MIB)),
+            "{help}"
+        );
         assert!(
             help.contains(&format!("default: {DEFAULT_MEMORY_MIB}")),
             "{help}"

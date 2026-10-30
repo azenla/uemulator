@@ -86,9 +86,7 @@ impl Cpu {
             .translate(self.monitor_address, super::mem::AccessKind::Read, true)
             .ok()?;
         let line = physical & !(MONITOR_WATCH_BYTES as u64 - 1);
-        let contents = self
-            .ram
-            .get(line as usize..line as usize + MONITOR_WATCH_BYTES)?;
+        let contents = self.ram.slice(line, MONITOR_WATCH_BYTES)?;
         Some((line, contents.try_into().unwrap()))
     }
 

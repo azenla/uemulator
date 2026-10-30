@@ -1,6 +1,7 @@
 use super::iommu::{Access, Iommu, PhysRead, PhysWrite};
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::ram::is_ram_range;
 use core::cell::RefCell;
 use core::sync::atomic::{Ordering, fence};
 
@@ -45,6 +46,9 @@ impl PhysRead for RamView<'_> {
 }
 
 fn read_slice(ram: &[u8], phys_addr: u64, buf: &mut [u8]) -> bool {
+    if !is_ram_range(ram.len() as u64, phys_addr, buf.len() as u64) {
+        return false;
+    }
     match usize::try_from(phys_addr)
         .ok()
         .and_then(|start| ram.get(start..start.checked_add(buf.len())?))
@@ -134,9 +138,7 @@ impl<'a> GuestMem<'a> {
     }
 
     fn contains_raw(&self, phys_addr: u64, len: u64) -> bool {
-        phys_addr
-            .checked_add(len)
-            .is_some_and(|end| end <= self.ram.len() as u64)
+        is_ram_range(self.ram.len() as u64, phys_addr, len)
     }
 
     /// Out-of-range reads fail instead of faulting: a bad guest descriptor must not panic the host.
@@ -213,8 +215,11 @@ impl<'a> GuestMem<'a> {
         let Some(end) = start.checked_add(data.len()) else {
             return false;
         };
-        if end > self.ram.len() || data.is_empty() {
-            return end <= self.ram.len();
+        if !is_ram_range(self.ram.len() as u64, phys_addr, data.len() as u64) {
+            return false;
+        }
+        if data.is_empty() {
+            return true;
         }
         self.ram[start..end].copy_from_slice(data);
         // Store first, then look at the flags: a vCPU that flags a page and decodes it after

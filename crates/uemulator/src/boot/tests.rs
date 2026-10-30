@@ -16,6 +16,7 @@ const LOW_INITRD_ADDR_MAX: u32 = (48 << 20) - 1;
 const ENTRY_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const HUGE_PAGE_OFFSET_MASK: u64 = (1 << HUGE_PAGE_SHIFT) - 1;
 const PAGE_TABLE_INDEX_MASK: u64 = ENTRIES_PER_TABLE - 1;
+const GIB_OFFSET_MASK: u64 = GIB - 1;
 const PML4_SHIFT: u32 = 39;
 const PDPT_SHIFT: u32 = 30;
 const FAKE_PAYLOAD_LEN: usize = ENTRY_64_OFFSET as usize + ENTRY_CODE.len();
@@ -91,8 +92,8 @@ fn initrd_fields(ram: &[u8]) -> (u32, u32) {
     )
 }
 
-/// Four-level walk over the tables `load` built, understanding only present entries and 2 MiB
-/// pages (all `load` creates).
+/// Four-level walk over the tables `load` built, understanding only present entries and the 1 GiB
+/// and 2 MiB pages `load` creates.
 fn walk(ram: &[u8], cr3: u64, linear: u64) -> Option<u64> {
     let entry =
         |table: u64, index: u64| u64_at(ram, (table + index * TABLE_ENTRY_SIZE as u64) as usize);
@@ -106,6 +107,9 @@ fn walk(ram: &[u8], cr3: u64, linear: u64) -> Option<u64> {
     );
     if pdpte & PTE_PRESENT == 0 {
         return None;
+    }
+    if pdpte & PTE_PAGE_SIZE != 0 {
+        return Some((pdpte & ENTRY_ADDRESS_MASK & !GIB_OFFSET_MASK) | (linear & GIB_OFFSET_MASK));
     }
     let pde = entry(
         pdpte & ENTRY_ADDRESS_MASK,
@@ -1109,7 +1113,7 @@ mod gdt_and_page_tables {
     #[test]
     fn page_tables_map_every_2mib_page_to_itself() {
         let (state, ram) = load_ok(&kernel(), None, "");
-        for page in 0..IDENTITY_MAP_GIB * ENTRIES_PER_TABLE {
+        for page in 0..IDENTITY_MAP_2M_GIB * ENTRIES_PER_TABLE {
             let linear = page << HUGE_PAGE_SHIFT;
             assert_eq!(walk(&ram, state.cr3, linear), Some(linear), "{linear:#x}");
         }
@@ -1136,11 +1140,11 @@ mod gdt_and_page_tables {
         assert_ne!(u64_at(table, 0), 0);
         assert!(table[TABLE_ENTRY_SIZE..].iter().all(|&byte| byte == 0));
         let pdpt = &ram[(state.cr3 + PAGE_SIZE) as usize..][..PAGE_SIZE as usize];
-        for gib in 0..IDENTITY_MAP_GIB as usize {
+        for gib in 0..IDENTITY_MAP_2M_GIB as usize {
             assert_ne!(u64_at(pdpt, gib * TABLE_ENTRY_SIZE) & PTE_PRESENT, 0);
         }
         assert!(
-            pdpt[IDENTITY_MAP_GIB as usize * TABLE_ENTRY_SIZE..]
+            pdpt[IDENTITY_MAP_2M_GIB as usize * TABLE_ENTRY_SIZE..]
                 .iter()
                 .all(|&byte| byte == 0)
         );
@@ -1155,7 +1159,7 @@ mod gdt_and_page_tables {
         assert_eq!(first_pde, PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE);
         let last_pde = u64_at(
             &ram,
-            (PML4 + (PAGE_TABLE_PAGES as u64) * PAGE_SIZE - TABLE_ENTRY_SIZE as u64) as usize,
+            (PML4 + (2 + IDENTITY_MAP_2M_GIB) * PAGE_SIZE - TABLE_ENTRY_SIZE as u64) as usize,
         );
         assert_eq!(
             last_pde,
@@ -1199,6 +1203,125 @@ mod gdt_and_page_tables {
             harness.cpu.gpr[0],
             u64_at(&harness.cpu.ram, BOOT_PARAMS as usize + SETUP_SECTS_OFFSET)
         );
+    }
+}
+
+/// RAM past the PCI hole: the flat buffer spans the hole, and the memory map and page tables
+/// say so. The buffers are lazily committed zeroes, so only the pages the loader writes cost
+/// anything.
+mod high_memory {
+    use super::*;
+    use crate::ram::{PCI_HOLE_END, PCI_HOLE_START, flat_bytes};
+
+    /// Guest RAM of `memory_gib` GiB as the flat buffer `EmulatedMachine` allocates.
+    fn flat(memory_gib: u64) -> usize {
+        flat_bytes(memory_gib * GIB) as usize
+    }
+
+    fn e820_entries(ram: &[u8]) -> Vec<(u64, u64, u32)> {
+        let params = boot_params(ram);
+        (0..params[E820_ENTRIES_OFFSET] as usize)
+            .map(|index| {
+                let at = E820_TABLE_OFFSET + index * E820_ENTRY_SIZE;
+                (
+                    u64_at(params, at),
+                    u64_at(params, at + 8),
+                    u32::from_le_bytes(params[at + 16..at + 20].try_into().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn up_to_the_hole_there_is_no_high_entry() {
+        let top = flat_bytes(3 * GIB);
+        assert_eq!(
+            e820_map(top).last().copied(),
+            Some((ONE_MIB, 3 * GIB - ONE_MIB, E820_RAM))
+        );
+    }
+
+    #[test]
+    fn ram_beyond_the_hole_is_reported_from_4_gib() {
+        let (result, ram) = load_with(&kernel(), None, "", flat(4));
+        result.unwrap();
+        let entries = e820_entries(&ram);
+        assert_eq!(
+            entries[2..],
+            [
+                (ONE_MIB, PCI_HOLE_START - ONE_MIB, E820_RAM),
+                (PCI_HOLE_END, GIB, E820_RAM),
+            ]
+        );
+        // Nothing the guest is told is RAM lies in the hole.
+        for (base, size, kind) in entries {
+            if kind == E820_RAM {
+                assert!(crate::ram::is_ram_range(flat(4) as u64, base, size));
+            }
+        }
+    }
+
+    #[test]
+    fn the_acpi_map_stays_sorted_with_high_ram() {
+        let map = e820_map_with_acpi(flat_bytes(8 * GIB));
+        assert!(
+            map.windows(2)
+                .all(|pair| pair[0].0 + pair[0].1 <= pair[1].0)
+        );
+        assert_eq!(map.last().copied(), Some((PCI_HOLE_END, 5 * GIB, E820_RAM)));
+    }
+
+    #[test]
+    fn the_kernel_and_initrd_stay_below_the_hole() {
+        // An initrd ceiling of 4 GiB must not tempt the loader into the hole.
+        let mut fake = kernel();
+        fake.initrd_addr_max = u32::MAX;
+        let initrd = vec![0x5au8; MIB];
+        let (result, ram) = load_with(&fake, Some(&initrd), "", flat(4));
+        result.unwrap();
+        let (image, size) = initrd_fields(&ram);
+        assert_eq!(size as usize, initrd.len());
+        assert!(image as u64 + size as u64 <= PCI_HOLE_START);
+        assert_eq!(&ram[image as usize..][..initrd.len()], &initrd[..]);
+    }
+
+    #[test]
+    fn page_tables_map_high_ram_with_1_gib_pages() {
+        let (result, ram) = load_with(&kernel(), None, "", flat(4));
+        let state = result.unwrap();
+        for linear in [
+            0,
+            0xc000_0000,
+            4 * GIB - 1,
+            4 * GIB,
+            4 * GIB + 0x1234_5678,
+            5 * GIB - 0x1000,
+            flat(4) as u64 - 1,
+        ] {
+            assert_eq!(walk(&ram, state.cr3, linear), Some(linear), "{linear:#x}");
+        }
+        // The map ends at the last GiB of RAM.
+        assert_eq!(walk(&ram, state.cr3, flat(4) as u64), None);
+    }
+
+    #[test]
+    fn page_tables_reach_the_last_gib_of_the_physical_address_space() {
+        // A terabyte guest needs the second PDPT. The tables are written into a small buffer
+        // while `ram_top` says how much RAM there is.
+        let ram_top = flat(1023) as u64;
+        let mut ram = vec![0u8; ONE_MIB as usize];
+        write_gdt_and_page_tables(&mut ram, ram_top, BOOT_CODE_DESCRIPTOR).unwrap();
+        for linear in [4 * GIB, 511 * GIB + 0x77, 512 * GIB, ram_top - 1] {
+            assert_eq!(walk(&ram, PML4, linear), Some(linear), "{linear:#x}");
+        }
+        assert_eq!(walk(&ram, PML4, ram_top), None);
+    }
+
+    #[test]
+    fn more_ram_than_the_address_space_is_an_error() {
+        let mut ram = vec![0u8; ONE_MIB as usize];
+        let ram_top = flat(1024) as u64;
+        assert!(write_gdt_and_page_tables(&mut ram, ram_top, BOOT_CODE_DESCRIPTOR).is_err());
     }
 }
 

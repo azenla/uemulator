@@ -309,7 +309,7 @@ impl Cpu {
         const OPERAND_BYTES: u64 = 16;
         let physical = self.translate(address, mem::AccessKind::Write, false)?;
         let host = unsafe { self.ram.base().add(physical as usize) };
-        if physical + OPERAND_BYTES > self.ram.len() as u64 || host as usize & 15 != 0 {
+        if !self.ram.contains(physical, OPERAND_BYTES) || host as usize & 15 != 0 {
             self.rmw = Rmw::NeedsExclusive;
             return Err(Exception::AtomicRetry);
         }
@@ -460,8 +460,7 @@ impl Cpu {
             return Err(Exception::AtomicRetry);
         }
         let physical = self.translate(linear, mem::AccessKind::Write, false)?;
-        let end = physical as usize + size as usize;
-        if end > self.ram.len() {
+        if !self.ram.contains(physical, size as u64) {
             // Device memory: there is nothing to make atomic, and the device lock serializes it.
             self.rmw = Rmw::Off;
             return self.read(linear, size);
@@ -949,13 +948,14 @@ impl Cpu {
             None
         };
         let dst_pa = self.translate(dst_linear, AccessKind::Write, false)?;
-        let ram_bytes = self.ram.len() as u64;
-        if dst_pa + bytes > ram_bytes || self.page_has_code[(dst_pa >> PAGE_SHIFT) as usize] != 0 {
+        if !self.ram.contains(dst_pa, bytes)
+            || self.page_has_code[(dst_pa >> PAGE_SHIFT) as usize] != 0
+        {
             return Ok(0);
         }
         let ram = self.ram.as_mut_ptr();
         if let Some(src_pa) = src_pa {
-            if src_pa + bytes > ram_bytes || (dst_pa > src_pa && dst_pa < src_pa + bytes) {
+            if !self.ram.contains(src_pa, bytes) || (dst_pa > src_pa && dst_pa < src_pa + bytes) {
                 return Ok(0);
             }
             // SAFETY: both ranges lie inside `ram` (checked above); a copy that moves memory

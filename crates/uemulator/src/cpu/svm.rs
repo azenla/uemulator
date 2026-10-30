@@ -1008,7 +1008,7 @@ impl Cpu {
             let shift = NPT_PAGE_SHIFT + NPT_INDEX_BITS * level;
             let index = (guest_physical >> shift) & ((1 << NPT_INDEX_BITS) - 1);
             let entry_address = table + index * 8;
-            if entry_address + 8 > self.ram.len() as u64 {
+            if !self.ram.contains(entry_address, 8) {
                 return fault(self, false, false);
             }
             let mut entry = self.phys_read(entry_address, 8);

@@ -598,7 +598,7 @@ impl Jit {
     pub fn translate(&mut self, cpu: &mut Cpu, rip: u64, phys_addr: u64) -> Result<u64, Exception> {
         loop {
             // Code can only execute from RAM; reported as a not-present fetch fault.
-            if phys_addr >= cpu.ram.len() as u64 {
+            if !cpu.ram.contains(phys_addr, 1) {
                 return Err(cpu.page_fault(rip, AccessKind::Exec, cpu.cpl == 3, false, false));
             }
             // Makes guest stores to this page take the slow path so `code_written` sees them.

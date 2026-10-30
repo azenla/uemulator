@@ -944,8 +944,12 @@ mod config {
     #[test]
     fn memory_limits_are_the_documented_ones() {
         assert_eq!(MIN_MEMORY_MIB, 64);
-        // RAM must end below the 0xc000_0000 MMIO window.
-        assert_eq!(MAX_MEMORY_MIB << BYTES_PER_MIB_SHIFT, 0xc000_0000);
+        // The last byte of the largest guest is the last one the 40-bit physical address space
+        // has, once the PCI hole is skipped.
+        assert_eq!(
+            crate::ram::flat_bytes((MAX_MEMORY_MIB as u64) << BYTES_PER_MIB_SHIFT),
+            1 << 40
+        );
     }
 
     fn with_memory(mib: usize) -> Result<EmulatedMachine, Error> {
@@ -958,11 +962,12 @@ mod config {
     }
 
     #[test]
-    fn memory_at_both_limits_is_accepted() {
-        assert!(with_memory(MIN_MEMORY_MIB).is_ok());
-        assert!(with_memory(MAX_MEMORY_MIB).is_ok());
-        assert!(with_memory(MIN_MEMORY_MIB + 1).is_ok());
-        assert!(with_memory(MAX_MEMORY_MIB - 1).is_ok());
+    fn memory_from_the_minimum_to_past_the_pci_hole_is_accepted() {
+        // The upper limit is not probed: acceptance at it would reserve a terabyte of address
+        // space, which a host that does not overcommit refuses.
+        for mib in [MIN_MEMORY_MIB, MIN_MEMORY_MIB + 1, 3072, 3073, 4096] {
+            assert!(with_memory(mib).is_ok(), "{mib}");
+        }
     }
 
     #[test]
@@ -1283,6 +1288,107 @@ mod guest_view {
     fn with_acpi_e820_also_lists_the_tables_and_the_ecam_window() {
         let run = run_guest(&PRINT_E820_COUNT, JitMode::Off);
         assert_eq!(run.console_output, [6]);
+    }
+
+    // Writes at the first and the last dword of 4 GiB..5 GiB (the RAM that a 4096 MiB guest has
+    // above the PCI hole), then prints the first byte of the first, the last of the second, the
+    // bytes of TOP_MEM2 (bits 31..24, then 39..32) and the top byte of TOP_MEM.
+    // Assembled with `hack/asm.sh`; high.s is
+    // mov dx, 0x3f8; mov rbx, 0x100000000; mov dword ptr [rbx], 0x12345678;
+    // mov rcx, 0x13ffffffc; mov dword ptr [rcx], 0x9abcdef0; mov al, [rbx]; out dx, al;
+    // mov al, [rcx+3]; out dx, al; mov ecx, 0xc001001d; rdmsr; mov r8d, edx; mov dx, 0x3f8;
+    // shr eax, 24; out dx, al; mov eax, r8d; out dx, al; mov ecx, 0xc001001a; rdmsr;
+    // mov dx, 0x3f8; shr eax, 24; out dx, al; mov al, 0xfe; out 0x64, al; hlt
+    // (rdmsr overwrites edx, hence the second `mov dx`)
+    const TOUCH_HIGH_RAM: [u8; 85] = [
+        0x66, 0xba, 0xf8, 0x03, 0x48, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xc7,
+        0x03, 0x78, 0x56, 0x34, 0x12, 0x48, 0xb9, 0xfc, 0xff, 0xff, 0x3f, 0x01, 0x00, 0x00, 0x00,
+        0xc7, 0x01, 0xf0, 0xde, 0xbc, 0x9a, 0x8a, 0x03, 0xee, 0x8a, 0x41, 0x03, 0xee, 0xb9, 0x1d,
+        0x00, 0x01, 0xc0, 0x0f, 0x32, 0x41, 0x89, 0xd0, 0x66, 0xba, 0xf8, 0x03, 0xc1, 0xe8, 0x18,
+        0xee, 0x44, 0x89, 0xc0, 0xee, 0xb9, 0x1a, 0x00, 0x01, 0xc0, 0x0f, 0x32, 0x66, 0xba, 0xf8,
+        0x03, 0xc1, 0xe8, 0x18, 0xee, 0xb0, 0xfe, 0xe6, 0x64, 0xf4,
+    ];
+
+    #[test]
+    fn ram_above_4_gib_is_there_and_the_amd_memory_top_msrs_say_so() {
+        for jit in auto_and_off() {
+            let run = run_machine(
+                fake_bzimage(&TOUCH_HIGH_RAM),
+                jit,
+                GENEROUS_LIMIT,
+                |config| config.memory_mib(4096),
+            );
+            assert_eq!(run.exit, ExitReason::Reset, "{jit:?}");
+            // TOP_MEM2 is 5 GiB = 0x1_4000_0000, TOP_MEM the start of the PCI hole.
+            assert_eq!(
+                run.console_output,
+                [0x78, 0x9a, 0x40, 0x01, 0xc0],
+                "{jit:?}"
+            );
+        }
+    }
+
+    // Reads the 16-bit `num_queues` field of the first virtio function's common config, which
+    // sits at the start of the PCI hole (0xc000_0000 + 0x12), and prints its low byte.
+    // mov dx, 0x3f8; mov ebx, 0xc0000012; mov ax, [rbx]; out dx, al; mov al, 0xfe; out 0x64, al;
+    // hlt
+    const READ_PCI_HOLE: [u8; 18] = [
+        0x66, 0xba, 0xf8, 0x03, 0xbb, 0x12, 0x00, 0x00, 0xc0, 0x66, 0x8b, 0x03, 0xee, 0xb0, 0xfe,
+        0xe6, 0x64, 0xf4,
+    ];
+
+    #[test]
+    fn the_pci_hole_is_the_devices_even_when_the_ram_around_it_is_there() {
+        // With 4096 MiB the flat RAM buffer covers 0xc000_0000 as well; the access must still go
+        // to the virtio BAR, which RAM would answer with zero.
+        for jit in auto_and_off() {
+            let run = run_machine(
+                fake_bzimage(&READ_PCI_HOLE),
+                jit,
+                GENEROUS_LIMIT,
+                |config| config.memory_mib(4096),
+            );
+            assert_eq!(run.exit, ExitReason::Reset, "{jit:?}");
+            assert_ne!(run.console_output, [0], "{jit:?}");
+            assert_eq!(run.console_output.len(), 1, "{jit:?}");
+        }
+    }
+
+    // Prints the high dword of the fourth e820 entry's base, the top byte of its base's low
+    // dword, the top byte of its size's low dword, and the entry count.
+    // mov dx, 0x3f8; mov al, [rsi+0x310]; out dx, al; mov al, [rsi+0x30f]; out dx, al;
+    // mov al, [rsi+0x317]; out dx, al; mov al, [rsi+0x1e8]; out dx, al; mov al, 0xfe;
+    // out 0x64, al; hlt
+    const PRINT_E820_HIGH_ENTRY: [u8; 37] = [
+        0x66, 0xba, 0xf8, 0x03, 0x8a, 0x86, 0x10, 0x03, 0x00, 0x00, 0xee, 0x8a, 0x86, 0x0f, 0x03,
+        0x00, 0x00, 0xee, 0x8a, 0x86, 0x17, 0x03, 0x00, 0x00, 0xee, 0x8a, 0x86, 0xe8, 0x01, 0x00,
+        0x00, 0xee, 0xb0, 0xfe, 0xe6, 0x64, 0xf4,
+    ];
+
+    #[test]
+    fn e820_lists_the_ram_above_4_gib_as_the_last_range() {
+        let run = run_machine(
+            fake_bzimage(&PRINT_E820_HIGH_ENTRY),
+            JitMode::Off,
+            GENEROUS_LIMIT,
+            |config| config.memory_mib(4096).acpi(false),
+        );
+        // The fourth of four entries starts at 4 GiB and is the 1 GiB that does not fit below
+        // the PCI hole.
+        assert_eq!(run.console_output, [0x01, 0x00, 0x40, 0x04]);
+    }
+
+    #[test]
+    fn the_third_e820_range_ends_at_the_pci_hole_with_ram_above_4_gib() {
+        let run = run_machine(
+            fake_bzimage(&PRINT_E820_LAST_SIZE),
+            JitMode::Off,
+            GENEROUS_LIMIT,
+            |config| config.memory_mib(4096).acpi(false),
+        );
+        let size = u32::from_le_bytes(run.console_output[..4].try_into().unwrap());
+        // 3 GiB less the first MiB.
+        assert_eq!(size as usize, 3072 * MIB - MIB);
     }
 
     #[test]

@@ -724,8 +724,10 @@ impl Cpu {
         const MSR_AMD64_BU_CFG2: u32 = 0xc001_102a;
         const MSR_ZEN4_BP_CFG: u32 = 0xc001_102e;
 
-        // RAM never reaches 4 GiB (the PCI window starts at 3 GiB), so TOP_MEM2 stays zero.
-        let top_of_memory = ram_bytes as u64;
+        // TOP_MEM is where DRAM ends below the PCI hole; TOP_MEM2 is where the DRAM remapped
+        // above 4 GiB ends, zero when there is none (APM vol. 2 sec. 7.9.1).
+        let top_of_memory = crate::ram::low_ram_end(ram_bytes as u64);
+        let top_of_high_memory = crate::ram::high_ram_end(ram_bytes as u64);
         // A secondary vCPU gets its decode cache from the scheduler.
         let has_machine_state = with_decode_cache;
         let flat = |sel: u16, flags: u32| Seg {
@@ -802,7 +804,7 @@ impl Cpu {
                 (MSR_ZEN4_BP_CFG, 0),
                 (MSR_AMD64_SYSCFG, SYSCFG_INITIAL),
                 (MSR_AMD64_TOP_MEM, top_of_memory),
-                (MSR_AMD64_TOP_MEM2, 0),
+                (MSR_AMD64_TOP_MEM2, top_of_high_memory),
             ]
             .into_iter()
             .chain((MSR_AMD64_IORR_FIRST..=MSR_AMD64_IORR_LAST).map(|msr| (msr, 0)))
@@ -1187,18 +1189,20 @@ impl Cpu {
                 // The faulting code may sit in the last RAM page or outside RAM (MMIO, where
                 // `translate` fell back to 0), so every slice here is bounds-checked: a panic in
                 // the diagnostics would hide the divergence being reported.
-                let page = page_base..page_base + PAGE_SIZE as usize;
-                let differing_offsets: Vec<usize> =
-                    match (self.ram.get(page.clone()), shadow.ram.get(page.clone())) {
-                        (Some(main_page), Some(shadow_page)) => (0..main_page.len())
-                            .filter(|&offset| main_page[offset] != shadow_page[offset])
-                            .take(MAX_DIFFERING_OFFSETS)
-                            .collect(),
-                        _ => Vec::new(),
-                    };
+                let (main_ram, shadow_ram) = (&self.ram, &shadow.ram);
+                let differing_offsets: Vec<usize> = match (
+                    main_ram.slice(page_base as u64, PAGE_SIZE as usize),
+                    shadow_ram.slice(page_base as u64, PAGE_SIZE as usize),
+                ) {
+                    (Some(main_page), Some(shadow_page)) => (0..main_page.len())
+                        .filter(|&offset| main_page[offset] != shadow_page[offset])
+                        .take(MAX_DIFFERING_OFFSETS)
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 let code_offset = page_base + (start & PAGE_OFFSET_MASK) as usize;
-                let code_bytes = |ram: &[u8]| {
-                    ram.get(code_offset..code_offset + DIVERGENCE_CODE_BYTES)
+                let code_bytes = |ram: &GuestRam| {
+                    ram.slice(code_offset as u64, DIVERGENCE_CODE_BYTES)
                         .map(<[u8]>::to_vec)
                         .unwrap_or_default()
                 };
@@ -1433,32 +1437,47 @@ impl Cpu {
             self.dev.lock().state(self.now_ns())
         );
         let mut found = 0;
-        let mut search_from = 0;
-        while found < MAX_BANNER_MATCHES && search_from + BANNER.len() < self.ram.len() {
-            let Some(relative) = self.ram[search_from..]
-                .windows(BANNER.len())
-                .position(|window| window == BANNER)
-            else {
-                break;
-            };
-            let start = search_from + relative;
-            let end = (start + LOG_SCAN_BYTES).min(self.ram.len());
-            let mut text = String::new();
-            let mut printable_run = String::new();
-            for &byte in &self.ram[start..end] {
-                if (b' '..0x7f).contains(&byte) {
-                    printable_run.push(byte as char);
-                } else {
-                    if printable_run.len() >= MIN_PRINTABLE_RUN {
-                        text += &printable_run;
-                        text.push('\n');
-                    }
-                    printable_run.clear();
+        // Each RAM range on its own: the PCI hole inside the buffer is not memory, and walking
+        // a terabyte of high RAM would take minutes.
+        let ram_bytes = self.ram.len() as u64;
+        let ranges = [
+            (0, crate::ram::low_ram_end(ram_bytes) as usize),
+            (
+                crate::ram::PCI_HOLE_END as usize,
+                crate::ram::high_ram_end(ram_bytes) as usize,
+            ),
+        ];
+        'scan: for (range_start, range_end) in ranges {
+            let mut search_from = range_start;
+            while search_from + BANNER.len() < range_end {
+                if found == MAX_BANNER_MATCHES {
+                    break 'scan;
                 }
+                let Some(relative) = self.ram[search_from..range_end]
+                    .windows(BANNER.len())
+                    .position(|window| window == BANNER)
+                else {
+                    break;
+                };
+                let start = search_from + relative;
+                let end = (start + LOG_SCAN_BYTES).min(range_end);
+                let mut text = String::new();
+                let mut printable_run = String::new();
+                for &byte in &self.ram[start..end] {
+                    if (b' '..0x7f).contains(&byte) {
+                        printable_run.push(byte as char);
+                    } else {
+                        if printable_run.len() >= MIN_PRINTABLE_RUN {
+                            text += &printable_run;
+                            text.push('\n');
+                        }
+                        printable_run.clear();
+                    }
+                }
+                s += &format!("--- ram match at {start:#x}\n{text}\n");
+                found += 1;
+                search_from = start + BANNER.len();
             }
-            s += &format!("--- ram match at {start:#x}\n{text}\n");
-            found += 1;
-            search_from = start + BANNER.len();
         }
         if let Some(histogram) = &self.helper_histogram {
             let mut counts: Vec<_> = histogram.iter().collect();

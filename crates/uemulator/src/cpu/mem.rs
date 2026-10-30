@@ -179,7 +179,7 @@ impl Cpu {
 
     fn read_ram_u64(&self, pa: u64) -> Option<u64> {
         let start = pa as usize;
-        let bytes = self.ram.get(start..start + PTE_BYTES as usize)?;
+        let bytes = self.ram.slice(pa, PTE_BYTES as usize)?;
         if self.ordered_memory && start & (PTE_BYTES as usize - 1) == 0 {
             // Another vCPU may be changing the entry; read it whole, as the hardware walker does.
             return Some(unsafe { atomic::load(bytes.as_ptr(), PTE_BYTES as u8) });
@@ -227,7 +227,7 @@ impl Cpu {
 
     fn read_ram_u32(&self, pa: u64) -> Option<u64> {
         let start = pa as usize;
-        let bytes = self.ram.get(start..start + LEGACY_PTE_BYTES as usize)?;
+        let bytes = self.ram.slice(pa, LEGACY_PTE_BYTES as usize)?;
         if self.ordered_memory && start & (LEGACY_PTE_BYTES as usize - 1) == 0 {
             return Some(unsafe { atomic::load(bytes.as_ptr(), LEGACY_PTE_BYTES as u8) });
         }
@@ -630,7 +630,7 @@ impl Cpu {
             && self.cr4 & (CR4_SMEP | CR4_SMAP) != 0
             && self.paging_mode() != PagingMode::Off;
         // Only RAM-backed pages are cached; MMIO has no host pointer to put in `addend`.
-        if page_pa < self.ram.len() as u64 && !uncacheable {
+        if self.ram.contains(page_pa, 1) && !uncacheable {
             let write_protect = self.cr0 & CR0_WP != 0;
             // Keep the other tags if the slot already maps this page, so a read refill does not
             // drop the page's exec tag and vice versa.
@@ -686,9 +686,8 @@ impl Cpu {
     /// Reads `size` bytes (at most 8, all inside one page) at a physical address: RAM, else
     /// MMIO, else all ones for unmapped space.
     pub(super) fn phys_read(&mut self, pa: u64, size: u8) -> u64 {
-        let start = pa as usize;
         let len = size as usize;
-        if let Some(src) = self.ram.get(start..start + len) {
+        if let Some(src) = self.ram.slice(pa, len) {
             if self.ordered_memory {
                 return unsafe { atomic::load(src.as_ptr(), size) };
             }
@@ -714,7 +713,7 @@ impl Cpu {
     pub(super) fn phys_write(&mut self, pa: u64, size: u8, val: u64) {
         let start = pa as usize;
         let len = size as usize;
-        if start + len <= self.ram.len() {
+        if self.ram.contains(pa, len as u64) {
             if self.ordered_memory {
                 // Store first, then look at the flag: a vCPU that flags the page and decodes it
                 // after our check must see these bytes, and one that flagged it before is seen
@@ -994,7 +993,7 @@ impl Cpu {
         let start = pa as usize;
         let mut buf = [0u8; MAX_INSN_LEN];
         // Executing from MMIO or unmapped space is reported as a not-present fetch fault.
-        if start + len > self.ram.len() {
+        if !self.ram.contains(pa, len as u64) {
             return Err(self.page_fault(rip, AccessKind::Exec, self.cpl == USER_CPL, false, false));
         }
         // Flag the page before reading it: see `mark_code`.
@@ -1025,7 +1024,7 @@ impl Cpu {
                 )?;
                 let missing = MAX_INSN_LEN - len;
                 let next_start = next_page_pa as usize;
-                if next_start + missing > self.ram.len() {
+                if !self.ram.contains(next_page_pa, missing as u64) {
                     return Err(Exception::invalid_opcode());
                 }
                 self.mark_code(next_page_pa);

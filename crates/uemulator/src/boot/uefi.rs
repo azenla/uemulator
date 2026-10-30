@@ -9,6 +9,7 @@ use super::{
 use crate::dev::kv::{KV_PORT_BASE, KV_PORT_COUNT};
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::ram;
 
 /// Where the image is placed: the first MiB belongs to legacy structures.
 pub(crate) const FIRMWARE_BASE: u64 = 0x10_0000;
@@ -95,8 +96,8 @@ pub(crate) struct FirmwareParams {
     pub acpi_region: (u64, u64),
 }
 
-/// What the firmware boots instead of looking at the disks: placed at the top of RAM, with the
-/// initramfs highest, then the kernel, then the command line.
+/// What the firmware boots instead of looking at the disks: placed at the top of the RAM below
+/// the PCI hole, with the initramfs highest, then the kernel, then the command line.
 pub(crate) struct UefiPayload<'a> {
     pub kernel: &'a [u8],
     pub initrd: Option<&'a [u8]>,
@@ -149,7 +150,7 @@ struct PlacedPayload {
     cmdline: (u64, u64),
 }
 
-/// Copies the payload into the top of RAM, above `floor` (the end of the firmware's footprint).
+/// Copies the payload into the top of the low RAM, above `floor` (the end of the firmware's footprint).
 /// The firmware reserves exactly these ranges (`memory::init`), so they must not overlap each
 /// other or anything the library wrote.
 fn place_payload(
@@ -158,7 +159,9 @@ fn place_payload(
     floor: u64,
 ) -> Result<PlacedPayload, Error> {
     let too_big = || Error::BadConfig("kernel and initramfs do not fit in guest memory".into());
-    let mut top = ram.len() as u64 & !(PAYLOAD_ALIGNMENT - 1);
+    // The top of the RAM below the PCI hole: there may be more RAM above 4 GiB, but the payload
+    // is one contiguous run and that RAM is not contiguous with this one.
+    let mut top = ram::low_ram_end(ram.len() as u64) & !(PAYLOAD_ALIGNMENT - 1);
     let mut place = |data: &[u8]| -> Result<(u64, u64), Error> {
         let size = data.len() as u64;
         let base = top
@@ -218,7 +221,7 @@ pub(crate) fn load_uefi_firmware(
         return Err(bad("entry or size out of range"));
     }
     let ram_top = ram.len() as u64;
-    if FIRMWARE_BASE + footprint > ram_top {
+    if FIRMWARE_BASE + footprint > ram::low_ram_end(ram_top) {
         return Err(Error::BadConfig(
             "guest memory too small for firmware".into(),
         ));
@@ -293,7 +296,7 @@ pub(crate) fn load_uefi_firmware(
     let handoff = handoff.0;
     put(ram, HANDOFF_ADDR, &handoff)?;
 
-    let gdt_limit = write_gdt_and_page_tables(ram, BOOT_CODE_DESCRIPTOR)?;
+    let gdt_limit = write_gdt_and_page_tables(ram, ram_top, BOOT_CODE_DESCRIPTOR)?;
     Ok(BootState {
         rip: FIRMWARE_BASE + entry,
         rdi: HANDOFF_ADDR,

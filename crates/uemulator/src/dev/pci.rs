@@ -9,9 +9,9 @@ use super::virtio::{
 #[cfg(freestanding)]
 use crate::prelude::*;
 
-/// Start of the MMIO window; everything at or above guest RAM size dispatches to the devices.
-/// RAM is capped at 0xC000_0000 so the two never overlap (plans/11).
-pub(crate) const MMIO_BASE: u64 = 0xc000_0000;
+/// Start of the MMIO window, which is the PCI hole in the RAM layout: guest RAM is never mapped
+/// from here up to 4 GiB (`ram::flat_bytes`), and accesses there dispatch to the devices.
+pub(crate) const MMIO_BASE: u64 = crate::ram::PCI_HOLE_START;
 /// The part of it the ACPI root bridge hands out as BAR space (up to the ECAM window).
 pub(crate) const PCI_MMIO_WINDOW_BYTES: u64 = 0x2000_0000;
 /// Each virtio function gets one BAR0 of this size, laid out back to back from `MMIO_BASE`.

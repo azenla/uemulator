@@ -335,8 +335,7 @@ mod tests {
     use crate::{AdvancedCmd, Cmd};
 
     const SAVED_SETTINGS: &str = "4500:5:bf:8a3b:3:1c:7f:15:4:0:1:0:11:13:1a:0:12:f:17:16:0:0";
-    const MIN_MEMORY_MIB: usize = 64;
-    const MAX_MEMORY_MIB: usize = 3072;
+    use uemulator::{MAX_MEMORY_MIB, MIN_MEMORY_MIB};
 
     /// The settings and runtime options `advanced boot --kernel k <extra>` parses to.
     fn boot_args(extra: &[&str]) -> (Settings, RuntimeArgs) {
@@ -682,19 +681,20 @@ mod tests {
     fn memory_below_the_library_minimum_is_rejected_by_the_library() {
         let memory = (MIN_MEMORY_MIB - 1).to_string();
         let cfg = build(&["-m", &memory, "--disable-jit"], None).unwrap();
-        assert!(machine_error(cfg).contains("between 64 and 3072"));
+        assert!(machine_error(cfg).contains(&format!("between 64 and {MAX_MEMORY_MIB}")));
     }
 
     #[test]
     fn memory_above_the_library_maximum_is_rejected_by_the_library() {
         let memory = (MAX_MEMORY_MIB + 1).to_string();
         let cfg = build(&["--memory", &memory, "--disable-jit"], None).unwrap();
-        assert!(machine_error(cfg).contains("between 64 and 3072"));
+        assert!(machine_error(cfg).contains(&format!("between 64 and {MAX_MEMORY_MIB}")));
     }
 
     #[test]
     fn the_minimum_memory_is_accepted_by_the_library() {
-        // Only the minimum is probed: acceptance at the maximum would allocate 3 GiB of guest RAM.
+        // Only the minimum is probed: acceptance at the maximum would reserve a terabyte of
+        // address space.
         let memory = MIN_MEMORY_MIB.to_string();
         let cfg = build(&["-m", &memory, "--disable-jit"], None).unwrap();
         assert!(machine_error(cfg).contains("kernel"));

@@ -8,7 +8,7 @@
 
 ## Memory
 
-`MachineConfig::memory_mib(n)` (already present), validated: 64 ..= 3072 MiB (RAM must stay below the 0xC000_0000 PCI/MMIO window). CLI: `--mem <MiB>`. e820 and the boot page tables follow the configured size; the loader rejects sizes too small for kernel+initrd.
+`MachineConfig::memory_mib(n)` (already present), validated: 64 ..= `MAX_MEMORY_MIB` (1 TiB less the PCI hole; RAM beyond 3 GiB is mapped from 4 GiB up, `plans/04-memory.md`). CLI: `--mem <MiB>`. e820 and the boot page tables follow the configured size; the loader rejects sizes too small for kernel+initrd.
 
 ## MMIO + PCI
 

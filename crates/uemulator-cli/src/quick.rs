@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::run::DEFAULT_MEMORY_MIB;
 
-/// The library's upper memory bound: RAM must stay below the 0xC000_0000 PCI/MMIO window.
-const MAX_MEMORY_MIB: usize = 3072;
+/// What a Fedora install gets: its stage2 image (~900 MB) is downloaded into RAM and must fit
+/// beside Anaconda.
+const FEDORA_INSTALL_MEMORY_MIB: usize = 3072;
 const DOWNLOAD_CHUNK_LEN: usize = 1 << 16;
 
 /// The lowercase name is both the command-line value and what `machine.toml` stores.
@@ -21,11 +22,9 @@ pub enum Distro {
 }
 
 impl Distro {
-    /// Fedora's stage2 image (~900 MB) is downloaded into RAM and must fit beside Anaconda, so it
-    /// gets the maximum the library allows.
     pub fn default_memory_mib(self) -> usize {
         match self {
-            Distro::Fedora => MAX_MEMORY_MIB,
+            Distro::Fedora => FEDORA_INSTALL_MEMORY_MIB,
             _ => DEFAULT_MEMORY_MIB,
         }
     }
@@ -225,20 +224,19 @@ mod tests {
     fn only_fedora_gets_more_than_the_default_memory() {
         assert_eq!(Distro::Debian.default_memory_mib(), DEFAULT_MEMORY_MIB);
         assert_eq!(Distro::Alpine.default_memory_mib(), DEFAULT_MEMORY_MIB);
-        assert_eq!(Distro::Fedora.default_memory_mib(), MAX_MEMORY_MIB);
+        assert_eq!(
+            Distro::Fedora.default_memory_mib(),
+            FEDORA_INSTALL_MEMORY_MIB
+        );
         assert!(Distro::Fedora.default_memory_mib() > DEFAULT_MEMORY_MIB);
     }
 
     #[test]
-    fn max_memory_matches_the_limit_the_library_enforces() {
-        let library = |mib: usize| match uemulator::EmulatedMachine::new(
-            uemulator::MachineConfig::new().memory_mib(mib),
-        ) {
-            Ok(_) => panic!("an empty kernel must not boot"),
-            Err(e) => e.to_string(),
-        };
-        assert!(library(MAX_MEMORY_MIB + 1).contains(&format!("{MAX_MEMORY_MIB}")));
-        assert!(library(MAX_MEMORY_MIB + 1).contains("between"));
+    fn the_fedora_install_fits_the_library_limits() {
+        assert!(
+            (uemulator::MIN_MEMORY_MIB..=uemulator::MAX_MEMORY_MIB)
+                .contains(&FEDORA_INSTALL_MEMORY_MIB)
+        );
     }
 
     #[test]

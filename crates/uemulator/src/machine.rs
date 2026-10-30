@@ -126,8 +126,14 @@ pub const MIN_CPUS: usize = 1;
 /// vCPU in a `u64`.
 pub const MAX_CPUS: usize = 64;
 pub const MIN_MEMORY_MIB: usize = 64;
-/// RAM must stay below the 0xc000_0000 MMIO window (3 GiB) where the virtio devices' BARs live.
-pub const MAX_MEMORY_MIB: usize = 3072;
+/// The most RAM the guest can address: its physical address space is 40 bits (CPUID
+/// MAXPHYADDR), and the 1 GiB PCI hole below 4 GiB is not RAM. RAM past 3 GiB is placed from
+/// 4 GiB up (`ram::flat_bytes`), so the last byte lands at 1 TiB when the hole is subtracted.
+/// Memory is committed lazily, so the host needs the RAM only as far as the guest touches it.
+pub const MAX_MEMORY_MIB: usize = (1 << (40 - BYTES_PER_MIB_SHIFT)) - HOLE_MIB;
+/// The PCI hole in MiB: `MAX_MEMORY_MIB` loses it from the 40-bit address space.
+const HOLE_MIB: usize =
+    ((crate::ram::PCI_HOLE_END - crate::ram::PCI_HOLE_START) >> BYTES_PER_MIB_SHIFT) as usize;
 const DEFAULT_MEMORY_MIB: usize = 512;
 const BYTES_PER_MIB_SHIFT: usize = 20;
 /// The word `DEFAULT_CMDLINE` carries for hosts without ACPI tables.
@@ -327,6 +333,8 @@ impl MachineConfig {
         self
     }
 
+    /// Guest RAM, `MIN_MEMORY_MIB` to `MAX_MEMORY_MIB` (default 512). RAM beyond 3 GiB is placed
+    /// above 4 GiB, as on a PC: the memory map the guest gets has a hole between them.
     pub fn memory_mib(mut self, n: usize) -> Self {
         self.memory_mib = n;
         self
@@ -553,6 +561,20 @@ fn back_with_huge_pages(ram: &mut [u8]) {
     let _ = ram;
 }
 
+/// Zeroed guest RAM for `memory_mib`, laid out around the PCI hole (`ram::flat_bytes`). Fails
+/// where the host cannot reserve that much address space (a 32-bit host, or one that does not
+/// overcommit).
+fn allocate_ram(memory_mib: usize) -> Result<Vec<u8>, Error> {
+    let cannot = || Error::BadConfig(format!("cannot allocate {memory_mib} MiB of guest memory"));
+    let flat_bytes = crate::ram::flat_bytes((memory_mib as u64) << BYTES_PER_MIB_SHIFT);
+    let mut ram = usize::try_from(flat_bytes)
+        .ok()
+        .and_then(crate::ram::zeroed_bytes)
+        .ok_or_else(cannot)?;
+    back_with_huge_pages(&mut ram);
+    Ok(ram)
+}
+
 /// `std::thread` where there is one.
 fn default_thread_spawner() -> Option<ThreadSpawner> {
     #[cfg(not(freestanding))]
@@ -757,7 +779,9 @@ impl Vcpu {
             }
             // Fresh zeroed RAM, not a `fill(0)` of the old one: `boot::load` relies on zeroes,
             // and filling would commit every page the host had lazily left untouched.
-            let mut ram = vec![0u8; finished.ram_bytes];
+            let Some(mut ram) = crate::ram::zeroed_bytes(finished.ram_bytes) else {
+                return ExitReason::Internal("reboot: cannot allocate guest memory".into());
+            };
             back_with_huge_pages(&mut ram);
             let loaded = match &image.uefi {
                 Some((firmware, params)) => boot::load_uefi_firmware(
@@ -983,8 +1007,7 @@ impl EmulatedMachine {
                 }
             }
         }
-        let mut ram = vec![0u8; cfg.memory_mib << BYTES_PER_MIB_SHIFT];
-        back_with_huge_pages(&mut ram);
+        let mut ram = allocate_ram(cfg.memory_mib)?;
         let kinds = if cfg.consoles.is_empty() {
             vec![ConsoleKind::Virtio]
         } else {

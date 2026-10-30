@@ -2,6 +2,7 @@ use crate::acpi::{self, AcpiConfig};
 use crate::machine::Error;
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::ram;
 
 /// Where a relocatable kernel's protected-mode part is loaded. 16 MiB is the Debian kernel's
 /// `pref_address` and a multiple of its 2 MiB `kernel_alignment`; a non-relocatable kernel is
@@ -10,7 +11,7 @@ pub(crate) const KERNEL_LOAD: u64 = 0x100_0000;
 
 // The low-memory layout. Everything here sits inside the first e820 usable range (below
 // `LOW_RAM_END`) and the ranges must not overlap: GDT 0x6000..0x6020, boot_params
-// 0x7000..0x8000, page tables 0x9000..0xf000, command line from 0x20000.
+// 0x7000..0x8000, page tables 0x9000..0x10000, command line from 0x20000.
 const GDT_ADDR: u64 = 0x6000;
 const BOOT_PARAMS: u64 = 0x7000;
 const PML4: u64 = 0x9000;
@@ -48,11 +49,18 @@ const PTE_PAGE_SIZE: u64 = 0x80;
 const TABLE_ENTRY_SIZE: usize = 8;
 const ENTRIES_PER_TABLE: u64 = 512;
 const HUGE_PAGE_SHIFT: u32 = 21;
-/// The identity map covers 4 GiB: one PDPT, four page directories of 512 2 MiB pages each. It
-/// therefore spans RAM (at most 3 GiB) and the MMIO window at 0xc000_0000 above it.
-const IDENTITY_MAP_GIB: u64 = 4;
-/// PML4, PDPT, then one page directory per GiB, laid out back to back from `PML4`.
-const PAGE_TABLE_PAGES: usize = 2 + IDENTITY_MAP_GIB as usize;
+const GIB_SHIFT: u32 = 30;
+/// The first 4 GiB are mapped with 2 MiB pages (four page directories of 512 entries each): the
+/// RAM below the PCI hole and the MMIO window in it.
+const IDENTITY_MAP_2M_GIB: u64 = 4;
+/// Everything above 4 GiB is mapped with 1 GiB pages straight from the PDPT entries, so that any
+/// amount of RAM needs no more page-table pages than the 512 GiB of one PDPT, plus a second PDPT
+/// for the last half of the 40-bit physical address space. (The CPU advertises pdpe1gb.)
+const PDPT_GIB: u64 = ENTRIES_PER_TABLE;
+/// Physical address space the CPU decodes (`PHYSICAL_ADDRESS_BITS` = 40), in GiB.
+const PHYSICAL_SPACE_GIB: u64 = 1 << 10;
+/// PML4, the first PDPT, four page directories, then the second PDPT, back to back from `PML4`.
+const PAGE_TABLE_PAGES: usize = 2 + IDENTITY_MAP_2M_GIB as usize + 1;
 
 // Offsets into the bzImage's setup header, which is also where `struct boot_params` keeps it
 // (Documentation/arch/x86/boot.rst).
@@ -181,20 +189,29 @@ pub enum BootMode {
 
 /// The memory map every boot path reports, as (base, size, type): the low range, which the
 /// kernel needs usable for its real-mode trampoline, then the reserved video and ROM hole, then
-/// the RAM above 1 MiB.
-pub(crate) fn e820_map(ram_top: u64) -> [(u64, u64, u32); 3] {
-    [
+/// the RAM above 1 MiB up to the PCI hole, then whatever RAM continues at 4 GiB. `ram_top` is
+/// the end of the flat RAM buffer (`ram::flat_bytes`).
+pub(crate) fn e820_map(ram_top: u64) -> Vec<(u64, u64, u32)> {
+    let mut map = vec![
         (0, LOW_RAM_END, E820_RAM),
         (LOW_RAM_END, ONE_MIB - LOW_RAM_END, E820_RESERVED),
-        (ONE_MIB, ram_top - ONE_MIB, E820_RAM),
-    ]
+        (ONE_MIB, ram::low_ram_end(ram_top) - ONE_MIB, E820_RAM),
+    ];
+    map.extend(high_ram_entry(ram_top));
+    map
+}
+
+/// The e820 entry for the RAM above 4 GiB, if there is any.
+fn high_ram_entry(ram_top: u64) -> Option<(u64, u64, u32)> {
+    let high_end = ram::high_ram_end(ram_top);
+    (high_end != 0).then(|| (ram::PCI_HOLE_END, high_end - ram::PCI_HOLE_END, E820_RAM))
 }
 
 /// `e820_map` with the ACPI tables marked as ACPI data and the ECAM window reserved: the
 /// regions Linux checks before it trusts MCFG and the tables.
 pub(crate) fn e820_map_with_acpi(ram_top: u64) -> Vec<(u64, u64, u32)> {
     let (ecam_base, ecam_bytes) = acpi::ECAM_RANGE;
-    vec![
+    let mut map = vec![
         (0, LOW_RAM_END, E820_RAM),
         (LOW_RAM_END, acpi::REGION_BASE - LOW_RAM_END, E820_RESERVED),
         (acpi::REGION_BASE, acpi::REGION_BYTES, E820_ACPI),
@@ -203,9 +220,12 @@ pub(crate) fn e820_map_with_acpi(ram_top: u64) -> Vec<(u64, u64, u32)> {
             ONE_MIB - (acpi::REGION_BASE + acpi::REGION_BYTES),
             E820_RESERVED,
         ),
-        (ONE_MIB, ram_top - ONE_MIB, E820_RAM),
+        (ONE_MIB, ram::low_ram_end(ram_top) - ONE_MIB, E820_RAM),
         (ecam_base, ecam_bytes, E820_RESERVED),
-    ]
+    ];
+    // After the ECAM, which is below 4 GiB: the table stays sorted.
+    map.extend(high_ram_entry(ram_top));
+    map
 }
 
 /// Register state of a Linux entry: in 64-bit mode paging on with `cr3`; in 32-bit mode paging
@@ -235,32 +255,62 @@ fn put(ram: &mut [u8], addr: u64, data: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Writes the boot GDT (null, null, `code_descriptor`, flat data) and the 4 GiB identity map
-/// where `BootState` says they are; returns the GDT limit.
-fn write_gdt_and_page_tables(ram: &mut [u8], code_descriptor: u64) -> Result<u16, Error> {
+/// Writes the boot GDT (null, null, `code_descriptor`, flat data) and the identity map where
+/// `BootState` says they are: the first 4 GiB, and every GiB above it up to the end of RAM.
+/// `ram_top` is the end of the flat RAM buffer (`ram::flat_bytes`), which `ram` itself may be
+/// shorter than only in tests. Returns the GDT limit.
+fn write_gdt_and_page_tables(
+    ram: &mut [u8],
+    ram_top: u64,
+    code_descriptor: u64,
+) -> Result<u16, Error> {
     // Entries 0 and 1 stay null so the code and data descriptors land on the selectors
     // `BOOT_CS` and `BOOT_DS`.
     let gdt: [u64; 4] = [0, 0, code_descriptor, BOOT_DATA_DESCRIPTOR];
     let gdt_bytes: Vec<u8> = gdt.iter().flat_map(|entry| entry.to_le_bytes()).collect();
     put(ram, GDT_ADDR, &gdt_bytes)?;
 
-    let pdpt = PML4 + PAGE_SIZE;
-    let first_page_directory = pdpt + PAGE_SIZE;
+    let first_pdpt = PML4 + PAGE_SIZE;
+    let first_page_directory = first_pdpt + PAGE_SIZE;
+    let second_pdpt = first_page_directory + IDENTITY_MAP_2M_GIB * PAGE_SIZE;
+    let mapped_gib = ram::high_ram_end(ram_top)
+        .div_ceil(1 << GIB_SHIFT)
+        .max(IDENTITY_MAP_2M_GIB);
+    if mapped_gib > PHYSICAL_SPACE_GIB {
+        return Err(Error::BadConfig("guest memory too large".into()));
+    }
     let mut tables = vec![0u8; PAGE_TABLE_PAGES * PAGE_SIZE as usize];
-    let entry_bytes = |value: u64| value.to_le_bytes();
-    tables[0..TABLE_ENTRY_SIZE].copy_from_slice(&entry_bytes(pdpt | PTE_PRESENT | PTE_WRITABLE));
-    for gib in 0..IDENTITY_MAP_GIB {
+    let mut set_entry = |table: u64, index: u64, value: u64| {
+        let at = (table - PML4) as usize + index as usize * TABLE_ENTRY_SIZE;
+        tables[at..at + TABLE_ENTRY_SIZE].copy_from_slice(&value.to_le_bytes());
+    };
+    set_entry(PML4, 0, first_pdpt | PTE_PRESENT | PTE_WRITABLE);
+    for gib in 0..IDENTITY_MAP_2M_GIB {
         let page_directory = first_page_directory + gib * PAGE_SIZE;
-        let pdpt_entry = (pdpt - PML4) as usize + gib as usize * TABLE_ENTRY_SIZE;
-        tables[pdpt_entry..pdpt_entry + TABLE_ENTRY_SIZE]
-            .copy_from_slice(&entry_bytes(page_directory | PTE_PRESENT | PTE_WRITABLE));
+        set_entry(first_pdpt, gib, page_directory | PTE_PRESENT | PTE_WRITABLE);
         for slot in 0..ENTRIES_PER_TABLE {
-            let entry = (page_directory - PML4) as usize + slot as usize * TABLE_ENTRY_SIZE;
             let physical = (gib * ENTRIES_PER_TABLE + slot) << HUGE_PAGE_SHIFT;
-            tables[entry..entry + TABLE_ENTRY_SIZE].copy_from_slice(&entry_bytes(
+            set_entry(
+                page_directory,
+                slot,
                 physical | PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE,
-            ));
+            );
         }
+    }
+    if mapped_gib > PDPT_GIB {
+        set_entry(PML4, 1, second_pdpt | PTE_PRESENT | PTE_WRITABLE);
+    }
+    for gib in IDENTITY_MAP_2M_GIB..mapped_gib {
+        let pdpt = if gib < PDPT_GIB {
+            first_pdpt
+        } else {
+            second_pdpt
+        };
+        set_entry(
+            pdpt,
+            gib % PDPT_GIB,
+            (gib << GIB_SHIFT) | PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE,
+        );
     }
     put(ram, PML4, &tables)?;
     Ok((gdt_bytes.len() - 1) as u16)
@@ -300,6 +350,8 @@ pub(crate) fn load_with_acpi(
         return Err(Error::BadConfig("kernel command line too long".into()));
     }
     let ram_top = ram.len() as u64;
+    // The kernel and initrd go below the PCI hole, where every boot path can reach them.
+    let low_ram_top = ram::low_ram_end(ram_top);
     let payload = &kernel[header.protected_offset()..];
     let load_addr = if header.relocatable {
         KERNEL_LOAD
@@ -317,7 +369,7 @@ pub(crate) fn load_with_acpi(
     // exceed the compressed payload; nothing else may live in it.
     let kernel_end = load_addr
         .checked_add((header.init_size as u64).max(payload.len() as u64))
-        .filter(|&end| end <= ram_top)
+        .filter(|&end| end <= low_ram_top)
         .ok_or_else(|| Error::BadConfig("guest memory too small for kernel".into()))?;
     put(ram, load_addr, payload)?;
     put(ram, CMDLINE_ADDR, cmdline.as_bytes())?;
@@ -338,7 +390,7 @@ pub(crate) fn load_with_acpi(
     if let Some(initrd) = initrd {
         // Highest page-aligned spot the kernel can still reach: it cannot read an initrd above
         // `initrd_addr_max`, and RAM may end below that.
-        let limit = ram_top.min(header.initrd_addr_max as u64 + 1);
+        let limit = low_ram_top.min(header.initrd_addr_max as u64 + 1);
         let addr = limit
             .checked_sub(initrd.len() as u64)
             .map(|unaligned| unaligned & !PAGE_MASK)
@@ -359,7 +411,7 @@ pub(crate) fn load_with_acpi(
                 .copy_from_slice(&rsdp.to_le_bytes());
             e820_map_with_acpi(ram_top)
         }
-        None => e820_map(ram_top).to_vec(),
+        None => e820_map(ram_top),
     };
     boot_params[E820_ENTRIES_OFFSET] = e820.len() as u8;
     for (index, (base, size, kind)) in e820.iter().enumerate() {
@@ -376,7 +428,7 @@ pub(crate) fn load_with_acpi(
     } else {
         BOOT_CODE32_DESCRIPTOR
     };
-    let gdt_limit = write_gdt_and_page_tables(ram, code_descriptor)?;
+    let gdt_limit = write_gdt_and_page_tables(ram, ram_top, code_descriptor)?;
 
     Ok(BootState {
         // A 32-bit kernel starts at the first byte of its protected-mode image (`startup_32`).

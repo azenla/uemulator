@@ -228,6 +228,7 @@ pub(crate) struct Bios {
     row: u8,
     column: u8,
     drives: usize,
+    /// End of the flat RAM buffer, which is past the PCI hole when there is RAM above 4 GiB.
     ram_top: u64,
 }
 
@@ -274,8 +275,7 @@ impl Cpu {
     }
 
     fn peek(&self, linear: u64, len: usize) -> Option<&[u8]> {
-        let start = usize::try_from(linear).ok()?;
-        self.ram.get(start..start.checked_add(len)?)
+        self.ram.slice(linear, len)
     }
 
     fn peek_u16(&self, linear: u64) -> Option<u16> {
@@ -298,7 +298,7 @@ impl Cpu {
         let Some(end) = start.checked_add(data.len()) else {
             return false;
         };
-        if end > self.ram.len() {
+        if !self.ram.contains(linear, data.len() as u64) {
             return false;
         }
         for page in (start >> PAGE_SHIFT)..=(end.saturating_sub(1) >> PAGE_SHIFT) {
@@ -1009,6 +1009,9 @@ impl Cpu {
         let Some(ram_top) = self.bios.as_ref().map(|b| b.ram_top) else {
             return;
         };
+        // The legacy size calls cannot describe RAM above the PCI hole (16-bit KiB counts, and
+        // a real-mode loader could not reach it); only E820 reports it.
+        let low_ram_top = crate::ram::low_ram_end(ram_top);
         match (self.ah(), self.al()) {
             // A20 gate: always open, because RAM is flat.
             (0x24, 0x00 | 0x01) => self.succeed(),
@@ -1048,15 +1051,15 @@ impl Cpu {
             }
             // Extended memory above 1 MiB, in KiB.
             (0x88, _) => {
-                let kib = ((ram_top.saturating_sub(ONE_MIB)) / 1024).min(EXTENDED_KIB_LIMIT);
+                let kib = ((low_ram_top.saturating_sub(ONE_MIB)) / 1024).min(EXTENDED_KIB_LIMIT);
                 self.set_reg16(RAX, kib as u16);
                 self.set_returned_flag(CF, false);
             }
             // Delay: instant.
             (0x86, _) => self.succeed(),
             (_, _) if self.gpr[RAX] as u16 == 0xe801 => {
-                let low = (ram_top.min(SIXTEEN_MIB).saturating_sub(ONE_MIB)) / 1024;
-                let high = ram_top.saturating_sub(SIXTEEN_MIB) / 65536;
+                let low = (low_ram_top.min(SIXTEEN_MIB).saturating_sub(ONE_MIB)) / 1024;
+                let high = low_ram_top.saturating_sub(SIXTEEN_MIB) / 65536;
                 self.set_reg16(RAX, low as u16);
                 self.set_reg16(RCX, low as u16);
                 self.set_reg16(RBX, high as u16);

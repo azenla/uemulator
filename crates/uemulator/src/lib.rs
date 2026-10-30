@@ -42,8 +42,8 @@ pub use disk::{BlockBackend, Disk};
 pub use kv::FileKeyValueStore;
 pub use kv::{KeyValueError, KeyValueStore, MemoryKeyValueStore};
 pub use machine::{
-    ClockMode, ConsoleKind, EmulatedMachine, Error, ExitReason, JitMode, MachineConfig, SmpMode,
-    StopHandle,
+    ClockMode, ConsoleKind, EmulatedMachine, Error, ExitReason, JitMode, MAX_MEMORY_MIB,
+    MIN_MEMORY_MIB, MachineConfig, SmpMode, StopHandle,
 };
 pub use netdev::NetHandle;
 pub use platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE, Platform, load_linux};
@@ -190,6 +190,6 @@ mod api_tests {
             Err(Error::BadConfig(message)) => message,
             other => panic!("unexpected {:?}", other.err()),
         };
-        assert!(message.contains("64") && message.contains("3072"));
+        assert!(message.contains("64") && message.contains("1047552"));
     }
 }

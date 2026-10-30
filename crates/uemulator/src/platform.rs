@@ -21,14 +21,16 @@ pub const DEFAULT_SERIAL_CMDLINE: &str =
 /// Lays out a bzImage, an optional initramfs, the command line, boot parameters, a GDT and
 /// identity-mapped page tables in `ram` (guest physical address 0 is `ram[0]`), and returns the
 /// 64-bit entry state. For hosts that start the guest themselves; `EmulatedMachine` calls the
-/// same loader.
+/// same loader. The guest is told about at most the first 3 GiB of `ram`: a host's flat buffer
+/// has no PCI hole in it, and `EmulatedMachine` is the one that lays RAM out around the hole.
 pub fn load_linux(
     ram: &mut [u8],
     kernel: &[u8],
     initrd: Option<&[u8]>,
     cmdline: &str,
 ) -> Result<BootState, Error> {
-    boot::load(ram, kernel, initrd, cmdline)
+    let ram_bytes = ram.len().min(crate::ram::PCI_HOLE_START as usize);
+    boot::load(&mut ram[..ram_bytes], kernel, initrd, cmdline)
 }
 
 /// The legacy PC devices (UART, PIC, PIT, CMOS, reset ports) without a CPU, for hosts that run the
