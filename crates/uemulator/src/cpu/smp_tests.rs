@@ -891,21 +891,7 @@ fn start_in_long_mode(cpu: &mut Cpu, bsp: &Cpu, rip: u64, rsp: u64) {
 /// again, and no worker may then run an older immediate than the version it saw published.
 #[test]
 fn code_rewritten_while_another_vcpu_translates_it_never_runs_stale() {
-    struct Pause;
-    impl Pause {
-        fn new() -> Self {
-            crate::jit::PAUSE_BEFORE_INSTALL_MICROS
-                .store(STALE_WINDOW_MICROS, std::sync::atomic::Ordering::Relaxed);
-            Pause
-        }
-    }
-    impl Drop for Pause {
-        fn drop(&mut self) {
-            crate::jit::PAUSE_BEFORE_INSTALL_MICROS.store(0, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
     both_engines(|jit| {
-        let _pause = jit.then(Pause::new);
         let run = run_threads_with(
             &STALE_WRITER,
             1 + STALE_WORKERS,
@@ -913,6 +899,9 @@ fn code_rewritten_while_another_vcpu_translates_it_never_runs_stale() {
             |cpu| {
                 place(cpu, STALE_SITE + 3, &STALE_SITE_CODE);
                 place(cpu, STALE_WORKER_CODE, &STALE_WORKER);
+                if let Some(jit) = &cpu.jit {
+                    jit.set_install_pause_micros(STALE_WINDOW_MICROS);
+                }
             },
             |cpus| {
                 let (bsp, others) = cpus.split_first_mut().unwrap();
@@ -973,26 +962,17 @@ const FLUSH_BSP: [u8; 35] = [
 /// those would run freed code, so nothing here may be lost, corrupted or stuck.
 #[test]
 fn a_full_code_cache_is_flushed_under_vcpus_that_keep_running() {
-    struct Limit;
-    impl Limit {
-        fn new() -> Self {
-            crate::jit::TEST_BLOCK_LIMIT
-                .store(FLUSH_BLOCK_LIMIT, std::sync::atomic::Ordering::Relaxed);
-            Limit
-        }
-    }
-    impl Drop for Limit {
-        fn drop(&mut self) {
-            crate::jit::TEST_BLOCK_LIMIT.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
     both_engines(|jit| {
-        let _limit = jit.then(Limit::new);
         let run = run_threads_with(
             &FLUSH_BSP,
             1 + STALE_WORKERS,
             jit,
-            |cpu| place(cpu, STALE_WORKER_CODE, &FLUSH_WORKER),
+            |cpu| {
+                place(cpu, STALE_WORKER_CODE, &FLUSH_WORKER);
+                if let Some(jit) = &cpu.jit {
+                    jit.set_block_limit(FLUSH_BLOCK_LIMIT);
+                }
+            },
             |cpus| {
                 let (bsp, others) = cpus.split_first_mut().unwrap();
                 for (index, worker) in others.iter_mut().enumerate() {

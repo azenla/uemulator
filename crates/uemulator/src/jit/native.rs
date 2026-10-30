@@ -176,6 +176,15 @@ struct SharedJit {
     /// Generate guest loads and stores with x86 ordering (acquire/release), for vCPUs that run
     /// beside others on their own threads. Only blocks compiled after it is set have it.
     ordered_memory: AtomicBool,
+    /// Test knob: the number of blocks after which the buffer counts as full, so a test can make
+    /// every vCPU hit a flush over and over without translating hundreds of thousands of blocks.
+    /// Per cache and not global, so tests running side by side do not flush each other's.
+    #[cfg(test)]
+    test_block_limit: std::sync::atomic::AtomicUsize,
+    /// Test knob: how long `translate` waits between reading the guest's bytes and taking the
+    /// lock, so a test can make another vCPU's write land in the window `Jit::install` closes.
+    #[cfg(test)]
+    test_install_pause_micros: AtomicU64,
     state: Mutex<State>,
 }
 
@@ -235,18 +244,6 @@ thread_local! {
     pub(crate) static AFTER_MARK: TranslateHook = const { std::cell::RefCell::new(None) };
 }
 
-/// Test knob: the number of blocks after which the buffer counts as full, so a test can make
-/// every vCPU hit a flush over and over without translating hundreds of thousands of blocks.
-#[cfg(test)]
-pub(crate) static TEST_BLOCK_LIMIT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(usize::MAX);
-
-/// Test hook that widens the window `Jit::install` closes: how long `translate` waits between
-/// reading the guest's bytes and taking the lock, so a test can make another vCPU's write land
-/// in it every time.
-#[cfg(test)]
-pub(crate) static PAUSE_BEFORE_INSTALL_MICROS: AtomicU64 = AtomicU64::new(0);
-
 pub(crate) const fn jump_cache_mask() -> u64 {
     (1 << JUMP_CACHE_BITS) - 1
 }
@@ -291,12 +288,12 @@ impl SharedJit {
 
 impl State {
     /// Whether the next block fits, moving on to the next segment when this one is used up.
-    fn make_room(&mut self, blocks_start: usize) -> bool {
+    fn make_room(&mut self, shared: &SharedJit) -> bool {
         if self.blocks.len() >= MAX_BLOCKS {
             return false;
         }
         #[cfg(test)]
-        if self.blocks.len() >= TEST_BLOCK_LIMIT.load(Ordering::Relaxed) {
+        if self.blocks.len() >= shared.test_block_limit.load(Ordering::Relaxed) {
             return false;
         }
         let segment = self.used_bytes / SEGMENT_SIZE;
@@ -304,7 +301,7 @@ impl State {
             return true;
         }
         if segment + 1 < SEGMENT_COUNT {
-            self.used_bytes = (segment + 1) * SEGMENT_SIZE + blocks_start;
+            self.used_bytes = (segment + 1) * SEGMENT_SIZE + shared.blocks_start;
             return true;
         }
         false
@@ -379,6 +376,10 @@ impl Jit {
             epoch: AtomicU64::new(0),
             invalidations: AtomicU64::new(0),
             ordered_memory: AtomicBool::new(false),
+            #[cfg(test)]
+            test_block_limit: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            #[cfg(test)]
+            test_install_pause_micros: AtomicU64::new(0),
             state: Mutex::new(State {
                 used_bytes: blocks_start,
                 blocks: Vec::new(),
@@ -447,7 +448,21 @@ impl Jit {
         if epoch != self.seen_epoch {
             self.jump_cache.fill(JumpEntry::default());
             self.seen_epoch = epoch;
+            // The flush rewrote addresses this core may still have fetched the old code of.
+            crate::sys::instruction_barrier();
         }
+    }
+
+    #[cfg(test)]
+    pub fn set_block_limit(&self, limit: usize) {
+        self.shared.test_block_limit.store(limit, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn set_install_pause_micros(&self, micros: u64) {
+        self.shared
+            .test_install_pause_micros
+            .store(micros, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -535,6 +550,8 @@ impl Jit {
         let index = *state.block_map.get(&(phys_addr, NO_SECOND_PAGE))?;
         let code_addr = state.blocks[index as usize].code_addr;
         drop(state);
+        // Another vCPU may have written this block.
+        crate::sys::instruction_barrier();
         self.jump_cache[jump_cache_hash(rip)] = JumpEntry {
             rip,
             phys_addr,
@@ -599,7 +616,11 @@ impl Jit {
                 hook(cpu);
             }
             #[cfg(test)]
-            match PAUSE_BEFORE_INSTALL_MICROS.load(Ordering::Relaxed) {
+            match self
+                .shared
+                .test_install_pause_micros
+                .load(Ordering::Relaxed)
+            {
                 0 => {}
                 micros => std::thread::sleep(std::time::Duration::from_micros(micros)),
             }
@@ -646,10 +667,12 @@ impl Jit {
         // Another vCPU may have translated it since this one missed.
         if let Some(&index) = state.block_map.get(&key) {
             let code_addr = state.blocks[index as usize].code_addr;
+            // Translated by another vCPU while this one decoded.
+            crate::sys::instruction_barrier();
             self.fill_jump_cache(rip, phys_addr, decoded.second_page, code_addr, index);
             return Install::Ready(code_addr);
         }
-        if !state.make_room(shared.blocks_start) {
+        if !state.make_room(&shared) {
             return Install::Full;
         }
         let Decoded {

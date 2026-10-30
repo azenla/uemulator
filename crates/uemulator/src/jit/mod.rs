@@ -27,12 +27,6 @@ mod native;
 
 #[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub(crate) use native::Jit;
-#[cfg(all(
-    test,
-    feature = "jit",
-    any(target_arch = "aarch64", target_arch = "x86_64")
-))]
-pub(crate) use native::{PAUSE_BEFORE_INSTALL_MICROS, TEST_BLOCK_LIMIT};
 
 /// Whether a writable+executable mapping can be created and run on this host.
 #[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -132,15 +126,6 @@ mod stub {
         pub resets: u64,
     }
 
-    #[cfg(test)]
-    pub(crate) static TEST_BLOCK_LIMIT: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(usize::MAX);
-
-    /// Only the real cache reads this; tests set it unconditionally.
-    #[cfg(test)]
-    pub(crate) static PAUSE_BEFORE_INSTALL_MICROS: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-
     impl Jit {
         pub fn new(_chaining: bool) -> Option<Jit> {
             None
@@ -154,6 +139,23 @@ mod stub {
         pub fn stats(&self) -> JitStats {
             JitStats::default()
         }
+        #[cfg(test)]
+        pub fn translate(
+            &mut self,
+            _cpu: &mut Cpu,
+            _rip: u64,
+            _phys: u64,
+        ) -> Result<u64, Exception> {
+            unreachable!()
+        }
+        #[cfg(test)]
+        pub fn lookup(&mut self, _rip: u64, _phys: u64) -> Option<u64> {
+            unreachable!()
+        }
+        #[cfg(test)]
+        pub fn set_block_limit(&self, _limit: usize) {}
+        #[cfg(test)]
+        pub fn set_install_pause_micros(&self, _micros: u64) {}
     }
 
     impl Cpu {
@@ -165,11 +167,6 @@ mod stub {
 
 #[cfg(not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))))]
 pub(crate) use stub::Jit;
-#[cfg(all(
-    test,
-    not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))
-))]
-pub(crate) use stub::{PAUSE_BEFORE_INSTALL_MICROS, TEST_BLOCK_LIMIT};
 
 #[cfg(not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))))]
 pub(crate) fn probe() -> bool {

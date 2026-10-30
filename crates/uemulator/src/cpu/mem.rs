@@ -770,11 +770,9 @@ impl Cpu {
         if let Some(runtime) = &self.threads {
             // The other vCPUs' translations of this page are stale too; they drop them at their
             // next block boundary.
-            runtime.links.publish_invalidation(
-                &self.page_has_code,
-                Some(self.cpu_index as usize),
-                ppn,
-            );
+            runtime
+                .links
+                .publish_invalidation(Some(self.cpu_index as usize), ppn);
         }
     }
 

@@ -77,6 +77,17 @@ impl ExecMem {
     }
 }
 
+/// Makes this core drop anything it fetched ahead of the point where it starts running code
+/// another core wrote or rewrote. The writer's cache maintenance reaches every core, but a core
+/// that already had stale instructions in its pipeline needs this (aarch64 only: x86 fetches are
+/// coherent). Called where a vCPU first takes a block it did not write itself.
+pub(crate) fn instruction_barrier() {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+}
+
 #[cfg(unix)]
 mod imp {
     use super::ExecMem;

@@ -220,11 +220,13 @@ impl VcpuLinks {
             .unwrap_or(ExitReason::Stopped)
     }
 
-    /// Queues `page` as holding stale translated code for every vCPU but `except` (which has
-    /// dropped its own) and clears its flag, so a page that is not translated again takes plain
-    /// stores. `except` is `None` for a write by a device.
-    pub fn publish_invalidation(&self, flags: &CodePages, except: Option<usize>, page: usize) {
-        flags.set(page, 0);
+    /// Tells every vCPU but `except` (which has dropped its own) that `page` held code that is
+    /// stale, so they drop their decode caches. It leaves the page's code flag alone: whoever
+    /// invalidated the page clears it, and for the JIT that has to happen under the cache's lock
+    /// (`Jit::invalidate_page`); clearing it again here, outside it, would let a translation flag,
+    /// decode and register a block in between and lose its stores to `code_written` for good.
+    /// `except` is `None` for a write by a device.
+    pub fn publish_invalidation(&self, except: Option<usize>, page: usize) {
         {
             let mut log = self.invalidations.lock().unwrap();
             if log.pages.len() == INVALIDATION_LOG_CAPACITY {
@@ -650,11 +652,29 @@ impl Drop for ThreadGuard {
     }
 }
 
+/// A device (DMA) wrote `page`, which held translated code: the blocks go for every vCPU, the
+/// flag is cleared, and the vCPUs are told to drop their decode caches. A vCPU's own write does
+/// the same from `Cpu::code_written`; this is the device thread's, which no exclusive section
+/// waits for, so it has to go through the cache's lock like any other writer.
+fn invalidate_for_device_write(
+    links: &VcpuLinks,
+    jit: Option<&crate::jit::Jit>,
+    flags: &CodePages,
+    page: usize,
+) {
+    match jit {
+        Some(jit) => jit.invalidate_page(page as u64, flags),
+        None => flags.set(page, 0),
+    }
+    links.publish_invalidation(None, page);
+}
+
 /// Runs the machine with one thread per vCPU and returns why it ended, with the bootstrap
 /// processor (for the exit dump) and a line per vCPU.
 ///
 /// The calling thread becomes the device thread: it ticks the devices until every vCPU thread has
-/// finished. `make_jit` builds each secondary vCPU's own JIT.
+/// finished. `make_jit` builds a handle on the shared code cache for each secondary vCPU and for
+/// the device thread.
 pub(crate) fn run_threaded(
     mut cpus: Vec<Cpu>,
     spawner: &ThreadSpawner,
@@ -699,6 +719,8 @@ pub(crate) fn run_threaded(
         }));
     }
     links.device_waker.register_current();
+    // The device thread is not a vCPU, so nothing else drops the blocks of a page a device wrote.
+    let device_jit = make_jit();
     while !links.all_finished() {
         if stop.load(Ordering::Relaxed) {
             links.request_exit(ExitReason::Stopped);
@@ -713,7 +735,7 @@ pub(crate) fn run_threaded(
             mem.code_pages_written
         };
         for page in written_code_pages {
-            links.publish_invalidation(&flags, None, page);
+            invalidate_for_device_write(&links, device_jit.as_deref(), &flags, page);
         }
         let (reset, shutdown, deadline) = {
             let devices = device_handle.lock();
@@ -807,6 +829,65 @@ mod tests {
         all_halted(&links);
         links.publish_device_bits(1, ATTENTION_START);
         assert!(!links.all_dead(), "the parked vCPU is about to start");
+    }
+
+    /// A harness CPU whose JIT has translated the block at `CODE_BASE`, and that block's page.
+    fn translated_block() -> Option<(crate::testkit::Harness, Box<crate::jit::Jit>, usize)> {
+        use crate::testkit::{CODE_BASE, Harness};
+        let mut harness = Harness::new(&[0x90, 0xf4]);
+        if !harness.enable_jit() {
+            return None;
+        }
+        let mut jit = harness.cpu.jit.take().unwrap();
+        jit.translate(&mut harness.cpu, CODE_BASE, CODE_BASE)
+            .unwrap();
+        let page = (CODE_BASE >> PAGE_SHIFT) as usize;
+        assert_eq!(harness.cpu.page_has_code.get(page), 1);
+        Some((harness, jit, page))
+    }
+
+    #[test]
+    fn a_device_write_to_a_code_page_drops_its_blocks_clears_its_flag_and_tells_the_vcpus() {
+        let Some((harness, mut jit, page)) = translated_block() else {
+            return;
+        };
+        let links = VcpuLinks::new(2);
+        invalidate_for_device_write(&links, Some(&jit), &harness.cpu.page_has_code, page);
+        assert_eq!(harness.cpu.page_has_code.get(page), 0);
+        assert_eq!(
+            jit.lookup(crate::testkit::CODE_BASE, crate::testkit::CODE_BASE),
+            None,
+            "the block of a page a device wrote stayed valid"
+        );
+        for link in &links.links {
+            assert_ne!(
+                link.attention.load(Ordering::SeqCst) & ATTENTION_INVALIDATE,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_write_without_a_jit_still_clears_the_flag() {
+        let Some((harness, _jit, page)) = translated_block() else {
+            return;
+        };
+        let links = VcpuLinks::new(1);
+        invalidate_for_device_write(&links, None, &harness.cpu.page_has_code, page);
+        assert_eq!(harness.cpu.page_has_code.get(page), 0);
+    }
+
+    /// The flag is cleared under the cache's lock by whoever invalidates the page. Telling the
+    /// vCPUs about it must not clear it again: a translation that flagged the page in between
+    /// would lose it.
+    #[test]
+    fn publishing_an_invalidation_leaves_the_code_flag_alone() {
+        let Some((harness, _jit, page)) = translated_block() else {
+            return;
+        };
+        let links = VcpuLinks::new(2);
+        links.publish_invalidation(None, page);
+        assert_eq!(harness.cpu.page_has_code.get(page), 1);
     }
 
     #[test]
