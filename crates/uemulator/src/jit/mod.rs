@@ -121,6 +121,8 @@ mod stub {
             None
         }
         pub fn invalidate_page(&mut self, _ppn: u64) {}
+        pub fn reset(&mut self) {}
+        pub fn set_ordered_memory(&mut self, _on: bool) {}
     }
 
     impl Cpu {

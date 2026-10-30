@@ -295,3 +295,29 @@ fn a_cpu_count_of_zero_is_one_cpu_and_acknowledge_follows_the_executing_cpu() {
     assert_eq!(dev.interrupt_ack(), Some(0x41));
     assert!(!dev.interrupt_pending());
 }
+
+#[test]
+fn with_threads_the_devices_never_see_time_go_backwards() {
+    // A vCPU samples the clock and then waits for the device lock; another may use a later time
+    // first. The guest must not read a counter that runs backwards.
+    let mut dev = machine(2);
+    dev.attach_links(crate::cpu::vcpus::VcpuLinks::new(2));
+    dev.set_time(100);
+    dev.set_time(40);
+    assert_eq!(dev.now_ns, 100);
+    dev.io_in(0x61, 1, 70);
+    assert_eq!(dev.now_ns, 100);
+    dev.io_out(0x61, 1, 0, 130);
+    assert_eq!(dev.now_ns, 130);
+    assert!(dev.apic_msr_read(X2APIC_MSR_FIRST, 20).is_none());
+    assert_eq!(dev.now_ns, 130);
+}
+
+#[test]
+fn without_threads_the_devices_follow_the_time_they_are_given() {
+    // The time-shared scheduler and the unit tests pass whatever time they mean.
+    let mut dev = machine(2);
+    dev.set_time(100);
+    dev.set_time(40);
+    assert_eq!(dev.now_ns, 40);
+}

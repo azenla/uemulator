@@ -988,6 +988,23 @@ mod tests {
     }
 
     #[test]
+    fn smp_mode_is_unset_by_default_and_takes_the_three_modes() {
+        use crate::args::SmpArg;
+        assert_eq!(hardware(&[]).smp, None);
+        for (name, mode) in [
+            ("auto", SmpArg::Auto),
+            ("timeshare", SmpArg::Timeshare),
+            ("threads", SmpArg::Threads),
+        ] {
+            assert_eq!(hardware(&["--smp", name]).smp, Some(mode));
+        }
+        assert!(matches!(
+            error_kind(&["advanced", "boot", "--kernel", "k", "--smp", "fast"]),
+            clap::error::ErrorKind::InvalidValue
+        ));
+    }
+
+    #[test]
     fn cpus_is_a_count_that_is_unset_by_default() {
         assert_eq!(hardware(&[]).cpus, None);
         assert_eq!(hardware(&["--cpus", "4"]).cpus, Some(4));

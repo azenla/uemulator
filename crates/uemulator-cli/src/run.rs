@@ -2,10 +2,10 @@ use std::io::{IsTerminal, Read, Write};
 use std::time::Duration;
 
 use uemulator::{
-    ConsoleKind, Disk, EmulatedMachine, ExitReason, JitMode, MachineConfig, NetHandle,
+    ConsoleKind, Disk, EmulatedMachine, ExitReason, JitMode, MachineConfig, NetHandle, SmpMode,
 };
 
-use crate::args::{ConsoleArg, NetLink, RuntimeArgs, Settings};
+use crate::args::{ConsoleArg, NetLink, RuntimeArgs, Settings, SmpArg};
 use crate::netgw;
 use crate::term::{stty, term_size};
 
@@ -156,6 +156,13 @@ fn build_config(
     cfg = cfg.reboot(!settings.no_reboot).iommu(settings.iommu);
     if let Some(cpus) = settings.cpus {
         cfg = cfg.cpus(cpus);
+    }
+    if let Some(smp) = settings.smp {
+        cfg = cfg.smp(match smp {
+            SmpArg::Auto => SmpMode::Auto,
+            SmpArg::Timeshare => SmpMode::Timeshare,
+            SmpArg::Threads => SmpMode::Threads,
+        });
     }
     Ok(cfg)
 }

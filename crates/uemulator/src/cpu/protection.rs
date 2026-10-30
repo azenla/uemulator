@@ -69,25 +69,27 @@ impl Cpu {
         }
         self.monitor_address = self.gpr[RAX];
         self.monitor_armed = true;
+        if self.multi {
+            // The line is armed here, not at MWAIT: a store between the two must make MWAIT
+            // return at once, or a vCPU that was handed work in that window sleeps through it.
+            self.monitor_snapshot = self.snapshot_monitored_line();
+        }
         Ok(())
     }
 
-    /// Remembers the monitored line so a store to it by another vCPU (or a device) wakes this
-    /// one, which is how a remote CPU hands work to an idle one without an IPI (the kernel's
-    /// idle loop polls a flag with MONITOR/MWAIT). An address that does not translate is not
-    /// watched: only interrupts wake it.
-    fn watch_monitored_line(&mut self) {
-        let Ok(physical) = self.translate(self.monitor_address, super::mem::AccessKind::Read, true)
-        else {
-            return;
-        };
+    /// The monitored line and its contents, so a store to it by another vCPU (or a device) can
+    /// be told from nothing having happened: that is how a remote CPU hands work to an idle one
+    /// without an IPI (the kernel's idle loop polls a flag with MONITOR/MWAIT). An address that
+    /// does not translate is not watched: only interrupts wake it.
+    fn snapshot_monitored_line(&mut self) -> Option<(u64, [u8; MONITOR_WATCH_BYTES])> {
+        let physical = self
+            .translate(self.monitor_address, super::mem::AccessKind::Read, true)
+            .ok()?;
         let line = physical & !(MONITOR_WATCH_BYTES as u64 - 1);
-        if let Some(contents) = self
+        let contents = self
             .ram
-            .get(line as usize..line as usize + MONITOR_WATCH_BYTES)
-        {
-            self.mwait_watch = Some((line, contents.try_into().unwrap()));
-        }
+            .get(line as usize..line as usize + MONITOR_WATCH_BYTES)?;
+        Some((line, contents.try_into().unwrap()))
     }
 
     /// 0F 01 C9. CPL 0 only, #GP on reserved ECX bits. Waits like `hlt` while interrupts are
@@ -104,11 +106,19 @@ impl Cpu {
             return Ok(());
         }
         self.monitor_armed = false;
+        let snapshot = self.monitor_snapshot.take();
         if self.eflags_full() & super::flags::IF != 0 {
-            self.halted = true;
-            if self.multi {
-                self.watch_monitored_line();
+            if self.multi
+                && let Some((line, contents)) = snapshot
+            {
+                let line_now = &self.ram[line as usize..line as usize + MONITOR_WATCH_BYTES];
+                if line_now != contents {
+                    // Written since MONITOR: MWAIT returns without waiting.
+                    return Ok(());
+                }
+                self.mwait_watch = snapshot;
             }
+            self.halted = true;
         }
         Ok(())
     }

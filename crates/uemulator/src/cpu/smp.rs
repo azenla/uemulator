@@ -27,6 +27,12 @@ pub(crate) struct Smp {
     stalled_slices: usize,
 }
 
+/// The vCPUs of a machine that gives each its own thread: `bootstrap` and the parked secondaries
+/// that share its RAM and devices.
+pub(crate) fn secondary_cpus(bootstrap: Cpu) -> Vec<Cpu> {
+    Smp::new(bootstrap).cpus
+}
+
 impl Smp {
     /// `bootstrap` is vCPU 0 and owns the machine-wide state; the others are created here, parked
     /// until a start-up IPI reaches them.
@@ -79,7 +85,7 @@ impl Smp {
 
     pub fn run(&mut self) -> ExitReason {
         loop {
-            self.apply_start_signals(self.active);
+            self.cpus[self.active].apply_start_signals();
             let icount_before = self.cpus[self.active].icount;
             let slice = self.cpus[self.active].run_slice();
             let progressed = self.cpus[self.active].icount != icount_before;
@@ -133,7 +139,7 @@ impl Smp {
             cpu.mwait_watch = None;
             return true;
         }
-        let dev = &mut self.cpus[self.active].dev;
+        let dev = &mut self.cpus[self.active].dev.lock();
         if waiting_for_start {
             // Only a start-up (or another INIT) leaves this state; interrupts and NMIs are held.
             return dev.lapic_of(index).start_signal_pending();
@@ -148,7 +154,7 @@ impl Smp {
             .cpus
             .iter()
             .any(|cpu| !cpu.wait_for_sipi && cpu.eflags & flags::IF != 0)
-            || self.cpus[self.active].dev.any_nmi_pending();
+            || self.cpus[self.active].dev.lock().any_nmi_pending();
         self.cpus[self.active].idle(may_wake)
     }
 
@@ -169,30 +175,8 @@ impl Smp {
         };
         let cpu = &mut self.cpus[target];
         cpu.start_slice(divisor.max(1));
-        cpu.dev.set_current_cpu(target);
+        cpu.dev.lock().set_current_cpu(target);
         cpu.revoke_stale_write_tags();
-    }
-
-    /// Acts on INIT and start-up IPIs that other vCPUs sent to `index` (which must be the active
-    /// one: resetting a vCPU touches the shared decode cache and TLB state).
-    fn apply_start_signals(&mut self, index: usize) {
-        let cpu = &mut self.cpus[index];
-        let lapic = cpu.dev.lapic_of(index);
-        if !lapic.start_signal_pending() {
-            return;
-        }
-        let init = lapic.take_init();
-        let startup = lapic.take_startup();
-        if init {
-            cpu.dev.lapic_of(index).init_reset();
-            cpu.init();
-        }
-        // A start-up IPI to a vCPU that is already running is ignored (SDM 10.4.7.3).
-        if let Some(vector) = startup
-            && cpu.wait_for_sipi
-        {
-            cpu.start_at(vector);
-        }
     }
 }
 
@@ -200,17 +184,16 @@ impl Cpu {
     /// Hands the machine-wide state to `other` (which must be the vCPU that does not hold it
     /// now; the roles swap). Every field of `Cpu` that is not per-vCPU must be listed here: one
     /// that is missed would stay with its old vCPU and the next one would run on a placeholder.
+    /// RAM, the code-page flags and the devices are not listed: every vCPU holds a handle on the
+    /// same ones (`ram.rs`, `dev/handle.rs`).
     pub(super) fn swap_shared(&mut self, other: &mut Cpu) {
         use core::mem::swap;
-        swap(&mut self.ram, &mut other.ram);
-        swap(&mut self.page_has_code, &mut other.page_has_code);
         swap(&mut self.pages_with_code, &mut other.pages_with_code);
         swap(&mut self.decode_cache, &mut other.decode_cache);
         swap(
             &mut self.decode_cache_generation,
             &mut other.decode_cache_generation,
         );
-        swap(&mut self.dev, &mut other.dev);
         #[cfg(not(freestanding))]
         swap(&mut self.bios, &mut other.bios);
         swap(&mut self.jit, &mut other.jit);
@@ -279,7 +262,7 @@ impl Cpu {
                 .wrapping_add(entry.addend)
                 .wrapping_sub(ram_base)
                 >> PAGE_SHIFT) as usize;
-            if self.page_has_code.get(page).is_some_and(|&flag| flag != 0) {
+            if self.page_has_code.get_or_zero(page) != 0 {
                 entry.tag_w = TLB_TAG_INVALID;
             }
         }
@@ -287,7 +270,7 @@ impl Cpu {
 
     /// INIT (SDM 9.1, table 9-1): the registers go back to their reset values and the vCPU waits
     /// for a start-up IPI. Memory, the TSC, the MTRRs and the other MSRs keep what they had.
-    fn init(&mut self) {
+    pub(super) fn init(&mut self) {
         self.gpr = [0; 16];
         self.reset_real_mode_registers();
         self.cr2 = 0;
@@ -308,6 +291,7 @@ impl Cpu {
         self.nmi_blocked = false;
         self.interrupt_shadow = false;
         self.monitor_armed = false;
+        self.monitor_snapshot = None;
         self.mwait_watch = None;
         self.flush_tlb();
         self.halted = true;
@@ -315,7 +299,7 @@ impl Cpu {
     }
 
     /// Start-up IPI: real mode at `vector << 12` (CS selector `vector << 8`, IP 0).
-    fn start_at(&mut self, vector: u8) {
+    pub(super) fn start_at(&mut self, vector: u8) {
         self.seg[SEG_CS].sel = (vector as u16) << 8;
         self.seg[SEG_CS].base = (vector as u64) << 12;
         self.rip = 0;

@@ -61,6 +61,18 @@ pub enum ConsoleArg {
     Virtio,
 }
 
+/// `--smp MODE`: how the vCPUs of a multi-processor guest run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmpArg {
+    /// One host thread per vCPU, falling back to timesharing where that is not possible
+    Auto,
+    /// Take turns on one host thread, deterministically on the virtual clock
+    Timeshare,
+    /// One host thread per vCPU, or fail
+    Threads,
+}
+
 /// `--disk PATH[,ro]`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskSpec {
@@ -98,9 +110,13 @@ pub struct HardwareArgs {
     /// Guest memory in MiB, 64 to 3072 [default: 2048, 3072 for a fedora install]
     #[arg(long, short = 'm')]
     pub memory: Option<usize>,
-    /// Guest vCPUs, 1 to 64 (they take turns on one host thread) [default: 1]
+    /// Guest vCPUs, 1 to 64 (each runs on its own host thread unless `--smp timeshare`) [default: 1]
     #[arg(long)]
     pub cpus: Option<usize>,
+    /// How the vCPUs run: a host thread each on the host clock (auto, threads) or in turns on one
+    /// thread, deterministically (timeshare) [default: auto]
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub smp: Option<SmpArg>,
     /// Attach a raw disk image as a virtio-blk device; append ",ro" for read-only. Repeat for more
     /// disks: the guest sees them in order (vda, vdb, ...)
     #[arg(long, value_name = "PATH[,ro]")]
@@ -274,6 +290,8 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpus: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub smp: Option<SmpArg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cmdline: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub append: Option<String>,
@@ -367,6 +385,9 @@ impl Settings {
         }
         if hardware.cpus.is_some() {
             self.cpus = hardware.cpus;
+        }
+        if hardware.smp.is_some() {
+            self.smp = hardware.smp;
         }
         if let Some(disable_jit) = hardware.disable_jit {
             self.disable_jit = disable_jit;
@@ -674,6 +695,7 @@ mod tests {
         let settings = Settings {
             memory: Some(4096),
             cpus: Some(4),
+            smp: Some(SmpArg::Timeshare),
             cmdline: Some("console=hvc0".into()),
             append: None,
             no_reboot: true,

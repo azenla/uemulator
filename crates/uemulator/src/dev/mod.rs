@@ -3,6 +3,7 @@ use crate::prelude::*;
 pub(crate) mod acpi_pm;
 pub(crate) mod apic;
 pub(crate) mod guestmem;
+pub(crate) mod handle;
 pub(crate) mod hpet;
 pub(crate) mod ioapic;
 pub(crate) mod iommu;
@@ -22,6 +23,7 @@ use crate::console::ConsoleHandle;
 #[cfg(not(freestanding))]
 use crate::disk::Disk;
 use crate::netdev::NetHandle;
+use crate::sync::Arc;
 use acpi_pm::AcpiPm;
 use apic::{Interrupt, Ipi, Lapic};
 use guestmem::GuestMem;
@@ -210,6 +212,9 @@ pub(crate) struct Devices {
     uart_peer_console: Option<usize>,
     /// Set by the reset ports (i8042, 0x92, 0xCF9); the CPU turns it into `ExitReason::Reset`.
     pub reset_requested: bool,
+    /// The vCPU threads' shared state while the machine runs one thread per vCPU: what the device
+    /// model tells them at every release of the device lock.
+    links: Option<Arc<crate::cpu::vcpus::VcpuLinks>>,
 }
 
 /// Mask of the low `size` bytes of a port value; sizes of 4 or more cover the whole dword.
@@ -311,6 +316,7 @@ impl Devices {
             now_ns: 0,
             uart_peer_console,
             reset_requested: false,
+            links: None,
         }
     }
 
@@ -377,6 +383,53 @@ impl Devices {
 
     pub fn set_current_cpu(&mut self, cpu: usize) {
         self.current_cpu = cpu;
+    }
+
+    pub fn attach_links(&mut self, links: Arc<crate::cpu::vcpus::VcpuLinks>) {
+        self.links = Some(links);
+    }
+
+    pub fn detach_links(&mut self) {
+        self.links = None;
+    }
+
+    /// What vCPU `cpu` would be woken by, as `ATTENTION_*` device bits: an INIT or start-up IPI,
+    /// an NMI, a deliverable interrupt (the CPU still checks IF and the interrupt shadow). The
+    /// PIC's output goes to the bootstrap processor only.
+    fn wake_bits(&self, cpu: usize) -> u32 {
+        use crate::cpu::vcpus::{ATTENTION_IRQ, ATTENTION_NMI, ATTENTION_START};
+        let lapic = &self.lapics[cpu];
+        let mut bits = 0;
+        if lapic.start_signal_pending() {
+            bits |= ATTENTION_START;
+        }
+        if lapic.nmi_pending() {
+            bits |= ATTENTION_NMI;
+        }
+        if lapic.pending_vector().is_some()
+            || (cpu == 0 && lapic.extint_connected() && self.pic.has_pending())
+        {
+            bits |= ATTENTION_IRQ;
+        }
+        bits
+    }
+
+    /// Runs when the device lock is released with real locking on: tells every vCPU's thread what
+    /// is now waiting for it (`cpu/vcpus.rs`), and the device thread that the guest may have
+    /// handed the devices work. The bits are recomputed from scratch each time, so the vCPUs
+    /// never need the lock just to ask.
+    pub fn publish_wake_hints(&mut self) {
+        let Some(links) = self.links.as_ref().map(Arc::as_ptr) else {
+            return;
+        };
+        // `links` outlives this call: only `detach_links` drops it, and that runs after every
+        // vCPU thread has been joined.
+        let links = unsafe { &*links };
+        self.route_line_events();
+        for cpu in 0..self.lapics.len() {
+            links.publish_device_bits(cpu, self.wake_bits(cpu));
+        }
+        links.poke_device_thread();
     }
 
     /// A vCPU's local APIC, for the scheduler's INIT and start-up handling.
@@ -649,8 +702,20 @@ impl Devices {
         self.lapics.iter().any(Lapic::nmi_pending)
     }
 
+    /// With threads, the time a caller sampled before it got the device lock can be older than
+    /// one another vCPU already used under it, and a counter read at the older time would run
+    /// backwards for the guest (Linux watches for that). Time only moves forward here.
+    fn clamp_time(&mut self, now: u64) -> u64 {
+        if self.links.is_none() {
+            return now;
+        }
+        self.now_ns = self.now_ns.max(now);
+        self.now_ns
+    }
+
     /// Reads an x2APIC register MSR; `None` is #GP (not in x2APIC mode, or a reserved register).
     pub fn apic_msr_read(&mut self, msr: u32, now: u64) -> Option<u64> {
+        let now = self.clamp_time(now);
         if !self.lapic().x2apic() {
             return None;
         }
@@ -664,6 +729,7 @@ impl Devices {
 
     /// Writes an x2APIC register MSR; `false` is #GP.
     pub fn apic_msr_write(&mut self, msr: u32, value: u64, now: u64) -> bool {
+        let now = self.clamp_time(now);
         if !self.lapic().x2apic() {
             return false;
         }
@@ -697,7 +763,7 @@ impl Devices {
     }
 
     pub fn set_time(&mut self, now: u64) {
-        self.now_ns = now;
+        self.now_ns = self.clamp_time(now);
     }
 
     /// The devices pulse `Pics::raise` on an interrupt event; a line the guest configured as
@@ -723,6 +789,7 @@ impl Devices {
     /// `mem` collects code pages the devices wrote by DMA; the caller must pass them to
     /// `Cpu::code_written` afterwards (see `GuestMem`).
     pub fn tick(&mut self, now: u64, mem: &mut GuestMem) {
+        let now = self.clamp_time(now);
         self.now_ns = now;
         for lapic in &mut self.lapics {
             lapic.tick(now);
@@ -872,6 +939,7 @@ impl Devices {
     }
 
     pub fn io_in(&mut self, port: u16, size: u8, now: u64) -> u32 {
+        let now = self.clamp_time(now);
         self.now_ns = now;
         self.uart.set_time(now);
         let ones = size_mask(size);
@@ -910,6 +978,7 @@ impl Devices {
 
     /// Port devices are byte-wide: only the low byte of `value` is used except for PCI config.
     pub fn io_out(&mut self, port: u16, size: u8, value: u32, now: u64) {
+        let now = self.clamp_time(now);
         self.now_ns = now;
         self.uart.set_time(now);
         let byte = value as u8;

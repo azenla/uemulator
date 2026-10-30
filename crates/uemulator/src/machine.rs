@@ -9,6 +9,7 @@ use crate::acpi::AcpiConfig;
 use crate::boot::{self, BootState};
 use crate::console::ConsoleHandle;
 use crate::cpu::smp::Smp;
+use crate::cpu::vcpus::ThreadSpawner;
 use crate::cpu::{Cpu, DEFAULT_RANDOM_SEED};
 use crate::dev::host_entropy;
 use crate::dev::kv::SharedKeyValueStore;
@@ -68,6 +69,23 @@ pub enum ClockMode {
     /// stays virtual, and under `verify_jit`.
     #[default]
     Realtime,
+}
+
+/// How the vCPUs of a multi-processor guest are run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SmpMode {
+    /// One host thread per vCPU when the host can do that: the guest then runs in parallel, on
+    /// the host clock (`ClockMode::Realtime`), with `MachineConfig::thread_spawner` or, hosted,
+    /// `std::thread`. Otherwise the vCPUs take turns on one thread, as `Timeshare` does.
+    #[default]
+    Auto,
+    /// Always take turns on the calling thread: a few thousand instructions each, deterministic
+    /// on the virtual clock, and the only mode on a freestanding host that cannot start threads.
+    Timeshare,
+    /// Fail `EmulatedMachine::new` instead of falling back when threads are not possible: the
+    /// clock is not realtime, `verify_jit` is on, or a freestanding host gave no spawner or no
+    /// `host_clock`.
+    Threads,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +161,8 @@ pub struct MachineConfig {
     acpi: bool,
     jit: JitMode,
     clock: ClockMode,
+    smp: SmpMode,
+    thread_spawner: Option<ThreadSpawner>,
     log: Option<LogFn>,
     poll: Option<HostPollFn>,
     host_clock: Option<HostClockFn>,
@@ -176,6 +196,8 @@ impl Default for MachineConfig {
             acpi: true,
             jit: JitMode::Auto,
             clock: ClockMode::Realtime,
+            smp: SmpMode::Auto,
+            thread_spawner: None,
             log: None,
             poll: None,
             host_clock: None,
@@ -310,14 +332,35 @@ impl MachineConfig {
         self
     }
 
-    /// How many vCPUs the guest sees, `MIN_CPUS` to `MAX_CPUS` (default 1). They run in turns on
-    /// the one host thread (a few thousand instructions each, or until one halts or spins), so
-    /// more vCPUs do not make the guest faster in host time, only let it use its SMP code paths;
-    /// guest time advances by the instructions of whichever vCPU runs. Needs ACPI (the MADT is
-    /// how the guest finds the others) and cannot be combined with `verify_jit`, a firmware image
-    /// or `boot_disk`'s BIOS shim.
+    /// How many vCPUs the guest sees, `MIN_CPUS` to `MAX_CPUS` (default 1). Each gets its own host
+    /// thread and the guest runs in parallel when the host allows it (`SmpMode`); otherwise they
+    /// run in turns on the one thread (a few thousand instructions each, or until one halts or
+    /// spins), which does not make the guest faster in host time, only lets it use its SMP code
+    /// paths. Needs ACPI (the MADT is how the guest finds the others) and cannot be combined with
+    /// `verify_jit`, a firmware image or `boot_disk`'s BIOS shim.
     pub fn cpus(mut self, n: usize) -> Self {
         self.cpus = n;
+        self
+    }
+
+    /// Chooses between a host thread per vCPU and taking turns (see `SmpMode`). Only matters with
+    /// more than one vCPU.
+    pub fn smp(mut self, mode: SmpMode) -> Self {
+        self.smp = mode;
+        self
+    }
+
+    /// How the machine starts the threads of a multi-processor guest, for a host that is not
+    /// `std`: `spawn` runs the body it is given on a new thread of the embedder's choosing, and
+    /// the body returns when the guest ends. Hosted builds start `std::thread`s without it; a
+    /// freestanding build (UEFI, WebAssembly) takes turns on one thread unless it gets a spawner
+    /// and a `host_clock`. The spawned threads share the machine's memory and devices, so the host
+    /// needs real parallel threads: WebAssembly needs shared memory and atomics.
+    pub fn thread_spawner(
+        mut self,
+        spawn: impl Fn(Box<dyn FnOnce() + Send + 'static>) + Send + Sync + 'static,
+    ) -> Self {
+        self.thread_spawner = Some(Arc::new(spawn));
         self
     }
 
@@ -456,6 +499,9 @@ struct Vcpu {
     debug: bool,
     jit: JitMode,
     clock: ClockMode,
+    smp: SmpMode,
+    /// Hosted builds fall back to `std::thread` when the embedder gave none.
+    thread_spawner: Option<ThreadSpawner>,
     verify: bool,
     unix_time: Option<u64>,
     random_seed: Option<u64>,
@@ -505,6 +551,18 @@ fn back_with_huge_pages(ram: &mut [u8]) {
     crate::sys::advise_huge_pages(ram);
     #[cfg(not(all(feature = "jit", target_os = "linux")))]
     let _ = ram;
+}
+
+/// `std::thread` where there is one.
+fn default_thread_spawner() -> Option<ThreadSpawner> {
+    #[cfg(not(freestanding))]
+    {
+        Some(crate::cpu::vcpus::std_thread_spawner())
+    }
+    #[cfg(freestanding)]
+    {
+        None
+    }
 }
 
 /// Wall-clock seconds, or 0 where there is no clock (UEFI keeps its own, see `unix_time`).
@@ -674,8 +732,8 @@ fn interpreter_twin(
     devices: DevConfig,
     uart_console: ConsoleHandle,
 ) -> Cpu {
-    let mut twin = Cpu::new(ram, boot, uart_console, stop, None, devices);
-    twin.dev.set_boot_time(boot_unix);
+    let twin = Cpu::new(ram, boot, uart_console, stop, None, devices);
+    twin.dev.lock().set_boot_time(boot_unix);
     twin
 }
 
@@ -735,6 +793,15 @@ impl Vcpu {
         }
     }
 
+    /// Whether a multi-processor guest gets a host thread per vCPU: not under `Timeshare`, not
+    /// without the host clock the threads' TSC needs, and not where nothing can start a thread.
+    fn runs_on_threads(&self, cpu: &Cpu) -> bool {
+        self.smp != SmpMode::Timeshare
+            && !self.verify
+            && cpu.wall_clock.is_some()
+            && self.thread_spawner.is_some()
+    }
+
     /// One power-on to the next exit. Everything the CPU owns is built here, so a reboot starts
     /// from a CPU with no leftover state and from a JIT with an empty code cache: a reused cache
     /// would never see stores to the new CPU's empty `page_has_code` map and could run
@@ -766,7 +833,7 @@ impl Vcpu {
             .map(|(_, _, boot_unix)| *boot_unix)
             .or(self.unix_time);
         if let Some(boot_unix) = boot_unix {
-            cpu.dev.set_boot_time(boot_unix);
+            cpu.dev.lock().set_boot_time(boot_unix);
         }
         if let Some(seed) = self.random_seed {
             cpu.rng_state = seed;
@@ -812,6 +879,28 @@ impl Vcpu {
                 twin.rng_state = cpu.rng_state;
                 cpu.run_verify(&mut twin)
             }
+            _ if cpu.cpu_count > 1 && self.runs_on_threads(&cpu) => {
+                let spawner = self
+                    .thread_spawner
+                    .clone()
+                    .expect("checked by runs_on_threads");
+                let jit_enabled = self.jit != JitMode::Off;
+                let make_jit = || {
+                    if jit_enabled {
+                        crate::jit::Jit::new(true).map(Box::new)
+                    } else {
+                        None
+                    }
+                };
+                let (reason, bootstrap, summary) = crate::cpu::vcpus::run_threaded(
+                    crate::cpu::smp::secondary_cpus(cpu),
+                    &spawner,
+                    &make_jit,
+                );
+                vcpu_summary = summary;
+                cpu = bootstrap;
+                reason
+            }
             _ if cpu.cpu_count > 1 => {
                 let mut smp = Smp::new(cpu);
                 let reason = smp.run();
@@ -830,7 +919,11 @@ impl Vcpu {
         let finished = Finished {
             ram_bytes,
             #[cfg(not(freestanding))]
-            disks: cpu.dev.into_disks(),
+            disks: cpu
+                .dev
+                .into_devices()
+                .map(crate::dev::Devices::into_disks)
+                .unwrap_or_default(),
         };
         (reason, finished)
     }
@@ -879,6 +972,19 @@ impl EmulatedMachine {
                      a BIOS disk boot"
                         .into(),
                 ));
+            }
+            if cfg.smp == SmpMode::Threads {
+                let clock_available =
+                    cfg.host_clock.is_some() || crate::cpu::default_host_clock().is_some();
+                let spawner_available =
+                    cfg.thread_spawner.is_some() || default_thread_spawner().is_some();
+                if cfg.clock != ClockMode::Realtime || !clock_available || !spawner_available {
+                    return Err(Error::BadConfig(
+                        "SmpMode::Threads needs the realtime clock, a host clock and a way to \
+                         start threads (`thread_spawner` on a freestanding host)"
+                            .into(),
+                    ));
+                }
             }
         }
         let mut ram = vec![0u8; cfg.memory_mib << BYTES_PER_MIB_SHIFT];
@@ -1072,6 +1178,8 @@ impl EmulatedMachine {
                 debug: cfg.debug,
                 jit: cfg.jit,
                 clock: cfg.clock,
+                smp: cfg.smp,
+                thread_spawner: cfg.thread_spawner.or_else(default_thread_spawner),
                 verify: cfg.verify,
                 unix_time: cfg.unix_time,
                 random_seed: cfg.random_seed,

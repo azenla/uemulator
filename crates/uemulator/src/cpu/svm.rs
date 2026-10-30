@@ -754,7 +754,7 @@ impl Cpu {
         let Some(guest) = &self.svm.guest else {
             return false;
         };
-        if self.dev.interrupt_pending() && guest.intercept3 & INTERCEPT_INTR != 0 {
+        if self.dev.lock().interrupt_pending() && guest.intercept3 & INTERCEPT_INTR != 0 {
             let next = self.rip;
             self.vmexit(VMEXIT_INTR, 0, 0, next);
             return true;
@@ -1034,14 +1034,21 @@ impl Cpu {
                 }
                 let updated = entry | NPT_ACCESSED | if write { NPT_DIRTY } else { 0 };
                 if updated != entry {
+                    // A nested hypervisor on another vCPU may be changing the entry (clearing
+                    // Dirty for dirty logging, say): update it as hardware does, and walk again
+                    // if it changed under us.
+                    if !self.update_ram_u64(entry_address, entry, updated) {
+                        return self.nested_translate(guest_physical, access, guest_table_walk);
+                    }
                     entry = updated;
-                    self.phys_write(entry_address, 8, entry);
                 }
                 let base = entry & NPT_ADDRESS_MASK & !alignment_mask;
                 return Ok(base | (guest_physical & alignment_mask));
             }
-            if entry & NPT_ACCESSED == 0 {
-                self.phys_write(entry_address, 8, entry | NPT_ACCESSED);
+            if entry & NPT_ACCESSED == 0
+                && !self.update_ram_u64(entry_address, entry, entry | NPT_ACCESSED)
+            {
+                return self.nested_translate(guest_physical, access, guest_table_walk);
             }
             table = entry & NPT_ADDRESS_MASK;
         }

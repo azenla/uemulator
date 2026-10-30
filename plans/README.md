@@ -26,6 +26,7 @@ Index. Read in order; each file ends with open questions where the answer needs 
 | 18-xen-dom0.md | plan for a Xen dom0 on a modern AMD machine |
 | 19-uefi-firmware.md | the UEFI firmware, key-value store, handoff page |
 | 20-jit-perf.md | JIT performance: direct chaining, inline integer ops, SIMD fast paths, measured against the initramfs unpack |
+| 22-smp-threads.md | one host thread per vCPU: shared RAM and devices, the exclusive section, code invalidation across threads, atomics and x86 ordering, the thread-spawn provider |
 | 21-ryzen-7000-parity.md | feature parity with a Ryzen 5 7000-class (Zen 4) part from public documentation: instruction sets, LA57, PKU, CET, SVM extras, PerfMonV2, CPU profile |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. Zero crate dependencies.

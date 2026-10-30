@@ -14,6 +14,7 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 - Firmware / real mode: `uemulator advanced boot-firmware --firmware IMAGE` (image ends at 1 MiB, CPU starts in real mode at F000:FFF0); a bzImage without a 64-bit entry boots in 32-bit protected mode (`plans/15-legacy-modes.md`)
 - Linux KVM check: `hack/kvm/run.sh` loads `kvm_amd` in the emulated guest and runs vCPUs in every CPU mode on the emulator's SVM (needs `unsquashfs`, a musl cross gcc, the Alpine artifacts and network for the modloop); run it after touching `cpu/svm.rs`, paging or the 16/32-bit modes
 - Test: `cargo test --release --workspace` (also `-p uemulator --no-default-features`)
+- SMP: `--cpus N` gives the guest N vCPUs, each on its own host thread when the host has threads and a clock (`--smp auto`, the default); `--smp timeshare` takes turns on one thread, deterministic on the virtual clock (`plans/22-smp-threads.md`). A freestanding embedder gets threads only through `MachineConfig::thread_spawner` and a `host_clock`
 - Before EVERY commit: run `./hack/autofix.sh` (clippy --fix + fmt), then fix by hand every warning it leaves; `cargo clippy --release --all-targets` must print zero warnings. Never commit with warnings.
 
 ## Rules
@@ -28,6 +29,7 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 - `../ext/qemu-uplink` is read-only reference (see `plans/09-qemu-map.md`). Study behavior; write Rust from scratch, don't transliterate.
 - The interpreter is the oracle for the JIT. Any new uop gets an interpreter implementation and a test first.
 - Advertise a CPUID bit only together with the tests for the instructions behind it.
+- With threads (`plans/22-smp-threads.md`) RAM and the devices are shared. Take the device lock through `cpu.dev.lock()` for every device access and never hold it into `Cpu::with_exclusive` (the others may be waiting for it). Guest memory goes through `mem_read`/`mem_write` (acquire/release, atomics), not through slices, whenever another vCPU could be writing it. Anything machine-wide you add to `Cpu` needs a decision twice: `swap_shared` for time-sharing, and shared handle or private copy for threads.
 - Debug-profile is optimized (`opt-level = 3`) because the kernel decompressor is ~1e9 guest instructions.
 
 ## Tests
@@ -36,6 +38,7 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 - `testkit::Harness` runs a snippet on one CPU, interpreter or JIT, with undelivered faults reported as `Stop::Fault`; `testkit::run_machine` boots a fake kernel on a full `EmulatedMachine`.
 - Anything the JIT compiles gets a case that runs `testkit::assert_jit_matches_interpreter`. The interpreter is the oracle.
 - Fixing a bug: write the failing test first.
+- Threaded tests (`testkit::run_threads`, `machine/tests.rs` with `SmpMode::Threads`) are the ones that catch memory-ordering and atomicity bugs, and only on a native aarch64 host (Rosetta runs x86 with hardware TSO). When you change the atomics or the ordering, remove the thing under test and watch the test fail before trusting it.
 - Under Rosetta (`--target x86_64-apple-darwin`) tests that run generated code take turns through `jit::serialize_jit_tests`; Rosetta's translation cache goes stale when one thread frees a code buffer and another maps one at the same address. `testkit::Harness::enable_jit` holds it for you; take it yourself when you use `Jit::new` directly.
 - Real-kernel lockstep check (not a test, needs a kernel you supply): `--verify` on the CLI.
 - Real boot loader check (not a test, needs a disk an installer wrote): `quick boot NAME --realtime` on an installed Alpine machine with `--firmware bios` (new machines are `uefi`); run it after touching `cpu/bios.rs`.

@@ -169,8 +169,10 @@ pub(crate) fn compile_block(
     insns: &[Insn],
     rips: &[u64],
     end_rip: u64,
+    ordered: bool,
 ) -> CompiledBlock {
     let mut generator = Gen::new(addr, addrs, insns);
+    let _ = ordered;
     generator.compile(rips, end_rip);
     CompiledBlock {
         code: generator.a.code,

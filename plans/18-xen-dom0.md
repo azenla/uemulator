@@ -21,7 +21,7 @@ Written by the first session on this work; update the status list as pieces land
 1. ACPI and platform devices. Verified by booting Linux with `acpi_rsdp` (boot_params has the field), no firmware needed: `dmesg` shows ACPI, HPET, `AMD-Vi`.
 2. IOMMU wiring. A guest Linux finds `AMD-Vi`, enables DMA remapping, virtio devices keep working behind it, x2APIC interrupt remapping is on.
 3. CPU model and AVX. Family 19h model, cache/topology leaves, MSRs; AVX checked in a real guest, not only in unit tests.
-4. SMP, cooperative round robin on the one host thread. Done.
+4. SMP, cooperative round robin on the one host thread. Done. (Later also one host thread per vCPU, `plans/22-smp-threads.md`; the round robin stays as the deterministic mode.)
 5. Firmware, key-value store, `quick` support, GRUB.
 6. Xen: boot `xen.efi` or GRUB multiboot2 + Linux dom0, then a PVH domU. Done, see "Step 6" below.
 

@@ -711,20 +711,20 @@ impl Cpu {
             if input {
                 let destination = self.gpr[GPR_RDI] & amask;
                 let to = self.segment_access(SEG_ES, destination, size, true)?;
-                let value = self.dev.io_in(port, size, now);
+                let value = self.dev.lock().io_in(port, size, now);
                 self.write(to, size, value as u64)?;
                 self.write_address_register(GPR_RDI, destination.wrapping_add(step), i);
             } else {
                 let source = self.gpr[GPR_RSI] & amask;
                 let from = self.segment_access(source_segment, source, size, false)?;
                 let value = self.read(from, size)? as u32;
-                self.dev.io_out(port, size, value, now);
+                self.dev.lock().io_out(port, size, value, now);
                 self.write_address_register(GPR_RSI, source.wrapping_add(step), i);
-                if self.dev.reset_requested {
+                if self.dev.lock().reset_requested {
                     self.rip = next;
                     return Err(Exception::Exit(ExitReason::Reset));
                 }
-                if self.dev.shutdown_requested() {
+                if self.dev.lock().shutdown_requested() {
                     self.rip = next;
                     return Err(Exception::Exit(ExitReason::Shutdown));
                 }

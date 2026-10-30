@@ -138,6 +138,10 @@ pub(crate) struct Jit {
     /// Offset of the first block, just past the prologue. `reset` rewinds to here.
     blocks_start: usize,
     stats: JitStats,
+    /// Generate guest loads and stores with x86 ordering (acquire/release), for a vCPU that
+    /// runs beside others on its own thread. Only blocks compiled after it is set have it, so
+    /// set it before the first one.
+    ordered_memory: bool,
 }
 
 /// Translation counters, read by tests to check that the cache is used and invalidated as
@@ -202,7 +206,12 @@ impl Jit {
             pending: HashMap::new(),
             blocks_start,
             stats: JitStats::default(),
+            ordered_memory: false,
         })
+    }
+
+    pub fn set_ordered_memory(&mut self, on: bool) {
+        self.ordered_memory = on;
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -262,7 +271,7 @@ impl Jit {
 
     /// Drops every block and rewinds the bump pointer, keeping the prologue. Only called from
     /// `translate`, so no generated code is running.
-    fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.blocks.clear();
         self.block_map.clear();
         self.page_blocks.clear();
@@ -311,6 +320,10 @@ impl Jit {
         if phys_addr >= ram_len {
             return Err(cpu.page_fault(rip, AccessKind::Exec, cpu.cpl == 3, false, false));
         }
+        // Makes guest stores to this page take the slow path so `code_written` sees them. Before
+        // the bytes are read: with threads, a store by another vCPU is then either already in
+        // them or sees the flag (`Cpu::mark_code`).
+        cpu.mark_code(phys_addr);
         let bytes_left_in_page = (PAGE_SIZE - (phys_addr & PAGE_MASK)) as usize;
         let mut insns: Vec<Insn> = Vec::new();
         // Guest rip of each entry in `insns`.
@@ -366,8 +379,6 @@ impl Jit {
         // and either pushes an instruction, returns, or takes the first-instruction `Truncated`
         // arm, so a block is never empty. An empty one would compile to "jump to `rip`" and spin.
         debug_assert!(!insns.is_empty());
-        // Makes guest stores to this page take the slow path so `code_written` sees them.
-        cpu.mark_code(phys_addr);
         let mut pages = vec![phys_addr >> PAGE_SHIFT];
         if crosses_page {
             let next_page_phys = cpu.translate(
@@ -386,6 +397,7 @@ impl Jit {
             &insns,
             &insn_rips,
             end_rip,
+            self.ordered_memory,
         );
         self.stats.inlined += compiled.inlined as u64;
         self.stats.flag_records_skipped += compiled.flag_records_skipped as u64;
@@ -875,6 +887,7 @@ mod tests {
             &block._insns,
             &rips,
             CODE_BASE + 4,
+            false,
         );
         let written =
             unsafe { std::slice::from_raw_parts(code_addr as *const u8, expected.code.len()) };

@@ -256,15 +256,15 @@ impl Cpu {
     pub fn rdmsr(&mut self, msr: u32) -> ExecResult<u64> {
         Ok(match msr {
             MSR_TSC => self.tsc(),
-            MSR_APIC_BASE => self.dev.lapic().base_msr(),
+            MSR_APIC_BASE => self.dev.lock().lapic().base_msr(),
             apic::X2APIC_MSR_FIRST..=apic::X2APIC_MSR_LAST => {
                 let now = self.now_ns();
-                match self.dev.apic_msr_read(msr, now) {
+                match self.dev.lock().apic_msr_read(msr, now) {
                     Some(value) => value,
                     None => return Err(Exception::general_protection(0)),
                 }
             }
-            apic::MSR_TSC_DEADLINE => self.dev.lapic().tsc_deadline(),
+            apic::MSR_TSC_DEADLINE => self.dev.lock().lapic().tsc_deadline(),
             MSR_PAT => self.pat,
             _ if mtrr::Mtrr::owns(msr) => self.mtrr.read(msr).unwrap_or(0),
             _ if mca::Mca::owns(msr) => self.mca.read(msr).unwrap_or(0),
@@ -317,19 +317,19 @@ impl Cpu {
         }
         match msr {
             MSR_APIC_BASE => {
-                if !self.dev.lapic_mut().set_base_msr(v) {
+                if !self.dev.lock().lapic_mut().set_base_msr(v) {
                     return Err(Exception::general_protection(0));
                 }
             }
             apic::X2APIC_MSR_FIRST..=apic::X2APIC_MSR_LAST => {
                 let now = self.now_ns();
-                if !self.dev.apic_msr_write(msr, v, now) {
+                if !self.dev.lock().apic_msr_write(msr, v, now) {
                     return Err(Exception::general_protection(0));
                 }
             }
             apic::MSR_TSC_DEADLINE => {
                 let now = self.now_ns();
-                self.dev.lapic_mut().set_tsc_deadline(v, now);
+                self.dev.lock().lapic_mut().set_tsc_deadline(v, now);
             }
             MSR_PAT => {
                 if !mtrr::pat_is_valid(v) {
@@ -435,7 +435,7 @@ impl Cpu {
                     2 => self.cr2,
                     3 => self.cr3,
                     4 => self.cr4,
-                    8 => (self.dev.lapic().tpr() >> CR8_TPR_SHIFT) as u64,
+                    8 => (self.dev.lock().lapic().tpr() >> CR8_TPR_SHIFT) as u64,
                     _ => return Err(Exception::invalid_opcode()),
                 };
                 // Outside IA-32e mode the access is 32 bits wide and clears the upper half.
@@ -479,7 +479,10 @@ impl Cpu {
                         if v & !CR8_MASK != 0 {
                             return Err(Exception::general_protection(0));
                         }
-                        self.dev.lapic_mut().set_tpr((v as u8) << CR8_TPR_SHIFT);
+                        self.dev
+                            .lock()
+                            .lapic_mut()
+                            .set_tpr((v as u8) << CR8_TPR_SHIFT);
                     }
                     _ => return Err(Exception::invalid_opcode()),
                 }

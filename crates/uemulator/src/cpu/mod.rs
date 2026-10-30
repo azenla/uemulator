@@ -1,5 +1,6 @@
 #[cfg(freestanding)]
 use crate::prelude::*;
+mod atomic;
 mod avx;
 mod avx_special;
 // Booting a disk needs the host disks, which freestanding builds do not have.
@@ -32,17 +33,20 @@ mod svm;
 mod sys;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub(crate) mod vcpus;
 pub(crate) mod xsave;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, fence};
 
 use crate::sync::Arc;
 
 use crate::boot::BootState;
 use crate::console::ConsoleHandle;
 use crate::dev::guestmem::GuestMem;
+use crate::dev::handle::DevHandle;
 use crate::dev::{DevConfig, Devices};
 use crate::machine::{ExitReason, HostClockFn, LogFn, PollFn};
+use crate::ram::{CodePages, GuestRam};
 
 use decode::Insn;
 use flags::LazyFlagsOp;
@@ -421,6 +425,8 @@ pub(crate) struct Cpu {
     /// MONITOR address and whether a monitor is armed for the next MWAIT.
     pub monitor_address: u64,
     pub monitor_armed: bool,
+    /// The line MONITOR armed and its contents then, with several vCPUs (see `Cpu::monitor`).
+    pub monitor_snapshot: Option<(u64, [u8; MONITOR_WATCH_BYTES])>,
     /// State of the generator behind rdrand/rdseed (splitmix64). Seeded by the machine.
     pub rng_state: u64,
     pub pat: u64,
@@ -465,7 +471,7 @@ pub(crate) struct Cpu {
     pub interrupt_shadow: bool,
     /// Guest physical RAM starting at address 0. It must never be resized or moved after
     /// `Cpu::new`, because `ram_base` and the TLB addends point into it.
-    pub ram: Vec<u8>,
+    pub ram: GuestRam,
     /// Host address of `ram[0]`.
     pub ram_base: u64,
     /// Two halves of `TLB_ENTRIES_PER_MODE` entries, supervisor then user. Fixed size, so its
@@ -479,11 +485,11 @@ pub(crate) struct Cpu {
     /// One byte per guest physical page: nonzero while a cached decode or a JIT block was
     /// built from that page. Stores to such pages take the slow path and call `code_written`.
     /// Devices see it through `GuestMem` for the same purpose.
-    pub page_has_code: Vec<u8>,
+    pub page_has_code: CodePages,
     /// Pages whose `page_has_code` byte is set, so `flush_decode` can clear them without
     /// scanning the whole array. May list pages already cleared by `code_written`.
     pub pages_with_code: Vec<u32>,
-    pub dev: Box<Devices>,
+    pub dev: DevHandle,
     /// Present when the machine boots a disk's boot sector: the BIOS services run as host code
     /// (`bios.rs`).
     #[cfg(not(freestanding))]
@@ -549,11 +555,64 @@ pub(crate) struct Cpu {
     pub code_mark_epoch: u64,
     /// The `code_mark_epoch` this vCPU's TLB is up to date with.
     pub code_mark_seen: u64,
+    /// Guest memory accesses use x86 ordering and atomic page-table updates (`atomic.rs`): set
+    /// when this vCPU runs on its own host thread beside others.
+    pub ordered_memory: bool,
+    /// How the instruction being executed treats its memory destination: see `Rmw`.
+    pub rmw: Rmw,
+    /// Set when this vCPU runs on its own host thread (`vcpus.rs`).
+    pub threads: Option<vcpus::ThreadRuntime>,
+    /// How much of the shared invalidation log this vCPU has applied.
+    pub invalidation_seen: u64,
+    /// `pause`s executed, so a spinning threaded vCPU yields its host core now and then.
+    pub pause_count: u32,
+    /// This vCPU is inside `with_exclusive`; a nested request runs in place.
+    pub in_exclusive: bool,
     /// Large leaves behind the soft TLB (see `LargePage`), replaced round robin from
     /// `large_page_next`. Last in the struct: generated code never reads it, and the fields it
     /// does read must stay within their short load offsets.
     pub large_pages: [LargePage; LARGE_PAGE_CACHE_ENTRIES],
     pub large_page_next: usize,
+}
+
+/// The state of a locked read-modify-write while `Cpu::exec_locked` runs it on a vCPU that shares
+/// memory with others. The instruction's ordinary code loads its destination with `load_operand`
+/// and stores the result with `store_operand`; those two see this state and turn the pair into a
+/// compare-and-swap, so every locked instruction (add, inc, bts, xadd, cmpxchg, xchg, ...) is
+/// atomic without a second implementation of each.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rmw {
+    /// Plain accesses.
+    Off,
+    /// A locked instruction being run with the other vCPUs stopped (`Cpu::with_exclusive`):
+    /// plain accesses, and `exec` must not treat it as locked again.
+    Plain,
+    /// Locked, destination not loaded yet.
+    Armed,
+    /// The destination (`host` is a host address) held `value`; the matching store must still
+    /// find it there.
+    Loaded {
+        host: usize,
+        size: u8,
+        value: u64,
+        page: usize,
+    },
+    /// The operand is split across a page or not naturally aligned: no host atomic covers it, so
+    /// the instruction has to run with the other vCPUs stopped.
+    NeedsExclusive,
+}
+
+/// What `Cpu::build` needs besides the boot state: the machine-wide handles a vCPU shares with the
+/// others, and how many there are.
+struct MachineParts {
+    ram: GuestRam,
+    page_has_code: CodePages,
+    dev: DevHandle,
+    ram_bytes: usize,
+    cpu_count: u32,
+    /// The bootstrap processor builds its own decode cache; a secondary gets one from the
+    /// scheduler (time-sharing) or `give_private_caches` (threads).
+    with_decode_cache: bool,
 }
 
 /// Size of the line MONITOR arms and the unit of the wait-on-store check.
@@ -571,26 +630,38 @@ impl Cpu {
         dev_config: DevConfig,
     ) -> Self {
         let ram_bytes = ram.len();
-        Self::build(ram, ram_bytes, boot, console, stop, log, dev_config)
+        let pages = ram_bytes >> PAGE_SHIFT;
+        let cpu_count = dev_config.cpus.max(1) as u32;
+        let devices = DevHandle::new(Devices::new(console, dev_config));
+        let parts = MachineParts {
+            ram: GuestRam::new(ram),
+            page_has_code: CodePages::new(pages),
+            dev: devices,
+            ram_bytes,
+            cpu_count,
+            with_decode_cache: true,
+        };
+        Self::build(parts, boot, stop, log)
     }
 
-    /// A vCPU that is not the bootstrap processor: waiting for a start-up IPI, with none of the
-    /// machine-wide state (that arrives when the scheduler first switches to it). It copies what
-    /// the machine-wide fields' consumers need from `bsp`, which must still own them.
+    /// A vCPU that is not the bootstrap processor: waiting for a start-up IPI. It shares the
+    /// machine-wide state (RAM, code-page flags, devices) with `bsp`; the decode cache and JIT
+    /// stay empty until the scheduler hands them over (time-sharing) or the vCPU's thread makes
+    /// its own.
     pub fn new_secondary(index: u32, bsp: &Cpu) -> Self {
         let boot = BootState {
             mode: crate::boot::BootMode::Real16,
             ..Default::default()
         };
-        let mut cpu = Self::build(
-            Vec::new(),
-            bsp.ram.len(),
-            boot,
-            ConsoleHandle::default(),
-            bsp.stop.clone(),
-            bsp.log.clone(),
-            DevConfig::default(),
-        );
+        let parts = MachineParts {
+            ram: bsp.ram.clone(),
+            page_has_code: bsp.page_has_code.clone(),
+            dev: bsp.dev.for_cpu(index as usize),
+            ram_bytes: bsp.ram.len(),
+            cpu_count: bsp.cpu_count,
+            with_decode_cache: false,
+        };
+        let mut cpu = Self::build(parts, boot, bsp.stop.clone(), bsp.log.clone());
         cpu.ram_base = bsp.ram_base;
         cpu.cpu_index = index;
         // The local APIC id is the vCPU number, and one thread per core keeps it equal to the
@@ -605,14 +676,19 @@ impl Cpu {
     }
 
     fn build(
-        ram: Vec<u8>,
-        ram_bytes: usize,
+        parts: MachineParts,
         boot: BootState,
-        console: ConsoleHandle,
         stop: Arc<AtomicBool>,
         log: Option<LogFn>,
-        dev_config: DevConfig,
     ) -> Self {
+        let MachineParts {
+            ram,
+            page_has_code,
+            dev,
+            ram_bytes,
+            cpu_count,
+            with_decode_cache,
+        } = parts;
         // Stored-only MSRs; names follow Linux's msr-index.h.
         /// MSR_AMD64_PATCH_LEVEL: the microcode revision. A plausible Genoa value, because Linux
         /// treats 0 as "no microcode information" and invents the lowest known revision.
@@ -648,12 +724,10 @@ impl Cpu {
         const MSR_AMD64_BU_CFG2: u32 = 0xc001_102a;
         const MSR_ZEN4_BP_CFG: u32 = 0xc001_102e;
 
-        let pages = ram.len() >> PAGE_SHIFT;
         // RAM never reaches 4 GiB (the PCI window starts at 3 GiB), so TOP_MEM2 stays zero.
         let top_of_memory = ram_bytes as u64;
-        let cpu_count = dev_config.cpus.max(1) as u32;
-        // A secondary vCPU is built without RAM and gets its decode cache from the scheduler.
-        let has_machine_state = !ram.is_empty();
+        // A secondary vCPU gets its decode cache from the scheduler.
+        let has_machine_state = with_decode_cache;
         let flat = |sel: u16, flags: u32| Seg {
             sel,
             base: 0,
@@ -710,6 +784,7 @@ impl Cpu {
             svm: svm::Svm::new(),
             monitor_address: 0,
             monitor_armed: false,
+            monitor_snapshot: None,
             rng_state: DEFAULT_RANDOM_SEED,
             pat: PAT_POWER_ON_DEFAULT,
             sysenter: [0; 3],
@@ -764,9 +839,9 @@ impl Cpu {
                 Vec::new()
             },
             decode_cache_generation: 1,
-            page_has_code: vec![0; pages],
+            page_has_code,
             pages_with_code: Vec::new(),
-            dev: Box::new(Devices::new(console, dev_config)),
+            dev,
             #[cfg(not(freestanding))]
             bios: None,
             icount: 0,
@@ -788,6 +863,12 @@ impl Cpu {
             tlb_active_base: 0,
             large_pages: [LARGE_PAGE_EMPTY; LARGE_PAGE_CACHE_ENTRIES],
             large_page_next: 0,
+            ordered_memory: false,
+            rmw: Rmw::Off,
+            threads: None,
+            invalidation_seen: 0,
+            pause_count: 0,
+            in_exclusive: false,
             block_exit_requested: false,
             prepaid_icount: 0,
             slow_access_insn: 0,
@@ -871,8 +952,8 @@ impl Cpu {
             poll(false);
         }
         let written_code_pages = {
-            let mut mem = GuestMem::new(&mut self.ram, &self.page_has_code);
-            self.dev.tick(now, &mut mem);
+            let mut mem = GuestMem::new(&mut self.ram, self.page_has_code.as_bytes());
+            self.dev.lock().tick(now, &mut mem);
             mem.code_pages_written
         };
         // DMA by devices bypasses the store path, so tell the code caches about it.
@@ -885,12 +966,18 @@ impl Cpu {
         if self.stop.load(Ordering::Relaxed) {
             return Some(ExitReason::Stopped);
         }
+        if self.threads.is_some() {
+            // The device thread ticks the devices; this vCPU only has to notice the machine
+            // ending, which `thread_attention` does at every block boundary.
+            self.next_event = self.icount + EVENT_INTERVAL;
+            return None;
+        }
         let now = self.now_ns();
         self.tick_devices(now);
-        if self.dev.reset_requested {
+        if self.dev.lock().reset_requested {
             return Some(ExitReason::Reset);
         }
-        if self.dev.shutdown_requested() {
+        if self.dev.lock().shutdown_requested() {
             return Some(ExitReason::Shutdown);
         }
         self.next_event = self.icount + EVENT_INTERVAL;
@@ -901,16 +988,22 @@ impl Cpu {
         if self.eflags & flags::IF == 0 || self.interrupt_shadow {
             return None;
         }
-        self.dev.interrupt_ack()
+        self.dev.lock().interrupt_ack()
     }
 
     /// Takes a pending NMI at this instruction boundary. NMIs ignore IF but not the one-instruction
     /// shadow of `mov ss`, and a second one waits until the handler's `iret` (SDM 6.7.1).
     fn take_pending_nmi(&mut self) -> bool {
-        if self.nmi_blocked || self.interrupt_shadow || !self.dev.nmi_pending() {
+        // A threaded vCPU asks the device lock only when the device model says something is
+        // waiting for it (`vcpus::ATTENTION_NMI`).
+        if self.nmi_blocked
+            || self.interrupt_shadow
+            || (self.threads.is_some() && self.attention() & vcpus::ATTENTION_NMI == 0)
+            || !self.dev.lock().nmi_pending()
+        {
             return false;
         }
-        self.dev.take_nmi();
+        self.dev.lock().take_nmi();
         self.nmi_blocked = true;
         true
     }
@@ -918,6 +1011,14 @@ impl Cpu {
     /// Runs the per-step housekeeping: device/stop polling, interrupt delivery, halt handling.
     /// Interrupts are only taken here, i.e. at instruction (or JIT block) boundaries.
     fn before_step(&mut self) -> BeforeStep {
+        if self.threads.is_some() {
+            if let Some(reason) = self.thread_attention() {
+                return BeforeStep::Exit(reason);
+            }
+            if self.attention() & vcpus::ATTENTION_START != 0 {
+                self.apply_start_signals();
+            }
+        }
         if self.icount >= self.next_event {
             // `pause` pulled the deadline forward only to get here: no device work is due.
             if self.pause_resume_event != 0 {
@@ -927,7 +1028,7 @@ impl Cpu {
             if let Some(reason) = self.service_events() {
                 return BeforeStep::Exit(reason);
             }
-            if self.multi {
+            if self.multi && self.threads.is_none() {
                 return BeforeStep::Yield;
             }
         }
@@ -943,7 +1044,8 @@ impl Cpu {
         if self.eflags & flags::IF != 0
             && self.svm.gif
             && !self.interrupt_shadow
-            && self.dev.interrupt_pending()
+            && (self.threads.is_none() || self.attention() & vcpus::ATTENTION_IRQ != 0)
+            && self.dev.lock().interrupt_pending()
             && let Some(vector) = self.pending_interrupt()
         {
             self.halted = false;
@@ -952,10 +1054,16 @@ impl Cpu {
             }
         }
         if self.halted {
+            if self.threads.is_some() {
+                return match self.wait_for_wake() {
+                    Some(reason) => BeforeStep::Exit(reason),
+                    None => BeforeStep::Idled,
+                };
+            }
             if self.multi {
                 return BeforeStep::Halted;
             }
-            let may_wake = self.eflags & flags::IF != 0 || self.dev.nmi_pending();
+            let may_wake = self.eflags & flags::IF != 0 || self.dev.lock().nmi_pending();
             return match self.idle(may_wake) {
                 Some(reason) => BeforeStep::Exit(reason),
                 None => BeforeStep::Idled,
@@ -983,6 +1091,9 @@ impl Cpu {
             }
             Err(Exception::Exit(reason)) => Some(reason),
             Err(Exception::Vmexit) => None,
+            Err(Exception::AtomicRetry) => Some(ExitReason::Internal(
+                "a locked instruction escaped its retry loop".into(),
+            )),
         }
     }
 
@@ -1210,10 +1321,10 @@ impl Cpu {
         }
         // A reset written just before the `hlt` (`out 0x64, 0xfe; hlt`, with IF=0 as in every
         // kernel's reboot path) must win over the shutdown check below.
-        if self.dev.reset_requested {
+        if self.dev.lock().reset_requested {
             return Some(ExitReason::Reset);
         }
-        if self.dev.shutdown_requested() {
+        if self.dev.lock().shutdown_requested() {
             return Some(ExitReason::Shutdown);
         }
         // `hlt` with IF=0 can only be woken by NMI, SMI, INIT or RESET (SDM vol. 3 sec. 6.8,
@@ -1225,7 +1336,8 @@ impl Cpu {
             return Some(ExitReason::Shutdown);
         }
         let now = self.now_ns();
-        match self.dev.next_deadline(now) {
+        let next_deadline = self.dev.lock().next_deadline(now);
+        match next_deadline {
             Some(deadline) => {
                 if deadline > now {
                     if self.wall_clock.is_some() {
@@ -1239,7 +1351,7 @@ impl Cpu {
             None => {
                 // No timer will ever wake the guest; only host input (console, network) can.
                 self.tick_devices(now);
-                if self.dev.interrupt_pending() || self.dev.nmi_pending() {
+                if self.dev.lock().interrupt_pending() || self.dev.lock().nmi_pending() {
                     return None;
                 }
                 #[cfg(not(freestanding))]
@@ -1250,7 +1362,7 @@ impl Cpu {
                 }
             }
         }
-        if self.dev.reset_requested {
+        if self.dev.lock().reset_requested {
             return Some(ExitReason::Reset);
         }
         None
@@ -1318,7 +1430,7 @@ impl Cpu {
             "halted={} shadow={} dev: {}\n",
             self.halted,
             self.interrupt_shadow,
-            self.dev.state(self.now_ns())
+            self.dev.lock().state(self.now_ns())
         );
         let mut found = 0;
         let mut search_from = 0;
@@ -1583,7 +1695,7 @@ mod cpu_tests {
             assert!(h.cpu.decode_cache.iter().all(|entry| entry.generation == 0));
             assert_eq!(h.cpu.decode_cache_generation, 1);
             assert_eq!(h.cpu.page_has_code.len(), h.cpu.ram.len() >> PAGE_SHIFT);
-            assert!(h.cpu.page_has_code.iter().all(|&flag| flag == 0));
+            assert!(h.cpu.page_has_code.iter().all(|flag| flag == 0));
             assert!(h.cpu.pages_with_code.is_empty());
             assert_eq!(
                 (h.cpu.icount, h.cpu.idle_skipped_ns, h.cpu.next_event),

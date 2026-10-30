@@ -179,9 +179,38 @@ impl Cpu {
 
     fn read_ram_u64(&self, pa: u64) -> Option<u64> {
         let start = pa as usize;
-        self.ram
-            .get(start..start + PTE_BYTES as usize)
-            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+        let bytes = self.ram.get(start..start + PTE_BYTES as usize)?;
+        if self.ordered_memory && start & (PTE_BYTES as usize - 1) == 0 {
+            // Another vCPU may be changing the entry; read it whole, as the hardware walker does.
+            return Some(unsafe { atomic::load(bytes.as_ptr(), PTE_BYTES as u8) });
+        }
+        Some(u64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    /// Sets Accessed/Dirty: replaces the 8-byte entry at `pa` with `updated` if it still holds
+    /// `seen`. Hardware does this with a locked update and walks again when the entry changed
+    /// under it. A plain read-modify-write here would race Linux's atomic PTE updates (a
+    /// copy-on-write `ptep_set_wrprotect`) and write the old writable bit back. `false`: the
+    /// entry changed, walk again.
+    pub(super) fn update_ram_u64(&mut self, pa: u64, seen: u64, updated: u64) -> bool {
+        let start = pa as usize;
+        if self.ordered_memory && start & (PTE_BYTES as usize - 1) == 0 {
+            let host = self.ram[start..][..PTE_BYTES as usize].as_mut_ptr();
+            return unsafe { atomic::update_entry_u64(host, seen, updated) }.is_ok();
+        }
+        self.ram[start..][..PTE_BYTES as usize].copy_from_slice(&updated.to_le_bytes());
+        true
+    }
+
+    /// `update_ram_u64` for the 4-byte entries of 32-bit paging.
+    fn update_ram_u32(&mut self, pa: u64, seen: u32, updated: u32) -> bool {
+        let start = pa as usize;
+        if self.ordered_memory && start & (LEGACY_PTE_BYTES as usize - 1) == 0 {
+            let host = self.ram[start..][..LEGACY_PTE_BYTES as usize].as_mut_ptr();
+            return unsafe { atomic::update_entry_u32(host, seen, updated) }.is_ok();
+        }
+        self.ram[start..][..LEGACY_PTE_BYTES as usize].copy_from_slice(&updated.to_le_bytes());
+        true
     }
 
     pub(crate) fn paging_mode(&self) -> PagingMode {
@@ -198,9 +227,11 @@ impl Cpu {
 
     fn read_ram_u32(&self, pa: u64) -> Option<u64> {
         let start = pa as usize;
-        self.ram
-            .get(start..start + LEGACY_PTE_BYTES as usize)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as u64)
+        let bytes = self.ram.get(start..start + LEGACY_PTE_BYTES as usize)?;
+        if self.ordered_memory && start & (LEGACY_PTE_BYTES as usize - 1) == 0 {
+            return Some(unsafe { atomic::load(bytes.as_ptr(), LEGACY_PTE_BYTES as u8) });
+        }
+        Some(u32::from_le_bytes(bytes.try_into().unwrap()) as u64)
     }
 
     /// Whether a leaf with these accumulated permissions refuses the access. Supervisor writes to
@@ -412,12 +443,13 @@ impl Cpu {
                     updated |= PTE_DIRTY;
                 }
                 if updated != pte {
-                    pte = updated;
                     // Updating Accessed/Dirty is a write to the page table.
                     let pte_address =
                         self.nested_translate(guest_pte_address, AccessKind::Write, true)?;
-                    self.ram[pte_address as usize..][..PTE_BYTES as usize]
-                        .copy_from_slice(&pte.to_le_bytes());
+                    if !self.update_ram_u64(pte_address, pte, updated) {
+                        return self.walk(linear, access, user);
+                    }
+                    pte = updated;
                 }
                 let leaf_shift = PAGE_SHIFT + LEVEL_INDEX_BITS * level;
                 let leaf_offset_mask = (1u64 << leaf_shift) - 1;
@@ -441,11 +473,12 @@ impl Cpu {
                 ));
             }
             if pte & PTE_ACCESSED == 0 {
-                pte |= PTE_ACCESSED;
                 let pte_address =
                     self.nested_translate(guest_pte_address, AccessKind::Write, true)?;
-                self.ram[pte_address as usize..][..PTE_BYTES as usize]
-                    .copy_from_slice(&pte.to_le_bytes());
+                if !self.update_ram_u64(pte_address, pte, pte | PTE_ACCESSED) {
+                    return self.walk(linear, access, user);
+                }
+                pte |= PTE_ACCESSED;
             }
             table = pte & PTE_ADDRESS_MASK;
             level -= 1;
@@ -490,11 +523,12 @@ impl Cpu {
                     updated |= PTE_DIRTY;
                 }
                 if updated != pte {
-                    pte = updated;
                     let pte_address =
                         self.nested_translate(guest_pte_address, AccessKind::Write, true)?;
-                    self.ram[pte_address as usize..][..LEGACY_PTE_BYTES as usize]
-                        .copy_from_slice(&(pte as u32).to_le_bytes());
+                    if !self.update_ram_u32(pte_address, pte as u32, updated as u32) {
+                        return self.walk_legacy(linear, access, user);
+                    }
+                    pte = updated;
                 }
                 let page_offset_in_leaf = if large {
                     linear & ((1u64 << LEGACY_LARGE_PAGE_SHIFT) - 1) & !PAGE_OFFSET_MASK
@@ -517,11 +551,12 @@ impl Cpu {
                 ));
             }
             if pte & PTE_ACCESSED == 0 {
-                pte |= PTE_ACCESSED;
                 let pte_address =
                     self.nested_translate(guest_pte_address, AccessKind::Write, true)?;
-                self.ram[pte_address as usize..][..LEGACY_PTE_BYTES as usize]
-                    .copy_from_slice(&(pte as u32).to_le_bytes());
+                if !self.update_ram_u32(pte_address, pte as u32, (pte | PTE_ACCESSED) as u32) {
+                    return self.walk_legacy(linear, access, user);
+                }
+                pte |= PTE_ACCESSED;
             }
             table = pte & LEGACY_TABLE_MASK;
             level -= 1;
@@ -654,14 +689,17 @@ impl Cpu {
         let start = pa as usize;
         let len = size as usize;
         if let Some(src) = self.ram.get(start..start + len) {
+            if self.ordered_memory {
+                return unsafe { atomic::load(src.as_ptr(), size) };
+            }
             let mut bytes = [0u8; 8];
             bytes[..len].copy_from_slice(src);
             u64::from_le_bytes(bytes)
         } else if let Some(value) = {
             // Device registers with timers (the APIC) need the time of this very access.
             let now = self.now_ns();
-            self.dev.set_time(now);
-            self.dev.mmio_read(pa, size)
+            self.dev.lock().set_time(now);
+            self.dev.lock().mmio_read(pa, size)
         } {
             value
         } else {
@@ -677,16 +715,28 @@ impl Cpu {
         let start = pa as usize;
         let len = size as usize;
         if start + len <= self.ram.len() {
+            if self.ordered_memory {
+                // Store first, then look at the flag: a vCPU that flags the page and decodes it
+                // after our check must see these bytes, and one that flagged it before is seen
+                // here (`Cpu::mark_code` fences the other half).
+                let host = self.ram[start..][..len].as_mut_ptr();
+                unsafe { atomic::store(host, size, val) };
+                fence(Ordering::SeqCst);
+                if self.page_has_code.get(start >> PAGE_SHIFT) != 0 {
+                    self.code_written(start >> PAGE_SHIFT);
+                }
+                return;
+            }
             if self.page_has_code[start >> PAGE_SHIFT] != 0 {
                 self.code_written(start >> PAGE_SHIFT);
             }
             self.ram[start..start + len].copy_from_slice(&val.to_le_bytes()[..len]);
         } else {
             let now = self.now_ns();
-            self.dev.set_time(now);
+            self.dev.lock().set_time(now);
             let written_code_pages = {
-                let mut mem = GuestMem::new(&mut self.ram, &self.page_has_code);
-                if self.dev.mmio_write(pa, size, val, &mut mem) {
+                let mut mem = GuestMem::new(&mut self.ram, self.page_has_code.as_bytes());
+                if self.dev.lock().mmio_write(pa, size, val, &mut mem) {
                     mem.code_pages_written
                 } else {
                     self.log_once(LOG_KEY_UNMAPPED_WRITE + (pa >> PAGE_SHIFT), || {
@@ -710,11 +760,21 @@ impl Cpu {
         if let Some(mut jit) = self.jit.take() {
             jit.invalidate_page(ppn as u64);
             self.jit = Some(jit);
-            self.page_has_code[ppn] = 0;
+            self.page_has_code.set(ppn, 0);
             self.decode_cache_generation = self.decode_cache_generation.wrapping_add(1);
             self.block_exit_requested = true;
         } else {
             self.flush_decode();
+            self.page_has_code.set(ppn, 0);
+        }
+        if let Some(runtime) = &self.threads {
+            // The other vCPUs' translations of this page are stale too; they drop them at their
+            // next block boundary.
+            runtime.links.publish_invalidation(
+                &self.page_has_code,
+                Some(self.cpu_index as usize),
+                ppn,
+            );
         }
     }
 
@@ -725,47 +785,60 @@ impl Cpu {
         // runs 64-bit code), and the page flags are what makes a store to their pages call
         // `code_written`. Clearing them here left stale blocks after every SVM #VMEXIT or VMRUN
         // (both flush): Linux's alternatives patching ran old `jmp` targets under Xen.
-        if self.jit.is_some() {
+        // With threads the flags are shared and other vCPUs' caches depend on them.
+        if self.jit.is_some() || self.threads.is_some() {
             return;
         }
         for page in self.pages_with_code.drain(..) {
-            self.page_has_code[page as usize] = 0;
+            self.page_has_code.set(page as usize, 0);
         }
     }
 
     /// Flags the physical page as holding translated code and revokes write tags pointing at
-    /// it, so the next store to it goes through `phys_write` and `code_written`.
+    /// it, so the next store to it goes through `phys_write` and `code_written`. Callers read
+    /// the guest bytes only after this returns (with threads, a store by another vCPU is then
+    /// either already in those bytes or sees the flag).
     pub fn mark_code(&mut self, pa: u64) {
         let page = (pa >> PAGE_SHIFT) as usize;
-        if page < self.page_has_code.len() && self.page_has_code[page] == 0 {
-            self.page_has_code[page] = 1;
-            // `code_written` clears a page's flag without un-listing it, so a page that is
-            // rewritten and retranslated over and over would grow the list without bound.
-            if self.pages_with_code.len() >= self.page_has_code.len() {
-                let flags = &self.page_has_code;
-                self.pages_with_code
-                    .retain(|&listed| flags[listed as usize] != 0);
-                self.pages_with_code.sort_unstable();
-                self.pages_with_code.dedup();
-            }
-            self.pages_with_code.push(page as u32);
-            // The other vCPUs' TLBs are revoked when they next run (`Smp::switch_to`); this one
-            // is done below.
-            self.code_mark_epoch += 1;
-            self.code_mark_seen = self.code_mark_epoch;
-            let ram_base = self.ram_base;
-            for entry in self.tlb.iter_mut() {
-                // tag + addend is the page's host address, minus ram_base its physical address.
-                if entry.tag_w != TLB_TAG_INVALID
-                    && (entry
-                        .tag_w
-                        .wrapping_add(entry.addend)
-                        .wrapping_sub(ram_base)
-                        >> PAGE_SHIFT) as usize
-                        == page
-                {
-                    entry.tag_w = TLB_TAG_INVALID;
-                }
+        if page >= self.page_has_code.len() || self.page_has_code.get(page) != 0 {
+            return;
+        }
+        if self.threads.is_some() {
+            self.with_exclusive(|cpu| cpu.flag_code_page_for_all(page));
+            return;
+        }
+        self.page_has_code.set(page, 1);
+        // `code_written` clears a page's flag without un-listing it, so a page that is
+        // rewritten and retranslated over and over would grow the list without bound.
+        if self.pages_with_code.len() >= self.page_has_code.len() {
+            let flags = &self.page_has_code;
+            self.pages_with_code
+                .retain(|&listed| flags.get(listed as usize) != 0);
+            self.pages_with_code.sort_unstable();
+            self.pages_with_code.dedup();
+        }
+        self.pages_with_code.push(page as u32);
+        // The other vCPUs' TLBs are revoked when they next run (`Smp::switch_to`); this one
+        // is done below.
+        self.code_mark_epoch += 1;
+        self.code_mark_seen = self.code_mark_epoch;
+        self.revoke_write_tags_for(page);
+    }
+
+    /// Drops this vCPU's write tags that point into physical page `page`.
+    pub(super) fn revoke_write_tags_for(&mut self, page: usize) {
+        let ram_base = self.ram_base;
+        for entry in self.tlb.iter_mut() {
+            // tag + addend is the page's host address, minus ram_base its physical address.
+            if entry.tag_w != TLB_TAG_INVALID
+                && (entry
+                    .tag_w
+                    .wrapping_add(entry.addend)
+                    .wrapping_sub(ram_base)
+                    >> PAGE_SHIFT) as usize
+                    == page
+            {
+                entry.tag_w = TLB_TAG_INVALID;
             }
         }
     }
@@ -780,6 +853,9 @@ impl Cpu {
             && (linear & PAGE_OFFSET_MASK) + size as u64 <= PAGE_SIZE
         {
             let host = linear.wrapping_add(entry.addend);
+            if self.ordered_memory {
+                return Ok(unsafe { atomic::load(host as *const u8, size) });
+            }
             unsafe {
                 return Ok(match size {
                     1 => *(host as *const u8) as u64,
@@ -815,6 +891,10 @@ impl Cpu {
             && (linear & PAGE_OFFSET_MASK) + size as u64 <= PAGE_SIZE
         {
             let host = linear.wrapping_add(entry.addend);
+            if self.ordered_memory {
+                unsafe { atomic::store(host as *mut u8, size, val) };
+                return Ok(());
+            }
             unsafe {
                 match size {
                     1 => *(host as *mut u8) = val as u8,
@@ -916,10 +996,12 @@ impl Cpu {
         let start = pa as usize;
         let mut buf = [0u8; MAX_INSN_LEN];
         // Executing from MMIO or unmapped space is reported as a not-present fetch fault.
-        let Some(src) = self.ram.get(start..start + len) else {
+        if start + len > self.ram.len() {
             return Err(self.page_fault(rip, AccessKind::Exec, self.cpl == USER_CPL, false, false));
-        };
-        buf[..len].copy_from_slice(src);
+        }
+        // Flag the page before reading it: see `mark_code`.
+        self.mark_code(pa);
+        buf[..len].copy_from_slice(&self.ram[start..start + len]);
         match decode::decode_in_mode(&buf[..len], mode) {
             Ok(insn) => {
                 self.decode_cache[slot] = DecodeCacheEntry {
@@ -927,7 +1009,6 @@ impl Cpu {
                     generation: self.decode_cache_generation,
                     insn,
                 };
-                self.mark_code(pa);
                 self.fetched_within_limit(insn)
             }
             Err(DecodeErr::Invalid) => Err(Exception::invalid_opcode()),
@@ -946,16 +1027,13 @@ impl Cpu {
                 )?;
                 let missing = MAX_INSN_LEN - len;
                 let next_start = next_page_pa as usize;
-                let Some(next_src) = self.ram.get(next_start..next_start + missing) else {
+                if next_start + missing > self.ram.len() {
                     return Err(Exception::invalid_opcode());
-                };
-                buf[len..MAX_INSN_LEN].copy_from_slice(next_src);
+                }
+                self.mark_code(next_page_pa);
+                buf[len..MAX_INSN_LEN].copy_from_slice(&self.ram[next_start..next_start + missing]);
                 match decode::decode_in_mode(&buf[..MAX_INSN_LEN], mode) {
-                    Ok(insn) => {
-                        self.mark_code(pa);
-                        self.mark_code(next_page_pa);
-                        self.fetched_within_limit(insn)
-                    }
+                    Ok(insn) => self.fetched_within_limit(insn),
                     Err(DecodeErr::Truncated) => Err(Exception::general_protection(0)),
                     Err(DecodeErr::Invalid) => Err(Exception::invalid_opcode()),
                 }
@@ -2575,6 +2653,39 @@ mod tests {
         }
 
         #[test]
+        fn ordered_memory_accesses_touch_exactly_their_own_bytes_at_every_offset() {
+            // A vCPU on its own thread reads and writes through `atomic::load`/`store`. A
+            // straddling access reaches them in pieces of 1 to 7 bytes, and widening one to a
+            // host atomic width would clobber (or return) its neighbours.
+            for size in [1u8, 2, 4, 8] {
+                for offset in (PAGE - 8)..PAGE {
+                    let mut h = two_pages();
+                    h.cpu.ordered_memory = true;
+                    h.write(PA, &[0xee; 16]);
+                    h.write(PA + PAGE - 16, &[0xee; 16]);
+                    h.write(PA_NEXT, &[0xdd; 16]);
+                    let value = PATTERN & mask(size);
+                    h.cpu.write(VA + offset, size, value).unwrap();
+                    for index in 0..size as u64 {
+                        assert_eq!(
+                            h.read(physical_of(offset, index), 1)[0],
+                            (value >> (8 * index)) as u8,
+                            "size {size} offset {offset:#x} byte {index}"
+                        );
+                    }
+                    let spill = (offset + size as u64).saturating_sub(PAGE);
+                    assert!(
+                        h.read(PA_NEXT + spill, 8).iter().all(|&byte| byte == 0xdd),
+                        "size {size} offset {offset:#x} wrote past its end"
+                    );
+                    assert_eq!(h.cpu.read(VA + offset, size).unwrap(), value);
+                    h.cpu.flush_tlb();
+                    assert_eq!(h.cpu.read(VA + offset, size).unwrap(), value);
+                }
+            }
+        }
+
+        #[test]
         fn read_of_sizes_one_to_eight_returns_zero_extended_values() {
             let mut h = two_pages();
             h.write(PA, &[0xff; 16]);
@@ -2957,7 +3068,7 @@ mod tests {
             h.cpu.mark_code(2 << PAGE_SHIFT);
             h.cpu.mark_code((pages as u64 - 1) << PAGE_SHIFT);
             h.cpu.flush_decode();
-            assert!(h.cpu.page_has_code.iter().all(|&flag| flag == 0));
+            assert!(h.cpu.page_has_code.iter().all(|flag| flag == 0));
         }
 
         #[test]

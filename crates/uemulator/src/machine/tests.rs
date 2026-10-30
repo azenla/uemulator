@@ -2657,6 +2657,24 @@ mod cpus {
         }
     }
 
+    fn on_threads(config: MachineConfig) -> MachineConfig {
+        config.clock(ClockMode::Realtime).smp(SmpMode::Threads)
+    }
+
+    #[test]
+    fn a_second_cpu_started_by_the_first_runs_on_its_own_thread() {
+        for jit in auto_and_off() {
+            let run = run_machine(
+                fake_bzimage(&start_the_second_cpu()),
+                jit,
+                GENEROUS_LIMIT,
+                |config| on_threads(config.cpus(2)),
+            );
+            assert_eq!(run.text(), "ok", "{:?}", run.exit);
+            assert_eq!(run.exit, ExitReason::Reset);
+        }
+    }
+
     #[test]
     fn the_same_kernel_waits_forever_for_a_cpu_that_does_not_exist() {
         // With one CPU the INIT/SIPI go nowhere, so the note never appears.
@@ -2668,6 +2686,95 @@ mod cpus {
         );
         assert_eq!(run.text(), "");
         assert_eq!(run.exit, ExitReason::Stopped);
+    }
+
+    #[test]
+    fn a_reboot_joins_every_thread_and_brings_every_cpu_back_to_power_on() {
+        // The same, with a thread per vCPU: the guest resets, every thread must end, and the
+        // next boot builds new ones.
+        let reboots = Arc::new(AtomicUsize::new(0));
+        let counter = reboots.clone();
+        let run = run_machine(
+            fake_bzimage(&start_the_second_cpu()),
+            JitMode::Off,
+            Duration::from_secs(1),
+            |config| {
+                on_threads(config.cpus(2).reboot(true)).log(move |line| {
+                    if line.contains("rebooting") {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            },
+        );
+        assert!(
+            run.text().starts_with("okok"),
+            "{:?} {:?}",
+            run.text(),
+            run.exit
+        );
+        assert!(reboots.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn the_embedders_thread_spawner_starts_one_thread_per_vcpu() {
+        // The provider a freestanding host supplies is what starts the vCPU threads; hosted
+        // builds accept one too.
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let counter = spawned.clone();
+        let run = run_machine(
+            fake_bzimage(&start_the_second_cpu()),
+            JitMode::Off,
+            GENEROUS_LIMIT,
+            |config| {
+                on_threads(config.cpus(2)).thread_spawner(move |body| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    std::thread::spawn(body);
+                })
+            },
+        );
+        assert_eq!(run.text(), "ok", "{:?}", run.exit);
+        assert_eq!(spawned.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_threaded_machine_stops_when_asked_even_with_every_vcpu_spinning() {
+        // jmp $ on the bootstrap processor; the second CPU stays parked.
+        for jit in auto_and_off() {
+            let run = run_machine(
+                fake_bzimage(&[0xeb, 0xfe]),
+                jit,
+                Duration::from_millis(300),
+                |config| on_threads(config.cpus(3)),
+            );
+            assert_eq!(run.exit, ExitReason::Stopped);
+        }
+    }
+
+    #[test]
+    fn a_threaded_machine_ends_when_every_cpu_halts_with_interrupts_off() {
+        let run = run_machine(
+            fake_bzimage(&[0xfa, 0xf4]),
+            JitMode::Off,
+            GENEROUS_LIMIT,
+            |config| on_threads(config.cpus(4)),
+        );
+        assert_eq!(run.exit, ExitReason::Shutdown);
+    }
+
+    #[test]
+    fn threads_need_the_realtime_clock_and_the_other_modes_do_not() {
+        let virtual_clock = |config: MachineConfig| config.cpus(2).clock(ClockMode::Virtual);
+        let base = || {
+            MachineConfig::new()
+                .kernel(fake_bzimage(&[0xf4]))
+                .memory_mib(MIN_MEMORY_MIB)
+        };
+        expect_config_error(EmulatedMachine::new(
+            virtual_clock(base()).smp(SmpMode::Threads),
+        ));
+        for mode in [SmpMode::Auto, SmpMode::Timeshare] {
+            assert!(EmulatedMachine::new(virtual_clock(base()).smp(mode)).is_ok());
+        }
     }
 
     #[test]

@@ -409,6 +409,10 @@ pub(crate) struct Gen<'a> {
     skip_flag_record: bool,
     /// Flag records left out, for `JitStats`.
     pub flag_records_skipped: u32,
+    /// Guest loads are acquires and stores are releases, and only naturally aligned accesses stay
+    /// inline: x86 is TSO, and plain aarch64 loads and stores are not, which breaks a guest spin
+    /// lock (a plain store releases it) once another vCPU runs on another host core.
+    pub ordered_memory: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -429,6 +433,7 @@ impl<'a> Gen<'a> {
             flag_record_needed: flag_record_needed(insns),
             skip_flag_record: false,
             flag_records_skipped: 0,
+            ordered_memory: false,
         }
     }
 
@@ -659,6 +664,12 @@ impl<'a> Gen<'a> {
         }
         self.asm.eor(page, tag, page, true);
         self.asm.cbnz(page, slow, true);
+        if self.ordered_memory && size > 1 {
+            // `ldar` and `stlr` fault on a misaligned address, so such an access takes the slow
+            // path, where the interpreter's accessor copes with it.
+            self.and_constant(page, ADDRESS, size as u64 - 1);
+            self.asm.cbnz(page, slow, true);
+        }
     }
 
     /// Loads `size` bytes at `ADDRESS` into `dst` (zero- or sign-extended to 64 bits). The slow
@@ -686,7 +697,20 @@ impl<'a> Gen<'a> {
         self.tlb_probe(size, TLB_TAG_READ_OFFSET, entry);
         // addend = host page - guest page, so the host address is ADDRESS + addend.
         self.asm.ldr(SCRATCH_B, SCRATCH_A, TLB_ADDEND_OFFSET);
-        self.asm.ldr_r(dst, ADDRESS, SCRATCH_B, size, signed);
+        if self.ordered_memory {
+            self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
+            self.asm.ldar(dst, SCRATCH_B, size);
+            if signed {
+                match size {
+                    1 => self.asm.sxtb(dst, dst, true),
+                    2 => self.asm.sxth(dst, dst, true),
+                    4 => self.asm.sxtw(dst, dst),
+                    _ => {}
+                }
+            }
+        } else {
+            self.asm.ldr_r(dst, ADDRESS, SCRATCH_B, size, signed);
+        }
         self.asm.bind(resume);
         self.slow_paths.push(SlowPath {
             entry,
@@ -737,7 +761,12 @@ impl<'a> Gen<'a> {
         let resume = self.asm.label();
         self.tlb_probe(size, TLB_TAG_WRITE_OFFSET, entry);
         self.asm.ldr(SCRATCH_B, SCRATCH_A, TLB_ADDEND_OFFSET);
-        self.asm.str_r(VALUE, ADDRESS, SCRATCH_B, size);
+        if self.ordered_memory {
+            self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
+            self.asm.stlr(VALUE, SCRATCH_B, size);
+        } else {
+            self.asm.str_r(VALUE, ADDRESS, SCRATCH_B, size);
+        }
         self.asm.bind(resume);
         self.slow_paths.push(SlowPath {
             entry,

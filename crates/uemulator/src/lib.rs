@@ -27,6 +27,7 @@ mod netdev;
 mod platform;
 #[cfg(freestanding)]
 mod prelude;
+mod ram;
 mod sync;
 #[cfg(feature = "jit")]
 mod sys;
@@ -41,7 +42,8 @@ pub use disk::{BlockBackend, Disk};
 pub use kv::FileKeyValueStore;
 pub use kv::{KeyValueError, KeyValueStore, MemoryKeyValueStore};
 pub use machine::{
-    ClockMode, ConsoleKind, EmulatedMachine, Error, ExitReason, JitMode, MachineConfig, StopHandle,
+    ClockMode, ConsoleKind, EmulatedMachine, Error, ExitReason, JitMode, MachineConfig, SmpMode,
+    StopHandle,
 };
 pub use netdev::NetHandle;
 pub use platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE, Platform, load_linux};

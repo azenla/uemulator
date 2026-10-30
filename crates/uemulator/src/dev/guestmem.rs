@@ -2,6 +2,7 @@ use super::iommu::{Access, Iommu, PhysRead, PhysWrite};
 #[cfg(freestanding)]
 use crate::prelude::*;
 use core::cell::RefCell;
+use core::sync::atomic::{Ordering, fence};
 
 /// Guest page size in bytes is 1 << PAGE_SHIFT; must match `Cpu::page_has_code` indexing.
 const PAGE_SHIFT: u32 = 12;
@@ -50,6 +51,9 @@ fn read_slice(ram: &[u8], phys_addr: u64, buf: &mut [u8]) -> bool {
     {
         Some(src) => {
             buf.copy_from_slice(src);
+            // A guest vCPU on another thread published what was just read (a virtqueue index)
+            // with a release store; reads after this one must not be satisfied earlier.
+            fence(Ordering::Acquire);
             true
         }
         None => false,
@@ -212,6 +216,13 @@ impl<'a> GuestMem<'a> {
         if end > self.ram.len() || data.is_empty() {
             return end <= self.ram.len();
         }
+        self.ram[start..end].copy_from_slice(data);
+        // Store first, then look at the flags: a vCPU that flags a page and decodes it after
+        // this check sees the new bytes, and one that flagged it before is seen here (the other
+        // half is the fence in `Cpu::flag_code_page_for_all`). The same fence orders this write
+        // before the next one, which is how a device publishes a used-ring entry and then its
+        // index to a guest on another thread.
+        fence(Ordering::SeqCst);
         // A write can span pages; `end - 1` is the last byte written, not one past it.
         for page in (start >> PAGE_SHIFT)..=((end - 1) >> PAGE_SHIFT) {
             if self.code.get(page).is_some_and(|&flag| flag != 0)
@@ -220,7 +231,6 @@ impl<'a> GuestMem<'a> {
                 self.code_pages_written.push(page);
             }
         }
-        self.ram[start..end].copy_from_slice(data);
         true
     }
 

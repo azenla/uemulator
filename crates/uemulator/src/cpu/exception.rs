@@ -67,6 +67,10 @@ pub(crate) enum Exception {
     /// An SVM #VMEXIT already switched the CPU back to the host: the instruction that raised it is
     /// fully accounted for and nothing is delivered.
     Vmexit,
+    /// A locked read-modify-write lost its compare-and-swap to another vCPU, or its operand needs
+    /// the other vCPUs stopped. `Cpu::exec` catches it, puts the registers back and runs the
+    /// instruction again; it never reaches the run loop.
+    AtomicRetry,
 }
 
 impl Exception {
@@ -171,6 +175,7 @@ impl Cpu {
                 Err(Exception::Exit(reason)) => return Some(reason),
                 // a nested-paging fault while delivering switched to the host already; the event
                 // being delivered is reported to the hypervisor so it can inject it again
+                Err(Exception::AtomicRetry) => unreachable!("exec retries locked instructions"),
                 Err(Exception::Vmexit) => {
                     let kind = if software {
                         super::svm::EVENT_TYPE_SOFTWARE

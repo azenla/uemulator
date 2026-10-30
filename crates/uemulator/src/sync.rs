@@ -5,6 +5,15 @@
 #[cfg(not(freestanding))]
 pub(crate) use std::sync::{Arc, Condvar, Mutex};
 
+/// Lets another thread run while this one waits for a lock. A freestanding host has no scheduler
+/// to offer the slice to, so it only tells the CPU it is spinning.
+pub(crate) fn yield_now() {
+    #[cfg(not(freestanding))]
+    std::thread::yield_now();
+    #[cfg(freestanding)]
+    core::hint::spin_loop();
+}
+
 #[cfg(freestanding)]
 pub(crate) use alloc::sync::Arc;
 #[cfg(freestanding)]

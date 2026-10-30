@@ -620,6 +620,30 @@ impl Asm {
         self.ldst_reg(base, rt, rn, rm);
     }
 
+    /// Load-acquire of `size` bytes from `[rn]`, zero-extended: `ldarb`/`ldarh`/`ldar`. The
+    /// address must be naturally aligned, or the access faults. Any size other than 1, 2 or 4
+    /// loads 8.
+    pub fn ldar(&mut self, rt: u32, rn: u32, size: u8) {
+        let base = match size {
+            1 => 0x08df_fc00,
+            2 => 0x48df_fc00,
+            4 => 0x88df_fc00,
+            _ => 0xc8df_fc00,
+        };
+        self.emit(base | rn << RN_SHIFT | rt);
+    }
+
+    /// Store-release of the low `size` bytes of `rt` to `[rn]`; the counterpart of `ldar`.
+    pub fn stlr(&mut self, rt: u32, rn: u32, size: u8) {
+        let base = match size {
+            1 => 0x089f_fc00,
+            2 => 0x489f_fc00,
+            4 => 0x889f_fc00,
+            _ => 0xc89f_fc00,
+        };
+        self.emit(base | rn << RN_SHIFT | rt);
+    }
+
     /// 64-bit `stp`/`ldp`. `imm` is a byte offset, a multiple of 8 in -512..=504.
     fn pair_imm7(imm: i32) -> u32 {
         ((imm / PAIR_OFFSET_SCALE) as u32 & IMM7_MASK) << IMM7_SHIFT
@@ -2511,6 +2535,44 @@ const BITMASK_CASES: &[(u64, bool, Option<u32>)] = &[
             ),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn acquire_loads_and_release_stores_move_the_selected_width() {
+        let mut buffer = [0xffu8; 16];
+        let base = buffer.as_mut_ptr() as u64;
+        for (size, written) in [(1u8, 1usize), (2, 2), (4, 4), (8, 8)] {
+            buffer.fill(0xff);
+            run(
+                |a| {
+                    a.mov_imm(2, 0x1122_3344_5566_7788);
+                    a.stlr(2, 0, size);
+                },
+                base,
+                0,
+            );
+            assert_eq!(
+                buffer[..written],
+                0x1122_3344_5566_7788u64.to_le_bytes()[..written]
+            );
+            assert!(
+                buffer[written..].iter().all(|&byte| byte == 0xff),
+                "size {size}"
+            );
+        }
+        buffer[..8].copy_from_slice(&0x8877_6655_4433_2211u64.to_le_bytes());
+        for (size, expected) in [
+            (1u8, 0x11u64),
+            (2, 0x2211),
+            (4, 0x4433_2211),
+            (8, 0x8877_6655_4433_2211),
+        ] {
+            assert_eq!(
+                run(|a| a.ldar(0, 0, size), base, 0),
+                expected,
+                "size {size}"
+            );
+        }
     }
 
     #[test]

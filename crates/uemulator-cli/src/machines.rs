@@ -566,6 +566,9 @@ pub fn describe(machine: &Machine) -> String {
     if let Some(cpus) = settings.cpus {
         out.push_str(&format!("  cpus      {cpus}\n"));
     }
+    if let Some(smp) = settings.smp {
+        out.push_str(&format!("  smp       {smp:?}\n").to_lowercase());
+    }
     let boot = match machine.boot_from {
         BootSource::Auto => "auto (the disk once an install is on it, else the installer)",
         BootSource::Installer => "installer",

@@ -267,6 +267,7 @@ impl Harness {
                 Err(Exception::Exit(reason)) => return Stop::Exit(format!("{reason:?}")),
                 // an SVM #VMEXIT switched back to the host; execution simply continues there
                 Err(Exception::Vmexit) => {}
+                Err(Exception::AtomicRetry) => unreachable!("exec retries locked instructions"),
             }
         }
         Stop::Limit
@@ -391,12 +392,12 @@ pub(crate) fn assert_jit_matches_interpreter(code: &[u8], setup: impl Fn(&mut Ha
         result.interpreter.snapshot(),
         "state differs (jit vs interpreter)"
     );
-    if jit.cpu.ram != result.interpreter.cpu.ram {
+    if jit.cpu.ram[..] != result.interpreter.cpu.ram[..] {
         let offset = jit
             .cpu
             .ram
             .iter()
-            .zip(&result.interpreter.cpu.ram)
+            .zip(result.interpreter.cpu.ram.iter())
             .position(|(a, b)| a != b)
             .unwrap();
         panic!("RAM differs first at {offset:#x} (jit vs interpreter)");
@@ -540,6 +541,92 @@ pub(crate) fn run_smp(code: &[u8], cpus: usize, jit: bool, setup: impl FnOnce(&m
     watchdog.join().unwrap();
     SmpRun {
         smp,
+        exit,
+        _jit_turn: jit_turn,
+    }
+}
+
+/// A finished run with one host thread per vCPU: the bootstrap processor (inspect RAM through
+/// it; the others share it), a line per vCPU, and why the machine ended.
+pub(crate) struct ThreadRun {
+    pub bsp: Cpu,
+    pub summary: String,
+    pub exit: ExitReason,
+    /// Declared last, like `SmpRun::_jit_turn`.
+    _jit_turn: Option<crate::jit::JitTestGuard>,
+}
+
+impl ThreadRun {
+    pub fn read(&self, addr: u64, len: usize) -> Vec<u8> {
+        self.bsp.ram[addr as usize..addr as usize + len].to_vec()
+    }
+
+    pub fn read_u16(&self, addr: u64) -> u16 {
+        u16::from_le_bytes(self.read(addr, 2).try_into().unwrap())
+    }
+
+    pub fn read_u32(&self, addr: u64) -> u32 {
+        u32::from_le_bytes(self.read(addr, 4).try_into().unwrap())
+    }
+}
+
+/// `run_smp` with a host thread per vCPU (`vcpus::run_threaded`) on the host clock.
+pub(crate) fn run_threads(
+    code: &[u8],
+    cpus: usize,
+    jit: bool,
+    setup: impl FnOnce(&mut Cpu),
+) -> ThreadRun {
+    let mut ram = vec![0u8; HARNESS_RAM_BYTES];
+    let state: BootState =
+        boot::load(&mut ram, &fake_bzimage(code), None, "").expect("fake kernel must load");
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut cpu = Cpu::new(
+        ram,
+        state,
+        ConsoleHandle::default(),
+        stop.clone(),
+        None,
+        DevConfig {
+            cpus,
+            ..Default::default()
+        },
+    );
+    cpu.gpr[RSP] = STACK_TOP;
+    cpu.wall_clock = Some(crate::cpu::WallClock::new(crate::cpu::std_host_clock()));
+    let jit_turn = jit.then(crate::jit::serialize_jit_tests);
+    if jit {
+        cpu.jit = crate::jit::Jit::new(true).map(Box::new);
+    }
+    setup(&mut cpu);
+    let finished = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let finished = finished.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + SMP_WATCHDOG;
+            while std::time::Instant::now() < deadline {
+                if finished.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let make_jit = || {
+        jit.then(|| crate::jit::Jit::new(true).map(Box::new))
+            .flatten()
+    };
+    let (exit, bsp, summary) = crate::cpu::vcpus::run_threaded(
+        crate::cpu::smp::secondary_cpus(cpu),
+        &crate::cpu::vcpus::std_thread_spawner(),
+        &make_jit,
+    );
+    finished.store(true, std::sync::atomic::Ordering::Relaxed);
+    watchdog.join().unwrap();
+    ThreadRun {
+        bsp,
+        summary,
         exit,
         _jit_turn: jit_turn,
     }

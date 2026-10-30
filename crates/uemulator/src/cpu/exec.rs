@@ -122,6 +122,9 @@ fn sign_extend(value: u64, bits: u32) -> i64 {
     ((value << shift) as i64) >> shift
 }
 
+/// `log_once` key base of `check_locked_instruction_was_atomic`; the opcode is added.
+const LOG_KEY_LOCKED_NOT_ATOMIC: u64 = 1 << 58;
+
 /// The flag state `Cpu::save_flags` captures: `eflags` plus the deferred-arithmetic fields.
 #[derive(Clone, Copy)]
 struct FlagsSnapshot {
@@ -281,6 +284,9 @@ impl Cpu {
         if address & (OPERAND_ALIGNMENT - 1) != 0 {
             return Err(Exception::general_protection(0));
         }
+        if self.rmw == Rmw::Armed {
+            return self.locked_cmpxchg16b(address, next);
+        }
         let current = self.read128(address)?;
         let expected = ((self.gpr[GPR_RDX] as u128) << 64) | self.gpr[GPR_RAX] as u128;
         let f = self.eflags_full();
@@ -293,6 +299,41 @@ impl Cpu {
             self.gpr[GPR_RAX] = current as u64;
             self.gpr[GPR_RDX] = (current >> 64) as u64;
             self.set_eflags_arith(f & !ZF);
+        }
+        self.rip = next;
+        Ok(())
+    }
+
+    /// `cmpxchg16b` with a LOCK prefix on a vCPU that shares memory: one 16-byte host atomic.
+    fn locked_cmpxchg16b(&mut self, address: u64, next: u64) -> ExecResult<()> {
+        const OPERAND_BYTES: u64 = 16;
+        let physical = self.translate(address, mem::AccessKind::Write, false)?;
+        let host = unsafe { self.ram.base().add(physical as usize) };
+        if physical + OPERAND_BYTES > self.ram.len() as u64 || host as usize & 15 != 0 {
+            self.rmw = Rmw::NeedsExclusive;
+            return Err(Exception::AtomicRetry);
+        }
+        let expected = ((self.gpr[GPR_RDX] as u128) << 64) | self.gpr[GPR_RAX] as u128;
+        let replacement = ((self.gpr[GPR_RCX] as u128) << 64) | self.gpr[GPR_RBX] as u128;
+        let Some(outcome) = (unsafe { atomic::compare_exchange_u128(host, expected, replacement) })
+        else {
+            self.rmw = Rmw::NeedsExclusive;
+            return Err(Exception::AtomicRetry);
+        };
+        let f = self.eflags_full();
+        match outcome {
+            Ok(()) => {
+                let page = (physical >> PAGE_SHIFT) as usize;
+                if self.page_has_code.get(page) != 0 {
+                    self.code_written(page);
+                }
+                self.set_eflags_arith(f | ZF);
+            }
+            Err(found) => {
+                self.gpr[GPR_RAX] = found as u64;
+                self.gpr[GPR_RDX] = (found >> 64) as u64;
+                self.set_eflags_arith(f & !ZF);
+            }
         }
         self.rip = next;
         Ok(())
@@ -370,6 +411,9 @@ impl Cpu {
         match loc {
             Loc::Reg(r) => Ok(self.read_gpr(r, size, i.rex_present)),
             Loc::Mem(a) => {
+                if self.rmw == Rmw::Armed {
+                    return self.locked_load(a, size);
+                }
                 self.check_operand_extent(size, false)?;
                 self.read(a, size)
             }
@@ -383,10 +427,133 @@ impl Cpu {
                 Ok(())
             }
             Loc::Mem(a) => {
+                if let Rmw::Loaded {
+                    host,
+                    size: loaded_size,
+                    value,
+                    page,
+                } = self.rmw
+                    && loaded_size == size
+                {
+                    return self.locked_store(host, size, value, page, v);
+                }
                 self.check_operand_extent(size, true)?;
                 self.write(a, size, v)
             }
         }
+    }
+
+    /// Whether `exec` has to run this instruction as an atomic read-modify-write: it carries a
+    /// LOCK prefix, or it is `xchg` with a memory operand, which is locked implicitly (SDM
+    /// vol. 2, XCHG).
+    fn is_locked(i: &Insn) -> bool {
+        i.lock || (matches!(i.op, 0x86 | 0x87) && i.md != 3)
+    }
+
+    /// The load half of a locked instruction: translates for writing (a locked access faults as a
+    /// write even when it would not change anything), then reads the operand atomically and
+    /// remembers where and what, for `locked_store`.
+    fn locked_load(&mut self, linear: u64, size: u8) -> ExecResult<u64> {
+        self.check_operand_extent(size, true)?;
+        if (linear & PAGE_OFFSET_MASK) + size as u64 > PAGE_SIZE {
+            self.rmw = Rmw::NeedsExclusive;
+            return Err(Exception::AtomicRetry);
+        }
+        let physical = self.translate(linear, mem::AccessKind::Write, false)?;
+        let end = physical as usize + size as usize;
+        if end > self.ram.len() {
+            // Device memory: there is nothing to make atomic, and the device lock serializes it.
+            self.rmw = Rmw::Off;
+            return self.read(linear, size);
+        }
+        let host = unsafe { self.ram.base().add(physical as usize) };
+        if !atomic::is_atomic_operand(host, size) {
+            self.rmw = Rmw::NeedsExclusive;
+            return Err(Exception::AtomicRetry);
+        }
+        let value = unsafe { atomic::load(host, size) };
+        self.rmw = Rmw::Loaded {
+            host: host as usize,
+            size,
+            value,
+            page: (physical >> PAGE_SHIFT) as usize,
+        };
+        Ok(value)
+    }
+
+    /// The store half: replaces the operand only if it still holds what `locked_load` saw. When
+    /// another vCPU got there first the instruction is run again from its start.
+    fn locked_store(
+        &mut self,
+        host: usize,
+        size: u8,
+        expected: u64,
+        page: usize,
+        new: u64,
+    ) -> ExecResult<()> {
+        self.rmw = Rmw::Off;
+        if unsafe { atomic::compare_exchange(host as *mut u8, size, expected, new) }.is_err() {
+            return Err(Exception::AtomicRetry);
+        }
+        // The compare-and-swap bypasses the store path that notices writes to code pages.
+        if self.page_has_code.get(page) != 0 {
+            self.code_written(page);
+        }
+        Ok(())
+    }
+
+    /// Runs a locked instruction to completion however many times other vCPUs make it start
+    /// over. Registers and flags are restored before each attempt because the instruction
+    /// updates some of them (xadd's source register, the arithmetic flags) before its store.
+    fn exec_locked(&mut self, i: &Insn) -> ExecResult<()> {
+        let registers = self.gpr;
+        let flags = self.save_flags();
+        loop {
+            self.rmw = Rmw::Armed;
+            let result = self.exec(i);
+            let state = core::mem::replace(&mut self.rmw, Rmw::Off);
+            if !matches!(result, Err(Exception::AtomicRetry)) {
+                if result.is_ok() {
+                    self.check_locked_instruction_was_atomic(i, state);
+                }
+                return result;
+            }
+            self.gpr = registers;
+            self.restore_flags(&flags);
+            if state == Rmw::NeedsExclusive {
+                // Split locks and misaligned operands: no host atomic exists, so stop everyone
+                // else and do it with plain accesses. `Plain` keeps `exec` from taking this
+                // path again from inside the section, which would wait for itself.
+                return self.with_exclusive(|cpu| {
+                    cpu.rmw = Rmw::Plain;
+                    let result = cpu.exec(i);
+                    cpu.rmw = Rmw::Off;
+                    result
+                });
+            }
+        }
+    }
+
+    /// A locked instruction with a memory operand that finished with its read-modify-write still
+    /// pending bypassed `load_operand`/`store_operand`, so it was not atomic: some form that
+    /// reads or writes its destination another way. Reported rather than silently racy.
+    fn check_locked_instruction_was_atomic(&mut self, i: &Insn, state: Rmw) {
+        let bypassed = match state {
+            Rmw::Armed => i.md != 3,
+            Rmw::Loaded { .. } => true,
+            _ => false,
+        };
+        if !bypassed {
+            return;
+        }
+        debug_assert!(
+            false,
+            "locked op {:#x} did not go through the atomic path",
+            i.op
+        );
+        self.log_once(LOG_KEY_LOCKED_NOT_ATOMIC + i.op as u64, || {
+            format!("locked instruction {:#x} is not atomic here", i.op)
+        });
     }
 
     fn save_flags(&self) -> FlagsSnapshot {
@@ -413,14 +580,18 @@ impl Cpu {
     ) -> ExecResult<()> {
         let result = self.store_operand(loc, size, i, v);
         if result.is_err() {
-            self.eflags = saved.eflags;
-            self.lazy_op = saved.lazy_op;
-            self.lazy_size = saved.lazy_size;
-            self.lazy_dst = saved.lazy_dst;
-            self.lazy_src = saved.lazy_src;
-            self.lazy_src2 = saved.lazy_src2;
+            self.restore_flags(&saved);
         }
         result
+    }
+
+    fn restore_flags(&mut self, saved: &FlagsSnapshot) {
+        self.eflags = saved.eflags;
+        self.lazy_op = saved.lazy_op;
+        self.lazy_size = saved.lazy_size;
+        self.lazy_dst = saved.lazy_dst;
+        self.lazy_src = saved.lazy_src;
+        self.lazy_src2 = saved.lazy_src2;
     }
 
     /// GPR_RSP is only updated after the store succeeds so a fault leaves it unchanged.
@@ -1135,6 +1306,9 @@ impl Cpu {
     /// pushed return address is right. Opcodes are `Insn::op`: one-byte opcodes as is, `0f xx` as
     /// `0x1xx`.
     pub fn exec(&mut self, i: &Insn) -> ExecResult<()> {
+        if self.ordered_memory && self.rmw == Rmw::Off && Self::is_locked(i) {
+            return self.exec_locked(i);
+        }
         let next = self.rip.wrapping_add(i.len as u64);
         let osz = i.opsize;
         let op = i.op;
@@ -1341,6 +1515,8 @@ impl Cpu {
                     let b = self.read_gpr(r, osz, true);
                     self.write_gpr(0, osz, true, b);
                     self.write_gpr(r, osz, true, a);
+                } else if i.rep != 0 && self.threads.is_some() {
+                    self.pause_threaded();
                 } else if i.rep != 0 && self.multi {
                     self.request_yield();
                 }
@@ -1748,19 +1924,19 @@ impl Cpu {
         }
         let now = self.now_ns();
         if op & 2 == 0 {
-            let v = self.dev.io_in(port, size, now);
+            let v = self.dev.lock().io_in(port, size, now);
             self.write_gpr(0, size, true, v as u64);
         } else {
             let v = self.read_gpr(0, size, true) as u32;
-            self.dev.io_out(port, size, v, now);
+            self.dev.lock().io_out(port, size, v, now);
             // A device asked for a machine reset; RIP is advanced first so the exit state is
             // after the out.
-            if self.dev.reset_requested {
+            if self.dev.lock().reset_requested {
                 self.rip = next;
                 return Err(Exception::Exit(ExitReason::Reset));
             }
             // The ACPI sleep register: S5 is the only state the DSDT offers and nothing wakes it.
-            if self.dev.shutdown_requested() {
+            if self.dev.lock().shutdown_requested() {
                 self.rip = next;
                 return Err(Exception::Exit(ExitReason::Shutdown));
             }
@@ -1883,7 +2059,10 @@ impl Cpu {
                     return Err(e);
                 }
             }
-            0x1a2 => self.cpuid(),
+            0x1a2 => {
+                self.cpuid();
+                self.serialize();
+            }
             // bt / bts / btr / btc r/m, r
             0x1a3 => self.bit_op(i, next, BIT_TEST, false)?,
             0x1ab => self.bit_op(i, next, BIT_SET, false)?,
@@ -2006,12 +2185,12 @@ impl Cpu {
                 if osz == 8 {
                     return self.cmpxchg16b(a, next);
                 }
-                let current = self.read(a, 8)?;
+                let current = self.load_operand(Loc::Mem(a), 8, i)?;
                 let expected = combine_dwords(self.gpr[GPR_RAX], self.gpr[GPR_RDX]);
                 let f = self.eflags_full();
                 if current == expected {
                     let replacement = combine_dwords(self.gpr[GPR_RBX], self.gpr[GPR_RCX]);
-                    self.write(a, 8, replacement)?;
+                    self.store_operand(Loc::Mem(a), 8, i, replacement)?;
                     self.set_eflags_arith(f | ZF);
                 } else {
                     self.set_edx_eax(current);

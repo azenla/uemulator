@@ -350,18 +350,18 @@ impl Cpu {
 
     fn port_write(&mut self, port: u16, value: u32) {
         let now = self.now_ns();
-        self.dev.io_out(port, 1, value, now);
+        self.dev.lock().io_out(port, 1, value, now);
     }
 
     fn port_read(&mut self, port: u16) -> u32 {
         let now = self.now_ns();
-        self.dev.io_in(port, 1, now)
+        self.dev.lock().io_in(port, 1, now)
     }
 
     /// Builds the interrupt vector table, the stubs, the BIOS data area and the timer, as a BIOS
     /// leaves them when it hands over to the boot loader. Needs the devices to exist.
     pub(crate) fn bios_install(&mut self) {
-        let drives = self.dev.disk_count();
+        let drives = self.dev.lock().disk_count();
         let ram_top = self.ram.len() as u64;
         self.bios = Some(Box::new(Bios {
             keys: VecDeque::new(),
@@ -469,6 +469,7 @@ impl Cpu {
         let mut sector = [0u8; SECTOR_BYTES];
         let loaded = self
             .dev
+            .lock()
             .disk_backend(0)
             .is_some_and(|disk| disk.read_at(0, &mut sector).is_ok());
         if !loaded || sector[SECTOR_BYTES - 2..] != BOOT_SIGNATURE {
@@ -570,6 +571,7 @@ impl Cpu {
         let mut sector = [0u8; SECTOR_BYTES];
         let loaded = self
             .dev
+            .lock()
             .disk_backend(0)
             .is_some_and(|disk| disk.read_at(0, &mut sector).is_ok());
         if !loaded || sector[SECTOR_BYTES - 2..] != BOOT_SIGNATURE {
@@ -811,7 +813,7 @@ impl Cpu {
 
     /// (cylinders, heads, sectors per track) of disk `index` as the CHS calls see it.
     fn disk_geometry(&mut self, index: usize) -> Option<(u64, u64, u64)> {
-        let sectors = self.dev.disk_backend(index)?.len() / SECTOR_BYTES as u64;
+        let sectors = self.dev.lock().disk_backend(index)?.len() / SECTOR_BYTES as u64;
         let cylinders = sectors / (GEOMETRY_HEADS * GEOMETRY_SECTORS);
         Some((cylinders, GEOMETRY_HEADS, GEOMETRY_SECTORS))
     }
@@ -843,31 +845,37 @@ impl Cpu {
             },
             false => None,
         };
-        let Some(disk) = self.dev.disk_backend(index) else {
-            return STATUS_BAD_COMMAND;
-        };
-        let Some((start, end)) = range.filter(|(_, end)| *end <= disk.len()) else {
-            return STATUS_SECTOR_NOT_FOUND;
-        };
-        match outgoing {
-            Some(data) if disk.read_only() => {
-                let _ = data;
-                STATUS_WRITE_PROTECTED
-            }
-            Some(data) => match disk.write_at(start, &data) {
-                Ok(()) => STATUS_OK,
-                Err(_) => STATUS_WRITE_FAULT,
-            },
-            None => {
-                let mut buffer = vec![0u8; (end - start) as usize];
-                if disk.read_at(start, &mut buffer).is_err() {
-                    return STATUS_CONTROLLER_FAILURE;
+        let buffer = {
+            let mut devices = self.dev.lock();
+            let Some(disk) = devices.disk_backend(index) else {
+                return STATUS_BAD_COMMAND;
+            };
+            let Some((start, end)) = range.filter(|(_, end)| *end <= disk.len()) else {
+                return STATUS_SECTOR_NOT_FOUND;
+            };
+            match outgoing {
+                Some(data) if disk.read_only() => {
+                    let _ = data;
+                    return STATUS_WRITE_PROTECTED;
                 }
-                match self.store(linear, &buffer) {
-                    true => STATUS_OK,
-                    false => STATUS_BAD_COMMAND,
+                Some(data) => {
+                    return match disk.write_at(start, &data) {
+                        Ok(()) => STATUS_OK,
+                        Err(_) => STATUS_WRITE_FAULT,
+                    };
+                }
+                None => {
+                    let mut buffer = vec![0u8; (end - start) as usize];
+                    if disk.read_at(start, &mut buffer).is_err() {
+                        return STATUS_CONTROLLER_FAILURE;
+                    }
+                    buffer
                 }
             }
+        };
+        match self.store(linear, &buffer) {
+            true => STATUS_OK,
+            false => STATUS_BAD_COMMAND,
         }
     }
 
@@ -920,8 +928,8 @@ impl Cpu {
             }
             // Disk type: a fixed disk of CX:DX sectors.
             0x15 => {
-                let sectors =
-                    self.dev.disk_backend(index).map_or(0, |d| d.len()) / SECTOR_BYTES as u64;
+                let sectors = self.dev.lock().disk_backend(index).map_or(0, |d| d.len())
+                    / SECTOR_BYTES as u64;
                 self.set_reg16(RCX, (sectors >> 16) as u16);
                 self.set_reg16(RDX, sectors as u16);
                 self.succeed();
@@ -980,7 +988,8 @@ impl Cpu {
         if size < EDD_PARAMETERS_BYTES {
             return self.fail(STATUS_BAD_COMMAND);
         }
-        let sectors = self.dev.disk_backend(index).map_or(0, |d| d.len()) / SECTOR_BYTES as u64;
+        let sectors =
+            self.dev.lock().disk_backend(index).map_or(0, |d| d.len()) / SECTOR_BYTES as u64;
         let cylinders = (sectors / (GEOMETRY_HEADS * GEOMETRY_SECTORS)).min(EDD_MAX_CYLINDERS);
         let mut block = [0u8; EDD_PARAMETERS_BYTES];
         block[0..2].copy_from_slice(&(EDD_PARAMETERS_BYTES as u16).to_le_bytes());
