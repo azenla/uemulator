@@ -4,6 +4,9 @@
 //! Argument order and count are hard-coded in the call sequences of `emit.rs` (`helper`,
 //! `emit_slows`) and `emit_x64.rs`: changing a signature here means updating those.
 
+#[cfg(freestanding)]
+use crate::prelude::*;
+
 use crate::cpu::Cpu;
 use crate::cpu::decode::Insn;
 
@@ -186,8 +189,11 @@ pub(crate) extern "C" fn helper_store(
 
 // x86-64 variants: at most four arguments (Win64 passes more on the stack) and no 16-byte
 // struct return (Win64 returns it through a hidden pointer). The JIT stores `cpu.rip` itself.
-/// `out` points at the 8-byte result slot in the block's stack frame (`OUT` in `emit_x64.rs`).
-#[cfg(target_arch = "x86_64")]
+// The WebAssembly backend uses them too: a wasm function returns one value, so the load result
+// comes back through memory there as well.
+/// `out` points at the 8-byte result slot in the block's stack frame (`OUT` in `emit_x64.rs`), or
+/// at the slot the wasm JIT keeps for it (`wasm::SharedJit::out`).
+#[cfg(any(target_arch = "x86_64", target_arch = "wasm32"))]
 pub(crate) extern "C" fn helper_load_via_out(
     cpu: &mut Cpu,
     linear_addr: u64,
@@ -207,7 +213,7 @@ pub(crate) extern "C" fn helper_load_via_out(
 }
 
 /// Stack flavor of `helper_load_via_out`; see `helper_load_stack`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "wasm32"))]
 pub(crate) extern "C" fn helper_load_stack_via_out(
     cpu: &mut Cpu,
     linear_addr: u64,
@@ -226,7 +232,7 @@ pub(crate) extern "C" fn helper_load_stack_via_out(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "wasm32"))]
 pub(crate) extern "C" fn helper_store_stack_x64(
     cpu: &mut Cpu,
     linear_addr: u64,
@@ -242,7 +248,7 @@ pub(crate) extern "C" fn helper_store_stack_x64(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "wasm32"))]
 pub(crate) extern "C" fn helper_store_x64(
     cpu: &mut Cpu,
     linear_addr: u64,
@@ -703,7 +709,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "wasm32"))]
     mod x86_64_memory_helpers {
         use super::*;
 

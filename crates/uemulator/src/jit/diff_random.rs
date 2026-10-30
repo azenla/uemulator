@@ -1243,7 +1243,14 @@ fn generated_programs_end_in_hlt_and_stay_short_enough_for_one_snippet() {
     }
 }
 
-#[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(
+    feature = "jit",
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )
+))]
 #[test]
 fn random_programs_exercise_the_inline_paths_not_only_the_helper() {
     let mut inlined = 0;

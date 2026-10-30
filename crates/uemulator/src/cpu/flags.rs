@@ -45,7 +45,14 @@ pub(crate) enum LazyFlagsOp {
     /// (`Cpu::shift_rotate`) and `imul` (`Cpu::imul_truncated`) leave, which the interpreter
     /// materializes eagerly: only the JIT produces this op.
     #[cfg_attr(
-        not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))),
+        not(all(
+            feature = "jit",
+            any(
+                target_arch = "aarch64",
+                target_arch = "x86_64",
+                target_arch = "wasm32"
+            )
+        )),
         allow(dead_code)
     )]
     SzpCfOf,

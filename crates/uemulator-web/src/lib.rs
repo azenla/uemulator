@@ -51,6 +51,9 @@ unsafe extern "C" {
     fn host_log(ptr: *const u8, len: usize);
 }
 
+// `host_jit_compile` and `host_jit_release` are imported by the library (`jit/wasm.rs`), from the
+// same `host` module: see `www/jit_host.js`.
+
 thread_local! {
     static MACHINE: RefCell<Option<EmulatedMachine>> = const { RefCell::new(None) };
     /// A copy of the machine's stop handle. `uw_run` takes the machine out of `MACHINE` and the
@@ -91,7 +94,8 @@ unsafe fn take_buffer(ptr: *mut u8, len: usize) -> Vec<u8> {
 }
 
 /// Builds the machine and loads the kernel. Returns 0, or 1 with the message in `uw_error_*`.
-/// `initrd_len == 0` means no initramfs, `cmdline_len == 0` the library's default command line.
+/// `initrd_len == 0` means no initramfs, `cmdline_len == 0` the library's default command line,
+/// `jit == 0` the interpreter only.
 /// Takes ownership of all three buffers either way.
 ///
 /// # Safety
@@ -108,6 +112,7 @@ pub unsafe extern "C" fn uw_create(
     unix_time: f64,
     cols: u16,
     rows: u16,
+    jit: i32,
 ) -> i32 {
     let kernel = unsafe { take_buffer(kernel, kernel_len) };
     let initrd = unsafe { take_buffer(initrd, initrd_len) };
@@ -116,8 +121,13 @@ pub unsafe extern "C" fn uw_create(
     let mut config = MachineConfig::new()
         .kernel(kernel)
         .memory_mib(memory_mib as usize)
-        // There is no JIT for WebAssembly.
-        .jit(JitMode::Off)
+        // Blocks are compiled to WebAssembly modules the page instantiates; without the page's
+        // `host_jit_*` imports working, `Auto` falls back to the interpreter.
+        .jit(if jit != 0 {
+            JitMode::Auto
+        } else {
+            JitMode::Off
+        })
         // Guest time follows the page's clock. A virtual clock jumps over every idle wait and
         // otherwise crawls at one nanosecond per interpreted instruction.
         .clock(ClockMode::Realtime)

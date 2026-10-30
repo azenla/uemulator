@@ -1,8 +1,11 @@
-//! Host JIT. `native` (translate, block cache, `Cpu::step_block`) and `helpers` are shared by both
-//! backends; `arch` is the per-host glue (prologue, helper addresses, block compiler) and
-//! `emit*`/`a64`/`x64` are the code generators and assemblers. Hosts or builds without the backend
-//! use `stub`, so `Cpu` can hold an `Option<Jit>` unconditionally and the interpreter runs alone.
-//! See `plans/06-jit.md`.
+//! Host JIT. `native` (translate, block cache, `Cpu::step_block`) and `helpers` are shared by the
+//! aarch64 and x86-64 backends; `arch` is the per-host glue (prologue, helper addresses, block
+//! compiler) and `emit*`/`a64`/`x64` are the code generators and assemblers. `wasm` is the
+//! WebAssembly backend: its own single-threaded code cache (`wasm`), generator (`emit_wasm`) and
+//! encoder (`wasm_encode`), with the host (`www/jit_host.js`) instantiating the modules. `blocks`
+//! (how a block is read from RAM and keyed) and `helpers` serve all of them. Hosts or builds
+//! without a backend use `stub`, so `Cpu` can hold an `Option<Jit>` unconditionally and the
+//! interpreter runs alone. See `plans/06-jit.md`.
 
 #[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) mod a64;
@@ -20,18 +23,58 @@ mod emit_x64;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod x64;
 
-#[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(feature = "jit", target_arch = "wasm32"))]
+mod emit_wasm;
+#[cfg(all(feature = "jit", target_arch = "wasm32"))]
+mod wasm;
+#[cfg(any(all(feature = "jit", target_arch = "wasm32"), test))]
+mod wasm_encode;
+
+#[cfg(all(
+    feature = "jit",
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )
+))]
+mod blocks;
+#[cfg(all(
+    feature = "jit",
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )
+))]
 mod helpers;
 #[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod native;
 
 #[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub(crate) use native::Jit;
+/// The counters tests read to see what the cache did (`Jit::stats`).
+#[cfg(all(
+    test,
+    feature = "jit",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+pub(crate) use native::JitStats;
+#[cfg(all(feature = "jit", target_arch = "wasm32"))]
+pub(crate) use wasm::Jit;
+#[cfg(all(test, feature = "jit", target_arch = "wasm32"))]
+pub(crate) use wasm::JitStats;
 
 /// Whether a writable+executable mapping can be created and run on this host.
 #[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub(crate) fn probe() -> bool {
     crate::sys::jit_probe()
+}
+
+/// Whether the host can turn a generated module into a function (see `wasm::probe`).
+#[cfg(all(feature = "jit", target_arch = "wasm32"))]
+pub(crate) fn probe() -> bool {
+    wasm::probe()
 }
 
 /// Held by tests while generated code runs. Rosetta (macOS x86_64 on Apple Silicon) keeps a
@@ -112,7 +155,14 @@ mod diff_smc;
 #[cfg(test)]
 mod diff_tests;
 
-#[cfg(not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))))]
+#[cfg(not(all(
+    feature = "jit",
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )
+)))]
 mod stub {
     use crate::cpu::Cpu;
     use crate::cpu::exception::Exception;
@@ -167,10 +217,24 @@ mod stub {
     }
 }
 
-#[cfg(not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))))]
+#[cfg(not(all(
+    feature = "jit",
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )
+)))]
 pub(crate) use stub::Jit;
 
-#[cfg(not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))))]
+#[cfg(not(all(
+    feature = "jit",
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )
+)))]
 pub(crate) fn probe() -> bool {
     false
 }

@@ -3,9 +3,13 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::arch;
+use super::blocks::{
+    BlockKey, Decoded, JUMP_CACHE_BITS, NO_SECOND_PAGE, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE,
+    SLOT_BLOCK_BITS, SLOT_BLOCK_MASK, STRADDLER_TAG, decode_block, jump_cache_hash,
+};
 use super::helpers;
 use crate::cpu::Cpu;
-use crate::cpu::decode::{self, DecodeErr, Insn};
+use crate::cpu::decode::Insn;
 use crate::cpu::exception::Exception;
 use crate::cpu::mem::AccessKind;
 use crate::ram::CodePages;
@@ -27,40 +31,12 @@ const BLOCK_ALIGN: usize = 16;
 /// The prologue is padded to a multiple of this before the first block (64 is a common cache
 /// line size; the exact reason is not documented).
 const HEADER_ALIGN: usize = 64;
-/// Longest block, in guest instructions.
-const MAX_INSNS: usize = 48;
-const MAX_INSN_LEN: usize = 15;
-const PAGE_SHIFT: u32 = 12;
-const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
-const PAGE_MASK: u64 = PAGE_SIZE - 1;
-
-const JUMP_CACHE_BITS: usize = 16;
 
 /// Most blocks one code buffer can hold, which is what sizes the validity table. The smallest
 /// block is a few dozen bytes, so a full buffer (`CODE_SIZE`) holds fewer than this.
 const MAX_BLOCKS: usize = 1 << 24;
 
-/// Set in the `phys_addr` of a jump cache slot that holds a straddling block, so the chain stub
-/// (which compares it with the exact physical address and validates only the first page) never
-/// takes it. `Jit::lookup_straddler` does, after checking the second page. Physical addresses are
-/// far below it.
-const STRADDLER_TAG: u64 = 1 << 63;
-/// A straddling slot keeps the physical page number of the second page above the block index in
-/// `JumpEntry::block`.
-const SLOT_BLOCK_BITS: u32 = 24;
-const SLOT_BLOCK_MASK: u64 = (1 << SLOT_BLOCK_BITS) - 1;
 const _: () = assert!(MAX_BLOCKS as u64 <= 1 << SLOT_BLOCK_BITS);
-
-/// The second-page part of a block's key when its instructions all lie in the first page.
-const NO_SECOND_PAGE: u64 = u64::MAX;
-
-/// What identifies a translated block: the physical address of its first instruction, and for a
-/// block that is one instruction straddling a page boundary the physical page it continues in.
-/// There is deliberately no virtual address: blocks are position independent (`PAGE_BASE` in
-/// `emit.rs`), so every mapping of the same physical code, in any address space, runs the one
-/// translation. The straddling case needs the second page because its bytes come from another
-/// mapping, which a different address space may point elsewhere.
-type BlockKey = (u64, u64);
 
 /// One slot of the direct-mapped jump cache. `#[repr(C)]` with a power-of-two size because the
 /// chain stub in `arch_*.rs` indexes the table and reads `rip`, `phys_addr` and `code_addr` at
@@ -246,25 +222,6 @@ thread_local! {
 
 pub(crate) const fn jump_cache_mask() -> u64 {
     (1 << JUMP_CACHE_BITS) - 1
-}
-
-fn jump_cache_hash(rip: u64) -> usize {
-    ((rip ^ (rip >> JUMP_CACHE_BITS)) as usize) & ((1 << JUMP_CACHE_BITS) - 1)
-}
-
-/// The guest instructions of one block, decoded and not yet compiled.
-struct Decoded {
-    insns: Vec<Insn>,
-    /// Offset in the block's page of each entry in `insns`: the code works in offsets from the
-    /// page start, never in guest addresses.
-    insn_rips: Vec<u64>,
-    /// Offset after the last instruction (past the page end for one that straddles it).
-    end_rip: u64,
-    crosses_page: bool,
-    /// Physical page the block's one straddling instruction continues in, else `NO_SECOND_PAGE`.
-    second_page: u64,
-    /// Physical page numbers the bytes came from.
-    pages: Vec<u64>,
 }
 
 /// What `Jit::install` found.
@@ -787,84 +744,6 @@ impl Jit {
     }
 }
 
-/// Reads the instructions of one block from guest RAM. Takes no lock.
-fn decode_block(cpu: &mut Cpu, rip: u64, phys_addr: u64) -> Result<Decoded, Exception> {
-    let bytes_left_in_page = (PAGE_SIZE - (phys_addr & PAGE_MASK)) as usize;
-    let mut insns: Vec<Insn> = Vec::new();
-    let mut insn_rips: Vec<u64> = Vec::new();
-    let entry_rip = rip & PAGE_MASK;
-    let mut offset = 0usize;
-    let mut crosses_page = false;
-    let mut end_rip = entry_rip;
-    while insns.len() < MAX_INSNS {
-        let window = (bytes_left_in_page - offset).min(MAX_INSN_LEN);
-        if window == 0 {
-            break;
-        }
-        let ram_offset = phys_addr as usize + offset;
-        match decode::decode(&cpu.ram[ram_offset..ram_offset + window]) {
-            Ok(insn) => {
-                insn_rips.push(entry_rip + offset as u64);
-                offset += insn.len as usize;
-                end_rip = entry_rip + offset as u64;
-                insns.push(insn);
-                if helpers::ends_block(insns.last().unwrap()) {
-                    break;
-                }
-            }
-            // Ran off the page mid-instruction. If it is the first instruction the block is
-            // that one instruction, decoded through the interpreter's page-crossing path;
-            // otherwise end the block here and let the next one start on the new page.
-            Err(DecodeErr::Truncated) => {
-                if insns.is_empty() {
-                    let insn = cpu.fetch_decode()?;
-                    insn_rips.push(entry_rip);
-                    end_rip = entry_rip + insn.len as u64;
-                    insns.push(insn);
-                    crosses_page = true;
-                }
-                break;
-            }
-            // Undecodable bytes become a one-byte marker instruction that exec turns into
-            // #UD when (and only if) the guest reaches it.
-            Err(DecodeErr::Invalid) => {
-                let marker = Insn {
-                    op: helpers::OP_INVALID,
-                    len: 1,
-                    ..Default::default()
-                };
-                insn_rips.push(entry_rip + offset as u64);
-                end_rip = entry_rip + offset as u64 + 1;
-                insns.push(marker);
-                break;
-            }
-        }
-    }
-    // The first iteration always runs (`MAX_INSNS > 0`, at least one byte is left in the page)
-    // and either pushes an instruction, returns, or takes the first-instruction `Truncated`
-    // arm, so a block is never empty. An empty one would compile to "jump to `rip`" and spin.
-    debug_assert!(!insns.is_empty());
-    let mut pages = vec![phys_addr >> PAGE_SHIFT];
-    let mut second_page = NO_SECOND_PAGE;
-    if crosses_page {
-        let next_page_phys = cpu.translate(
-            (rip & !PAGE_MASK).wrapping_add(PAGE_SIZE),
-            AccessKind::Exec,
-            false,
-        )?;
-        pages.push(next_page_phys >> PAGE_SHIFT);
-        second_page = next_page_phys & !PAGE_MASK;
-    }
-    Ok(Decoded {
-        insns,
-        insn_rips,
-        end_rip,
-        crosses_page,
-        second_page,
-        pages,
-    })
-}
-
 impl Cpu {
     /// Runs one block (or, on a miss, translates then runs it) starting at `self.rip`.
     ///
@@ -931,7 +810,9 @@ mod tests {
     //! accounting, tested against real translated blocks.
 
     use super::*;
+    use crate::cpu::decode;
     use crate::cpu::exception::Exception;
+    use crate::jit::blocks::MAX_INSNS;
     use crate::jit::serialize_jit_tests;
     use crate::testkit::*;
 

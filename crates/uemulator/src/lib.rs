@@ -29,7 +29,7 @@ mod platform;
 mod prelude;
 mod ram;
 mod sync;
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
 mod sys;
 #[cfg(test)]
 mod testkit;

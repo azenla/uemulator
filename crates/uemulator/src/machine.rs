@@ -820,8 +820,12 @@ impl Vcpu {
     /// Whether a multi-processor guest gets a host thread per vCPU: not under `Timeshare`, not
     /// without the host clock the threads' TSC needs, and not where nothing can start a thread.
     fn runs_on_threads(&self, cpu: &Cpu) -> bool {
+        // WebAssembly blocks are called through the function table of one instance, which a
+        // second thread cannot reach (`jit/wasm.rs`): with the JIT the vCPUs take turns.
+        let jit_ties_vcpus_to_one_thread = cfg!(target_arch = "wasm32") && cpu.jit.is_some();
         self.smp != SmpMode::Timeshare
             && !self.verify
+            && !jit_ties_vcpus_to_one_thread
             && cpu.wall_clock.is_some()
             && self.thread_spawner.is_some()
     }

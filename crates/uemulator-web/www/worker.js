@@ -2,6 +2,7 @@
 // While it runs this worker cannot receive messages: keystrokes, resizes and the stop request come
 // through the SharedArrayBuffer `control` that main.js shares with us (layout in protocol.js).
 import { CTRL, RING_BYTES, RING_OFFSET } from "./protocol.js";
+import { createJitHost } from "./jit_host.js";
 
 const OUTPUT_FLUSH_MS = 16;
 const OUTPUT_FLUSH_BYTES = 1 << 16;
@@ -35,7 +36,11 @@ function flushOutput() {
   postMessage({ type: "output", bytes: merged.buffer }, [merged.buffer]);
 }
 
+// Instantiates the modules the library's WebAssembly JIT generates (see jit_host.js).
+const jit = createJitHost();
+
 const host = {
+  ...jit.host,
   host_output(ptr, len) {
     outputChunks.push(memoryBytes(ptr, len).slice());
     outputBytes += len;
@@ -110,6 +115,7 @@ async function boot(message) {
   const response = await fetch(new URL("uemulator_web.wasm", import.meta.url));
   const { instance } = await WebAssembly.instantiate(await response.arrayBuffer(), { host });
   wasm = instance.exports;
+  jit.attach(wasm);
 
   const kernel = new Uint8Array(message.kernel);
   const initrd = message.initrd ? new Uint8Array(message.initrd) : new Uint8Array(0);
@@ -119,7 +125,7 @@ async function boot(message) {
   const cmdlinePtr = upload(cmdline);
   const failed = wasm.uw_create(
     kernelPtr, kernel.length, initrdPtr, initrd.length, cmdlinePtr, cmdline.length,
-    message.memoryMib, Math.floor(Date.now() / 1000), message.cols, message.rows,
+    message.memoryMib, Math.floor(Date.now() / 1000), message.cols, message.rows, message.jit ? 1 : 0,
   );
   if (failed) {
     postMessage({ type: "exit", code: -2, message: lastError() });

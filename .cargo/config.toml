@@ -1,0 +1,7 @@
+# The library's tests run on wasm32-wasip1 under Node (hack/wasm/test-runner.sh) so the WebAssembly
+# JIT is exercised by the same differential tests as the native backends:
+#   cargo test --release --target wasm32-wasip1 -p uemulator --lib -- --test-threads=1 jit::
+# The table flags let the host append generated blocks to the module's function table.
+[target.wasm32-wasip1]
+runner = ["hack/wasm/test-runner.sh"]
+rustflags = ["-C", "link-arg=--export-table", "-C", "link-arg=--growable-table"]

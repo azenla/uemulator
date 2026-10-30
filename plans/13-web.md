@@ -4,12 +4,12 @@
 
 ## What is ported
 
-- Interpreter only: no JIT (`JitMode::Off`; the library builds with `default-features = false`), no virtio disk (`Disk` needs `std::fs`) and no network (no sockets). Console only: virtio-console (`hvc0`), the 16550 carries early boot text.
+- Hot code runs on a WebAssembly JIT (below; the page has a checkbox, and `uw_create` takes the flag). No virtio disk (`Disk` needs `std::fs`) and no network (no sockets). Console only: virtio-console (`hvc0`), the 16550 carries early boot text.
 - Boots the Alpine netboot kernel and initramfs to userspace in about 1 s of guest time and roughly 15 s wall clock in Chrome; with the distro's init it ends at `Mounting boot media: failed` like the UEFI app, so the page defaults to `rdinit=/bin/sh`, which gives a working busybox shell (keyboard included).
 
 ## Library changes
 
-`target_os = "uefi"` became `cfg(freestanding)`, set by `crates/uemulator/build.rs` for UEFI and for any `wasm32` target. Freestanding means `no_std`, no threads, no clock and no `std::fs`: the vCPU runs on the caller's thread inside `EmulatedMachine::wait` and the host is reached through `MachineConfig::poll`, exactly as in 12-uefi.md. `libm` is a dependency on the same targets. The RTC starts at `unix_time`, which the page passes from `Date.now()`; guest time follows `performance.now()` through `MachineConfig::host_clock` (`ClockMode::Realtime`): a virtual clock crawls at one nanosecond per interpreted instruction, far slower than the wall, then jumps over every idle wait. A halted guest waits in the poll hook's `host_idle` (1 ms), so a due timer fires at most that late.
+`target_os = "uefi"` became `cfg(freestanding)`, set by `crates/uemulator/build.rs` for UEFI and for `wasm32` targets other than WASI (`wasm32-wasip1` is the hosted test target, below). Freestanding means `no_std`, no threads, no clock and no `std::fs`: the vCPU runs on the caller's thread inside `EmulatedMachine::wait` and the host is reached through `MachineConfig::poll`, exactly as in 12-uefi.md. `libm` is a dependency on the same targets. The RTC starts at `unix_time`, which the page passes from `Date.now()`; guest time follows `performance.now()` through `MachineConfig::host_clock` (`ClockMode::Realtime`): a virtual clock crawls at one nanosecond per interpreted instruction, far slower than the wall, then jumps over every idle wait. A halted guest waits in the poll hook's `host_idle` (1 ms), so a due timer fires at most that late.
 
 ## Shape of the port
 
@@ -18,8 +18,30 @@
 - Guest output is batched in the worker and posted every 16 ms. An idle guest sleeps in `Atomics.wait` on the ring head, woken by the next keystroke.
 - wasm32 has 32-bit `usize`; the library needed no change for it, but guest RAM is one `Vec`, so the page offers 128 to 1024 MiB (the module's memory is limited to 4 GiB).
 
+## The JIT
+
+`jit/wasm.rs` (code cache and `Cpu::step_block`), `jit/emit_wasm.rs` (block generator) and `jit/wasm_encode.rs` (binary encoder) are the third backend; `plans/06-jit.md` has the shared design. What is different here:
+
+- A block is a WebAssembly module of its own with one export, `block: (cpu: i32) -> i64`, which imports the emulator's `memory` and function `table`. It reads and writes the `Cpu` and guest RAM directly (both live in the module's linear memory) and calls the helpers with `call_indirect`: a Rust function pointer on wasm32 is its table index, so `Addrs` is just those numbers. The helper types are fixed in `wasm_encode` (`FUNCTION_TYPES`); a wrong one traps and takes the emulator down.
+- The library cannot instantiate a module itself. It hands the bytes to the host import `host_jit_compile(ptr, len) -> slot` (`www/jit_host.js`: `new WebAssembly.Module` + `Instance` with `{env: {memory, table}}`, then `table.set`), calls the block through that slot like a function pointer, and returns the slot with `host_jit_release`. The final link needs `--export-table --growable-table` (`uemulator-web/build.rs`, `.cargo/config.toml`).
+- No host flags: every flag writer leaves its operands and result in locals, and `cmp; jcc`, `setcc` and `cmov` are computed from them (`Fused`) with no call; the lazy record is stored as well (it is what the next block and `pushf` read). `helper_cond` covers what the locals cannot (after inc/dec the CF-reading conditions).
+- Blocks chain: an exit is a `return_call_indirect` (a WebAssembly tail call) into the chain stub, one module compiled in `Jit::new` that does what `arch_x64::chain_stub` does (event budget, `block_exit_requested`, exec TLB, jump cache, validity) and tail-calls the successor or returns to the run loop. Without tail calls the stub fails to compile and the JIT runs unchained. There are no direct links (no code to patch): every transition costs the stub.
+- Compiling is the expensive part (tens of microseconds per module), so a block is compiled only after its first instruction has run `COMPILE_THRESHOLD` times in the interpreter; until then `step_block` interprets one instruction. A tiering counter table (`Heat`) is indexed by physical address. Tests build with a threshold of zero.
+- The function table belongs to one instance, so a second wasm thread could not call the blocks: with the JIT the vCPUs take turns on one thread even when a `thread_spawner` is given (`runs_on_threads`), and the jump cache is one table shared by all handles.
+- A full cache (`MAX_BLOCKS`, every block is a live engine instance) is flushed and its slots released.
+- 64-bit `imul`, adc/sbb, rotates, narrow shifts, BMI and the rest run in the interpreter through `helper_exec`.
+
+## Tests
+
+The library's suite runs on `wasm32-wasip1` under Node, so the JIT is exercised by the same differential corpus as the native backends (`jit/diff_*.rs`, `assert_jit_matches_interpreter`):
+
+    cargo test --release --target wasm32-wasip1 -p uemulator --lib -- --test-threads=1 jit::
+
+`.cargo/config.toml` points the runner at `hack/wasm/test-runner.sh` (`run-wasi.mjs`: Node's WASI plus the same `host_jit_*` imports as the page; wasmtime cannot compile new modules for its guest). WASI has `std` but no threads, so `wasm32-wasip1` is built hosted (not `freestanding`), and what needs a second thread (`EmulatedMachine::start`, the `smp`/`atomic` threaded tests, `netdev` wake-ups) or an unwinding panic cannot run there; a panicking test aborts the process (wasm has no unwinding), so run a module at a time to find the failing test. `diff_tests.rs` and `wasm.rs` pin that the JIT is really in use (the corpus skips itself without one). The pure encoder tests also run on the host.
+
+`node hack/wasm/boot.mjs --kernel K --initrd I [--no-jit] [--until TEXT]` boots a kernel on the real `uemulator_web.wasm` (the page's module and imports) under Node and prints the time to a console message: a Debian netboot kernel reaches `Machine keyring initialized` in about 6 s with the JIT against about 55 s interpreted, and goes on to start the installer.
+
 ## Not done
 
-- A wasm JIT (translate blocks to wasm functions and instantiate them), which is the only route to more than interpreter speed.
 - Disk (a `BlockBackend` over OPFS or an in-memory image) and network (a WebSocket or fetch gateway for `NetHandle`).
-- Automated tests: the crate is exercised by hand (and with headless Chrome over CDP during development), since the library's own suite does not run on wasm.
+- Direct block links, 64-bit `imul` and the other helper-only forms inline, and a JIT per worker for SMP.

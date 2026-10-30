@@ -1099,14 +1099,28 @@ mod config {
         }
     }
 
-    #[cfg(not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))))]
+    #[cfg(not(all(
+        feature = "jit",
+        any(
+            target_arch = "aarch64",
+            target_arch = "x86_64",
+            target_arch = "wasm32"
+        )
+    )))]
     #[test]
     fn without_a_jit_backend_jit_on_is_jit_unavailable_even_before_the_kernel_is_parsed() {
         let result = EmulatedMachine::new(MachineConfig::new().reboot(false).jit(JitMode::On));
         assert!(matches!(result, Err(Error::JitUnavailable)));
     }
 
-    #[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(all(
+        feature = "jit",
+        any(
+            target_arch = "aarch64",
+            target_arch = "x86_64",
+            target_arch = "wasm32"
+        )
+    ))]
     #[test]
     fn with_a_jit_backend_jit_on_is_accepted() {
         let result = EmulatedMachine::new(

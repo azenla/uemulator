@@ -228,7 +228,11 @@ fn the_host_has_a_jit_so_the_corpus_is_not_vacuous() {
         result.jit.is_some(),
         cfg!(all(
             feature = "jit",
-            any(target_arch = "aarch64", target_arch = "x86_64")
+            any(
+                target_arch = "aarch64",
+                target_arch = "x86_64",
+                target_arch = "wasm32"
+            )
         ))
     );
 }
@@ -300,10 +304,17 @@ fn enter_with_unmapped_stack_faults_the_same() {
 
 /// Tests that look inside the JIT (block counts, inline coverage), so they exist only where
 /// there is one.
-#[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(
+    feature = "jit",
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )
+))]
 mod translation {
     use super::*;
-    use crate::jit::native::JitStats;
+    use crate::jit::JitStats;
 
     fn stats_of(result: &Differential) -> JitStats {
         let (jit, _) = result.jit.as_ref().expect("this host has a JIT");

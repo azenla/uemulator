@@ -25,7 +25,7 @@ function setStatus(text, kind = "") {
 function setRunning(running) {
   $("start").disabled = running;
   $("stop").disabled = !running;
-  for (const id of ["kernel-file", "kernel-url", "initrd-file", "initrd-url", "memory", "cmdline", "shell"]) {
+  for (const id of ["kernel-file", "kernel-url", "initrd-file", "initrd-url", "memory", "cmdline", "shell", "jit"]) {
     $(id).disabled = running;
   }
 }
@@ -123,6 +123,7 @@ async function start() {
       initrd,
       cmdline: `console=hvc0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1 ${extra}`.trim(),
       memoryMib: Number($("memory").value),
+      jit: $("jit").checked,
       cols: term.cols,
       rows: term.rows,
       control: shared,

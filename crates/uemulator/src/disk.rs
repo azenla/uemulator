@@ -36,7 +36,8 @@ struct FileDisk {
 struct MemDisk(Vec<u8>);
 
 // Positional I/O (no shared seek offset). Unix has it natively; Windows `seek_*` can return
-// short counts and moves the file pointer, so loop to match `read_exact_at`/`write_all_at`.
+// short counts and moves the file pointer, so loop to match `read_exact_at`/`write_all_at`. WASI's
+// positional calls are unstable in `std`, and a WASI module has one thread, so seeking is safe.
 #[cfg(unix)]
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
@@ -45,6 +46,20 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 #[cfg(unix)]
 fn write_all_at(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, data, offset)
+}
+
+#[cfg(target_os = "wasi")]
+fn read_exact_at(mut file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(buf)
+}
+
+#[cfg(target_os = "wasi")]
+fn write_all_at(mut file: &File, data: &[u8], offset: u64) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(data)
 }
 
 #[cfg(windows)]

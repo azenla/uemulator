@@ -374,7 +374,14 @@ fn rewriting_identical_bytes_and_invalidating_runs_the_same_code() {
 }
 
 /// Translation counts only exist where there is a JIT.
-#[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(
+    feature = "jit",
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )
+))]
 mod translation_counts {
     use super::*;
 
