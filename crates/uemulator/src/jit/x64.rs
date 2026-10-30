@@ -62,6 +62,11 @@ const REX_R: u8 = 1 << 2;
 const REX_X: u8 = 1 << 1;
 const REX_B: u8 = 1;
 
+const MANDATORY_PREFIX_F3: u8 = 0xf3;
+const TWO_BYTE_OPCODE: u8 = 0x0f;
+const OPCODE_MOVDQU_LOAD: u8 = 0x6f;
+const OPCODE_MOVDQU_STORE: u8 = 0x7f;
+const OPCODE_PMOVMSKB: u8 = 0xd7;
 const OPERAND_SIZE_PREFIX: u8 = 0x66;
 
 /// ModRM.mod values.
@@ -332,6 +337,41 @@ impl Asm {
     pub fn st_imm16(&mut self, m: Mem, v: u16) {
         self.op_rm(true, false, false, &[0xc7], 0, m);
         self.code.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// `movdqu xmm, m` and `movdqu m, xmm`: 128-bit loads and stores with no alignment rule.
+    pub fn xmm_ld(&mut self, x: u8, m: Mem) {
+        self.sse_rm(MANDATORY_PREFIX_F3, OPCODE_MOVDQU_LOAD, x, m);
+    }
+    pub fn xmm_st(&mut self, m: Mem, x: u8) {
+        self.sse_rm(MANDATORY_PREFIX_F3, OPCODE_MOVDQU_STORE, x, m);
+    }
+
+    /// A `66 0f xx` integer SSE2 instruction `d = d op s` on two xmm registers: pxor, pcmpeqb,
+    /// paddq and the like, named by the `0f` opcode byte, which the guest instruction shares.
+    pub fn xmm_op(&mut self, opcode: u8, d: u8, s: u8) {
+        self.sse_rr(OPERAND_SIZE_PREFIX, opcode, d, s);
+    }
+
+    /// `pmovmskb r32, xmm`.
+    pub fn pmovmskb(&mut self, d: u8, x: u8) {
+        self.sse_rr(OPERAND_SIZE_PREFIX, OPCODE_PMOVMSKB, d, x);
+    }
+
+    /// The mandatory prefix comes before REX.
+    fn sse_rm(&mut self, prefix: u8, opcode: u8, reg: u8, m: Mem) {
+        self.code.push(prefix);
+        self.rex(false, reg, m.index.map_or(0, |i| i.0), m.base, false);
+        self.code.extend_from_slice(&[TWO_BYTE_OPCODE, opcode]);
+        self.modrm_mem(reg, m);
+    }
+
+    fn sse_rr(&mut self, prefix: u8, opcode: u8, reg: u8, rm: u8) {
+        self.code.push(prefix);
+        self.rex(false, reg, 0, rm, false);
+        self.code.extend_from_slice(&[TWO_BYTE_OPCODE, opcode]);
+        self.code
+            .push(MOD_REGISTER << 6 | (reg & 7) << 3 | (rm & 7));
     }
 
     /// Does not touch host flags, which is why the block generator computes effective addresses
@@ -3817,6 +3857,24 @@ fn stores_match_the_assembler() {
 
     /// Lea with every addressing shape.
 #[rustfmt::skip]
+#[test]
+fn sse_forms_match_the_assembler() {
+    let cases: &[EncodeCase] = &[
+        ("movdqu xmm0, [rbx + 1296]", |a| { a.xmm_ld(0, mem(RBX, 1296)); }, &[0xf3, 0x0f, 0x6f, 0x83, 0x10, 0x05, 0x00, 0x00]),
+        ("movdqu xmm1, [rbx + 8]", |a| { a.xmm_ld(1, mem(RBX, 8)); }, &[0xf3, 0x0f, 0x6f, 0x4b, 0x08]),
+        ("movdqu xmm1, [rdx + rdi]", |a| { a.xmm_ld(1, mem_idx(RDX, RDI, 0, 0)); }, &[0xf3, 0x0f, 0x6f, 0x0c, 0x3a]),
+        ("movdqu [rbx + 1296], xmm0", |a| { a.xmm_st(mem(RBX, 1296), 0); }, &[0xf3, 0x0f, 0x7f, 0x83, 0x10, 0x05, 0x00, 0x00]),
+        ("movdqu [rdx + rdi + 8], xmm1", |a| { a.xmm_st(mem_idx(RDX, RDI, 0, 8), 1); }, &[0xf3, 0x0f, 0x7f, 0x4c, 0x3a, 0x08]),
+        ("pxor xmm0, xmm1", |a| { a.xmm_op(0xef, 0, 1); }, &[0x66, 0x0f, 0xef, 0xc1]),
+        ("pcmpeqb xmm0, xmm1", |a| { a.xmm_op(0x74, 0, 1); }, &[0x66, 0x0f, 0x74, 0xc1]),
+        ("psubq xmm0, xmm1", |a| { a.xmm_op(0xfb, 0, 1); }, &[0x66, 0x0f, 0xfb, 0xc1]),
+        ("pmovmskb r9d, xmm1", |a| { a.pmovmskb(R9, 1); }, &[0x66, 0x44, 0x0f, 0xd7, 0xc9]),
+        ("pmovmskb eax, xmm1", |a| { a.pmovmskb(RAX, 1); }, &[0x66, 0x0f, 0xd7, 0xc1]),
+    ];
+    check_encodings(cases);
+}
+
+    #[rustfmt::skip]
 #[test]
 fn lea_matches_the_assembler() {
     let cases: &[EncodeCase] = &[

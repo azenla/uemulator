@@ -76,6 +76,10 @@ const XMM_SIZE: u32 = size_of::<u128>() as u32;
 const XMM_HALF: u32 = XMM_SIZE / 2;
 /// Legacy-SSE 128-bit memory operands of movaps/movdqa and friends must be aligned to this.
 const VECTOR_ALIGNMENT: u64 = XMM_SIZE as u64;
+/// Host vector registers of an inline vector instruction: the guest destination (also the result)
+/// and the source operand.
+const VECTOR_DST: u32 = 0;
+const VECTOR_SRC: u32 = 1;
 const RCX_INDEX: u32 = 1;
 const SEG_BASE_OFFSET: u32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as u32;
 const SEG_STRIDE: u32 = size_of::<Seg>() as u32;
@@ -2243,6 +2247,28 @@ impl<'a> Gen<'a> {
                 };
                 is_store = self.vector_move(&insn, form, next_rip, insn_index, rip);
             }
+            // pxor/por/pand/pandn, pcmpeq*, pminub/pmaxub, padd*, psub*, pmovmskb (66 prefix)
+            0x1d4
+            | 0x1d7
+            | 0x1da
+            | 0x1db
+            | 0x1de
+            | 0x1df
+            | 0x1eb
+            | 0x1ef
+            | 0x174..=0x176
+            | 0x1f8..=0x1fe
+                if plain =>
+            {
+                let Some(form) = vector_alu(&insn) else {
+                    return false;
+                };
+                // pmovmskb has no memory form (the decoder-level #UD stays with the interpreter)
+                if form.op == VectorOp::MoveMask && is_memory {
+                    return false;
+                }
+                is_store = self.vector_alu(&insn, form, next_rip, insn_index, rip);
+            }
             _ => return false,
         }
         if is_store {
@@ -2252,8 +2278,11 @@ impl<'a> Gen<'a> {
         true
     }
 
-    /// `Exec` slow path entry for instruction `insn_index`.
-    fn exec_slow_path(&mut self, insn_index: u32, rip: u64) -> (Label, Label) {
+    /// Starts an inline SSE instruction: registers its out-of-line interpreter fallback and, for
+    /// the first one of the block, checks the SSE gate (#UD for CR0.EM or no CR4.OSFXSR, #NM for
+    /// CR0.TS), jumping to the fallback so the interpreter raises the exception. Returns the
+    /// fallback's entry and the label to bind where the inline code ends.
+    fn sse_entry(&mut self, insn_index: u32, rip: u64) -> (Label, Label) {
         let entry = self.asm.label();
         let resume = self.asm.label();
         self.slow_paths.push(SlowPath {
@@ -2263,6 +2292,15 @@ impl<'a> Gen<'a> {
             insn_index,
             rip,
         });
+        if !self.sse_gated {
+            self.sse_gated = true;
+            self.asm.ldr(SCRATCH_A, CPU, CR0_OFFSET);
+            self.and_constant(SCRATCH_A, SCRATCH_A, CR0_EM | CR0_TS);
+            self.asm.cbnz(SCRATCH_A, entry, true);
+            self.asm.ldr(SCRATCH_A, CPU, CR4_OFFSET);
+            self.and_constant(SCRATCH_A, SCRATCH_A, CR4_OSFXSR);
+            self.asm.cbz(SCRATCH_A, entry, true);
+        }
         (entry, resume)
     }
 
@@ -2279,16 +2317,7 @@ impl<'a> Gen<'a> {
         insn_index: u32,
         rip: u64,
     ) -> bool {
-        let (slow, resume) = self.exec_slow_path(insn_index, rip);
-        if !self.sse_gated {
-            self.sse_gated = true;
-            self.asm.ldr(SCRATCH_A, CPU, CR0_OFFSET);
-            self.and_constant(SCRATCH_A, SCRATCH_A, CR0_EM | CR0_TS);
-            self.asm.cbnz(SCRATCH_A, slow, true);
-            self.asm.ldr(SCRATCH_A, CPU, CR4_OFFSET);
-            self.and_constant(SCRATCH_A, SCRATCH_A, CR4_OSFXSR);
-            self.asm.cbz(SCRATCH_A, slow, true);
-        }
+        let (slow, resume) = self.sse_entry(insn_index, rip);
         let xmm = |reg: u8| XMM_OFFSET + XMM_SIZE * reg as u32;
         let memory_is_store = !form.load;
         if insn.md == MODRM_MOD_REGISTER {
@@ -2345,6 +2374,75 @@ impl<'a> Gen<'a> {
         // The slow path's call clobbered host NZCV.
         self.live = None;
         memory_is_store
+    }
+
+    /// A lane-wise integer vector instruction (`VectorAlu`) on xmm registers, the source being a
+    /// register or a 16-byte aligned memory operand (misaligned, page-crossing and gate failures
+    /// run in the interpreter, as for `vector_move`). The registers are loaded into v0 and v1
+    /// from `Cpu::xmm`, so nothing is live in host vector registers across instructions.
+    fn vector_alu(
+        &mut self,
+        insn: &Insn,
+        form: VectorAlu,
+        next_rip: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let (slow, resume) = self.sse_entry(insn_index, rip);
+        let xmm = |reg: u8| XMM_OFFSET + XMM_SIZE * reg as u32;
+        if form.op == VectorOp::MoveMask {
+            // The sign bit of every byte, gathered by the `sse2neon` sequence: shift each bit 7
+            // down to bit 0 of its byte, then fold neighbouring bytes, words and dwords together
+            // so each byte of the low and of the high half ends up holding its half's eight bits.
+            self.asm.ldr_q(VECTOR_SRC, CPU, xmm(insn.rm));
+            self.asm.vec_ushr(VECTOR_SRC, VECTOR_SRC, 8, 7);
+            self.asm.vec_usra(VECTOR_SRC, VECTOR_SRC, 16, 7);
+            self.asm.vec_usra(VECTOR_SRC, VECTOR_SRC, 32, 14);
+            self.asm.vec_usra(VECTOR_SRC, VECTOR_SRC, 64, 28);
+            self.asm.umov_byte(VALUE, VECTOR_SRC, 0);
+            self.asm.umov_byte(SCRATCH_A, VECTOR_SRC, XMM_HALF);
+            self.asm.add_lsl(VALUE, VALUE, SCRATCH_A, u8::BITS);
+            self.write_reg(insn.reg, false, 4, VALUE);
+            self.asm.bind(resume);
+            self.live = None;
+            return false;
+        }
+        self.asm.ldr_q(VECTOR_DST, CPU, xmm(insn.reg));
+        if insn.md == MODRM_MOD_REGISTER {
+            self.asm.ldr_q(VECTOR_SRC, CPU, xmm(insn.rm));
+        } else {
+            self.effective_address(insn, next_rip, ADDRESS);
+            // Every legacy-SSE form of these instructions needs a 16-byte aligned memory operand.
+            self.and_constant(SCRATCH_A, ADDRESS, VECTOR_ALIGNMENT - 1);
+            self.asm.cbnz(SCRATCH_A, slow, true);
+            self.tlb_probe(XMM_SIZE as u8, TLB_TAG_READ_OFFSET, slow);
+            self.asm.ldr(SCRATCH_B, SCRATCH_A, TLB_ADDEND_OFFSET);
+            self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
+            self.asm.ldr_q(VECTOR_SRC, SCRATCH_B, 0);
+            if self.ordered_memory {
+                // Loads are acquires (see `ordered_memory`); `ldar` has no 128-bit form.
+                self.asm.dmb_ishld();
+            }
+        }
+        let lane = form.lane_log2;
+        let (base, size, destination, first, second) = match form.op {
+            VectorOp::And => (VEC_AND, 0, VECTOR_DST, VECTOR_DST, VECTOR_SRC),
+            // bic computes its first operand & !second: src & !dst
+            VectorOp::AndNot => (VEC_BIC, 0, VECTOR_DST, VECTOR_SRC, VECTOR_DST),
+            VectorOp::Or => (VEC_ORR, 0, VECTOR_DST, VECTOR_DST, VECTOR_SRC),
+            VectorOp::Xor => (VEC_EOR, 0, VECTOR_DST, VECTOR_DST, VECTOR_SRC),
+            VectorOp::CompareEqual => (VEC_CMEQ, lane, VECTOR_DST, VECTOR_DST, VECTOR_SRC),
+            VectorOp::MinUnsigned8 => (VEC_UMIN, 0, VECTOR_DST, VECTOR_DST, VECTOR_SRC),
+            VectorOp::MaxUnsigned8 => (VEC_UMAX, 0, VECTOR_DST, VECTOR_DST, VECTOR_SRC),
+            VectorOp::Add => (VEC_ADD, lane, VECTOR_DST, VECTOR_DST, VECTOR_SRC),
+            VectorOp::Subtract => (VEC_SUB, lane, VECTOR_DST, VECTOR_DST, VECTOR_SRC),
+            VectorOp::MoveMask => unreachable!("handled above"),
+        };
+        self.asm.vec_op(base, size, destination, first, second);
+        self.asm.str_q(VECTOR_DST, CPU, xmm(insn.reg));
+        self.asm.bind(resume);
+        self.live = None;
+        false
     }
 
     /// Compiles the whole block. `rips[k]` is the offset in the block's page of instruction `k`

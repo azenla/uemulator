@@ -36,6 +36,23 @@ const RM_SHIFT: u32 = 16;
 const SF: u32 = 1 << 31;
 const COND_SHIFT: u32 = 12;
 const IMM12_SHIFT: u32 = 10;
+const IMM12_MASK: u32 = 0xfff;
+/// Bytes in a 128-bit vector register; the scale of `ldr_q`/`str_q` offsets.
+const VECTOR_BYTES: u32 = 16;
+const VEC_SIZE_SHIFT: u32 = 22;
+/// immh:immb of the vector shifts, and imm5 of `umov`.
+const VEC_SHIFT_IMMEDIATE_SHIFT: u32 = 16;
+
+/// Bases of the three-register vector forms `Asm::vec_op` takes (Q = 1, 128-bit).
+pub const VEC_AND: u32 = 0x4e20_1c00;
+pub const VEC_BIC: u32 = 0x4e60_1c00;
+pub const VEC_ORR: u32 = 0x4ea0_1c00;
+pub const VEC_EOR: u32 = 0x6e20_1c00;
+pub const VEC_CMEQ: u32 = 0x6e20_8c00;
+pub const VEC_UMIN: u32 = 0x6e20_6c00;
+pub const VEC_UMAX: u32 = 0x6e20_6400;
+pub const VEC_ADD: u32 = 0x4e20_8400;
+pub const VEC_SUB: u32 = 0x6e20_8400;
 /// Shift amount of the shifted-register add.
 const IMM6_SHIFT: u32 = 10;
 /// MOVZ/MOVK/MOVN: 16-bit immediate, and which halfword it replaces (`hw` * 16 bits).
@@ -674,6 +691,58 @@ impl Asm {
     pub fn ldp_post(&mut self, rt: u32, rt2: u32, rn: u32, imm: i32) {
         self.emit(0xa8c0_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt);
     }
+
+    /// 128-bit `ldr`/`str` of vector register `vt`; `off` is a byte offset, a multiple of 16 below
+    /// 64 KiB.
+    pub fn ldr_q(&mut self, vt: u32, rn: u32, off: u32) {
+        self.emit(0x3dc0_0000 | Self::q_offset(off) | rn << RN_SHIFT | vt);
+    }
+    pub fn str_q(&mut self, vt: u32, rn: u32, off: u32) {
+        self.emit(0x3d80_0000 | Self::q_offset(off) | rn << RN_SHIFT | vt);
+    }
+    fn q_offset(off: u32) -> u32 {
+        assert!(
+            off.is_multiple_of(VECTOR_BYTES) && off / VECTOR_BYTES <= IMM12_MASK,
+            "q offset {off}"
+        );
+        (off / VECTOR_BYTES) << IMM12_SHIFT
+    }
+
+    /// A three-register vector operation on the full 128 bits: one of the `VEC_*` bases, `size`
+    /// the lane width as log2 of the byte count (0 = 16 x 8-bit .. 3 = 2 x 64-bit; the
+    /// bitwise operations take 0). `vd = vn op vm`; `VEC_BIC` is `vn & !vm`.
+    pub fn vec_op(&mut self, base: u32, size: u32, vd: u32, vn: u32, vm: u32) {
+        self.emit(base | size << VEC_SIZE_SHIFT | vm << RM_SHIFT | vn << RN_SHIFT | vd);
+    }
+
+    /// `ushr vd.16b, vn.16b, #shift` and the accumulating `usra`, per lane of `lane_bits` (8, 16,
+    /// 32 or 64) bits, shift 1..=lane_bits.
+    pub fn vec_ushr(&mut self, vd: u32, vn: u32, lane_bits: u32, shift: u32) {
+        self.vec_shift_right(0x6f00_0400, vd, vn, lane_bits, shift);
+    }
+    pub fn vec_usra(&mut self, vd: u32, vn: u32, lane_bits: u32, shift: u32) {
+        self.vec_shift_right(0x6f00_1400, vd, vn, lane_bits, shift);
+    }
+    fn vec_shift_right(&mut self, base: u32, vd: u32, vn: u32, lane_bits: u32, shift: u32) {
+        assert!(lane_bits.is_power_of_two() && (1..=lane_bits).contains(&shift));
+        // immh:immb is `2 * lane_bits - shift`; the position of its top set bit gives the lane size.
+        let immediate = 2 * lane_bits - shift;
+        self.emit(base | immediate << VEC_SHIFT_IMMEDIATE_SHIFT | vn << RN_SHIFT | vd);
+    }
+
+    /// `umov wd, vn.b[index]`.
+    pub fn umov_byte(&mut self, rd: u32, vn: u32, index: u32) {
+        assert!(index < VECTOR_BYTES);
+        self.emit(
+            0x0e00_3c00 | (index << 1 | 1) << VEC_SHIFT_IMMEDIATE_SHIFT | vn << RN_SHIFT | rd,
+        );
+    }
+
+    /// `dmb ishld`: loads before it complete before any later load or store. A plain vector
+    /// load plus this is an acquire, which `ldar` cannot give a 128-bit access.
+    pub fn dmb_ishld(&mut self) {
+        self.emit(0xd503_39bf);
+    }
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -691,6 +760,85 @@ mod tests {
         m.write(0, &a.code);
         let fun: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(m.base() as usize) };
         fun(a0, a1)
+    }
+
+    /// The words clang produces for the same instructions.
+    #[test]
+    fn vector_instructions_encode_like_the_assembler() {
+        let words = |build: &dyn Fn(&mut Asm)| {
+            let mut a = Asm::new(0);
+            build(&mut a);
+            a.code.clone()
+        };
+        assert_eq!(
+            words(&|a| {
+                a.ldr_q(0, 19, 1296); // ldr q0, [x19, #1296]
+                a.ldr_q(1, 19, 1312);
+                a.str_q(0, 19, 1296);
+                a.str_q(1, 19, 1328);
+            }),
+            [0x3dc1_4660, 0x3dc1_4a61, 0x3d81_4660, 0x3d81_4e61]
+        );
+        assert_eq!(
+            words(&|a| {
+                a.vec_op(VEC_AND, 0, 0, 0, 1);
+                a.vec_op(VEC_BIC, 0, 0, 1, 0); // bic v0.16b, v1.16b, v0.16b
+                a.vec_op(VEC_ORR, 0, 0, 0, 1);
+                a.vec_op(VEC_EOR, 0, 0, 0, 1);
+                a.vec_op(VEC_CMEQ, 0, 0, 0, 1);
+                a.vec_op(VEC_CMEQ, 1, 0, 0, 1);
+                a.vec_op(VEC_CMEQ, 2, 0, 0, 1);
+                a.vec_op(VEC_UMIN, 0, 0, 0, 1);
+                a.vec_op(VEC_UMAX, 0, 0, 0, 1);
+                a.vec_op(VEC_ADD, 0, 0, 0, 1);
+                a.vec_op(VEC_ADD, 1, 0, 0, 1);
+                a.vec_op(VEC_ADD, 2, 0, 0, 1);
+                a.vec_op(VEC_ADD, 3, 0, 0, 1);
+                a.vec_op(VEC_SUB, 0, 0, 0, 1);
+                a.vec_op(VEC_SUB, 1, 0, 0, 1);
+                a.vec_op(VEC_SUB, 2, 0, 0, 1);
+                a.vec_op(VEC_SUB, 3, 0, 0, 1);
+            }),
+            [
+                0x4e21_1c00,
+                0x4e60_1c20,
+                0x4ea1_1c00,
+                0x6e21_1c00,
+                0x6e21_8c00,
+                0x6e61_8c00,
+                0x6ea1_8c00,
+                0x6e21_6c00,
+                0x6e21_6400,
+                0x4e21_8400,
+                0x4e61_8400,
+                0x4ea1_8400,
+                0x4ee1_8400,
+                0x6e21_8400,
+                0x6e61_8400,
+                0x6ea1_8400,
+                0x6ee1_8400,
+            ]
+        );
+        assert_eq!(
+            words(&|a| {
+                a.vec_ushr(1, 1, 8, 7);
+                a.vec_usra(1, 1, 16, 7);
+                a.vec_usra(1, 1, 32, 14);
+                a.vec_usra(1, 1, 64, 28);
+                a.umov_byte(9, 1, 0);
+                a.umov_byte(10, 1, 8);
+                a.dmb_ishld();
+            }),
+            [
+                0x6f09_0421,
+                0x6f19_1421,
+                0x6f32_1421,
+                0x6f64_1421,
+                0x0e01_3c29,
+                0x0e11_3c2a,
+                0xd503_39bf,
+            ]
+        );
     }
 
     #[test]

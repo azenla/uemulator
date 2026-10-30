@@ -437,6 +437,67 @@ pub(crate) fn vector_move(insn: &Insn) -> Option<VectorMove> {
     Some(VectorMove { load, aligned })
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum VectorOp {
+    And,
+    /// `dst = !dst & src`.
+    AndNot,
+    Or,
+    Xor,
+    /// Lanes become all ones where equal, zero elsewhere.
+    CompareEqual,
+    MinUnsigned8,
+    MaxUnsigned8,
+    Add,
+    Subtract,
+    /// pmovmskb: the sign bit of each byte of an xmm register into the low 16 bits of a general
+    /// register. Register source only; it is the one form whose destination is not an xmm register.
+    MoveMask,
+}
+
+/// A legacy-encoded `66 0f xx` integer vector instruction that works lane by lane on a full xmm
+/// register (or `MoveMask`). The `Cpu::sse` semantics are the definition; the same instruction
+/// without the 66 prefix is MMX and with f3/f2 is a different instruction, so neither matches.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VectorAlu {
+    pub op: VectorOp,
+    /// Lane width as log2 of the byte count: 0 = bytes, 1 = words, 2 = dwords, 3 = qwords.
+    pub lane_log2: u32,
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) fn vector_alu(insn: &Insn) -> Option<VectorAlu> {
+    const OPCODE_MAP_0F: u16 = 1 << 8;
+    if insn.rep != 0 || !insn.p66 {
+        return None;
+    }
+    let opcode = insn
+        .op
+        .checked_sub(OPCODE_MAP_0F)
+        .filter(|&byte| byte <= 0xff)?;
+    let (op, lane_log2) = match opcode {
+        0xdb => (VectorOp::And, 0),
+        0xdf => (VectorOp::AndNot, 0),
+        0xeb => (VectorOp::Or, 0),
+        0xef => (VectorOp::Xor, 0),
+        // pcmpeqb, pcmpeqw, pcmpeqd
+        0x74..=0x76 => (VectorOp::CompareEqual, (opcode - 0x74) as u32),
+        0xda => (VectorOp::MinUnsigned8, 0),
+        0xde => (VectorOp::MaxUnsigned8, 0),
+        // paddb, paddw, paddd; paddq
+        0xfc..=0xfe => (VectorOp::Add, (opcode - 0xfc) as u32),
+        0xd4 => (VectorOp::Add, 3),
+        // psubb, psubw, psubd; psubq
+        0xf8..=0xfa => (VectorOp::Subtract, (opcode - 0xf8) as u32),
+        0xfb => (VectorOp::Subtract, 3),
+        0xd7 => (VectorOp::MoveMask, 0),
+        _ => return None,
+    };
+    Some(VectorAlu { op, lane_log2 })
+}
+
 #[cfg(test)]
 mod tests {
     //! The block-ending set, the clock-reading set, the exit-code layout and the helper ABI that
@@ -462,6 +523,45 @@ mod tests {
             rep,
             p66,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn vector_alu_covers_the_lane_wise_integer_instructions() {
+        let alu = |opcode: u8, rep: u8, p66: bool| {
+            vector_alu(&sse_insn(opcode, rep, p66)).map(|a| (a.op, a.lane_log2))
+        };
+        use VectorOp::*;
+        for (opcode, expected) in [
+            (0xdb, (And, 0)),
+            (0xdf, (AndNot, 0)),
+            (0xeb, (Or, 0)),
+            (0xef, (Xor, 0)),
+            (0x74, (CompareEqual, 0)),
+            (0x75, (CompareEqual, 1)),
+            (0x76, (CompareEqual, 2)),
+            (0xda, (MinUnsigned8, 0)),
+            (0xde, (MaxUnsigned8, 0)),
+            (0xfc, (Add, 0)),
+            (0xfd, (Add, 1)),
+            (0xfe, (Add, 2)),
+            (0xd4, (Add, 3)),
+            (0xf8, (Subtract, 0)),
+            (0xf9, (Subtract, 1)),
+            (0xfa, (Subtract, 2)),
+            (0xfb, (Subtract, 3)),
+            (0xd7, (MoveMask, 0)),
+        ] {
+            assert_eq!(alu(opcode, 0, true), Some(expected), "{opcode:#x}");
+            // without the 66 prefix these are MMX, with f3/f2 something else
+            assert_eq!(alu(opcode, 0, false), None, "{opcode:#x} mmx");
+            assert_eq!(alu(opcode, 1, true), None, "{opcode:#x} f3");
+            assert_eq!(alu(opcode, 2, true), None, "{opcode:#x} f2");
+        }
+        // pcmpgtb, punpcklbw, pshufd: not lowered
+        for opcode in [0x64, 0x60, 0x70] {
+            assert_eq!(alu(opcode, 0, true), None, "{opcode:#x}");
         }
     }
 

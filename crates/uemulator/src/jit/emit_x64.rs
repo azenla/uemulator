@@ -63,6 +63,10 @@ const XMM_SIZE: i32 = size_of::<u128>() as i32;
 const XMM_HALF: i32 = XMM_SIZE / 2;
 /// Legacy-SSE 128-bit memory operands of movaps/movdqa and friends must be aligned to this.
 const VECTOR_ALIGNMENT: i32 = XMM_SIZE;
+/// Host xmm registers of an inline vector instruction: the guest destination (also the result)
+/// and the source operand. Both are caller-saved on every host ABI.
+const HOST_XMM_DST: u8 = 0;
+const HOST_XMM_SRC: u8 = 1;
 // `Seg` is not `repr(C)`; `offset_of!` and `size_of` still report the real layout.
 const SEG_BASE: i32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as i32;
 const SEG_SIZE: i32 = size_of::<Seg>() as i32;
@@ -1800,6 +1804,28 @@ impl<'a> Gen<'a> {
                 };
                 store = self.vector_move(&insn, form, next, insn_index, rip);
             }
+            // pxor/por/pand/pandn, pcmpeq*, pminub/pmaxub, padd*, psub*, pmovmskb (66 prefix)
+            0x1d4
+            | 0x1d7
+            | 0x1da
+            | 0x1db
+            | 0x1de
+            | 0x1df
+            | 0x1eb
+            | 0x1ef
+            | 0x174..=0x176
+            | 0x1f8..=0x1fe
+                if plain =>
+            {
+                let Some(form) = vector_alu(&insn) else {
+                    return false;
+                };
+                // pmovmskb has no memory form (the #UD stays with the interpreter)
+                if form.op == VectorOp::MoveMask && is_mem {
+                    return false;
+                }
+                store = self.vector_alu(&insn, form, next, insn_index, rip);
+            }
             _ => return false,
         }
         if store {
@@ -1809,19 +1835,11 @@ impl<'a> Gen<'a> {
         true
     }
 
-    /// A 128-bit whole-register move (`VectorMove`). The fast path needs the memory operand
-    /// inside one page and, for the aligned forms, 16-byte aligned; anything else, and the SSE
-    /// gate (#UD/#NM) failing, runs the instruction in the interpreter so faults and the
-    /// partial-store rules (`Cpu::write128` probes both pages first) stay in one place. Returns
-    /// whether the instruction stores to memory (the caller then polls for self-modifying code).
-    fn vector_move(
-        &mut self,
-        insn: &Insn,
-        form: VectorMove,
-        next: u64,
-        insn_index: u32,
-        rip: u64,
-    ) -> bool {
+    /// Starts an inline SSE instruction: registers its out-of-line interpreter fallback and, for
+    /// the first one of the block, checks the SSE gate (#UD for CR0.EM or no CR4.OSFXSR, #NM for
+    /// CR0.TS), jumping to the fallback so the interpreter raises the exception. Returns the
+    /// fallback's entry and the label to bind where the inline code ends.
+    fn sse_entry(&mut self, insn_index: u32, rip: u64) -> (Label, Label) {
         let slow = self.a.label();
         let resume = self.a.label();
         self.slows.push(Slow {
@@ -1841,6 +1859,23 @@ impl<'a> Gen<'a> {
             self.a.alu_ri(AND, SCRATCH_A, CR4_OSFXSR as i32, true);
             self.a.jcc(E, slow);
         }
+        (slow, resume)
+    }
+
+    /// A 128-bit whole-register move (`VectorMove`). The fast path needs the memory operand
+    /// inside one page and, for the aligned forms, 16-byte aligned; anything else, and the SSE
+    /// gate (#UD/#NM) failing, runs the instruction in the interpreter so faults and the
+    /// partial-store rules (`Cpu::write128` probes both pages first) stay in one place. Returns
+    /// whether the instruction stores to memory (the caller then polls for self-modifying code).
+    fn vector_move(
+        &mut self,
+        insn: &Insn,
+        form: VectorMove,
+        next: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let (slow, resume) = self.sse_entry(insn_index, rip);
         let xmm = |reg: u8| XMM + XMM_SIZE * reg as i32;
         // The two halves travel through VALUE and SCRATCH_C, both free once the probe is done.
         if insn.md == MODRM_MOD_REGISTER {
@@ -1883,6 +1918,53 @@ impl<'a> Gen<'a> {
         self.a.bind(resume);
         self.live = false;
         !form.load
+    }
+
+    /// A lane-wise integer vector instruction (`VectorAlu`) on xmm registers, the source being a
+    /// register or a 16-byte aligned memory operand (misaligned, page-crossing and gate failures
+    /// run in the interpreter, as for `vector_move`). Both operands are loaded from `Cpu::xmm`
+    /// into host xmm0 and xmm1 with `movdqu`, so nothing depends on how `Cpu` is aligned and
+    /// nothing is live in host vector registers across instructions (every helper call clobbers
+    /// them).
+    fn vector_alu(
+        &mut self,
+        insn: &Insn,
+        form: VectorAlu,
+        next: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let (slow, resume) = self.sse_entry(insn_index, rip);
+        let xmm = |reg: u8| XMM + XMM_SIZE * reg as i32;
+        if form.op == VectorOp::MoveMask {
+            self.a.xmm_ld(HOST_XMM_SRC, mem(CPU, xmm(insn.rm)));
+            self.a.pmovmskb(VALUE, HOST_XMM_SRC);
+            self.write_reg(insn.reg, false, 4, VALUE);
+            self.a.bind(resume);
+            self.live = false;
+            return false;
+        }
+        self.a.xmm_ld(HOST_XMM_DST, mem(CPU, xmm(insn.reg)));
+        if insn.md == MODRM_MOD_REGISTER {
+            self.a.xmm_ld(HOST_XMM_SRC, mem(CPU, xmm(insn.rm)));
+        } else {
+            self.ea(insn, next);
+            // Every legacy-SSE form of these instructions needs a 16-byte aligned memory operand.
+            self.a.mov_rr(SCRATCH_A, ADDR, true);
+            self.a.alu_ri(AND, SCRATCH_A, VECTOR_ALIGNMENT - 1, true);
+            self.a.jcc(NE, slow);
+            self.tlb_probe(XMM_SIZE as u8, TLB_TAG_READ, slow);
+            self.a.ld(SCRATCH_B, mem(SCRATCH_A, TLB_ADDEND));
+            self.a.xmm_ld(HOST_XMM_SRC, mem_idx(ADDR, SCRATCH_B, 0, 0));
+        }
+        // The guest and host are the same `66 0f xx` instruction, so the opcode byte carries over
+        // (pandn included: both compute `!dst & src`).
+        self.a
+            .xmm_op((insn.op & 0xff) as u8, HOST_XMM_DST, HOST_XMM_SRC);
+        self.a.xmm_st(mem(CPU, xmm(insn.reg)), HOST_XMM_DST);
+        self.a.bind(resume);
+        self.live = false;
+        false
     }
 
     /// `rips[k]` is the guest rip of instruction `k`; `end_rip` is the rip after the last one.
