@@ -34,6 +34,9 @@ jobs:
       with:
         persist-credentials: false
 
+    - name: install firmware target
+      run: rustup target add x86_64-unknown-none
+
     - name: cargo build
       run: cargo build --release --workspace
 
@@ -50,6 +53,9 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
+
+    - name: install firmware target
+      run: rustup target add x86_64-unknown-none
 
     - name: cargo test
       run: cargo test --release --workspace
@@ -73,6 +79,9 @@ jobs:
 
     - name: install clippy
       run: rustup component add clippy
+
+    - name: install firmware target
+      run: rustup target add x86_64-unknown-none
 
     - name: cargo clippy
       run: cargo clippy --release --workspace --all-targets -- -D warnings
