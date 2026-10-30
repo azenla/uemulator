@@ -288,7 +288,7 @@ impl<S: Storage> Volume<S> {
         let mut long_units: Vec<u16> = Vec::new();
         let mut long_checksum = 0u8;
         let mut expected_sequence = 0u8;
-        for raw in bytes.chunks_exact(DIRECTORY_ENTRY_BYTES) {
+        for raw in bytes.as_chunks::<DIRECTORY_ENTRY_BYTES>().0 {
             match raw[0] {
                 END_OF_DIRECTORY => break,
                 DELETED => {

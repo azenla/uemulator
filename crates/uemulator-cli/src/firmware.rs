@@ -66,8 +66,8 @@ pub fn set_boot_entry(
     let order_key = variable_key("BootOrder");
     let mut order = vec![0u8, 0];
     if let Some(existing) = store.get(&order_key) {
-        for pair in existing.get(4..).unwrap_or(&[]).chunks_exact(2) {
-            if pair != [0, 0] {
+        for pair in existing.get(4..).unwrap_or(&[]).as_chunks::<2>().0 {
+            if *pair != [0, 0] {
                 order.extend_from_slice(pair);
             }
         }

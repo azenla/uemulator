@@ -219,7 +219,9 @@ pub fn nodes(bytes: &[u8]) -> impl Iterator<Item = Node<'_>> {
 
 fn file_node_text(payload: &[u8]) -> String {
     let units: Vec<u16> = payload
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .take_while(|&unit| unit != 0)
         .collect();
