@@ -257,6 +257,14 @@ enum Src {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+enum BitScan {
+    Bsf,
+    Bsr,
+    Tzcnt,
+    Lzcnt,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum ShiftKind {
     Shl,
     Shr,
@@ -1285,6 +1293,118 @@ impl<'a> Gen<'a> {
         self.live = false;
     }
 
+    /// bsf, bsr, tzcnt and lzcnt of a 32- or 64-bit operand, the same results and
+    /// `LazyFlagsOp::SzpCfOf` records as the aarch64 `bit_scan`. The host `bsf`/`bsr` stand in
+    /// for tzcnt/lzcnt too, so no host BMI is needed: a zero source (ZF) selects the width.
+    fn bit_scan(&mut self, insn: &Insn, scan: BitScan, next: u64, insn_index: u32, rip: u64) {
+        let is64 = insn.opsize == 8;
+        let bits = 8 * insn.opsize as u64;
+        let (index, other) = (SCRATCH_C, SCRATCH_D);
+        self.bmi_source(insn, next, insn_index, rip);
+        match scan {
+            BitScan::Tzcnt => {
+                self.a.bsf_rr(index, ACC, is64);
+                // CF = source is zero, read before the host flags change; `mov_imm` of a
+                // non-zero constant leaves them alone, and so does `cmov`.
+                self.a.mov_imm(other, bits);
+                self.a.cmov_rr(E, index, other, true);
+                self.a.setcc(E, OPERAND);
+                self.a.ext_rr(OPERAND, OPERAND, 1, false);
+                self.a.mov_rr(ACC, index, true);
+            }
+            BitScan::Lzcnt => {
+                self.a.bsr_rr(index, ACC, is64);
+                // For a zero source use 2 * bits - 1, which xor (bits - 1) turns into `bits`; for
+                // any other the xor turns the bit index into the leading-zero count.
+                self.a.mov_imm(other, 2 * bits - 1);
+                self.a.cmov_rr(E, index, other, true);
+                self.a.setcc(E, OPERAND);
+                self.a.ext_rr(OPERAND, OPERAND, 1, false);
+                self.a.alu_ri(XOR, index, bits as i32 - 1, true);
+                self.a.mov_rr(ACC, index, true);
+            }
+            BitScan::Bsf | BitScan::Bsr => {
+                if scan == BitScan::Bsf {
+                    self.a.bsf_rr(index, ACC, is64);
+                } else {
+                    self.a.bsr_rr(index, ACC, is64);
+                }
+                // A zero source leaves the whole destination register as it was.
+                self.ld_gpr(other, insn.reg);
+                self.a.cmov_rr(E, index, other, true);
+                self.st_gpr(insn.reg, index);
+                // SzpCfOf of the source (still in ACC) with CF = OF = 0
+                self.a.mov_imm(OPERAND, 0);
+                self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
+                self.live = false;
+                return;
+            }
+        }
+        self.st_gpr(insn.reg, ACC);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
+        self.live = false;
+    }
+
+    /// `shld`/`shrd r/m, r, imm8` at 32 and 64 bits with a count of 1 to the width minus 1, as on
+    /// aarch64. The host instruction gives the value and CF; OF (defined by the host for a count
+    /// of 1 only) is the sign change, worked out from the original operand.
+    #[allow(clippy::too_many_arguments)]
+    fn double_shift(
+        &mut self,
+        insn: &Insn,
+        left: bool,
+        dst: Dst,
+        count: u32,
+        next: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let size = insn.opsize;
+        let is64 = size == 8;
+        let (source, original) = (SCRATCH_C, SCRATCH_D);
+        self.load_dst(insn, dst, ACC, size, next, insn_index, rip);
+        self.read_reg(source, insn.reg, false, size);
+        self.a.mov_rr(original, ACC, true);
+        self.a.double_shift_ri(left, ACC, source, count as u8, is64);
+        self.a.setcc(B, OPERAND);
+        self.a.ext_rr(OPERAND, OPERAND, 1, false);
+        self.a.alu_rr(XOR, original, ACC, true);
+        self.a.shift_ri(SHR, original, 8 * size - 1, true);
+        self.a.alu_ri(AND, original, 1, false);
+        self.a
+            .shift_ri(SHL, original, SZP_CF_OF_SRC_OF_BIT as u8, false);
+        self.a.alu_rr(OR, OPERAND, original, false);
+        let stored = self.store_dst(dst, size, true, insn_index, rip);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, size);
+        self.live = false;
+        stored
+    }
+
+    /// One-operand `mul` and `imul` (`group3` /4 and /5) at 32 and 64 bits, as on aarch64: the
+    /// host instruction produces rDX:rAX and the right CF = OF, so only the flag record and the
+    /// two register stores are ours. The memory operand goes first: its slow path clobbers
+    /// everything, and afterwards `ADDR` (rdx) is free for the high half.
+    fn mul_wide(&mut self, insn: &Insn, signed: bool, next: u64, insn_index: u32, rip: u64) {
+        let is64 = insn.opsize == 8;
+        self.bmi_source(insn, next, insn_index, rip);
+        self.a.mov_rr(OPERAND, ACC, true);
+        self.ld_gpr(ACC, GUEST_RAX);
+        if signed {
+            self.a.imul_r(OPERAND, is64);
+        } else {
+            self.a.mul_r(OPERAND, is64);
+        }
+        let overflow = SCRATCH_C;
+        self.a.setcc(O, overflow);
+        self.a.ext_rr(overflow, overflow, 1, false);
+        self.a.mov_imm(OPERAND, IMUL_OVERFLOW_FLAGS as u64);
+        self.a.imul_rr(OPERAND, overflow, false);
+        self.st_gpr(GUEST_RAX, ACC);
+        self.st_gpr(GUEST_RDX, ADDR);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
+        self.live = false;
+    }
+
     /// `imul r, r/m` and the three-operand `imul r, r/m, imm`, at 32 and 64 bits. The host
     /// `imul` sets CF = OF when the full product does not fit, which is what the interpreter
     /// computes; SF/ZF/PF are undefined on the host, so they come from the truncated result
@@ -1408,6 +1528,26 @@ impl<'a> Gen<'a> {
                 store = self.alu(&insn, ALU_TEST, dst, src, size, next, insn_index, rip);
             }
             // group 3: /0 test r/m, imm; /2 not; /3 neg
+            // shld/shrd r/m, r, imm8 at 32 and 64 bits
+            0x1a4 | 0x1ac if wide && plain => {
+                let count = insn.imm as u32 & (8 * osz as u32 - 1);
+                if count == 0 {
+                    return false;
+                }
+                store = self.double_shift(
+                    &insn,
+                    insn.op == 0x1a4,
+                    Self::rm_dst(&insn, osz),
+                    count,
+                    next,
+                    insn_index,
+                    rip,
+                );
+            }
+            // group 3 /4 mul and /5 imul r/m, one operand, at 32 and 64 bits
+            0xf7 if wide && plain && matches!(insn.reg & 7, 4 | 5) => {
+                self.mul_wide(&insn, insn.reg & 7 == 5, next, insn_index, rip);
+            }
             0xf6 | 0xf7 if plain && matches!(insn.reg & 7, 0 | 2 | 3) => {
                 let size = if insn.op == 0xf6 { 1 } else { osz };
                 let dst = Self::rm_dst(&insn, size);
@@ -1699,6 +1839,16 @@ impl<'a> Gen<'a> {
                     self.a.mov_rr(VALUE, VALUE, false);
                 }
                 self.st_gpr(insn.reg, VALUE);
+            }
+            // bsf/bsr (no prefix) and tzcnt/lzcnt (F3) at 32 and 64 bits
+            0x1bc | 0x1bd if wide && plain && matches!(insn.rep, 0 | 1) => {
+                let scan = match (insn.op, insn.rep) {
+                    (0x1bc, 0) => BitScan::Bsf,
+                    (0x1bd, 0) => BitScan::Bsr,
+                    (0x1bc, _) => BitScan::Tzcnt,
+                    _ => BitScan::Lzcnt,
+                };
+                self.bit_scan(&insn, scan, next, insn_index, rip);
             }
             // BMI1/BMI2 (VEX.LZ, map 0f38): shlx/shrx/sarx f7 with 66/F2/F3, bzhi f5, andn f2 and
             // the blsr/blsmsk/blsi group f3. bextr and the rest go to the interpreter.

@@ -127,7 +127,9 @@ pub(super) const VALUE: u32 = 6;
 /// Intra-procedure-call scratch register of AAPCS64; holds the target of `blr`.
 pub(super) const CALL_TARGET: u32 = 16;
 
-/// Index of rsp in `Cpu::gpr`.
+/// Indices of rax, rdx and rsp in `Cpu::gpr`.
+const RAX: u8 = 0;
+const RDX: u8 = 2;
 const RSP: u8 = 4;
 /// Without a REX prefix, byte-register numbers 4..=7 mean ah/ch/dh/bh (bits 15:8 of registers
 /// 0..=3); with one they mean spl/bpl/sil/dil.
@@ -255,6 +257,14 @@ enum ShiftKind {
     Shl,
     Shr,
     Sar,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BitScan {
+    Bsf,
+    Bsr,
+    Tzcnt,
+    Lzcnt,
 }
 
 /// What a condition code reduces to right after a flag-setting instruction of a given kind.
@@ -1510,6 +1520,96 @@ impl<'a> Gen<'a> {
         self.live = None;
     }
 
+    /// `shld`/`shrd r/m, r, imm8` at 32 and 64 bits with a count of 1 to the width minus 1 (a
+    /// masked count of zero changes nothing and stays in the interpreter): one `extr` of the two
+    /// operands. CF is the last bit shifted out of r/m, OF is set when the sign changed.
+    #[allow(clippy::too_many_arguments)]
+    fn double_shift(
+        &mut self,
+        insn: &Insn,
+        left: bool,
+        dst: Dst,
+        count: u32,
+        next_rip: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let size = insn.opsize;
+        let is64 = size == 8;
+        let bits = 8 * size as u32;
+        let (result, source, scratch) = (SCRATCH_A, SCRATCH_B, SCRATCH_C);
+        let flags = 1;
+        self.load_dst(insn, dst, 0, size, next_rip, insn_index, rip);
+        if !is64 {
+            self.asm.uxtw(0, 0);
+        }
+        self.load_gpr(source, insn.reg);
+        if left {
+            // (r/m:reg) >> (bits - count)
+            self.asm.extr(result, 0, source, bits - count, is64);
+            self.asm.ubfx(flags, 0, bits - count, 1, is64);
+        } else {
+            // (reg:r/m) >> count
+            self.asm.extr(result, source, 0, count, is64);
+            self.asm.ubfx(flags, 0, count - 1, 1, is64);
+        }
+        self.asm.eor(scratch, result, 0, is64);
+        self.asm.ubfx(scratch, scratch, bits - 1, 1, is64);
+        self.asm.bfi(flags, scratch, CF_OF_OF_BIT, 1, false);
+        self.asm.mov(0, result);
+        let stored = self.store_dst(dst, size, true, insn_index, rip);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, size);
+        self.live = None;
+        stored
+    }
+
+    /// One-operand `mul` and `imul` (`group3` /4 and /5) at 32 and 64 bits: rDX:rAX = rAX * r/m.
+    /// CF = OF = (the high half is not zero for `mul`, not the sign of the low half for `imul`),
+    /// SF/ZF/PF from the low half: `LazyFlagsOp::SzpCfOf`, as `Cpu::mul_div` leaves them.
+    fn mul_wide(&mut self, insn: &Insn, signed: bool, next_rip: u64, insn_index: u32, rip: u64) {
+        let is64 = insn.opsize == 8;
+        let (low, high, check) = (SCRATCH_A, SCRATCH_B, SCRATCH_C);
+        self.bmi_source(insn, next_rip, insn_index, rip);
+        self.load_gpr(1, RAX);
+        if is64 {
+            self.asm.mul(low, 0, 1, true);
+            if signed {
+                self.asm.smulh(high, 0, 1);
+                self.asm.asr_imm(check, low, 63);
+                self.asm.cmp(high, check, true);
+            } else {
+                self.asm.umulh(high, 0, 1);
+                self.asm.cmp_imm(high, 0, true);
+            }
+        } else {
+            // Two 32-bit operands extended to 64 bits multiply exactly in 64 bits.
+            if signed {
+                self.asm.sxtw(0, 0);
+                self.asm.sxtw(1, 1);
+            } else {
+                self.asm.uxtw(0, 0);
+                self.asm.uxtw(1, 1);
+            }
+            self.asm.mul(low, 0, 1, true);
+            self.asm.ubfx(high, low, 32, 32, true);
+            if signed {
+                self.asm.sxtw(check, low);
+                self.asm.cmp(low, check, true);
+            } else {
+                self.asm.cmp_imm(high, 0, true);
+            }
+            self.asm.uxtw(low, low);
+        }
+        // x1 = 3 (CF and OF) or 0 for `store_lazy`
+        self.asm.mov_imm(check, 3);
+        self.asm.csel(1, check, XZR, NE);
+        self.store_gpr(RAX, low);
+        self.store_gpr(RDX, high);
+        self.asm.mov(0, low);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
+        self.live = None;
+    }
+
     /// Loads the r/m operand of a VEX BMI instruction into x0 (a 32-bit operation reads only the
     /// low half). The memory operand comes first: its slow path calls a helper that clobbers
     /// every scratch register.
@@ -1602,6 +1702,49 @@ impl<'a> Gen<'a> {
             self.asm.and(0, 0, 2, is64);
         }
         self.store_gpr(insn.vex_v, 0);
+        self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
+        self.live = None;
+    }
+
+    /// bsf, bsr, tzcnt and lzcnt of a 32- or 64-bit operand. tzcnt/lzcnt write the count (the
+    /// width for a zero source) with CF = (source is zero) and SF/ZF/PF from the count; bsf/bsr
+    /// leave the destination alone for a zero source, else write the bit index, and take
+    /// SF/ZF/PF from the source with CF clear. Both are `LazyFlagsOp::SzpCfOf`, which is what the
+    /// interpreter leaves (every flag but ZF is undefined for bsf/bsr, and QEMU does the same).
+    fn bit_scan(&mut self, insn: &Insn, scan: BitScan, next_rip: u64, insn_index: u32, rip: u64) {
+        let is64 = insn.opsize == 8;
+        let (index, old_destination) = (2, 3);
+        self.bmi_source(insn, next_rip, insn_index, rip);
+        if !is64 {
+            self.asm.uxtw(0, 0);
+        }
+        self.asm.cmp_imm(0, 0, true);
+        match scan {
+            BitScan::Tzcnt | BitScan::Lzcnt => {
+                self.asm.cset(1, EQ);
+                if scan == BitScan::Tzcnt {
+                    self.asm.rbit(0, 0, is64);
+                }
+                self.asm.clz(0, 0, is64);
+                self.store_gpr(insn.reg, 0);
+            }
+            BitScan::Bsf | BitScan::Bsr => {
+                if scan == BitScan::Bsf {
+                    self.asm.rbit(index, 0, is64);
+                    self.asm.clz(index, index, is64);
+                } else {
+                    self.asm.clz(index, 0, is64);
+                    self.asm
+                        .mov_imm(old_destination, 8 * insn.opsize as u64 - 1);
+                    self.asm.sub(index, old_destination, index, false);
+                }
+                self.load_gpr(old_destination, insn.reg);
+                self.asm.csel(index, old_destination, index, EQ);
+                self.store_gpr(insn.reg, index);
+                // SzpCfOf of the source with CF = OF = 0
+                self.asm.mov_imm(1, 0);
+            }
+        }
         self.store_lazy(LazyFlagsOp::SzpCfOf, insn.opsize);
         self.live = None;
     }
@@ -1804,6 +1947,26 @@ impl<'a> Gen<'a> {
                 is_store = self.alu(&insn, ALU_TEST, dst, src, size, next_rip, insn_index, rip);
             }
             // group 3 /0: test r/m, imm; /2 not; /3 neg
+            // shld/shrd r/m, r, imm8 at 32 and 64 bits
+            0x1a4 | 0x1ac if wide_operand && plain => {
+                let count = insn.imm as u32 & (8 * operand_size as u32 - 1);
+                if count == 0 {
+                    return false;
+                }
+                is_store = self.double_shift(
+                    &insn,
+                    insn.op == 0x1a4,
+                    Self::rm_dst(&insn, operand_size),
+                    count,
+                    next_rip,
+                    insn_index,
+                    rip,
+                );
+            }
+            // group 3 /4 mul and /5 imul r/m, one operand, at 32 and 64 bits
+            0xf7 if wide_operand && plain && matches!(insn.reg & 7, 4 | 5) => {
+                self.mul_wide(&insn, insn.reg & 7 == 5, next_rip, insn_index, rip);
+            }
             0xf6 | 0xf7 if plain && matches!(insn.reg & 7, 0 | 2 | 3) => {
                 let size = if insn.op == 0xf6 { 1 } else { operand_size };
                 let dst = Self::rm_dst(&insn, size);
@@ -2175,6 +2338,16 @@ impl<'a> Gen<'a> {
                     }
                     _ => return false,
                 }
+            }
+            // bsf/bsr (no prefix) and tzcnt/lzcnt (F3) at 32 and 64 bits
+            0x1bc | 0x1bd if wide_operand && plain && matches!(insn.rep, 0 | 1) => {
+                let scan = match (insn.op, insn.rep) {
+                    (0x1bc, 0) => BitScan::Bsf,
+                    (0x1bd, 0) => BitScan::Bsr,
+                    (0x1bc, _) => BitScan::Tzcnt,
+                    _ => BitScan::Lzcnt,
+                };
+                self.bit_scan(&insn, scan, next_rip, insn_index, rip);
             }
             // push r64. rsp is written back only after the store, so a faulting push leaves it
             // unchanged; the value is read from the register file, so `push rsp` pushes the old rsp.

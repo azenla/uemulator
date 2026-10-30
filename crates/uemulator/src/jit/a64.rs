@@ -428,6 +428,20 @@ impl Asm {
     pub fn smulh(&mut self, rd: u32, rn: u32, rm: u32) {
         self.reg3(0x9b40_7c00, rd, rn, rm, false);
     }
+    /// High 64 bits of the unsigned 128-bit product.
+    pub fn umulh(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.reg3(0x9bc0_7c00, rd, rn, rm, false);
+    }
+    /// Counts leading zero bits of the 32- or 64-bit operand (the width when it is zero).
+    pub fn clz(&mut self, rd: u32, rn: u32, is64: bool) {
+        let sf = if is64 { SF } else { 0 };
+        self.emit(sf | 0x5ac0_1000 | rn << RN_SHIFT | rd);
+    }
+    /// Reverses the bits of the 32- or 64-bit operand.
+    pub fn rbit(&mut self, rd: u32, rn: u32, is64: bool) {
+        let sf = if is64 { SF } else { 0 };
+        self.emit(sf | 0x5ac0_0000 | rn << RN_SHIFT | rd);
+    }
     pub fn mul(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
         self.reg3(0x1b00_7c00, rd, rn, rm, is64);
     }
@@ -443,10 +457,16 @@ impl Asm {
     pub fn rorv(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
         self.reg3(0x1ac0_2c00, rd, rn, rm, is64);
     }
+    /// `extr rd, rn, rm, #lsb`: the low 32 or 64 bits of the concatenation rn:rm shifted right
+    /// by `lsb`.
+    pub fn extr(&mut self, rd: u32, rn: u32, rm: u32, lsb: u32, is64: bool) {
+        let opcode = if is64 { 0x93c0_0000 } else { 0x1380_0000 };
+        self.emit(opcode | rm << RM_SHIFT | lsb << IMMS_SHIFT | rn << RN_SHIFT | rd);
+    }
+
     /// `ror rd, rn, #amount`, the alias of `extr rd, rn, rn, #amount`.
     pub fn ror_imm(&mut self, rd: u32, rn: u32, amount: u32, is64: bool) {
-        let opcode = if is64 { 0x93c0_0000 } else { 0x1380_0000 };
-        self.emit(opcode | rn << RM_SHIFT | amount << IMMS_SHIFT | rn << RN_SHIFT | rd);
+        self.extr(rd, rn, rn, amount, is64);
     }
 
     /// 64-bit `add rd, rn, rm, lsl #shift`.
@@ -2784,6 +2804,15 @@ fn bitfield_extract_and_sized_shift_encodings_match_the_assembler() {
         ("smulh x0, x1, x2", |a| { a.smulh(0, 1, 2); }, &[0x9b427c20]),
         ("smulh x28, x29, x30", |a| { a.smulh(28, 29, 30); }, &[0x9b5e7fbc]),
         ("smulh x3, x3, x4", |a| { a.smulh(3, 3, 4); }, &[0x9b447c63]),
+        ("umulh x0, x1, x2", |a| { a.umulh(0, 1, 2); }, &[0x9bc27c20]),
+        ("umulh x28, x29, x30", |a| { a.umulh(28, 29, 30); }, &[0x9bde7fbc]),
+        ("extr x0, x1, x2, #5", |a| { a.extr(0, 1, 2, 5, true); }, &[0x93c21420]),
+        ("extr w28, w29, w30, #31", |a| { a.extr(28, 29, 30, 31, false); }, &[0x139e7fbc]),
+        ("extr x3, x3, x4, #63", |a| { a.extr(3, 3, 4, 63, true); }, &[0x93c4fc63]),
+        ("clz x0, x1", |a| { a.clz(0, 1, true); }, &[0xdac01020]),
+        ("clz w28, w29", |a| { a.clz(28, 29, false); }, &[0x5ac013bc]),
+        ("rbit x0, x1", |a| { a.rbit(0, 1, true); }, &[0xdac00020]),
+        ("rbit w28, w29", |a| { a.rbit(28, 29, false); }, &[0x5ac003bc]),
     ];
     check_encodings(cases);
 }

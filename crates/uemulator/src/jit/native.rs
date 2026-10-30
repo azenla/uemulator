@@ -1707,6 +1707,58 @@ mod tests {
     }
 
     #[test]
+    fn bit_scans_are_lowered_inline_at_32_and_64_bits_only() {
+        let _guard = serialize_jit_tests();
+        for (code, inlined) in [
+            // bsf rax, rcx | bsr eax, [rsi] | tzcnt rax, rcx | lzcnt eax, [rsi]
+            (&[0x48, 0x0f, 0xbc, 0xc1][..], 1),
+            (&[0x0f, 0xbd, 0x06], 1),
+            (&[0xf3, 0x48, 0x0f, 0xbc, 0xc1], 1),
+            (&[0xf3, 0x0f, 0xbd, 0x06], 1),
+            // bsf ax, cx | tzcnt ax, cx | repne bsf rax, rcx
+            (&[0x66, 0x0f, 0xbc, 0xc1], 0),
+            (&[0x66, 0xf3, 0x0f, 0xbc, 0xc1], 0),
+            (&[0xf2, 0x48, 0x0f, 0xbc, 0xc1], 0),
+        ] {
+            assert_eq!(inlined_in(&[code, &[0xf4]].concat()), inlined, "{code:x?}");
+        }
+    }
+
+    #[test]
+    fn one_operand_mul_and_imul_are_lowered_inline_at_32_and_64_bits_only() {
+        let _guard = serialize_jit_tests();
+        for (code, inlined) in [
+            // mul rcx | imul dword ptr [rsi] | mul ecx
+            (&[0x48, 0xf7, 0xe1][..], 1),
+            (&[0xf7, 0x2e], 1),
+            (&[0xf7, 0xe1], 1),
+            // mul cx | mul cl | div rcx
+            (&[0x66, 0xf7, 0xe1], 0),
+            (&[0xf6, 0xe1], 0),
+            (&[0x48, 0xf7, 0xf1], 0),
+        ] {
+            assert_eq!(inlined_in(&[code, &[0xf4]].concat()), inlined, "{code:x?}");
+        }
+    }
+
+    #[test]
+    fn double_shifts_by_a_nonzero_immediate_are_lowered_inline_at_32_and_64_bits_only() {
+        let _guard = serialize_jit_tests();
+        for (code, inlined) in [
+            // shld rax, rcx, 5 | shrd dword ptr [rsi], ecx, 31 | shld rax, rcx, 1
+            (&[0x48, 0x0f, 0xa4, 0xc8, 0x05][..], 1),
+            (&[0x0f, 0xac, 0x0e, 0x1f], 1),
+            (&[0x48, 0x0f, 0xa4, 0xc8, 0x01], 1),
+            // a count that masks to zero | the cl form | shld ax, cx, 5
+            (&[0x48, 0x0f, 0xa4, 0xc8, 0x40], 0),
+            (&[0x48, 0x0f, 0xa5, 0xc8], 0),
+            (&[0x66, 0x0f, 0xa4, 0xc8, 0x05], 0),
+        ] {
+            assert_eq!(inlined_in(&[code, &[0xf4]].concat()), inlined, "{code:x?}");
+        }
+    }
+
+    #[test]
     fn adc_and_sbb_are_lowered_inline_at_32_and_64_bits_only() {
         let _guard = serialize_jit_tests();
         for (code, inlined) in [
@@ -1762,8 +1814,8 @@ mod tests {
     #[test]
     fn helper_histogram_counts_the_instructions_that_reach_the_interpreter() {
         let _guard = serialize_jit_tests();
-        // bsf eax, ebx three times (no inline lowering), then hlt.
-        let bsf = [0x0f, 0xbc, 0xc3];
+        // bsf ax, bx three times (16-bit forms have no inline lowering), then hlt.
+        let bsf = [0x66, 0x0f, 0xbc, 0xc3];
         let code = [&bsf[..], &bsf, &bsf, &[0xf4, 0xf4]].concat();
         let mut cpu = cpu_running(&code);
         cpu.jit = Some(Box::new(new_jit()));

@@ -1064,6 +1064,167 @@ fn bsf_bsr_16_bit_and_memory_forms() {
     ]);
 }
 
+/// Every 32/64-bit bit-scan form, register and memory source, over sources around zero, the
+/// width's edges and single bits, with noise in the destination and the arithmetic flags.
+#[test]
+fn bit_scan_forms_match_over_edge_sources() {
+    #[rustfmt::skip]
+    let forms: &[(&str, &[u8])] = &[
+        ("tzcnt rax, rcx", &[0xf3, 0x48, 0x0f, 0xbc, 0xc1, 0xf4]),
+        ("tzcnt eax, ecx", &[0xf3, 0x0f, 0xbc, 0xc1, 0xf4]),
+        ("tzcnt r9, [rbx]", &[0xf3, 0x4c, 0x0f, 0xbc, 0x0b, 0xf4]),
+        ("tzcnt r9d, [rbx]", &[0xf3, 0x44, 0x0f, 0xbc, 0x0b, 0xf4]),
+        ("lzcnt rax, rcx", &[0xf3, 0x48, 0x0f, 0xbd, 0xc1, 0xf4]),
+        ("lzcnt eax, ecx", &[0xf3, 0x0f, 0xbd, 0xc1, 0xf4]),
+        ("lzcnt r9, [rbx]", &[0xf3, 0x4c, 0x0f, 0xbd, 0x0b, 0xf4]),
+        ("lzcnt r9d, [rbx]", &[0xf3, 0x44, 0x0f, 0xbd, 0x0b, 0xf4]),
+        ("bsf rax, rcx", &[0x48, 0x0f, 0xbc, 0xc1, 0xf4]),
+        ("bsf eax, ecx", &[0x0f, 0xbc, 0xc1, 0xf4]),
+        ("bsf r9, [rbx]", &[0x4c, 0x0f, 0xbc, 0x0b, 0xf4]),
+        ("bsf r9d, [rbx]", &[0x44, 0x0f, 0xbc, 0x0b, 0xf4]),
+        ("bsr rax, rcx", &[0x48, 0x0f, 0xbd, 0xc1, 0xf4]),
+        ("bsr eax, ecx", &[0x0f, 0xbd, 0xc1, 0xf4]),
+        ("bsr r9, [rbx]", &[0x4c, 0x0f, 0xbd, 0x0b, 0xf4]),
+        ("bsr r9d, [rbx]", &[0x44, 0x0f, 0xbd, 0x0b, 0xf4]),
+        // the destination is also the source
+        ("bsf rcx, rcx", &[0x48, 0x0f, 0xbc, 0xc9, 0xf4]),
+        ("tzcnt ecx, ecx", &[0xf3, 0x0f, 0xbc, 0xc9, 0xf4]),
+    ];
+    let mut sources = vec![
+        0u64,
+        1,
+        0xff,
+        0x8000_0000,
+        0x1_0000_0000,
+        0x8000_0000_0000_0000,
+        u64::MAX,
+        0xdead_beef_0bad_f00d,
+        0xffff_ffff_0000_0000,
+        0x0000_0000_ffff_ff00,
+    ];
+    sources.extend((0..64).map(|bit| 1u64 << bit));
+    for (_name, code) in forms {
+        for &source in &sources {
+            for flags in [0u64, crate::cpu::flags::ARITH] {
+                check_with(code, |harness| {
+                    seed_registers_and_memory(harness);
+                    harness.cpu.gpr[1] = source;
+                    harness.cpu.gpr[0] = 0x1122_3344_5566_7788;
+                    harness.cpu.gpr[9] = 0x99aa_bbcc_ddee_ff00;
+                    let address = harness.cpu.gpr[3];
+                    harness.write(address, &source.to_le_bytes());
+                    harness.cpu.set_eflags_arith(flags);
+                });
+            }
+        }
+    }
+}
+
+/// One-operand mul/imul at 32 and 64 bits, source in a register (including rax and rdx
+/// themselves) or memory, over operand pairs around the sign and carry boundaries.
+#[test]
+fn one_operand_multiply_forms_match_over_edge_operands() {
+    #[rustfmt::skip]
+    let forms: &[&[u8]] = &[
+        &[0x48, 0xf7, 0xe1, 0xf4], // mul rcx
+        &[0x48, 0xf7, 0xe9, 0xf4], // imul rcx
+        &[0xf7, 0xe1, 0xf4],       // mul ecx
+        &[0xf7, 0xe9, 0xf4],       // imul ecx
+        &[0x48, 0xf7, 0x23, 0xf4], // mul qword ptr [rbx]
+        &[0x48, 0xf7, 0x2b, 0xf4], // imul qword ptr [rbx]
+        &[0xf7, 0x23, 0xf4],       // mul dword ptr [rbx]
+        &[0xf7, 0x2b, 0xf4],       // imul dword ptr [rbx]
+        &[0x48, 0xf7, 0xe0, 0xf4], // mul rax
+        &[0xf7, 0xe8, 0xf4],       // imul eax
+        &[0x48, 0xf7, 0xe2, 0xf4], // mul rdx
+        &[0xf7, 0xea, 0xf4],       // imul edx
+        &[0x49, 0xf7, 0xe1, 0xf4], // mul r9
+        &[0x41, 0xf7, 0xe9, 0xf4], // imul r9d
+    ];
+    let operands = [
+        0u64,
+        1,
+        2,
+        0x7fff_ffff,
+        0x8000_0000,
+        0xffff_ffff,
+        0x1_0000_0000,
+        0x7fff_ffff_ffff_ffff,
+        0x8000_0000_0000_0000,
+        u64::MAX,
+        0xdead_beef_0bad_f00d,
+        0x0000_0001_0000_0001,
+    ];
+    for code in forms {
+        for &first in &operands {
+            for &second in &operands {
+                check_with(code, |harness| {
+                    seed_registers_and_memory(harness);
+                    harness.cpu.gpr[0] = first;
+                    harness.cpu.gpr[1] = second;
+                    harness.cpu.gpr[2] = second.rotate_left(13);
+                    harness.cpu.gpr[9] = second;
+                    let address = harness.cpu.gpr[3];
+                    harness.write(address, &second.to_le_bytes());
+                });
+            }
+        }
+    }
+}
+
+/// shld/shrd by an immediate at 32 and 64 bits into a register or memory, including counts that
+/// mask to zero (left to the interpreter) and a destination that is also the source.
+#[test]
+fn double_shift_by_immediate_matches_over_edge_operands() {
+    #[rustfmt::skip]
+    let forms: &[&[u8]] = &[
+        &[0x48, 0x0f, 0xa4, 0xc8], // shld rax, rcx, imm8
+        &[0x48, 0x0f, 0xac, 0xc8], // shrd rax, rcx, imm8
+        &[0x0f, 0xa4, 0xc8],       // shld eax, ecx, imm8
+        &[0x0f, 0xac, 0xc8],       // shrd eax, ecx, imm8
+        &[0x48, 0x0f, 0xa4, 0x0b], // shld qword ptr [rbx], rcx, imm8
+        &[0x48, 0x0f, 0xac, 0x0b], // shrd qword ptr [rbx], rcx, imm8
+        &[0x0f, 0xa4, 0x0b],       // shld dword ptr [rbx], ecx, imm8
+        &[0x0f, 0xac, 0x0b],       // shrd dword ptr [rbx], ecx, imm8
+        &[0x4d, 0x0f, 0xa4, 0xd1], // shld r9, r10, imm8
+        &[0x45, 0x0f, 0xac, 0xd1], // shrd r9d, r10d, imm8
+        &[0x48, 0x0f, 0xa4, 0xc0], // shld rax, rax, imm8
+        &[0x0f, 0xac, 0xc9],       // shrd ecx, ecx, imm8
+    ];
+    let operands = [
+        0u64,
+        1,
+        0x8000_0000,
+        0xffff_ffff,
+        0x8000_0000_0000_0000,
+        u64::MAX,
+        0xdead_beef_0bad_f00d,
+        0x0123_4567_89ab_cdef,
+    ];
+    for form in forms {
+        for count in [0u8, 1, 5, 31, 32, 33, 63, 64, 65] {
+            let mut code = form.to_vec();
+            code.extend_from_slice(&[count, 0xf4]);
+            for &first in &operands {
+                for &second in &operands {
+                    for flags in [0u64, crate::cpu::flags::ARITH] {
+                        check_with(&code, |harness| {
+                            seed_registers_and_memory(harness);
+                            harness.cpu.gpr[0] = first;
+                            harness.cpu.gpr[1] = second;
+                            harness.cpu.gpr[9] = first;
+                            harness.cpu.gpr[10] = second;
+                            let address = harness.cpu.gpr[3];
+                            harness.write(address, &first.to_le_bytes());
+                            harness.cpu.set_eflags_arith(flags);
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn cmpxchg_success_and_failure() {
     // mov rax, [rbx]; mov rcx, 0x77; cmpxchg [rbx], rcx; mov rax, 1

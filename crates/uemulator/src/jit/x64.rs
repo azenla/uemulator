@@ -93,6 +93,8 @@ const ALU_RM_REG: u8 = WIDE_FORM;
 const UNARY_TEST: u8 = 0;
 const UNARY_NOT: u8 = 2;
 const UNARY_NEG: u8 = 3;
+const UNARY_MUL: u8 = 4;
+const UNARY_IMUL: u8 = 5;
 const UNARY_INC: u8 = 0;
 const UNARY_DEC: u8 = 1;
 /// ModRM.reg extension of `bt r/m, imm8` (`0f ba`).
@@ -441,6 +443,36 @@ impl Asm {
     /// other flags are undefined.
     pub fn imul_rr(&mut self, d: u8, s: u8, w: bool) {
         self.op_rr(false, w, false, &[0x0f, 0xaf], d, s);
+    }
+
+    /// `shld d, s, count` (`left`) or `shrd d, s, count`: shifts `d` by `count` (1 to the width
+    /// minus 1) and fills the vacated bits from `s`. CF is the last bit shifted out; OF is defined
+    /// only for a count of 1.
+    pub fn double_shift_ri(&mut self, left: bool, d: u8, s: u8, count: u8, w: bool) {
+        let opcode = if left { 0xa4 } else { 0xac };
+        self.op_rr(false, w, false, &[0x0f, opcode], s, d);
+        self.code.push(count);
+    }
+
+    /// One-operand `mul r`: rDX:rAX = rAX * r (unsigned; EDX:EAX without `w`, both zero-extended).
+    /// CF = OF = the high half is not zero; the other flags are undefined.
+    pub fn mul_r(&mut self, r: u8, w: bool) {
+        self.op_rr(false, w, false, &[0xf7], UNARY_MUL, r);
+    }
+
+    /// One-operand `imul r`: the signed `mul_r`. CF = OF = the product does not fit the low half.
+    pub fn imul_r(&mut self, r: u8, w: bool) {
+        self.op_rr(false, w, false, &[0xf7], UNARY_IMUL, r);
+    }
+
+    /// `d = index of the lowest set bit of s`; ZF is set (and `d` undefined) when `s` is zero.
+    pub fn bsf_rr(&mut self, d: u8, s: u8, w: bool) {
+        self.op_rr(false, w, false, &[0x0f, 0xbc], d, s);
+    }
+
+    /// `d = index of the highest set bit of s`; ZF is set (and `d` undefined) when `s` is zero.
+    pub fn bsr_rr(&mut self, d: u8, s: u8, w: bool) {
+        self.op_rr(false, w, false, &[0x0f, 0xbd], d, s);
     }
 
     /// `if cc { d = s }`. With a 32-bit operand `d` is zero-extended whether or not it moved.
@@ -6164,6 +6196,18 @@ fn sized_unary_and_conditional_forms_match_the_assembler() {
         ("imul eax, ecx", |a| a.imul_rr(RAX, RCX, false), &[0x0f, 0xaf, 0xc1]),
         ("imul rax, r9", |a| a.imul_rr(RAX, R9, true), &[0x49, 0x0f, 0xaf, 0xc1]),
         ("imul r10d, edx", |a| a.imul_rr(R10, RDX, false), &[0x44, 0x0f, 0xaf, 0xd2]),
+        ("shld rax, rcx, 5", |a| a.double_shift_ri(true, RAX, RCX, 5, true), &[0x48, 0x0f, 0xa4, 0xc8, 0x05]),
+        ("shrd rax, rcx, 5", |a| a.double_shift_ri(false, RAX, RCX, 5, true), &[0x48, 0x0f, 0xac, 0xc8, 0x05]),
+        ("shld eax, ecx, 5", |a| a.double_shift_ri(true, RAX, RCX, 5, false), &[0x0f, 0xa4, 0xc8, 0x05]),
+        ("shld r9, r10, 5", |a| a.double_shift_ri(true, R9, R10, 5, true), &[0x4d, 0x0f, 0xa4, 0xd1, 0x05]),
+        ("mul rcx", |a| a.mul_r(RCX, true), &[0x48, 0xf7, 0xe1]),
+        ("imul ecx", |a| a.imul_r(RCX, false), &[0xf7, 0xe9]),
+        ("mul r9", |a| a.mul_r(R9, true), &[0x49, 0xf7, 0xe1]),
+        ("imul r9d", |a| a.imul_r(R9, false), &[0x41, 0xf7, 0xe9]),
+        ("bsf rax, r9", |a| a.bsf_rr(RAX, R9, true), &[0x49, 0x0f, 0xbc, 0xc1]),
+        ("bsf r10d, edx", |a| a.bsf_rr(R10, RDX, false), &[0x44, 0x0f, 0xbc, 0xd2]),
+        ("bsr rax, r9", |a| a.bsr_rr(RAX, R9, true), &[0x49, 0x0f, 0xbd, 0xc1]),
+        ("bsr r10d, edx", |a| a.bsr_rr(R10, RDX, false), &[0x44, 0x0f, 0xbd, 0xd2]),
         ("cmove eax, ecx", |a| a.cmov_rr(E, RAX, RCX, false), &[0x0f, 0x44, 0xc1]),
         ("cmovne rax, r9", |a| a.cmov_rr(NE, RAX, R9, true), &[0x49, 0x0f, 0x45, 0xc1]),
         ("cmovl r10d, edx", |a| a.cmov_rr(CONDITION_L, R10, RDX, false), &[0x44, 0x0f, 0x4c, 0xd2]),

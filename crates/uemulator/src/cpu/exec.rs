@@ -2240,12 +2240,11 @@ impl Cpu {
                 let operand_bits = osz as u32 * 8;
                 let count = v.leading_zeros() - (u64::BITS - operand_bits);
                 self.write_gpr(i.reg, osz, true, count as u64);
-                let mut f = 0;
+                // SF/PF are architecturally undefined; they follow the count, as the JIT's
+                // `LazyFlagsOp::SzpCfOf` record has them.
+                let mut f = szp_flags(count as u64, osz);
                 if v == 0 {
                     f |= CF;
-                }
-                if count == 0 {
-                    f |= ZF;
                 }
                 self.set_eflags_arith(f);
             }
@@ -2261,12 +2260,9 @@ impl Cpu {
                     v.trailing_zeros()
                 };
                 self.write_gpr(i.reg, osz, true, count as u64);
-                let mut f = 0;
+                let mut f = szp_flags(count as u64, osz);
                 if v == 0 {
                     f |= CF;
-                }
-                if count == 0 {
-                    f |= ZF;
                 }
                 self.set_eflags_arith(f);
             }
@@ -2274,18 +2270,17 @@ impl Cpu {
             0x1bc | 0x1bd => {
                 let loc = self.modrm_location(i, next)?;
                 let v = self.load_operand(loc, osz, i)? & mask(osz);
-                let f = self.eflags_full();
-                if v == 0 {
-                    self.set_eflags_arith(f | ZF);
-                } else {
+                // Everything but ZF is undefined: SF/PF follow the source and CF/OF/AF clear, as
+                // in QEMU and as the JIT's `LazyFlagsOp::SzpCfOf` record has them.
+                if v != 0 {
                     let bit_index = if op == 0x1bc {
                         v.trailing_zeros()
                     } else {
                         63 - v.leading_zeros()
                     };
                     self.write_gpr(i.reg, osz, true, bit_index as u64);
-                    self.set_eflags_arith(f & !ZF);
                 }
+                self.set_eflags_arith(szp_flags(v, osz));
             }
             _ => {
                 if self.sse(i, next)? {
