@@ -427,4 +427,143 @@ mod tests {
         });
         assert_eq!(handle.join().unwrap(), [7]);
     }
+
+    #[test]
+    fn write_word_replaces_exactly_one_aligned_word() {
+        let mem = mapping();
+        mem.write_bytes(0, &[0xff; 16]);
+        mem.write_word(8, 0x1122_3344);
+        let all = contents(&mem, 0, 16);
+        assert_eq!(&all[8..12], 0x1122_3344u32.to_le_bytes());
+        assert!(all[..8].iter().all(|&byte| byte == 0xff));
+        assert!(all[12..].iter().all(|&byte| byte == 0xff));
+    }
+
+    #[test]
+    fn write_word_can_write_the_first_and_the_last_word_and_repeat() {
+        let mem = mapping();
+        mem.write_word(0, 1);
+        mem.write_word(MAPPING_BYTES - 4, 2);
+        mem.write_word(0, 3);
+        assert_eq!(contents(&mem, 0, 4), 3u32.to_le_bytes());
+        assert_eq!(contents(&mem, MAPPING_BYTES - 4, 4), 2u32.to_le_bytes());
+    }
+
+    #[test]
+    #[should_panic(expected = "misaligned")]
+    fn write_word_refuses_an_offset_that_is_not_word_aligned() {
+        mapping().write_word(2, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the")]
+    fn write_word_refuses_a_word_that_ends_past_the_mapping() {
+        mapping().write_word(MAPPING_BYTES, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "misaligned or outside")]
+    fn write_word_refuses_an_offset_that_wraps_the_address_space() {
+        mapping().write_word(usize::MAX - 3, 1);
+    }
+
+    #[test]
+    fn instruction_barrier_can_be_called_anywhere_any_number_of_times() {
+        for _ in 0..1000 {
+            instruction_barrier();
+        }
+    }
+
+    /// The code a patched word changes: aarch64 `mov w0, #value; ret`, x86-64
+    /// `mov eax, value; ret` placed so the immediate is the aligned word at offset 4.
+    const PATCH_OFFSET: usize = 4;
+    #[cfg(target_arch = "x86_64")]
+    const X86_NOP: u8 = 0x90;
+
+    fn install_patchable_function(mem: &ExecMem, value: u32) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            mem.write(0, &[0x5280_0000 | (value << 5), AARCH64_RET]);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut bytes = vec![X86_NOP, X86_NOP, X86_NOP, 0xb8];
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.push(X86_RET);
+            mem.write_bytes(0, &bytes);
+        }
+    }
+
+    /// The word that makes the function return `value`.
+    fn patched_word(value: u32) -> u32 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            0x5280_0000 | (value << 5)
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            value
+        }
+    }
+
+    fn patch_offset() -> usize {
+        if cfg!(target_arch = "aarch64") {
+            0
+        } else {
+            PATCH_OFFSET
+        }
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn a_patched_word_changes_what_the_function_returns() {
+        let mem = mapping();
+        install_patchable_function(&mem, RETURNED_VALUE);
+        #[cfg(target_arch = "x86_64")]
+        let entry: extern "C" fn() -> u32 = unsafe { std::mem::transmute(mem.base() as usize + 3) };
+        #[cfg(target_arch = "aarch64")]
+        let entry: extern "C" fn() -> u32 = unsafe { std::mem::transmute(mem.base() as usize) };
+        assert_eq!(entry(), RETURNED_VALUE);
+        mem.write_word(patch_offset(), patched_word(PATCHED_RETURN_VALUE));
+        assert_eq!(entry(), PATCHED_RETURN_VALUE);
+    }
+
+    /// Link patching: a thread runs a function in a loop while another keeps rewriting its
+    /// word. Every call returns one of the two values, never a mix of them: the store is atomic
+    /// for instruction fetch too.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn a_word_patched_under_a_running_thread_is_never_seen_half_written() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Values whose bytes differ everywhere, so a torn immediate would show.
+        const FIRST: u32 = 0x1111;
+        const SECOND: u32 = 0x2222;
+        let mem = Arc::new(mapping());
+        install_patchable_function(&mem, FIRST);
+        let done = Arc::new(AtomicBool::new(false));
+        let runner = {
+            let (mem, done) = (mem.clone(), done.clone());
+            std::thread::spawn(move || {
+                #[cfg(target_arch = "x86_64")]
+                let offset = 3;
+                #[cfg(target_arch = "aarch64")]
+                let offset = 0;
+                let entry: extern "C" fn() -> u32 =
+                    unsafe { std::mem::transmute(mem.base() as usize + offset) };
+                let mut seen = std::collections::BTreeSet::new();
+                while !done.load(Ordering::Relaxed) {
+                    seen.insert(entry());
+                }
+                seen
+            })
+        };
+        for round in 0..20_000 {
+            let value = if round % 2 == 0 { SECOND } else { FIRST };
+            mem.write_word(patch_offset(), patched_word(value));
+        }
+        done.store(true, Ordering::Relaxed);
+        let seen = runner.join().unwrap();
+        assert!(seen.is_subset(&[FIRST, SECOND].into()), "{seen:x?}");
+    }
 }

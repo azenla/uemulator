@@ -2723,4 +2723,140 @@ mod tests {
             unsafe { std::mem::transmute(memory.base() as usize) };
         assert_eq!(function(0, 0xffff), 0xffff + 0x1234);
     }
+
+    /// Runs the code `rip_to` emits for `offset` with `PAGE_BASE` set to `page_base`. x21 is
+    /// callee-saved, so the function saves it (and the link register) around the test.
+    fn rip_to_result(page_base: u64, offset: u64) -> (u64, usize) {
+        let _guard = crate::jit::serialize_jit_tests();
+        let memory = ExecMem::new(16384).unwrap();
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(memory.base(), &DUMMY_ADDRESSES, &insns);
+        generator.asm.stp_pre(PAGE_BASE, 30, SP, -16);
+        generator.asm.mov(PAGE_BASE, 0);
+        let before = generator.asm.code.len();
+        generator.rip_to(0, offset);
+        let words = generator.asm.code.len() - before;
+        generator.asm.ldp_post(PAGE_BASE, 30, SP, 16);
+        generator.asm.ret();
+        generator.asm.finish();
+        memory.write(0, &generator.asm.code);
+        let function: extern "C" fn(u64) -> u64 =
+            unsafe { std::mem::transmute(memory.base() as usize) };
+        (function(page_base), words)
+    }
+
+    const PAGE_BASES: [u64; 4] = [
+        0,
+        0x0000_7f12_3456_7000,
+        0xffff_ffff_8100_0000,
+        0xffff_ffff_ffff_f000,
+    ];
+
+    #[test]
+    fn rip_to_adds_every_kind_of_offset_to_the_page_base_with_wraparound() {
+        let offsets: [i64; 20] = [
+            0,
+            1,
+            4095,
+            4096,
+            4097,
+            0x12_3456,
+            0xff_ffff,
+            0x100_0000,
+            0x4000_0000,
+            0x7fff_f000,
+            i64::MAX,
+            -1,
+            -4095,
+            -4096,
+            -4097,
+            -0x12_3456,
+            -0x4000_0000,
+            -0x7fff_f000,
+            i64::MIN,
+            i64::MIN + 1,
+        ];
+        for page_base in PAGE_BASES {
+            for offset in offsets {
+                let (result, _) = rip_to_result(page_base, offset as u64);
+                assert_eq!(
+                    result,
+                    page_base.wrapping_add(offset as u64),
+                    "base {page_base:#x} offset {offset:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rip_to_is_one_instruction_for_an_offset_within_a_page_either_way() {
+        for offset in [0i64, 1, 100, 4095, -1, -100, -4095] {
+            assert_eq!(rip_to_result(0x1000, offset as u64).1, 1, "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn rip_to_needs_more_than_one_instruction_beyond_a_page() {
+        for offset in [4096i64, -4096, 0x12_3456, i64::MAX, i64::MIN] {
+            assert!(rip_to_result(0, offset as u64).1 > 1, "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn rip_to_leaves_the_host_flags_alone() {
+        let _guard = crate::jit::serialize_jit_tests();
+        for offset in [0u64, 8, 4096, 0x12_3456, u64::MAX] {
+            let memory = ExecMem::new(16384).unwrap();
+            let insns: [Insn; 0] = [];
+            let mut generator = Gen::new(memory.base(), &DUMMY_ADDRESSES, &insns);
+            generator.asm.stp_pre(PAGE_BASE, 30, SP, -16);
+            generator.asm.mov(PAGE_BASE, 1);
+            // x0 - x0 sets Z and C; the materialisation must not clear them.
+            generator.asm.cmp(0, 0, true);
+            generator.rip_to(2, offset);
+            generator.asm.cset(0, EQ);
+            generator.asm.cset(3, CS);
+            generator.asm.add(0, 0, 3, true);
+            generator.asm.ldp_post(PAGE_BASE, 30, SP, 16);
+            generator.asm.ret();
+            generator.asm.finish();
+            memory.write(0, &generator.asm.code);
+            let function: extern "C" fn(u64) -> u64 =
+                unsafe { std::mem::transmute(memory.base() as usize) };
+            assert_eq!(function(5), 2, "Z and C survived rip_to({offset:#x})");
+        }
+    }
+
+    #[test]
+    fn rip_to_writes_only_its_destination() {
+        let _guard = crate::jit::serialize_jit_tests();
+        let memory = ExecMem::new(16384).unwrap();
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(memory.base(), &DUMMY_ADDRESSES, &insns);
+        generator.asm.stp_pre(PAGE_BASE, 30, SP, -16);
+        generator.asm.mov(PAGE_BASE, 0);
+        // Sentinels in the scratch registers the address arithmetic uses.
+        for register in [SCRATCH_A, SCRATCH_B, SCRATCH_C, VALUE, 1] {
+            generator
+                .asm
+                .mov_imm(register, 0x1111_0000 + register as u64);
+        }
+        generator.rip_to(ADDRESS, 0x12_3456);
+        generator.asm.mov(0, SCRATCH_A);
+        generator.asm.add(0, 0, SCRATCH_B, true);
+        generator.asm.add(0, 0, SCRATCH_C, true);
+        generator.asm.add(0, 0, VALUE, true);
+        generator.asm.add(0, 0, 1, true);
+        generator.asm.ldp_post(PAGE_BASE, 30, SP, 16);
+        generator.asm.ret();
+        generator.asm.finish();
+        memory.write(0, &generator.asm.code);
+        let function: extern "C" fn(u64) -> u64 =
+            unsafe { std::mem::transmute(memory.base() as usize) };
+        let expected: u64 = [SCRATCH_A, SCRATCH_B, SCRATCH_C, VALUE, 1]
+            .iter()
+            .map(|&register| 0x1111_0000 + register as u64)
+            .sum();
+        assert_eq!(function(0x7000), expected);
+    }
 }

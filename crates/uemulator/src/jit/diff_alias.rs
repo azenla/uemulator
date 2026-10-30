@@ -11,8 +11,8 @@ use crate::testkit::*;
 /// address with `ALIAS_DELTA` switches between them. The page numbers also differ in their low
 /// bits: the soft TLB is direct-mapped on them, and aliases sharing a slot would evict each other
 /// and keep the chain stub from ever hitting, which is the path these tests are about.
-const ALIAS_A: u64 = 0x0000_2000_0000_0000;
-const ALIAS_B: u64 = 0x0000_2100_0000_1000;
+pub(super) const ALIAS_A: u64 = 0x0000_2000_0000_0000;
+pub(super) const ALIAS_B: u64 = 0x0000_2100_0000_1000;
 const ALIAS_DELTA: u64 = ALIAS_A ^ ALIAS_B;
 const CODE_PAGE: u64 = SCRATCH + 0x2000;
 /// Reads here page-fault: nothing maps it.
@@ -197,6 +197,146 @@ fn return_addresses_rip_relative_operands_and_fault_rips_follow_the_alias_being_
         match blocks {
             None => blocks = Some(translated(&harness)),
             Some(count) => assert_eq!(translated(&harness), count, "alias {alias:#x}"),
+        }
+    }
+}
+
+/// Extra virtual pages next to the code page, at `alias + delta` for both aliases.
+pub(super) struct Extra {
+    pub delta: i64,
+    /// What the page holds from its start.
+    pub bytes: &'static [u8],
+    /// What alias B's page holds instead, if it should be another physical page than alias A's.
+    pub alias_b_bytes: Option<&'static [u8]>,
+}
+
+pub(super) struct Init {
+    pub register: usize,
+    pub value: u64,
+}
+
+/// One program for the aliased code page: where it starts in the page, the extra pages it
+/// reaches, and the registers it starts with (`rsp` is `STACK_TOP` unless given).
+pub(super) struct Case {
+    pub start: u64,
+    pub code: &'static [u8],
+    pub extras: &'static [Extra],
+    pub init: &'static [Init],
+    /// Every run after the first translates nothing new (false when the program rewrites itself
+    /// or reads a page that differs per alias).
+    pub same_translation: bool,
+}
+
+/// RAM the cases may use freely (`rep stosb` and friends), identity mapped.
+const SCRATCH_PAGES: u64 = 4;
+const EXTRA_POOL: u64 = SCRATCH + 0x20000;
+const EXTRA_STRIDE: u64 = 0x2000;
+
+fn extra_physical(index: usize, alias_b: bool) -> u64 {
+    EXTRA_POOL + index as u64 * EXTRA_STRIDE + if alias_b { PAGE } else { 0 }
+}
+
+fn aliased_case(case: &Case, jit: bool) -> Option<Harness> {
+    let mut harness = Harness::new(&[HLT]);
+    if jit && !harness.enable_jit() {
+        return None;
+    }
+    let mut tables = PageTables::new(&mut harness.cpu);
+    let flags = PTE_PRESENT_WRITABLE_USER;
+    for (alias, alias_b) in [(ALIAS_A, false), (ALIAS_B, true)] {
+        tables.map_4k(&mut harness.cpu, alias, CODE_PAGE, flags);
+        for (index, extra) in case.extras.iter().enumerate() {
+            let physical = match extra.alias_b_bytes {
+                Some(_) => extra_physical(index, alias_b),
+                None => extra_physical(index, false),
+            };
+            let virtual_page = alias.wrapping_add(extra.delta as u64);
+            tables.map_4k(&mut harness.cpu, virtual_page, physical, flags);
+        }
+    }
+    let stack_page = STACK_TOP - PAGE;
+    tables.map_4k(&mut harness.cpu, stack_page, stack_page, flags);
+    for page in 0..SCRATCH_PAGES {
+        let address = SCRATCH + page * PAGE;
+        tables.map_4k(&mut harness.cpu, address, address, flags);
+    }
+    harness.write(CODE_PAGE + case.start, case.code);
+    for (index, extra) in case.extras.iter().enumerate() {
+        harness.write(extra_physical(index, false), extra.bytes);
+        if let Some(bytes) = extra.alias_b_bytes {
+            harness.write(extra_physical(index, true), bytes);
+        }
+    }
+    Some(harness)
+}
+
+fn start_case(harness: &mut Harness, case: &Case, alias: u64) {
+    harness.cpu.halted = false;
+    harness.cpu.gpr = [0; 16];
+    harness.cpu.gpr[RSP] = STACK_TOP;
+    for init in case.init {
+        harness.cpu.gpr[init.register] = init.value;
+    }
+    harness.cpu.rip = alias + case.start;
+}
+
+/// The bytes a case can have changed: the code page, the extra pages and the scratch data.
+fn case_memory(harness: &Harness, case: &Case) -> Vec<Vec<u8>> {
+    let mut regions = vec![harness.read(CODE_PAGE, PAGE as usize)];
+    for (index, extra) in case.extras.iter().enumerate() {
+        regions.push(harness.read(extra_physical(index, false), PAGE as usize));
+        if extra.alias_b_bytes.is_some() {
+            regions.push(harness.read(extra_physical(index, true), PAGE as usize));
+        }
+    }
+    regions.push(harness.read(SCRATCH, (SCRATCH_PAGES * PAGE) as usize));
+    regions
+}
+
+/// Runs `case` at alias A, B, B and A again on the interpreter and on the JIT. Every run must
+/// stop the same way and leave the same registers, `rip` and memory: the oracle computes every
+/// address from the alias it runs at, so a block that kept an address from the alias it was
+/// translated at (or from the one it last came from) differs. With `same_translation` the first
+/// run translates all there is and the others find it.
+pub(super) fn check_aliases(case: &Case) {
+    check_aliases_with(case, &|_| {});
+}
+
+/// `check_aliases` with `setup` run on both CPUs before every run (registers, flags and memory
+/// beyond what `case` says).
+pub(super) fn check_aliases_with(case: &Case, setup: &dyn Fn(&mut Harness)) {
+    let mut oracle = aliased_case(case, false).unwrap();
+    let Some(mut jitted) = aliased_case(case, true) else {
+        return;
+    };
+    let mut translated_after_first = None;
+    for (run, alias) in [ALIAS_A, ALIAS_B, ALIAS_B, ALIAS_A].into_iter().enumerate() {
+        start_case(&mut oracle, case, alias);
+        start_case(&mut jitted, case, alias);
+        setup(&mut oracle);
+        setup(&mut jitted);
+        let expected = oracle.run(1_000_000);
+        let actual = jitted.run(1_000_000);
+        let place = format!("run {run} at alias {alias:#x}");
+        assert_eq!(actual, expected, "{place}");
+        assert_eq!(jitted.cpu.gpr, oracle.cpu.gpr, "{place}");
+        assert_eq!(jitted.cpu.rip, oracle.cpu.rip, "{place}");
+        assert_eq!(
+            jitted.cpu.eflags_full() & 0x8d5,
+            oracle.cpu.eflags_full() & 0x8d5,
+            "{place}"
+        );
+        assert_eq!(
+            case_memory(&jitted, case),
+            case_memory(&oracle, case),
+            "{place}"
+        );
+        if case.same_translation {
+            let count = translated(&jitted);
+            match translated_after_first {
+                None => translated_after_first = Some(count),
+                Some(first) => assert_eq!(count, first, "{place} translated again"),
+            }
         }
     }
 }

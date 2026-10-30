@@ -217,3 +217,46 @@ pub(crate) fn link_word(site: u64, destination: u64) -> Option<u32> {
 pub(crate) fn unlink_word() -> u32 {
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SITE: u64 = 0x7000_0000_0000;
+
+    #[test]
+    fn a_link_to_the_next_instruction_after_the_jump_is_displacement_zero() {
+        assert_eq!(link_word(SITE, SITE + 5), Some(0));
+        assert_eq!(
+            unlink_word(),
+            0,
+            "unlinked is the same jump to the same place"
+        );
+    }
+
+    #[test]
+    fn displacements_count_from_the_end_of_the_five_byte_jump() {
+        assert_eq!(link_word(SITE, SITE + 5 + 0x100), Some(0x100));
+        assert_eq!(link_word(SITE, SITE), Some((-5i32) as u32));
+        assert_eq!(link_word(SITE, SITE - 0x100), Some((-0x105i32) as u32));
+    }
+
+    #[test]
+    fn links_reach_two_gibibytes_either_way_and_no_further() {
+        assert!(link_word(SITE, SITE + 5 + i32::MAX as u64).is_some());
+        assert_eq!(link_word(SITE, SITE + 6 + i32::MAX as u64), None);
+        assert!(link_word(SITE, SITE + 5 - (1 << 31)).is_some());
+        assert_eq!(link_word(SITE, SITE + 4 - (1 << 31)), None);
+    }
+
+    #[test]
+    fn the_patched_word_is_the_displacement_after_the_opcode_byte() {
+        assert_eq!(LINK_WORD_OFFSET, 1);
+        assert_eq!(
+            super::super::emit_x64::LINK_JMP[0],
+            JMP_REL32_OPCODE_FOR_TEST
+        );
+    }
+
+    const JMP_REL32_OPCODE_FOR_TEST: u8 = 0xe9;
+}

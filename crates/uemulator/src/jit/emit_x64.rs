@@ -1803,3 +1803,181 @@ impl<'a> Gen<'a> {
         self.emit_slows();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! `Gen::rip_to` run as real code: the page base is in the frame slot the trampoline fills.
+
+    use super::*;
+    use crate::sys::ExecMem;
+
+    const DUMMY_ADDRESSES: Addrs = Addrs {
+        exec: 0,
+        ld: 0,
+        st: 0,
+        ld_stack: 0,
+        st_stack: 0,
+        cond: 0,
+        exit_ok: 0,
+        exit_fail: 0,
+        chain: 0,
+    };
+
+    /// `extern "C" fn(page_base) -> rip_to(offset)`, with the frame slot set up as the
+    /// trampoline does.
+    fn rip_to_function(offset: u64, live_flags: bool) -> (ExecMem, usize) {
+        let memory = ExecMem::new(16384).unwrap();
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(memory.base(), &DUMMY_ADDRESSES, &insns);
+        generator.a.alu_ri(SUB, RSP, FRAME, true);
+        generator.a.st(mem(RSP, PAGE_BASE_SLOT), ARGS[0], 8);
+        if live_flags {
+            // 0 - 0 sets ZF, and the result must survive.
+            generator.a.alu_rr(XOR, RAX, RAX, true);
+        }
+        let before = generator.a.code.len();
+        generator.rip_to(RDX, offset);
+        let bytes = generator.a.code.len() - before;
+        if live_flags {
+            generator.a.mov_imm(RAX, 0);
+            generator.a.mov_imm(RCX, 1);
+            // cmove rax, rcx
+            generator
+                .a
+                .code
+                .extend_from_slice(&[0x48, 0x0f, 0x44, 0xc1]);
+            generator.a.alu_rr(ADD, RAX, RDX, true);
+        } else {
+            generator.a.mov_rr(RAX, RDX, true);
+        }
+        generator.a.alu_ri(ADD, RSP, FRAME, true);
+        generator.a.ret();
+        generator.a.finish();
+        memory.write_bytes(0, &generator.a.code);
+        (memory, bytes)
+    }
+
+    fn rip_to_result(page_base: u64, offset: u64) -> (u64, usize) {
+        let _guard = crate::jit::serialize_jit_tests();
+        let (memory, bytes) = rip_to_function(offset, false);
+        let function: extern "C" fn(u64) -> u64 =
+            unsafe { std::mem::transmute(memory.base() as usize) };
+        (function(page_base), bytes)
+    }
+
+    const PAGE_BASES: [u64; 4] = [
+        0,
+        0x0000_7f12_3456_7000,
+        0xffff_ffff_8100_0000,
+        0xffff_ffff_ffff_f000,
+    ];
+
+    #[test]
+    fn rip_to_adds_every_kind_of_offset_to_the_page_base_with_wraparound() {
+        let offsets: [i64; 20] = [
+            0,
+            1,
+            4095,
+            4096,
+            0x12_3456,
+            0x4000_0000,
+            0x7fff_ffff,
+            0x8000_0000,
+            0x8000_0fff,
+            i64::MAX,
+            -1,
+            -4096,
+            -0x12_3456,
+            -0x4000_0000,
+            -0x8000_0000,
+            -0x8000_0001,
+            -0x8000_1000,
+            i64::MIN,
+            i64::MIN + 1,
+            0x1_0000_0000,
+        ];
+        for page_base in PAGE_BASES {
+            for offset in offsets {
+                let (result, _) = rip_to_result(page_base, offset as u64);
+                assert_eq!(
+                    result,
+                    page_base.wrapping_add(offset as u64),
+                    "base {page_base:#x} offset {offset:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rip_to_leaves_the_host_flags_alone_for_every_offset_size() {
+        let _guard = crate::jit::serialize_jit_tests();
+        for offset in [0u64, 8, 0x7fff_ffff, 0x8000_0000, u64::MAX, 1 << 40] {
+            let (memory, _) = rip_to_function(offset, true);
+            let function: extern "C" fn(u64) -> u64 =
+                unsafe { std::mem::transmute(memory.base() as usize) };
+            // rax = 1 (ZF was still set) + the address.
+            assert_eq!(
+                function(0x1000),
+                1 + 0x1000u64.wrapping_add(offset),
+                "offset {offset:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_offset_is_one_load_and_a_small_one_adds_a_single_lea() {
+        let zero = rip_to_result(0, 0).1;
+        let small = rip_to_result(0, 8).1;
+        assert!(small > zero);
+        assert!(
+            rip_to_result(0, 1 << 40).1 > small,
+            "an offset beyond i32 needs a scratch constant"
+        );
+    }
+
+    #[test]
+    fn the_page_base_slot_lies_above_the_helper_result_slot_and_inside_the_frame() {
+        const {
+            assert!(PAGE_BASE_SLOT >= OUT + 8);
+            assert!(JUMP_CACHE_SLOT >= PAGE_BASE_SLOT + 8);
+            assert!(VALID_SLOT >= JUMP_CACHE_SLOT + 8);
+            assert!(VALID_SLOT + 8 <= FRAME);
+            // The eight pushes leave rsp 8 mod 16, so calls from blocks see it 16-byte aligned.
+            assert!((FRAME + 8 * 8) % 16 == 8);
+        }
+    }
+
+    #[test]
+    fn link_slots_are_padded_so_the_displacement_is_four_byte_aligned() {
+        for padding in 0..8u64 {
+            let memory = ExecMem::new(16384).unwrap();
+            let insns: [Insn; 0] = [];
+            let mut generator =
+                Gen::new(memory.base() + padding, &DUMMY_ADDRESSES_WITH_CHAIN, &insns);
+            generator.entry_rip = 0;
+            for _ in 0..padding {
+                generator.a.code.push(0x90);
+            }
+            generator.link_slot(0x10);
+            let site = generator.links[0].code_offset as u64;
+            assert_eq!(
+                (memory.base() + padding + site + 1) % 4,
+                0,
+                "padding {padding}"
+            );
+            assert_eq!(&generator.a.code[site as usize..][..5], LINK_JMP);
+        }
+    }
+
+    const DUMMY_ADDRESSES_WITH_CHAIN: Addrs = Addrs {
+        exec: 0,
+        ld: 0,
+        st: 0,
+        ld_stack: 0,
+        st_stack: 0,
+        cond: 0,
+        exit_ok: 0,
+        exit_fail: 0,
+        chain: 1,
+    };
+}

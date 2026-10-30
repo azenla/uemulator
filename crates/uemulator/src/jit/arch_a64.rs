@@ -400,3 +400,47 @@ pub(crate) fn link_word(site: u64, destination: u64) -> Option<u32> {
 pub(crate) fn unlink_word() -> u32 {
     NOP_WORD
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SITE: u64 = 0x1_0000_0000;
+
+    #[test]
+    fn a_link_to_the_next_instruction_is_branch_plus_one() {
+        assert_eq!(link_word(SITE, SITE + 4), Some(0x1400_0001));
+    }
+
+    #[test]
+    fn a_link_to_itself_is_branch_zero_and_one_backwards_is_all_ones() {
+        assert_eq!(link_word(SITE, SITE), Some(0x1400_0000));
+        assert_eq!(link_word(SITE, SITE - 4), Some(0x17ff_ffff));
+    }
+
+    #[test]
+    fn links_reach_just_under_128_mebibytes_either_way() {
+        let reach = (BRANCH_REACH_INSNS - 1) * INSN_BYTES;
+        assert!(link_word(SITE, SITE + reach as u64).is_some());
+        assert!(link_word(SITE, SITE - reach as u64).is_some());
+        assert_eq!(link_word(SITE, SITE + reach as u64 + 4), None);
+        assert_eq!(link_word(SITE, SITE - reach as u64 - 4), None);
+    }
+
+    #[test]
+    fn a_link_word_branches_where_it_says_when_decoded() {
+        for delta in [-1_000_000i64, -4, 0, 4, 8, 1_000_000, 100_000_000] {
+            let destination = (SITE as i64 + delta) as u64;
+            let word = link_word(SITE, destination).unwrap();
+            assert_eq!(word & !BRANCH_IMM26_MASK, BRANCH_OPCODE);
+            let offset = ((word & BRANCH_IMM26_MASK) << 6) as i32 >> 6;
+            assert_eq!(SITE as i64 + offset as i64 * INSN_BYTES, destination as i64);
+        }
+    }
+
+    #[test]
+    fn an_unlinked_slot_is_a_nop_and_the_word_replaces_the_whole_instruction() {
+        assert_eq!(unlink_word(), NOP_WORD);
+        assert_eq!(LINK_WORD_OFFSET, 0);
+    }
+}

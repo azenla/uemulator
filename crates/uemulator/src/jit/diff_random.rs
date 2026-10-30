@@ -1268,3 +1268,44 @@ fn random_programs_exercise_the_inline_paths_not_only_the_helper() {
         "programs with branches and loops span many blocks: {blocks}"
     );
 }
+
+/// The same programs, run at a virtual address the code was not translated at, then at the one it
+/// was, and so on (`diff_alias::check_aliases_with`): a block that kept a guest address from the
+/// alias it was translated at would leave other state than the interpreter.
+fn run_seeds_at_aliases(profile: Profile, first_seed: u64) {
+    use super::diff_alias::{Case, check_aliases_with};
+    const SEEDS_AT_ALIASES: u64 = 40;
+    for seed in first_seed..first_seed + SEEDS_AT_ALIASES {
+        let program = generate(seed, profile, PROGRAM_LENGTH);
+        let code: &'static [u8] = Box::leak(program_bytes(&program).into_boxed_slice());
+        let case = Case {
+            start: 0,
+            code,
+            extras: &[],
+            init: &[],
+            same_translation: true,
+        };
+        check_aliases_with(&case, &random_setup(seed));
+    }
+}
+
+macro_rules! random_alias_tests {
+    ($($name:ident => ($profile:ident, $first_seed:expr),)*) => {
+        $(#[test]
+        fn $name() {
+            run_seeds_at_aliases(Profile::$profile, $first_seed);
+        })*
+    };
+}
+
+random_alias_tests! {
+    random_alu_programs_at_aliases => (Alu, 20_000),
+    random_memory_programs_at_aliases_a => (Memory, 21_000),
+    random_memory_programs_at_aliases_b => (Memory, 22_000),
+    random_shift_programs_at_aliases => (Shifts, 23_000),
+    random_flag_programs_at_aliases => (Flags, 24_000),
+    random_wide_instruction_programs_at_aliases => (Wide, 25_000),
+    random_mixed_programs_at_aliases_a => (Everything, 26_000),
+    random_mixed_programs_at_aliases_b => (Everything, 27_000),
+    random_mixed_programs_at_aliases_c => (Everything, 28_000),
+}

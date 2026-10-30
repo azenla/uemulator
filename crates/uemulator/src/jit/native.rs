@@ -2091,3 +2091,6 @@ mod tests {
         assert_eq!(sibling.lookup(CODE_BASE, CODE_BASE), None);
     }
 }
+
+#[cfg(test)]
+mod shared_tests;

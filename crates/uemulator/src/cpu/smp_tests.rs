@@ -992,3 +992,208 @@ fn a_full_code_cache_is_flushed_under_vcpus_that_keep_running() {
         }
     });
 }
+
+/// Two virtual addresses of the same physical pages. They differ in the page number's low bits as
+/// well as high ones, so they do not evict each other from the soft TLB.
+const ALIAS_ONE: u64 = 0x0000_2000_0000_0000;
+const ALIAS_TWO: u64 = 0x0000_2100_0000_1000;
+const IDENTITY_PAGES: u64 = 0x24;
+/// Where `identity_paging` maps what the threaded JIT tests share.
+const BSP_CODE_PAGE: u64 = crate::testkit::CODE_BASE & !0xfff;
+
+/// Replaces the bootstrap processor's page tables with 4 KiB identity mappings of what these
+/// tests use (its code and stack, the data pages from `STALE_DATA`), plus whatever `aliases`
+/// maps: `(virtual page, physical page)`. The others copy the result (`start_in_long_mode`).
+fn identity_paging(cpu: &mut Cpu, aliases: &[(u64, u64)]) {
+    use super::test_support::{PTE_PRESENT_WRITABLE_USER, PageTables};
+    let mut tables = PageTables::new(cpu);
+    let flags = PTE_PRESENT_WRITABLE_USER;
+    for page in [
+        BSP_CODE_PAGE,
+        BSP_CODE_PAGE + 0x1000,
+        crate::testkit::STACK_TOP - 0x1000,
+    ] {
+        tables.map_4k(cpu, page, page, flags);
+    }
+    for index in 0..IDENTITY_PAGES {
+        let page = STALE_DATA + index * 0x1000;
+        tables.map_4k(cpu, page, page, flags);
+    }
+    for &(virtual_page, physical) in aliases {
+        tables.map_4k(cpu, virtual_page, physical, flags);
+    }
+}
+
+// The stale-translation worker (`STALE_WORKER`) with the site's address in rdi instead of a
+// constant, so each worker can reach it through its own mapping:
+// work: mov r8d, [VERSION]; xor eax, eax; cpuid; mov rax, rdi; call rax; cmp eax, r8d; jae ok;
+//   lock inc qword [FAILURES]; ok: cmp dword [DONE], 0; je work; lock inc dword [EXITED]; cli; hlt
+const ALIASED_WORKER: &[u8] = &[
+    0x44, 0x8b, 0x04, 0x25, 0x08, 0x00, 0x40, 0x00, 0x31, 0xc0, 0x0f, 0xa2, 0x48, 0x89, 0xf8, 0xff,
+    0xd0, 0x44, 0x39, 0xc0, 0x73, 0x09, 0xf0, 0x48, 0xff, 0x04, 0x25, 0x10, 0x00, 0x40, 0x00, 0x83,
+    0x3c, 0x25, 0x00, 0x00, 0x40, 0x00, 0x00, 0x74, 0xd7, 0xf0, 0xff, 0x04, 0x25, 0x18, 0x00, 0x40,
+    0x00, 0xfa, 0xf4,
+];
+
+/// `STALE_WRITER` and `STALE_WORKER` again, but the workers reach the site through two different
+/// virtual addresses while the writer rewrites it through a third (the identity mapping): a
+/// rewrite must drop the one translation for every address, and no worker may then run an older
+/// immediate than the version it saw published.
+#[test]
+fn code_rewritten_through_one_address_is_never_stale_through_the_aliases_of_its_page() {
+    both_engines(|jit| {
+        let aliases = [(ALIAS_ONE, STALE_SITE), (ALIAS_TWO, STALE_SITE)];
+        let run = run_threads_with(
+            &STALE_WRITER,
+            1 + STALE_WORKERS,
+            jit,
+            |cpu| {
+                place(cpu, STALE_SITE + 3, &STALE_SITE_CODE);
+                place(cpu, STALE_WORKER_CODE, ALIASED_WORKER);
+                identity_paging(cpu, &aliases);
+                if let Some(jit) = &cpu.jit {
+                    jit.set_install_pause_micros(STALE_WINDOW_MICROS);
+                }
+            },
+            |cpus| {
+                let (bsp, others) = cpus.split_first_mut().unwrap();
+                for (index, worker) in others.iter_mut().enumerate() {
+                    let stack = STALE_WORKER_STACKS + (index as u64 + 1) * STALE_WORKER_STACK_BYTES;
+                    start_in_long_mode(worker, bsp, STALE_WORKER_CODE, stack);
+                    worker.gpr[crate::testkit::RDI] = aliases[index].0 + 3;
+                }
+            },
+        );
+        assert_thread_shutdown(&run);
+        assert_eq!(run.read_u32(STALE_VERSION), 1000);
+        assert_eq!(
+            run.read(STALE_FAILURES, 8),
+            [0; 8],
+            "a worker ran code older than the version it saw published (jit {jit})"
+        );
+        if let Some(cache) = run.bsp.jit.as_ref() {
+            assert!(cache.stats().stale_decodes > 0, "the window was never hit");
+        }
+    });
+}
+
+// FLUSH_WORKER/FLUSH_BSP, at the aliases: the same loop, counted into the same variable.
+// With the workers on one alias each, and again with both on the same one, the cache must hold
+// the same blocks: an alias costs no translation.
+fn translated_with_workers_at(first: u64, second: u64) -> (u64, u32) {
+    let aliases = [
+        (ALIAS_ONE, STALE_WORKER_CODE),
+        (ALIAS_TWO, STALE_WORKER_CODE),
+    ];
+    let run = run_threads_with(
+        &FLUSH_BSP,
+        3,
+        true,
+        |cpu| {
+            place(cpu, STALE_WORKER_CODE, &FLUSH_WORKER);
+            identity_paging(cpu, &aliases);
+        },
+        |cpus| {
+            let (bsp, others) = cpus.split_first_mut().unwrap();
+            for (worker, rip) in others.iter_mut().zip([first, second]) {
+                let stack = STALE_WORKER_STACKS + 0x1000 * (rip >> 40);
+                start_in_long_mode(worker, bsp, rip, stack);
+            }
+        },
+    );
+    assert_thread_shutdown(&run);
+    let translated = run.bsp.jit.as_ref().map_or(0, |jit| jit.stats().translated);
+    (translated, run.read_u32(FLUSH_COUNTER))
+}
+
+#[test]
+fn vcpus_running_one_physical_page_at_different_addresses_share_its_blocks() {
+    let expected = 3 * FLUSH_ITERATIONS;
+    let (same, same_count) = translated_with_workers_at(ALIAS_ONE, ALIAS_ONE);
+    let (different, different_count) = translated_with_workers_at(ALIAS_ONE, ALIAS_TWO);
+    assert_eq!(
+        (same_count, different_count),
+        (expected, expected),
+        "an increment was lost"
+    );
+    if same != 0 {
+        assert_eq!(
+            different, same,
+            "the second alias translated what the first had"
+        );
+    }
+}
+
+const CHAIN_64: u64 = STALE_DATA + 0x40000;
+const CHAIN_64_PAGES: u64 = 64;
+const CHAIN_64_COUNTER: u64 = STALE_DATA + 0x40;
+const CHAIN_64_DONE: u64 = STALE_DATA + 0x44;
+// lock inc dword [CHAIN_64_COUNTER]
+const CHAIN_64_STEP: [u8; 8] = [0xf0, 0xff, 0x04, 0x25, 0x40, 0x00, 0x40, 0x00];
+// lock inc dword [CHAIN_64_COUNTER]; lock inc dword [CHAIN_64_DONE]; cli; hlt
+const CHAIN_64_END: [u8; 18] = [
+    0xf0, 0xff, 0x04, 0x25, 0x40, 0x00, 0x40, 0x00, 0xf0, 0xff, 0x04, 0x25, 0x44, 0x00, 0x40, 0x00,
+    0xfa, 0xf4,
+];
+// mov eax, CHAIN_64; jmp rax
+const BSP_ENTER_CHAIN_64: [u8; 7] = [0xb8, 0x00, 0x00, 0x44, 0x00, 0xff, 0xe0];
+
+fn run_the_chain(vcpus: usize) -> ThreadRun {
+    run_threads_with(
+        &BSP_ENTER_CHAIN_64,
+        vcpus,
+        true,
+        |cpu| {
+            for page in 0..CHAIN_64_PAGES {
+                let at = CHAIN_64 + page * 0x1000;
+                if page + 1 < CHAIN_64_PAGES {
+                    // lock inc; jmp rel32 to the next page
+                    let mut code = CHAIN_64_STEP.to_vec();
+                    let rel = 0x1000u32 - (CHAIN_64_STEP.len() as u32 + 5);
+                    code.push(0xe9);
+                    code.extend_from_slice(&rel.to_le_bytes());
+                    place(cpu, at, &code);
+                } else {
+                    place(cpu, at, &CHAIN_64_END);
+                }
+            }
+        },
+        |cpus| {
+            let (bsp, others) = cpus.split_first_mut().unwrap();
+            for (index, worker) in others.iter_mut().enumerate() {
+                let stack = STALE_WORKER_STACKS + (index as u64 + 1) * STALE_WORKER_STACK_BYTES;
+                start_in_long_mode(worker, bsp, CHAIN_64, stack);
+            }
+        },
+    )
+}
+
+/// Four vCPUs run the same 64 pages of 64-bit code, one block each (and the last page two), all
+/// starting at once: every block must be translated exactly once however the translations
+/// interleave, which a lone vCPU running the same code shows as the number to expect, and every
+/// locked increment must land.
+#[test]
+fn four_vcpus_running_the_same_pages_at_once_translate_each_block_once() {
+    let vcpus = 4usize;
+    let alone = run_the_chain(1);
+    assert_thread_shutdown(&alone);
+    // Without a JIT (a build or host that has none) there is nothing to count.
+    let Some(alone_cache) = alone.bsp.jit.as_ref() else {
+        return;
+    };
+    let expected = alone_cache.stats().translated;
+    assert!(expected >= CHAIN_64_PAGES, "{expected}");
+    for _ in 0..10 {
+        let run = run_the_chain(vcpus);
+        assert_thread_shutdown(&run);
+        assert_eq!(run.read_u32(CHAIN_64_DONE), vcpus as u32);
+        assert_eq!(
+            run.read_u32(CHAIN_64_COUNTER),
+            vcpus as u32 * CHAIN_64_PAGES as u32,
+            "a locked increment was lost"
+        );
+        let stats = run.bsp.jit.as_ref().unwrap().stats();
+        assert_eq!(stats.translated, expected, "a block was translated twice");
+        assert_eq!(stats.resets, 0);
+    }
+}
