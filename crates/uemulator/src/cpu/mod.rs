@@ -52,6 +52,8 @@ use decode::Insn;
 use flags::LazyFlagsOp;
 
 pub(crate) use exception::Exception;
+#[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
+pub(crate) use sys::{CR0_EM, CR0_TS, CR4_OSFXSR};
 
 /// `Cpu::rng_state` until the machine overrides it with `MachineConfig::random_seed`.
 pub(crate) const DEFAULT_RANDOM_SEED: u64 = 0x9e37_79b9_7f4a_7c15;

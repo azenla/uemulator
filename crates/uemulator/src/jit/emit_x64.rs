@@ -27,7 +27,9 @@ use super::native::LinkSite;
 use super::x64::*;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
 use crate::cpu::flags::{LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT, SZP_CF_OF_SRC_OF_BIT};
-use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TlbEntry};
+use crate::cpu::{
+    CR0_EM, CR0_TS, CR4_OSFXSR, Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TlbEntry,
+};
 
 // Offsets into `Cpu` baked into generated code. They come from `offset_of!`, so they always match
 // the compiled layout; what has to stay true is the shape of the `#[repr(C)]` `Cpu` and `TlbEntry`:
@@ -54,6 +56,13 @@ const LAZY_SIZE_SHIFT: u32 = 8;
 const LAZY_DST: i32 = offset_of!(Cpu, lazy_dst) as i32;
 const LAZY_SRC: i32 = offset_of!(Cpu, lazy_src) as i32;
 const LAZY_SRC2: i32 = offset_of!(Cpu, lazy_src2) as i32;
+const CR0: i32 = offset_of!(Cpu, cr0) as i32;
+const CR4: i32 = offset_of!(Cpu, cr4) as i32;
+const XMM: i32 = offset_of!(Cpu, xmm) as i32;
+const XMM_SIZE: i32 = size_of::<u128>() as i32;
+const XMM_HALF: i32 = XMM_SIZE / 2;
+/// Legacy-SSE 128-bit memory operands of movaps/movdqa and friends must be aligned to this.
+const VECTOR_ALIGNMENT: i32 = XMM_SIZE;
 // `Seg` is not `repr(C)`; `offset_of!` and `size_of` still report the real layout.
 const SEG_BASE: i32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as i32;
 const SEG_SIZE: i32 = size_of::<Seg>() as i32;
@@ -197,6 +206,9 @@ const IMUL_OVERFLOW_FLAGS: u8 = 3;
 
 /// A TLB-miss path, emitted out of line after the block body.
 enum SlowKind {
+    /// A whole-instruction fallback (`vector_move`): the probe or a gate check failed, so the
+    /// interpreter runs the instruction and raises the right fault.
+    Exec,
     Ld {
         dst: u8,
         size: u8,
@@ -277,6 +289,10 @@ pub(crate) struct Gen<'a> {
     /// instruction). Every instruction that emits code which may clobber them must clear this;
     /// the memory access paths do it in `tlb_probe`.
     live: bool,
+    /// An inline SSE instruction of this block already checks CR0.EM/TS and CR4.OSFXSR. Whatever
+    /// changes them (mov to cr, clts, lmsw, vmrun...) ends a block, so the first check covers the
+    /// rest.
+    sse_gated: bool,
     /// Block index of the last instruction whose clock read was paid for in advance; see
     /// `Gen::helper` and the field of the same name in `emit.rs`.
     prepaid_insns: u32,
@@ -326,6 +342,7 @@ impl<'a> Gen<'a> {
             slows: Vec::new(),
             smc: Vec::new(),
             live: false,
+            sse_gated: false,
             prepaid_insns: 0,
             inlined: 0,
             entry_rip: 0,
@@ -658,6 +675,20 @@ impl<'a> Gen<'a> {
         let slows = std::mem::take(&mut self.slows);
         for slow in slows {
             self.a.bind(slow.slow);
+            if matches!(slow.kind, SlowKind::Exec) {
+                // Not `helper`: that pays for the instructions before this one at translation time,
+                // which a path that is only sometimes taken cannot do. `exit_fail` works out the
+                // retired count from the index, as for a faulting memory access.
+                let insn = &self.insns[slow.insn_index as usize] as *const Insn as u64;
+                self.a.mov_rr(ARGS[0], CPU, true);
+                self.a.mov_imm(ARGS[1], insn);
+                self.rip_to(ARGS[2], slow.rip);
+                self.call(self.addrs.exec);
+                self.a.test_rr(ACC, ACC, true);
+                self.a.jcc(E, slow.resume);
+                self.fail_exit(slow.insn_index);
+                continue;
+            }
             // `OPERAND` is an argument register on both ABIs, so a preserving store parks it
             // before any argument is set up.
             if let SlowKind::St { preserve: true, .. } = slow.kind {
@@ -674,6 +705,7 @@ impl<'a> Gen<'a> {
             self.a.mov_rr(ARGS[1], SAVED_ADDR, true);
             let fail = self.a.label();
             match slow.kind {
+                SlowKind::Exec => unreachable!("handled above"),
                 SlowKind::Ld {
                     dst,
                     size,
@@ -1761,6 +1793,13 @@ impl<'a> Gen<'a> {
                 self.inlined += 1;
                 return true;
             }
+            // movups/movupd, movaps/movapd, movdqa/movdqu
+            0x110 | 0x111 | 0x128 | 0x129 | 0x16f | 0x17f if plain => {
+                let Some(form) = vector_move(&insn) else {
+                    return false;
+                };
+                store = self.vector_move(&insn, form, next, insn_index, rip);
+            }
             _ => return false,
         }
         if store {
@@ -1768,6 +1807,82 @@ impl<'a> Gen<'a> {
         }
         self.inlined += 1;
         true
+    }
+
+    /// A 128-bit whole-register move (`VectorMove`). The fast path needs the memory operand
+    /// inside one page and, for the aligned forms, 16-byte aligned; anything else, and the SSE
+    /// gate (#UD/#NM) failing, runs the instruction in the interpreter so faults and the
+    /// partial-store rules (`Cpu::write128` probes both pages first) stay in one place. Returns
+    /// whether the instruction stores to memory (the caller then polls for self-modifying code).
+    fn vector_move(
+        &mut self,
+        insn: &Insn,
+        form: VectorMove,
+        next: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let slow = self.a.label();
+        let resume = self.a.label();
+        self.slows.push(Slow {
+            slow,
+            resume,
+            kind: SlowKind::Exec,
+            insn_index,
+            rip,
+        });
+        if !self.sse_gated {
+            self.sse_gated = true;
+            self.a.ld(SCRATCH_A, mem(CPU, CR0));
+            self.a
+                .alu_ri(AND, SCRATCH_A, (CR0_EM | CR0_TS) as i32, true);
+            self.a.jcc(NE, slow);
+            self.a.ld(SCRATCH_A, mem(CPU, CR4));
+            self.a.alu_ri(AND, SCRATCH_A, CR4_OSFXSR as i32, true);
+            self.a.jcc(E, slow);
+        }
+        let xmm = |reg: u8| XMM + XMM_SIZE * reg as i32;
+        // The two halves travel through VALUE and SCRATCH_C, both free once the probe is done.
+        if insn.md == MODRM_MOD_REGISTER {
+            let (from, to) = if form.load {
+                (insn.rm, insn.reg)
+            } else {
+                (insn.reg, insn.rm)
+            };
+            self.a.ld(VALUE, mem(CPU, xmm(from)));
+            self.a.ld(SCRATCH_C, mem(CPU, xmm(from) + XMM_HALF));
+            self.a.st(mem(CPU, xmm(to)), VALUE, 8);
+            self.a.st(mem(CPU, xmm(to) + XMM_HALF), SCRATCH_C, 8);
+            self.a.bind(resume);
+            self.live = false;
+            return false;
+        }
+        self.ea(insn, next);
+        if form.aligned {
+            self.a.mov_rr(SCRATCH_A, ADDR, true);
+            self.a.alu_ri(AND, SCRATCH_A, VECTOR_ALIGNMENT - 1, true);
+            self.a.jcc(NE, slow);
+        }
+        let register = xmm(insn.reg);
+        if form.load {
+            self.tlb_probe(XMM_SIZE as u8, TLB_TAG_READ, slow);
+            self.a.ld(SCRATCH_B, mem(SCRATCH_A, TLB_ADDEND));
+            self.a.ld(VALUE, mem_idx(ADDR, SCRATCH_B, 0, 0));
+            self.a.ld(SCRATCH_C, mem_idx(ADDR, SCRATCH_B, 0, XMM_HALF));
+            self.a.st(mem(CPU, register), VALUE, 8);
+            self.a.st(mem(CPU, register + XMM_HALF), SCRATCH_C, 8);
+        } else {
+            self.tlb_probe(XMM_SIZE as u8, TLB_TAG_WRITE, slow);
+            self.a.ld(SCRATCH_B, mem(SCRATCH_A, TLB_ADDEND));
+            self.a.ld(VALUE, mem(CPU, register));
+            self.a.ld(SCRATCH_C, mem(CPU, register + XMM_HALF));
+            self.a.st(mem_idx(ADDR, SCRATCH_B, 0, 0), VALUE, 8);
+            self.a
+                .st(mem_idx(ADDR, SCRATCH_B, 0, XMM_HALF), SCRATCH_C, 8);
+        }
+        self.a.bind(resume);
+        self.live = false;
+        !form.load
     }
 
     /// `rips[k]` is the guest rip of instruction `k`; `end_rip` is the rip after the last one.

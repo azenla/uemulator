@@ -402,6 +402,41 @@ fn leaves_flags_alone(insn: &Insn) -> bool {
     }
 }
 
+/// The 128-bit whole-register moves the generators lower inline: movups/movupd, movaps/movapd and
+/// movdqu/movdqa, legacy-encoded, register or memory form.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VectorMove {
+    /// The destination is the xmm register `reg`; otherwise it is `rm` (register) or memory.
+    pub load: bool,
+    /// A memory operand must be 16-byte aligned (#GP(0) otherwise): movaps, movapd, movdqa.
+    pub aligned: bool,
+}
+
+/// `Some` for the forms `VectorMove` describes. The scalar forms (`f3`/`f2` movss/movsd, which
+/// merge into the low lane), movlps/movhps, movntdq, MMX `movq` and every VEX/EVEX form are not
+/// included: `Insn::op` carries a flag for the VEX and EVEX ones, so they never match.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) fn vector_move(insn: &Insn) -> Option<VectorMove> {
+    const OPCODE_MAP_0F: u16 = 1 << 8;
+    let opcode = insn
+        .op
+        .checked_sub(OPCODE_MAP_0F)
+        .filter(|&byte| byte <= 0xff)?;
+    // Same precedence as `Cpu::sse`: an f3/f2 prefix wins over 66.
+    let packed = insn.rep == 0;
+    let (load, aligned) = match opcode {
+        // movups/movupd (no prefix or 66)
+        0x10 | 0x11 if packed => (opcode == 0x10, false),
+        // movaps/movapd
+        0x28 | 0x29 if packed => (opcode == 0x28, true),
+        // movdqa (66) and movdqu (f3); without a prefix 0f 6f/7f is MMX movq
+        0x6f | 0x7f if insn.rep == 1 || (packed && insn.p66) => (opcode == 0x6f, insn.rep == 0),
+        _ => return None,
+    };
+    Some(VectorMove { load, aligned })
+}
+
 #[cfg(test)]
 mod tests {
     //! The block-ending set, the clock-reading set, the exit-code layout and the helper ABI that
@@ -418,6 +453,53 @@ mod tests {
             op,
             ..Default::default()
         }
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn sse_insn(opcode: u8, rep: u8, p66: bool) -> Insn {
+        Insn {
+            op: 0x100 | opcode as u16,
+            rep,
+            p66,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn vector_move_covers_exactly_the_whole_register_moves() {
+        let form = |opcode, rep, p66| vector_move(&sse_insn(opcode, rep, p66));
+        let (load, store) = (true, false);
+        for (opcode, rep, p66, expected) in [
+            (0x10, 0, false, Some((load, false))),
+            (0x10, 0, true, Some((load, false))),
+            (0x11, 0, true, Some((store, false))),
+            (0x28, 0, false, Some((load, true))),
+            (0x29, 0, true, Some((store, true))),
+            (0x6f, 0, true, Some((load, true))),
+            (0x7f, 0, true, Some((store, true))),
+            (0x6f, 1, false, Some((load, false))),
+            (0x7f, 1, true, Some((store, false))),
+            // movss/movsd merge into the low lane; 0f 6f/7f without a prefix is MMX movq
+            (0x10, 1, false, None),
+            (0x11, 2, false, None),
+            (0x6f, 0, false, None),
+            (0x7f, 2, false, None),
+            // movlps
+            (0x12, 0, false, None),
+        ] {
+            assert_eq!(
+                form(opcode, rep, p66).map(|m| (m.load, m.aligned)),
+                expected,
+                "{opcode:#x} rep {rep} 66 {p66}"
+            );
+        }
+        // a VEX-encoded op number never lands in the 0f map
+        assert_eq!(
+            vector_move(&insn_with_op(crate::cpu::decode::VEX_OP_FLAG | 0x110)),
+            None
+        );
+        assert_eq!(vector_move(&insn_with_op(0x6f)), None);
     }
 
     fn group_five(reg: u8) -> Insn {
