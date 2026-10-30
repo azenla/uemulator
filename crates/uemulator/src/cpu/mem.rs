@@ -757,10 +757,10 @@ impl Cpu {
     /// block that is currently running stop after this store instead of executing bytes it
     /// may just have overwritten. Without it the whole decode cache is flushed.
     pub fn code_written(&mut self, ppn: usize) {
-        if let Some(mut jit) = self.jit.take() {
-            jit.invalidate_page(ppn as u64);
+        if let Some(jit) = self.jit.take() {
+            // Clears the page's flag too, which has to happen under the cache's lock.
+            jit.invalidate_page(ppn as u64, &self.page_has_code);
             self.jit = Some(jit);
-            self.page_has_code.set(ppn, 0);
             self.decode_cache_generation = self.decode_cache_generation.wrapping_add(1);
             self.block_exit_requested = true;
         } else {

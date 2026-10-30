@@ -8,8 +8,12 @@ pub(crate) struct ExecMem {
     len: usize,
 }
 
-// The mapping is owned exclusively by this value.
+// The mapping is owned by this value. It is shared between threads on purpose: they execute
+// blocks while another thread writes new ones and patches links. Writers must be serialized by
+// the caller (`Jit`'s lock) and write only code no thread can reach yet, except through
+// `write_word`.
 unsafe impl Send for ExecMem {}
+unsafe impl Sync for ExecMem {}
 
 impl ExecMem {
     pub fn base(&self) -> u64 {
@@ -28,6 +32,28 @@ impl ExecMem {
             std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words))
         };
         self.write_bytes(offset, bytes);
+    }
+
+    /// Replaces one aligned 32-bit word of code with a single atomic store, for patching code
+    /// other threads may be executing (a block link): they run either the old word or the new,
+    /// never a mix. Same write protection and cache handling as `write_bytes`.
+    pub fn write_word(&self, offset: usize, word: u32) {
+        assert!(
+            offset.is_multiple_of(std::mem::size_of::<u32>())
+                && offset
+                    .checked_add(std::mem::size_of::<u32>())
+                    .is_some_and(|end| end <= self.len),
+            "word write at offset {offset:#x} is misaligned or outside the {}-byte mapping",
+            self.len
+        );
+        unsafe {
+            let target = self.ptr.add(offset) as *mut u32;
+            imp::set_write_protect(false);
+            std::sync::atomic::AtomicU32::from_ptr(target)
+                .store(word, std::sync::atomic::Ordering::Release);
+            imp::set_write_protect(true);
+            imp::flush(target as *mut u8, std::mem::size_of::<u32>());
+        }
     }
 
     /// Makes the region writable for this thread only, copies, restores execute permission and

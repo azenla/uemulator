@@ -884,14 +884,10 @@ impl Vcpu {
                     .thread_spawner
                     .clone()
                     .expect("checked by runs_on_threads");
-                let jit_enabled = self.jit != JitMode::Off;
-                let make_jit = || {
-                    if jit_enabled {
-                        crate::jit::Jit::new(true).map(Box::new)
-                    } else {
-                        None
-                    }
-                };
+                // Every vCPU runs the one code cache the bootstrap processor made, through a
+                // handle of its own (`Jit::sibling`); with the JIT off there is none.
+                let jit_source = cpu.jit.as_ref().map(|jit| jit.sibling());
+                let make_jit = || jit_source.as_ref().map(|jit| Box::new(jit.sibling()));
                 let (reason, bootstrap, summary) = crate::cpu::vcpus::run_threaded(
                     crate::cpu::smp::secondary_cpus(cpu),
                     &spawner,

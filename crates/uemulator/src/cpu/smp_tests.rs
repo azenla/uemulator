@@ -4,7 +4,7 @@
 
 use super::smp::Smp;
 use super::*;
-use crate::testkit::{Harness, SmpRun, ThreadRun, run_smp, run_threads};
+use crate::testkit::{Harness, SmpRun, ThreadRun, run_smp, run_threads, run_threads_with};
 
 /// SIPI vector 8: the start-up code runs in real mode at 0x8000.
 const TRAMPOLINE: u64 = 0x8000;
@@ -74,21 +74,23 @@ const AP_WAIT_FOR_IPI: [u8; 67] = [
     0xb8, 0xff, 0x01, 0x00, 0x00, 0x66, 0x31, 0xd2, 0x0f, 0x30, 0xc6, 0x06, 0x00, 0x10, 0x42, 0xfb,
     0xf4, 0xfa, 0xf4,
 ];
-// The store lands between MONITOR and MWAIT: arms the monitor, tells the AP to go, waits until
-// its store is visible, and only then executes MWAIT, which must return at once.
-//   mov byte [0x1004], 1; lea rax, [0x2000]; xor ecx, ecx; xor edx, edx; monitor;
+// The store lands between MONITOR and MWAIT: arms the monitor, only then tells the AP to go (a
+// store before MONITOR is not seen by it, on hardware either), waits until the AP's store is
+// visible, and executes MWAIT, which must return at once.
+//   lea rax, [0x2000]; xor ecx, ecx; xor edx, edx; monitor; mov byte [0x1004], 1;
 //   wait: pause; cmp byte [0x2000], 1; jne wait; sti; mwait; cli; mov byte [0x1008], 0x99; hlt
 const BSP_MONITOR_THEN_MWAIT_AFTER_THE_STORE: [u8; 50] = [
-    0xc6, 0x04, 0x25, 0x04, 0x10, 0x00, 0x00, 0x01, 0x48, 0x8d, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00,
-    0x31, 0xc9, 0x31, 0xd2, 0x0f, 0x01, 0xc8, 0xf3, 0x90, 0x80, 0x3c, 0x25, 0x00, 0x20, 0x00, 0x00,
+    0x48, 0x8d, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x31, 0xc9, 0x31, 0xd2, 0x0f, 0x01, 0xc8, 0xc6,
+    0x04, 0x25, 0x04, 0x10, 0x00, 0x00, 0x01, 0xf3, 0x90, 0x80, 0x3c, 0x25, 0x00, 0x20, 0x00, 0x00,
     0x01, 0x75, 0xf4, 0xfb, 0x0f, 0x01, 0xc9, 0xfa, 0xc6, 0x04, 0x25, 0x08, 0x10, 0x00, 0x00, 0x99,
     0xf4, 0xf4,
 ];
-// mov byte [0x1004], 1; lea rax, [0x2000]; xor ecx, ecx; xor edx, edx; monitor; sti; mwait;
+// lea rax, [0x2000]; xor ecx, ecx; xor edx, edx; monitor; mov byte [0x1004], 1; sti; mwait;
 // cli; mov byte [MWAIT_WOKEN_NOTE], 0x99; hlt
+// The AP is told to store only after the monitor is armed: a store before MONITOR is not seen.
 const BSP_MWAIT: [u8; 37] = [
-    0xc6, 0x04, 0x25, 0x04, 0x10, 0x00, 0x00, 0x01, 0x48, 0x8d, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00,
-    0x31, 0xc9, 0x31, 0xd2, 0x0f, 0x01, 0xc8, 0xfb, 0x0f, 0x01, 0xc9, 0xfa, 0xc6, 0x04, 0x25, 0x08,
+    0x48, 0x8d, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x31, 0xc9, 0x31, 0xd2, 0x0f, 0x01, 0xc8, 0xc6,
+    0x04, 0x25, 0x04, 0x10, 0x00, 0x00, 0x01, 0xfb, 0x0f, 0x01, 0xc9, 0xfa, 0xc6, 0x04, 0x25, 0x08,
     0x10, 0x00, 0x00, 0x99, 0xf4,
 ];
 // wait: pause; cmp byte [0x1004], 1; jne wait; mov byte [0x2000], 1; hlt
@@ -815,5 +817,198 @@ fn a_lock_bts_spin_lock_keeps_a_plain_counter_exact() {
             run.read_u32(PROTECTED_COUNTER),
             (AP_COUNT + 1) * LOCKED_SECTIONS_PER_CPU
         );
+    });
+}
+
+/// Where the stale-translation test keeps its notes and code: RAM the fake kernel leaves alone.
+const STALE_DATA: u64 = crate::testkit::SCRATCH;
+const STALE_DONE: u64 = STALE_DATA;
+const STALE_VERSION: u64 = STALE_DATA + 0x08;
+const STALE_FAILURES: u64 = STALE_DATA + 0x10;
+const STALE_EXITED: u64 = STALE_DATA + 0x18;
+/// The page the writer rewrites and the workers run: `mov eax, <version>; ret`.
+const STALE_SITE: u64 = STALE_DATA + 0x1000;
+const STALE_WORKER_CODE: u64 = STALE_DATA + 0x2000;
+const STALE_WORKER_STACKS: u64 = STALE_DATA + 0x10000;
+const STALE_WORKER_STACK_BYTES: u64 = 0x1000;
+const STALE_WORKERS: usize = 2;
+/// How long a translation lingers between reading the bytes and registering the block, and how
+/// long the writer waits between rewrites. The first is the longer, so a rewrite always lands in
+/// a worker's window.
+const STALE_WINDOW_MICROS: u64 = 1000;
+// mov eax, 0; ret
+const STALE_SITE_CODE: [u8; 6] = [0xb8, 0x00, 0x00, 0x00, 0x00, 0xc3];
+
+// The writer: for version 1 to 1000, patch the immediate of the site (a store to a code page, so
+// `code_written` runs) and then publish the version; wait a little between versions; at the end
+// raise DONE and wait for the workers.
+//   xor ebx, ebx
+// again: inc ebx; mov [site + 1], ebx; mov [VERSION], ebx
+//   mov ecx, 1000; spin: dec ecx; jnz spin; cmp ebx, 1000; jb again
+//   mov dword [DONE], 1; wait: pause; cmp dword [EXITED], 2; jne wait; cli; hlt
+const STALE_WRITER: [u8; 60] = [
+    0x31, 0xdb, 0xff, 0xc3, 0x89, 0x1c, 0x25, 0x04, 0x10, 0x40, 0x00, 0x89, 0x1c, 0x25, 0x08, 0x00,
+    0x40, 0x00, 0xb9, 0xe8, 0x03, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xfc, 0x81, 0xfb, 0xe8, 0x03, 0x00,
+    0x00, 0x72, 0xdf, 0xc7, 0x04, 0x25, 0x00, 0x00, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00, 0xf3, 0x90,
+    0x83, 0x3c, 0x25, 0x18, 0x00, 0x40, 0x00, 0x02, 0x75, 0xf4, 0xfa, 0xf4,
+];
+
+// A worker, the cross-modifying code protocol of SDM vol. 3, 8.1.3: read the version the writer
+// published, run a serializing `cpuid`, then run the site, which must be at least that new.
+// work: mov r8d, [VERSION]; xor eax, eax; cpuid; mov eax, site; call rax
+//   cmp eax, r8d; jae ok; lock inc qword [FAILURES]
+// ok: cmp dword [DONE], 0; je work; lock inc dword [EXITED]; cli; hlt
+const STALE_WORKER: [u8; 54] = [
+    0x44, 0x8b, 0x04, 0x25, 0x08, 0x00, 0x40, 0x00, 0x31, 0xc0, 0x0f, 0xa2, 0xb8, 0x03, 0x10, 0x40,
+    0x00, 0xff, 0xd0, 0x44, 0x39, 0xc0, 0x73, 0x09, 0xf0, 0x48, 0xff, 0x04, 0x25, 0x10, 0x00, 0x40,
+    0x00, 0x83, 0x3c, 0x25, 0x00, 0x00, 0x40, 0x00, 0x00, 0x74, 0xd5, 0xf0, 0xff, 0x04, 0x25, 0x18,
+    0x00, 0x40, 0x00, 0xfa, 0xf4, 0xf4,
+];
+
+/// Starts a parked secondary in the 64-bit mode the bootstrap processor runs in, at `rip`.
+fn start_in_long_mode(cpu: &mut Cpu, bsp: &Cpu, rip: u64, rsp: u64) {
+    cpu.cr0 = bsp.cr0;
+    cpu.cr3 = bsp.cr3;
+    cpu.cr4 = bsp.cr4;
+    cpu.efer = bsp.efer;
+    cpu.seg = bsp.seg;
+    cpu.gdtr = bsp.gdtr;
+    cpu.idtr = bsp.idtr;
+    cpu.eflags = bsp.eflags;
+    cpu.set_cpl(0);
+    cpu.flush_tlb();
+    cpu.rip = rip;
+    cpu.gpr[crate::testkit::RSP] = rsp;
+    cpu.halted = false;
+    cpu.wait_for_sipi = false;
+}
+
+/// One vCPU rewrites code while the others run it. Another vCPU's translation of that page can
+/// read the old bytes, lose the race with the writer's `code_written`, and register its block
+/// after the writer dropped the page's blocks: stale code that stays valid until the next write.
+/// Every translation is held for longer than the writer waits between rewrites, so the race is
+/// lost every time; the cache has to notice (`Jit::install` compares `invalidations`) and decode
+/// again, and no worker may then run an older immediate than the version it saw published.
+#[test]
+fn code_rewritten_while_another_vcpu_translates_it_never_runs_stale() {
+    struct Pause;
+    impl Pause {
+        fn new() -> Self {
+            crate::jit::PAUSE_BEFORE_INSTALL_MICROS
+                .store(STALE_WINDOW_MICROS, std::sync::atomic::Ordering::Relaxed);
+            Pause
+        }
+    }
+    impl Drop for Pause {
+        fn drop(&mut self) {
+            crate::jit::PAUSE_BEFORE_INSTALL_MICROS.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    both_engines(|jit| {
+        let _pause = jit.then(Pause::new);
+        let run = run_threads_with(
+            &STALE_WRITER,
+            1 + STALE_WORKERS,
+            jit,
+            |cpu| {
+                place(cpu, STALE_SITE + 3, &STALE_SITE_CODE);
+                place(cpu, STALE_WORKER_CODE, &STALE_WORKER);
+            },
+            |cpus| {
+                let (bsp, others) = cpus.split_first_mut().unwrap();
+                for (index, worker) in others.iter_mut().enumerate() {
+                    let stack = STALE_WORKER_STACKS + (index as u64 + 1) * STALE_WORKER_STACK_BYTES;
+                    start_in_long_mode(worker, bsp, STALE_WORKER_CODE, stack);
+                }
+            },
+        );
+        assert_thread_shutdown(&run);
+        assert_eq!(run.read_u32(STALE_VERSION), 1000);
+        assert_eq!(run.read_u32(STALE_DONE), 1, "the writer finished");
+        assert_eq!(
+            run.read_u32(STALE_EXITED),
+            STALE_WORKERS as u32,
+            "every worker left its loop"
+        );
+        assert_eq!(
+            run.read(STALE_FAILURES, 8),
+            [0; 8],
+            "a worker ran code older than the version it saw published (jit {jit})"
+        );
+        if let Some(cache) = run.bsp.jit.as_ref() {
+            assert!(
+                cache.stats().stale_decodes > 0,
+                "no translation lost the race: the test did not test"
+            );
+        }
+    });
+}
+
+const FLUSH_COUNTER: u64 = STALE_DATA + 0x20;
+const FLUSH_ITERATIONS: u32 = 3000;
+/// Blocks the cache may hold in `a_full_code_cache_is_flushed_under_vcpus_that_keep_running`:
+/// fewer than the loop below needs, so the buffer is flushed every few iterations.
+const FLUSH_BLOCK_LIMIT: usize = 3;
+
+// Every vCPU runs this loop (placed at a page of its own): `jmp` chained blocks around a locked
+// increment of a shared counter, so a flush lands under blocks that are linked to each other.
+//   mov ecx, 3000; top: jmp a; a: lock inc dword [COUNTER]; jmp b; b: dec ecx; jnz top
+// then the workers count themselves out and halt:
+//   lock inc dword [EXITED]; cli; hlt
+const FLUSH_WORKER: [u8; 31] = [
+    0xb9, 0xb8, 0x0b, 0x00, 0x00, 0xeb, 0x00, 0xf0, 0xff, 0x04, 0x25, 0x20, 0x00, 0x40, 0x00, 0xeb,
+    0x00, 0xff, 0xc9, 0x75, 0xf0, 0xf0, 0xff, 0x04, 0x25, 0x18, 0x00, 0x40, 0x00, 0xfa, 0xf4,
+];
+// and the bootstrap processor waits for them instead:
+//   wait: pause; cmp dword [EXITED], 2; jne wait; cli; hlt
+const FLUSH_BSP: [u8; 35] = [
+    0xb9, 0xb8, 0x0b, 0x00, 0x00, 0xeb, 0x00, 0xf0, 0xff, 0x04, 0x25, 0x20, 0x00, 0x40, 0x00, 0xeb,
+    0x00, 0xff, 0xc9, 0x75, 0xf0, 0xf3, 0x90, 0x83, 0x3c, 0x25, 0x18, 0x00, 0x40, 0x00, 0x02, 0x75,
+    0xf4, 0xfa, 0xf4,
+];
+
+/// The cache fills up while every vCPU is running blocks that are linked to each other: the
+/// flush has to stop them all outside generated code, throw the blocks and links away, make each
+/// vCPU forget its jump cache, and leave every vCPU able to carry on. A flush that missed one of
+/// those would run freed code, so nothing here may be lost, corrupted or stuck.
+#[test]
+fn a_full_code_cache_is_flushed_under_vcpus_that_keep_running() {
+    struct Limit;
+    impl Limit {
+        fn new() -> Self {
+            crate::jit::TEST_BLOCK_LIMIT
+                .store(FLUSH_BLOCK_LIMIT, std::sync::atomic::Ordering::Relaxed);
+            Limit
+        }
+    }
+    impl Drop for Limit {
+        fn drop(&mut self) {
+            crate::jit::TEST_BLOCK_LIMIT.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    both_engines(|jit| {
+        let _limit = jit.then(Limit::new);
+        let run = run_threads_with(
+            &FLUSH_BSP,
+            1 + STALE_WORKERS,
+            jit,
+            |cpu| place(cpu, STALE_WORKER_CODE, &FLUSH_WORKER),
+            |cpus| {
+                let (bsp, others) = cpus.split_first_mut().unwrap();
+                for (index, worker) in others.iter_mut().enumerate() {
+                    let stack = STALE_WORKER_STACKS + (index as u64 + 1) * STALE_WORKER_STACK_BYTES;
+                    start_in_long_mode(worker, bsp, STALE_WORKER_CODE, stack);
+                }
+            },
+        );
+        assert_thread_shutdown(&run);
+        assert_eq!(
+            run.read_u32(FLUSH_COUNTER),
+            (1 + STALE_WORKERS as u32) * FLUSH_ITERATIONS,
+            "an increment was lost"
+        );
+        if let Some(cache) = run.bsp.jit.as_ref() {
+            assert!(cache.stats().resets > 0, "the cache was never flushed");
+        }
     });
 }

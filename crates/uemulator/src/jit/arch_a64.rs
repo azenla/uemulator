@@ -29,6 +29,8 @@ fn bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
+const JUMP_CACHE_ARGUMENT: u32 = 2;
+const VALID_ARGUMENT: u32 = 3;
 const PAGE_SHIFT: u32 = 12;
 const PAGE_OFFSET_MASK: u64 = (1 << PAGE_SHIFT) - 1;
 const FRAME_POINTER: u32 = 29;
@@ -37,19 +39,25 @@ const LINK_REGISTER: u32 = 30;
 /// x20 (`CPU`, `TLB_BASE`), x21 (`PAGE_BASE`), x22 and x23 (slow-path state), x24..x26 (values
 /// that must survive a slow-path helper call) and x27/x28 (the memory thunks' info pointer and
 /// return address, see `emit.rs`).
-const FRAME_SIZE: i32 = 96;
+const FRAME_SIZE: i32 = 112;
 const SAVE_X21: u32 = 88;
+/// The jump cache of the vCPU running the block, which the run loop passes to the trampoline: the
+/// code (and so the chain stub) is shared by every vCPU, the cache is not.
+const JUMP_CACHE_SLOT: u32 = 96;
+/// The validity table (`Jit::valid`), passed the same way.
+const VALID_SLOT: u32 = 104;
 const SAVE_X19_X20: i32 = 16;
 const SAVE_X22_X23: i32 = 32;
 const SAVE_X24_X25: i32 = 48;
 const SAVE_X26_X27: i32 = 64;
 const SAVE_X28: i32 = 80;
 
-/// Builds `extern "C" fn(cpu: *mut Cpu, block: u64) -> u64` (the call in `Cpu::step_block`).
+/// Builds `extern "C" fn(cpu: *mut Cpu, block: u64, jump_cache: u64, valid: u64) -> u64` (the
+/// call in `Cpu::step_block`).
 /// It saves the callee-saved registers the blocks use, latches `CPU` and `TLB_BASE`, and jumps
 /// into the block. Blocks call helpers with `blr`, which overwrites x30, so the return address
 /// is saved in the frame and the stubs return through the restored x30.
-pub(crate) fn prologue(base: u64, jump_cache_base: u64, valid_base: u64) -> Prologue {
+pub(crate) fn prologue(base: u64) -> Prologue {
     let mut asm = Asm::new(base);
     asm.stp_pre(FRAME_POINTER, LINK_REGISTER, a64::SP, -FRAME_SIZE);
     asm.stp_off(19, 20, a64::SP, SAVE_X19_X20);
@@ -58,6 +66,8 @@ pub(crate) fn prologue(base: u64, jump_cache_base: u64, valid_base: u64) -> Prol
     asm.stp_off(26, 27, a64::SP, SAVE_X26_X27);
     asm.str(28, a64::SP, SAVE_X28 as u32);
     asm.str(PAGE_BASE, a64::SP, SAVE_X21);
+    asm.str(JUMP_CACHE_ARGUMENT, a64::SP, JUMP_CACHE_SLOT);
+    asm.str(VALID_ARGUMENT, a64::SP, VALID_SLOT);
     asm.mov(CPU, 0);
     asm.ldr(
         TLB_BASE,
@@ -86,7 +96,7 @@ pub(crate) fn prologue(base: u64, jump_cache_base: u64, valid_base: u64) -> Prol
     asm.ldp_off(19, 20, a64::SP, SAVE_X19_X20);
     asm.ldp_post(FRAME_POINTER, LINK_REGISTER, a64::SP, FRAME_SIZE);
     asm.ret();
-    let chain = chain_stub(&mut asm, jump_cache_base, valid_base, exit_ok);
+    let chain = chain_stub(&mut asm, exit_ok);
     let addrs = Addrs {
         exec: exec_stub(&mut asm),
         cond: tail_call_stub(&mut asm, helpers::helper_cond as *const () as usize as u64),
@@ -277,7 +287,7 @@ const CHAIN_RIP: u32 = 1;
 ///   `Jit::lookup`, and the block was not invalidated since (`Jit::valid`).
 ///
 /// The miss path gives back the successor's pre-charge: the loop adds it again.
-fn chain_stub(asm: &mut Asm, jump_cache_base: u64, valid_base: u64, exit_ok: u64) -> u64 {
+fn chain_stub(asm: &mut Asm, exit_ok: u64) -> u64 {
     const TLB_SLOT_MASK: u64 = (TLB_ENTRIES_PER_MODE - 1) as u64;
     const TLB_ENTRY_SHIFT: u32 = std::mem::size_of::<TlbEntry>().trailing_zeros();
     // `jump_cache_hash` in `native.rs`: rip ^ (rip >> bits), masked.
@@ -305,7 +315,7 @@ fn chain_stub(asm: &mut Asm, jump_cache_base: u64, valid_base: u64, exit_ok: u64
     asm.lsr_imm(slot, CHAIN_RIP, JUMP_HASH_FOLD_SHIFT);
     asm.eor(slot, slot, CHAIN_RIP, true);
     assert!(asm.and_imm(slot, slot, jump_cache_mask(), true));
-    asm.mov_imm(key, jump_cache_base);
+    asm.ldr(key, a64::SP, JUMP_CACHE_SLOT);
     asm.add_lsl(slot, key, slot, JUMP_ENTRY_SHIFT);
     asm.ldr(key, slot, 0);
     asm.cmp(key, CHAIN_RIP, true);
@@ -317,10 +327,8 @@ fn chain_stub(asm: &mut Asm, jump_cache_base: u64, valid_base: u64, exit_ok: u64
     asm.cbz(key, miss, true);
     // The slot may name a block whose page was written since (`Jit::valid`).
     asm.ldr(phys, slot, JUMP_ENTRY_BLOCK_OFFSET);
-    asm.sub_imm(phys, phys, 1, true);
-    asm.mov_imm(slot, valid_base);
-    asm.add(slot, slot, phys, true);
-    asm.ldrb(slot, slot, 0);
+    asm.ldr(slot, a64::SP, VALID_SLOT);
+    asm.ldr_r(slot, slot, phys, 1, false);
     asm.cbz(slot, miss, false);
     // The successor is entered with its own page as `PAGE_BASE`; `page` still holds it.
     asm.mov(PAGE_BASE, page);
@@ -367,6 +375,9 @@ pub(crate) fn compile_block(
     }
 }
 
+/// A link slot is one instruction, patched whole.
+pub(crate) const LINK_WORD_OFFSET: usize = 0;
+
 const BRANCH_OPCODE: u32 = 0x1400_0000;
 const BRANCH_IMM26_MASK: u32 = 0x03ff_ffff;
 const INSN_BYTES: i64 = 4;
@@ -374,20 +385,18 @@ const INSN_BYTES: i64 = 4;
 const BRANCH_REACH_INSNS: i64 = 1 << 25;
 
 /// The instruction that makes the slot at `site` jump to `destination`, or `None` when the two
-/// are further apart than a `b` reaches (blocks in different code segments).
-pub(crate) fn link_bytes(site: u64, destination: u64) -> Option<Vec<u8>> {
+/// are further apart than a `b` reaches (blocks in different code segments). Written with
+/// `ExecMem::write_word`: another vCPU may be executing the slot, and aarch64 allows a `nop` to
+/// be replaced by a branch (and back) under a running thread.
+pub(crate) fn link_word(site: u64, destination: u64) -> Option<u32> {
     let offset = (destination as i64 - site as i64) / INSN_BYTES;
     if offset.abs() >= BRANCH_REACH_INSNS {
         return None;
     }
-    Some(
-        (BRANCH_OPCODE | (offset as u32 & BRANCH_IMM26_MASK))
-            .to_le_bytes()
-            .to_vec(),
-    )
+    Some(BRANCH_OPCODE | (offset as u32 & BRANCH_IMM26_MASK))
 }
 
 /// What an unlinked slot holds: a nop, so execution falls into the chain stub sequence after it.
-pub(crate) fn unlink_bytes() -> Vec<u8> {
-    NOP_WORD.to_le_bytes().to_vec()
+pub(crate) fn unlink_word() -> u32 {
+    NOP_WORD
 }

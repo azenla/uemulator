@@ -40,8 +40,13 @@ const RIP: i32 = offset_of!(Cpu, rip) as i32;
 const ICOUNT: i32 = offset_of!(Cpu, icount) as i32;
 const BLOCK_EXIT_REQUESTED: i32 = offset_of!(Cpu, block_exit_requested) as i32;
 const NEXT_EVENT: i32 = offset_of!(Cpu, next_event) as i32;
-/// `nop dword [rax + rax]`, five bytes: the size of the `jmp rel32` that replaces it.
-pub(crate) const LINK_NOP: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
+/// A link slot: `jmp rel32` to the very next instruction, until `Jit` points it at a successor
+/// block. The jump is always there and only its 32-bit displacement is rewritten, in one aligned
+/// atomic store (`ExecMem::write_word`), because another vCPU may be executing the slot while it
+/// is patched and a five-byte rewrite could be seen half done.
+pub(crate) const LINK_JMP: [u8; 5] = [0xe9, 0x00, 0x00, 0x00, 0x00];
+const LINK_JMP_OPCODE_BYTES: u64 = 1;
+const LINK_WORD_ALIGN: u64 = 4;
 const PREPAID_ICOUNT: i32 = offset_of!(Cpu, prepaid_icount) as i32;
 const SLOW_ACCESS_INSN: i32 = offset_of!(Cpu, slow_access_insn) as i32;
 const LAZY_OP: i32 = offset_of!(Cpu, lazy_op) as i32;
@@ -125,18 +130,25 @@ const PUSH_POP_SIZE: i32 = 8;
 /// Condition code 2 (B): CF.
 const CONDITION_BELOW: u64 = 2;
 
+const NOP: u8 = 0x90;
+
 /// Stack frame the prologue reserves below its saved registers. The eight pushes leave rsp at
 /// 8 mod 16, so the frame must be 8 mod 16 for calls from blocks to see rsp 16-byte aligned (both
 /// ABIs require it). It also has to hold the 32 bytes of Win64 shadow space at the bottom, with
 /// the slow-path load result slot (`OUT`) above it. Shared with `arch_x64`.
-pub(crate) const FRAME: i32 = 56;
+pub(crate) const FRAME: i32 = 72;
 /// Offset from rsp of the 8-byte slot holding the guest address of the page the running block
 /// belongs to (`rip & !0xfff`), where aarch64 keeps it in a register (`PAGE_BASE` in `emit.rs`;
 /// every host register here has a role). The trampoline sets it from `Cpu::rip`, the chain stub
 /// from its target; a direct link keeps it because links stay within a page. Above `OUT`, in the
-/// frame's spare 16 bytes, which no callee touches.
+/// frame's spare bytes, which no callee touches.
 pub(crate) const PAGE_BASE_SLOT: i32 = 40;
-const _: () = assert!(PAGE_BASE_SLOT >= OUT + 8 && PAGE_BASE_SLOT + 8 <= FRAME);
+/// Where the trampoline keeps the jump cache of the vCPU running the block (the code and the chain
+/// stub are shared by every vCPU, the cache is not).
+pub(crate) const JUMP_CACHE_SLOT: i32 = 48;
+/// The validity table (`Jit::valid`), passed the same way.
+pub(crate) const VALID_SLOT: i32 = 56;
+const _: () = assert!(PAGE_BASE_SLOT >= OUT + 8 && VALID_SLOT + 8 <= FRAME);
 /// Offset from rsp of the 8-byte slot `helper_load_via_out` writes its result to. Above the shadow space so the
 /// callee cannot spill its register arguments over it.
 const OUT: i32 = 32;
@@ -397,18 +409,22 @@ impl<'a> Gen<'a> {
         self.a.jmp_abs(self.addrs.chain);
     }
 
-    /// Emits the 5-byte nop that `Jit::translate` turns into a direct `jmp` to the block at
-    /// `target_rip` once it exists, when `target_rip` is in this block's page; see `emit.rs`.
-    /// It sits right before the `jmp chain`, so the stub path still runs while it is a nop.
+    /// Emits the `jmp rel32` that `Jit::translate` points at the block for `target_rip` once it
+    /// exists, when `target_rip` is in this block's page; see `emit.rs`. It sits right before the
+    /// `jmp chain`, so while it is unpatched (a jump to the next instruction) the stub path runs.
+    /// The displacement is padded to a 4-byte boundary so one store replaces it.
     fn link_slot(&mut self, target_rip: u64) {
         if self.addrs.chain == 0 || target_rip >> PAGE_SHIFT != self.entry_rip >> PAGE_SHIFT {
             return;
+        }
+        while !(self.a.here() + LINK_JMP_OPCODE_BYTES).is_multiple_of(LINK_WORD_ALIGN) {
+            self.a.code.push(NOP);
         }
         self.links.push(LinkSite {
             code_offset: (self.a.here() - self.a.base()) as u32,
             target_rip,
         });
-        self.a.code.extend_from_slice(&LINK_NOP);
+        self.a.code.extend_from_slice(&LINK_JMP);
     }
 
     /// The checks `chain_stub` does before it jumps into a block, for a block reached by a direct

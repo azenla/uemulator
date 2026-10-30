@@ -577,6 +577,18 @@ pub(crate) fn run_threads(
     jit: bool,
     setup: impl FnOnce(&mut Cpu),
 ) -> ThreadRun {
+    run_threads_with(code, cpus, jit, setup, |_| {})
+}
+
+/// `run_threads`, with `prepare` given the vCPUs (the bootstrap processor first) before their
+/// threads start, to put the others somewhere other than waiting for a start-up IPI.
+pub(crate) fn run_threads_with(
+    code: &[u8],
+    cpus: usize,
+    jit: bool,
+    setup: impl FnOnce(&mut Cpu),
+    prepare: impl FnOnce(&mut [Cpu]),
+) -> ThreadRun {
     let mut ram = vec![0u8; HARNESS_RAM_BYTES];
     let state: BootState =
         boot::load(&mut ram, &fake_bzimage(code), None, "").expect("fake kernel must load");
@@ -613,15 +625,13 @@ pub(crate) fn run_threads(
             stop.store(true, std::sync::atomic::Ordering::SeqCst);
         })
     };
-    let make_jit = || {
-        jit.then(|| crate::jit::Jit::new(true).map(Box::new))
-            .flatten()
-    };
-    let (exit, bsp, summary) = crate::cpu::vcpus::run_threaded(
-        crate::cpu::smp::secondary_cpus(cpu),
-        &crate::cpu::vcpus::std_thread_spawner(),
-        &make_jit,
-    );
+    // As in `EmulatedMachine`: every vCPU gets a handle on the one code cache.
+    let jit_source = cpu.jit.as_ref().map(|jit| jit.sibling());
+    let make_jit = || jit_source.as_ref().map(|jit| Box::new(jit.sibling()));
+    let mut cpus = crate::cpu::smp::secondary_cpus(cpu);
+    prepare(&mut cpus);
+    let (exit, bsp, summary) =
+        crate::cpu::vcpus::run_threaded(cpus, &crate::cpu::vcpus::std_thread_spawner(), &make_jit);
     finished.store(true, std::sync::atomic::Ordering::Relaxed);
     watchdog.join().unwrap();
     ThreadRun {

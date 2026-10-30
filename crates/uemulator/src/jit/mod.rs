@@ -27,6 +27,12 @@ mod native;
 
 #[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub(crate) use native::Jit;
+#[cfg(all(
+    test,
+    feature = "jit",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+pub(crate) use native::{PAUSE_BEFORE_INSTALL_MICROS, TEST_BLOCK_LIMIT};
 
 /// Whether a writable+executable mapping can be created and run on this host.
 #[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -118,13 +124,36 @@ mod stub {
     /// Never constructed: `Jit::new` returns `None`, so `Cpu::step_block` is unreachable.
     pub(crate) struct Jit;
 
+    #[cfg(test)]
+    #[derive(Default)]
+    pub(crate) struct JitStats {
+        pub translated: u64,
+        pub stale_decodes: u64,
+        pub resets: u64,
+    }
+
+    #[cfg(test)]
+    pub(crate) static TEST_BLOCK_LIMIT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    /// Only the real cache reads this; tests set it unconditionally.
+    #[cfg(test)]
+    pub(crate) static PAUSE_BEFORE_INSTALL_MICROS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     impl Jit {
         pub fn new(_chaining: bool) -> Option<Jit> {
             None
         }
-        pub fn invalidate_page(&mut self, _ppn: u64) {}
-        pub fn reset(&mut self) {}
+        pub fn sibling(&self) -> Jit {
+            Jit
+        }
+        pub fn invalidate_page(&self, _ppn: u64, _flags: &crate::ram::CodePages) {}
         pub fn set_ordered_memory(&mut self, _on: bool) {}
+        #[cfg(test)]
+        pub fn stats(&self) -> JitStats {
+            JitStats::default()
+        }
     }
 
     impl Cpu {
@@ -136,6 +165,11 @@ mod stub {
 
 #[cfg(not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))))]
 pub(crate) use stub::Jit;
+#[cfg(all(
+    test,
+    not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))
+))]
+pub(crate) use stub::{PAUSE_BEFORE_INSTALL_MICROS, TEST_BLOCK_LIMIT};
 
 #[cfg(not(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64"))))]
 pub(crate) fn probe() -> bool {

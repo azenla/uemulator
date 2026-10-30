@@ -1,5 +1,5 @@
 pub(crate) use super::emit_x64::Addrs;
-use super::emit_x64::{CPU, FRAME, Gen, LINK_NOP, PAGE_BASE_SLOT, TLB_BASE};
+use super::emit_x64::{CPU, FRAME, Gen, JUMP_CACHE_SLOT, PAGE_BASE_SLOT, TLB_BASE, VALID_SLOT};
 use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
 use super::native::{
     CompiledBlock, JUMP_ENTRY_BLOCK_OFFSET, JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET,
@@ -25,17 +25,19 @@ pub(crate) struct Prologue {
 /// callee-saved there and blocks use them as scratch); on System V the extra saves are harmless.
 const SAVED_REGS: [u8; 8] = [RBX, RBP, RSI, RDI, R12, R13, R14, R15];
 
-/// Builds `enter(cpu: *mut Cpu, code: u64) -> exit_code`, which `Cpu::step_block` calls through a
+/// Builds `enter(cpu: *mut Cpu, code: u64, jump_cache: u64, valid: u64) -> exit_code`, which `Cpu::step_block` calls through a
 /// function pointer: it sets up the frame, pins the `Cpu` pointer and TLB base for the block (see
 /// `emit_x64`), then jumps to `code`. Blocks never return themselves; they jump to `exit_ok` or
 /// `exit_fail` below.
-pub(crate) fn prologue(base: u64, jump_cache_base: u64, valid_base: u64) -> Prologue {
+pub(crate) fn prologue(base: u64) -> Prologue {
     let mut a = Asm::new(base);
     for r in SAVED_REGS {
         a.push(r);
     }
     a.alu_ri(SUB, RSP, FRAME, true);
     a.mov_rr(CPU, ARGS[0], true);
+    a.st(mem(RSP, JUMP_CACHE_SLOT), ARGS[2], 8);
+    a.st(mem(RSP, VALID_SLOT), ARGS[3], 8);
     a.ld(TLB_BASE, mem(CPU, offset_of!(Cpu, tlb_active_base) as i32));
     // The run loop enters at `Cpu::rip`, so that is the page the block runs from. rax is neither
     // an argument register nor needed by the block.
@@ -60,7 +62,7 @@ pub(crate) fn prologue(base: u64, jump_cache_base: u64, valid_base: u64) -> Prol
         a.pop(*r);
     }
     a.ret();
-    let chain = chain_stub(&mut a, jump_cache_base, valid_base, exit_ok);
+    let chain = chain_stub(&mut a, exit_ok);
     a.finish();
     Prologue {
         code: a.code,
@@ -101,7 +103,7 @@ const CHAIN_RIP: u8 = RCX;
 /// The miss path gives back the successor's pre-charge: the loop adds it again. It reports one
 /// retired instruction in the exit code, which `step_block` counts as nothing further (it
 /// subtracts the first instruction, which `Cpu::run` already counted).
-fn chain_stub(a: &mut Asm, jump_cache_base: u64, valid_base: u64, exit_ok: u64) -> u64 {
+fn chain_stub(a: &mut Asm, exit_ok: u64) -> u64 {
     const TLB_SLOT_MASK: i32 = (TLB_ENTRIES_PER_MODE - 1) as i32;
     const TLB_ENTRY_SHIFT: u8 = size_of::<TlbEntry>().trailing_zeros() as u8;
     // `jump_cache_hash` in `native.rs`: rip ^ (rip >> bits), masked.
@@ -136,7 +138,7 @@ fn chain_stub(a: &mut Asm, jump_cache_base: u64, valid_base: u64, exit_ok: u64) 
     a.alu_rr(XOR, slot, CHAIN_RIP, true);
     a.alu_ri(AND, slot, jump_cache_mask() as i32, false);
     a.shift_ri(SHL, slot, JUMP_ENTRY_SHIFT as u8, true);
-    a.mov_imm(key, jump_cache_base);
+    a.ld(key, mem(RSP, JUMP_CACHE_SLOT));
     a.alu_rr(ADD, slot, key, true);
     a.cmp_mr(mem(slot, 0), CHAIN_RIP);
     a.jcc(NE, miss);
@@ -148,8 +150,8 @@ fn chain_stub(a: &mut Asm, jump_cache_base: u64, valid_base: u64, exit_ok: u64) 
     // The slot may name a block whose page was written since (`Jit::valid`). r8 and r9 are
     // caller-saved scratch the blocks keep nothing in.
     a.ld(R8, mem(slot, JUMP_ENTRY_BLOCK_OFFSET as i32));
-    a.mov_imm(R9, valid_base);
-    a.cmp_m8_imm(mem_idx(R9, R8, 0, -1), 0);
+    a.ld(R9, mem(RSP, VALID_SLOT));
+    a.cmp_m8_imm(mem_idx(R9, R8, 0, 0), 0);
     a.jcc(E, miss);
     a.jmp_reg(key);
     a.bind(miss);
@@ -198,19 +200,20 @@ pub(crate) fn compile_block(
     }
 }
 
-const JMP_REL32_OPCODE: u8 = 0xe9;
 const JMP_REL32_BYTES: i64 = 5;
+/// A link slot is `jmp rel32` (`emit_x64::LINK_JMP`); only the displacement after the opcode is
+/// rewritten, as one aligned 32-bit store.
+pub(crate) const LINK_WORD_OFFSET: usize = 1;
 
-/// The `jmp rel32` that makes the slot at `site` jump to `destination`, or `None` when it does
-/// not fit (the buffer is far smaller than 2 GiB, so only a corrupt address).
-pub(crate) fn link_bytes(site: u64, destination: u64) -> Option<Vec<u8>> {
+/// The displacement that makes the slot at `site` (its opcode byte) jump to `destination`, or
+/// `None` when it does not fit (the buffer is far smaller than 2 GiB, so only a corrupt address).
+pub(crate) fn link_word(site: u64, destination: u64) -> Option<u32> {
     let rel = i32::try_from(destination as i64 - (site as i64 + JMP_REL32_BYTES)).ok()?;
-    let mut bytes = vec![JMP_REL32_OPCODE];
-    bytes.extend_from_slice(&rel.to_le_bytes());
-    Some(bytes)
+    Some(rel as u32)
 }
 
-/// What an unlinked slot holds: a nop, so execution falls into the chain stub sequence after it.
-pub(crate) fn unlink_bytes() -> Vec<u8> {
-    LINK_NOP.to_vec()
+/// The displacement of an unlinked slot: zero, a jump to the next instruction, which is the chain
+/// stub sequence.
+pub(crate) fn unlink_word() -> u32 {
+    0
 }

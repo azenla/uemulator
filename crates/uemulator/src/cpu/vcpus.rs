@@ -243,11 +243,16 @@ impl VcpuLinks {
 
     /// Every vCPU is halted and none could be woken by an interrupt: the guest is dead, which is
     /// how a `cli; hlt` poweroff ends.
+    ///
+    /// `wakeable` is kept by each vCPU's own thread, so it lags behind what the device model just
+    /// published: a start-up IPI for a parked vCPU sets `ATTENTION_START` before that thread has
+    /// looked at it, and a bootstrap processor that goes straight to `cli; hlt` after sending it
+    /// would otherwise end the machine before the others ever run.
     pub fn all_dead(&self) -> bool {
         self.links.iter().all(|link| {
             link.halted.load(Ordering::SeqCst)
                 && !link.wakeable.load(Ordering::SeqCst)
-                && link.attention.load(Ordering::SeqCst) & ATTENTION_NMI == 0
+                && link.attention.load(Ordering::SeqCst) & (ATTENTION_NMI | ATTENTION_START) == 0
         })
     }
 
@@ -402,39 +407,21 @@ impl Cpu {
         links.enter_running();
     }
 
-    /// Drops the translations of every page another vCPU or a device wrote since this one last
-    /// looked.
+    /// Catches this vCPU up with the code other vCPUs and devices wrote since it last looked: its
+    /// decode cache goes. The JIT needs nothing here: the cache is shared, so the writer dropped
+    /// the blocks of the page for every vCPU at once (`Jit::invalidate_page`), and the
+    /// jump-cache entries that named them fail the validity check.
     fn drain_invalidations(&mut self, links: &VcpuLinks) {
         self.clear_attention(ATTENTION_INVALIDATE);
-        let (behind, pages, next) = {
-            let log = links.invalidations.lock().unwrap();
-            let behind = self.invalidation_seen < log.first_sequence;
-            let skip = self.invalidation_seen.saturating_sub(log.first_sequence) as usize;
-            let pages: Vec<u32> = if behind {
-                Vec::new()
-            } else {
-                log.pages.iter().skip(skip).copied().collect()
-            };
-            (behind, pages, log.next_sequence())
-        };
-        self.invalidation_seen = next;
+        self.invalidation_seen = links.invalidations.lock().unwrap().next_sequence();
         self.decode_cache_generation = self.decode_cache_generation.wrapping_add(1);
-        if let Some(jit) = &mut self.jit {
-            if behind {
-                jit.reset();
-            } else {
-                for page in pages {
-                    jit.invalidate_page(page as u64);
-                }
-            }
-        }
     }
 
     /// Runs `f` with every other vCPU stopped: parked at a block boundary or halted. For what
     /// cannot be done to memory another vCPU may be using, or to another vCPU's state: flagging a
     /// page as code (which revokes write tags in every TLB), a locked access no host atomic
     /// covers. Never call it with the device lock held: the others could be waiting for it.
-    pub(super) fn with_exclusive<R>(&mut self, f: impl FnOnce(&mut Cpu) -> R) -> R {
+    pub(crate) fn with_exclusive<R>(&mut self, f: impl FnOnce(&mut Cpu) -> R) -> R {
         let Some(runtime) = &self.threads else {
             return f(self);
         };
@@ -795,4 +782,38 @@ pub(crate) fn run_threaded(
     }
     let bsp = finished.remove(0);
     (reason, bsp, summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_halted(links: &VcpuLinks) {
+        for link in &links.links {
+            link.halted.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn halted_vcpus_that_cannot_wake_are_a_dead_guest() {
+        let links = VcpuLinks::new(2);
+        all_halted(&links);
+        assert!(links.all_dead());
+    }
+
+    #[test]
+    fn a_pending_startup_ipi_is_not_a_dead_guest_even_before_its_vcpu_notices() {
+        let links = VcpuLinks::new(2);
+        all_halted(&links);
+        links.publish_device_bits(1, ATTENTION_START);
+        assert!(!links.all_dead(), "the parked vCPU is about to start");
+    }
+
+    #[test]
+    fn a_pending_nmi_is_not_a_dead_guest() {
+        let links = VcpuLinks::new(2);
+        all_halted(&links);
+        links.publish_device_bits(0, ATTENTION_NMI);
+        assert!(!links.all_dead());
+    }
 }

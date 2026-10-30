@@ -29,6 +29,7 @@ Read `plans/README.md` first; the plans are the source of truth for design and m
 - `../ext/qemu-uplink` is read-only reference (see `plans/09-qemu-map.md`). Study behavior; write Rust from scratch, don't transliterate.
 - The interpreter is the oracle for the JIT. Any new uop gets an interpreter implementation and a test first.
 - Advertise a CPUID bit only together with the tests for the instructions behind it.
+- JIT blocks are position independent: keyed by physical address, and every guest `rip` a block uses is the page base (`PAGE_BASE`) plus a translation-time offset (`Gen::rip_to`); never embed a guest virtual address in generated code (`plans/06-jit.md`). The code cache is shared by all vCPUs: add or patch code only under its lock, and patch links with `ExecMem::write_word`.
 - With threads (`plans/22-smp-threads.md`) RAM and the devices are shared. Take the device lock through `cpu.dev.lock()` for every device access and never hold it into `Cpu::with_exclusive` (the others may be waiting for it). Guest memory goes through `mem_read`/`mem_write` (acquire/release, atomics), not through slices, whenever another vCPU could be writing it. Anything machine-wide you add to `Cpu` needs a decision twice: `swap_shared` for time-sharing, and shared handle or private copy for threads.
 - Debug-profile is optimized (`opt-level = 3`) because the kernel decompressor is ~1e9 guest instructions.
 
