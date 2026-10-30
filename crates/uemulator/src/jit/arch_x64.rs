@@ -1,9 +1,9 @@
 pub(crate) use super::emit_x64::Addrs;
-use super::emit_x64::{CPU, FRAME, Gen, LINK_NOP, TLB_BASE};
+use super::emit_x64::{CPU, FRAME, Gen, LINK_NOP, PAGE_BASE_SLOT, TLB_BASE};
 use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
 use super::native::{
-    CompiledBlock, JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET, JUMP_ENTRY_SHIFT,
-    jump_cache_mask,
+    CompiledBlock, JUMP_ENTRY_BLOCK_OFFSET, JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET,
+    JUMP_ENTRY_SHIFT, jump_cache_mask,
 };
 use super::x64::*;
 use crate::cpu::decode::Insn;
@@ -29,7 +29,7 @@ const SAVED_REGS: [u8; 8] = [RBX, RBP, RSI, RDI, R12, R13, R14, R15];
 /// function pointer: it sets up the frame, pins the `Cpu` pointer and TLB base for the block (see
 /// `emit_x64`), then jumps to `code`. Blocks never return themselves; they jump to `exit_ok` or
 /// `exit_fail` below.
-pub(crate) fn prologue(base: u64, jump_cache_base: u64) -> Prologue {
+pub(crate) fn prologue(base: u64, jump_cache_base: u64, valid_base: u64) -> Prologue {
     let mut a = Asm::new(base);
     for r in SAVED_REGS {
         a.push(r);
@@ -37,6 +37,11 @@ pub(crate) fn prologue(base: u64, jump_cache_base: u64) -> Prologue {
     a.alu_ri(SUB, RSP, FRAME, true);
     a.mov_rr(CPU, ARGS[0], true);
     a.ld(TLB_BASE, mem(CPU, offset_of!(Cpu, tlb_active_base) as i32));
+    // The run loop enters at `Cpu::rip`, so that is the page the block runs from. rax is neither
+    // an argument register nor needed by the block.
+    a.ld(RAX, mem(CPU, offset_of!(Cpu, rip) as i32));
+    a.alu_ri(AND, RAX, PAGE_BASE_MASK, true);
+    a.st(mem(RSP, PAGE_BASE_SLOT), RAX, 8);
     a.jmp_reg(ARGS[1]);
     // rax = helper status, rcx = index of the failing instruction. Fold into the exit code
     // `(retired << EXIT_COUNT_SHIFT) | status`: an exception means rcx instructions retired, but
@@ -55,7 +60,7 @@ pub(crate) fn prologue(base: u64, jump_cache_base: u64) -> Prologue {
         a.pop(*r);
     }
     a.ret();
-    let chain = chain_stub(&mut a, jump_cache_base, exit_ok);
+    let chain = chain_stub(&mut a, jump_cache_base, valid_base, exit_ok);
     a.finish();
     Prologue {
         code: a.code,
@@ -64,6 +69,10 @@ pub(crate) fn prologue(base: u64, jump_cache_base: u64) -> Prologue {
         chain,
     }
 }
+
+const PAGE_SHIFT: u8 = 12;
+/// Sign-extends to `!0xfff` in a 64-bit `and`.
+const PAGE_BASE_MASK: i32 = !((1 << PAGE_SHIFT) - 1);
 
 /// Registers of the chain stub's calling convention (see `Gen::chain_exit`). The scratch
 /// registers are caller-saved on both ABIs and hold nothing a block needs across the jump;
@@ -87,16 +96,13 @@ const CHAIN_RIP: u8 = RCX;
 /// - the exec TLB (the half `TLB_BASE` selects, which a block never leaves) has the page, so the
 ///   physical address is known without a walk and permissions were already checked;
 /// - the jump cache has a block for exactly this rip and physical address, the same key as
-///   `Jit::lookup`. Invalidation clears slots, so a hit is never stale.
+///   `Jit::lookup`, and the block was not invalidated since (`Jit::valid`).
 ///
 /// The miss path gives back the successor's pre-charge: the loop adds it again. It reports one
 /// retired instruction in the exit code, which `step_block` counts as nothing further (it
 /// subtracts the first instruction, which `Cpu::run` already counted).
-fn chain_stub(a: &mut Asm, jump_cache_base: u64, exit_ok: u64) -> u64 {
+fn chain_stub(a: &mut Asm, jump_cache_base: u64, valid_base: u64, exit_ok: u64) -> u64 {
     const TLB_SLOT_MASK: i32 = (TLB_ENTRIES_PER_MODE - 1) as i32;
-    const PAGE_SHIFT: u8 = 12;
-    /// Sign-extends to `!0xfff` in a 64-bit `and`.
-    const PAGE_BASE_MASK: i32 = !((1 << PAGE_SHIFT) - 1);
     const TLB_ENTRY_SHIFT: u8 = size_of::<TlbEntry>().trailing_zeros() as u8;
     // `jump_cache_hash` in `native.rs`: rip ^ (rip >> bits), masked.
     const JUMP_HASH_FOLD_SHIFT: u8 = 16;
@@ -115,6 +121,9 @@ fn chain_stub(a: &mut Asm, jump_cache_base: u64, exit_ok: u64) -> u64 {
     a.alu_rr(ADD, entry, TLB_BASE, true);
     a.mov_rr(page, CHAIN_RIP, true);
     a.alu_ri(AND, page, PAGE_BASE_MASK, true);
+    // The successor is entered with its own page as the page base. Stored before the checks (a
+    // miss leaves the block anyway, and the next entry sets it again).
+    a.st(mem(RSP, PAGE_BASE_SLOT), page, 8);
     a.cmp_mr(mem(entry, offset_of!(TlbEntry, tag_x) as i32), page);
     a.jcc(NE, miss);
     // phys = rip + addend - ram_base
@@ -135,6 +144,12 @@ fn chain_stub(a: &mut Asm, jump_cache_base: u64, exit_ok: u64) -> u64 {
     a.jcc(NE, miss);
     a.ld(key, mem(slot, JUMP_ENTRY_CODE_OFFSET as i32));
     a.test_rr(key, key, true);
+    a.jcc(E, miss);
+    // The slot may name a block whose page was written since (`Jit::valid`). r8 and r9 are
+    // caller-saved scratch the blocks keep nothing in.
+    a.ld(R8, mem(slot, JUMP_ENTRY_BLOCK_OFFSET as i32));
+    a.mov_imm(R9, valid_base);
+    a.cmp_m8_imm(mem_idx(R9, R8, 0, -1), 0);
     a.jcc(E, miss);
     a.jmp_reg(key);
     a.bind(miss);

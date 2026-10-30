@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::arch;
 use super::helpers;
@@ -33,6 +34,21 @@ const PAGE_MASK: u64 = PAGE_SIZE - 1;
 
 const JUMP_CACHE_BITS: usize = 16;
 
+/// Most blocks one code buffer can hold, which is what sizes the validity table. The smallest
+/// block is a few dozen bytes, so a full buffer (`CODE_SIZE`) holds fewer than this.
+const MAX_BLOCKS: usize = 1 << 24;
+
+/// The second-page part of a block's key when its instructions all lie in the first page.
+const NO_SECOND_PAGE: u64 = u64::MAX;
+
+/// What identifies a translated block: the physical address of its first instruction, and for a
+/// block that is one instruction straddling a page boundary the physical page it continues in.
+/// There is deliberately no virtual address: blocks are position independent (`PAGE_BASE` in
+/// `emit.rs`), so every mapping of the same physical code, in any address space, runs the one
+/// translation. The straddling case needs the second page because its bytes come from another
+/// mapping, which a different address space may point elsewhere.
+type BlockKey = (u64, u64);
+
 /// One slot of the direct-mapped jump cache. `#[repr(C)]` with a power-of-two size because the
 /// chain stub in `arch_*.rs` indexes the table and reads `rip`, `phys_addr` and `code_addr` at
 /// these offsets (`JUMP_ENTRY_*`). An empty slot has `code_addr == 0`, which the stub treats as
@@ -43,8 +59,9 @@ pub(crate) struct JumpEntry {
     pub rip: u64,
     pub phys_addr: u64,
     pub code_addr: u64,
-    /// Index into `Jit::blocks` plus one, so `invalidate_page` can tell whether the slot still
-    /// belongs to the block it is dropping or was since taken over by a colliding rip.
+    /// Index into `Jit::blocks` plus one. The chain stub and `lookup` check it against the
+    /// validity table, which is how an invalidated block's slots stop being usable without
+    /// finding them (the slot is keyed by virtual rip, the block by physical address).
     block: u64,
 }
 
@@ -53,6 +70,7 @@ pub(crate) const JUMP_ENTRY_SHIFT: u32 = std::mem::size_of::<JumpEntry>().traili
 const _: () = assert!(std::mem::size_of::<JumpEntry>().is_power_of_two());
 pub(crate) const JUMP_ENTRY_PHYS_OFFSET: u32 = std::mem::offset_of!(JumpEntry, phys_addr) as u32;
 pub(crate) const JUMP_ENTRY_CODE_OFFSET: u32 = std::mem::offset_of!(JumpEntry, code_addr) as u32;
+pub(crate) const JUMP_ENTRY_BLOCK_OFFSET: u32 = std::mem::offset_of!(JumpEntry, block) as u32;
 
 /// A patchable slot in a compiled block: the exit to the fixed guest address `target_rip` (in the
 /// block's own page) is preceded by a nop of `arch::link_bytes` size that becomes a direct jump to
@@ -77,29 +95,24 @@ pub(crate) struct CompiledBlock {
     pub flag_records_skipped: u32,
 }
 
-/// A slot in the code buffer and the block it should jump to: `(rip, phys_addr)` of the
-/// destination, the same key as `block_map`.
+/// A slot in the code buffer and the block it should jump to: the physical address of the
+/// destination, which is its `BlockKey` (links stay within a page, so never a straddling block).
 #[derive(Clone)]
 struct LinkedSite {
     /// Offset into `ExecMem`.
     exec_offset: usize,
-    destination: (u64, u64),
+    destination: u64,
 }
 
-/// One translated block. Blocks are only ever added; an invalidated block keeps its slot (and its
-/// `valid == false` flag) until `Jit::reset`, so indices held in `page_blocks` and the jump cache
-/// stay stable.
+/// One translated block. Blocks are only ever added; an invalidated block keeps its slot (cleared
+/// in `Jit::valid`) until `Jit::reset`, so indices held in `page_blocks` and the jump cache stay
+/// stable.
 pub(crate) struct Block {
-    rip: u64,
-    /// Physical address of the first instruction. Part of the lookup key together with `rip`: the
-    /// code embeds rip-relative constants, and a remapped virtual page must not hit a stale block.
-    phys_addr: u64,
+    key: BlockKey,
     /// The body entry (run loop, chain stub, jump cache).
     code_addr: u64,
     /// The first byte of the block: the entry direct links jump to.
     link_addr: u64,
-    #[cfg_attr(not(test), allow(dead_code))]
-    valid: bool,
     /// Generated code calls `helper_exec` with raw pointers into this slice, so it must outlive the
     /// code. Heap storage keeps the addresses stable when `blocks` reallocates.
     _insns: Box<[Insn]>,
@@ -125,16 +138,19 @@ pub(crate) struct Jit {
     /// Every live block by `(rip, phys_addr)`. The jump cache is direct-mapped and much smaller
     /// than the working set of a boot (hundreds of thousands of blocks), so without this a
     /// colliding rip would evict a block and the next visit would translate it all over again.
-    block_map: HashMap<(u64, u64), u32>,
+    block_map: HashMap<BlockKey, u32>,
+    /// Per block index: 1 while the block may run, 0 once its page was written (or after
+    /// `reset`). Read by the chain stub through the address baked into the prologue.
+    valid: Box<[AtomicU8]>,
     /// Physical page number -> blocks that decoded bytes from it. A block that crosses a page is
     /// listed under both.
     page_blocks: HashMap<u64, Vec<u32>>,
     /// Slots patched to jump into a block (by its index), so invalidating the block can put them
     /// back to falling through to the chain stub.
     incoming: HashMap<u32, Vec<LinkedSite>>,
-    /// Unpatched slots by the `(rip, phys_addr)` of the block they want: the destination was not
+    /// Unpatched slots by the physical address of the block they want: the destination was not
     /// translated yet, or was invalidated since.
-    pending: HashMap<(u64, u64), Vec<LinkedSite>>,
+    pending: HashMap<u64, Vec<LinkedSite>>,
     /// Offset of the first block, just past the prologue. `reset` rewinds to here.
     blocks_start: usize,
     stats: JitStats,
@@ -184,11 +200,21 @@ impl Jit {
         let exec_mem = ExecMem::new(CODE_SIZE)?;
         let base = exec_mem.base();
         let jump_cache = vec![JumpEntry::default(); 1 << JUMP_CACHE_BITS];
+        // Zeroed pages the allocator hands over untouched, so the table costs address space until
+        // blocks are made. `AtomicU8` has the layout of `u8`.
+        let valid: Box<[AtomicU8]> = unsafe {
+            let bytes = vec![0u8; MAX_BLOCKS].into_boxed_slice();
+            Box::from_raw(Box::into_raw(bytes) as *mut [AtomicU8])
+        };
         let mut segment_addrs = Vec::with_capacity(SEGMENT_COUNT);
         let mut blocks_start = 0;
         for segment in 0..SEGMENT_COUNT {
             let segment_offset = segment * SEGMENT_SIZE;
-            let prologue = arch::prologue(base + segment_offset as u64, jump_cache.as_ptr() as u64);
+            let prologue = arch::prologue(
+                base + segment_offset as u64,
+                jump_cache.as_ptr() as u64,
+                valid.as_ptr() as u64,
+            );
             exec_mem.write_bytes(segment_offset, &prologue.code);
             blocks_start = (prologue.code.len() + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
             segment_addrs.push(arch::addrs(&prologue, chaining));
@@ -200,6 +226,7 @@ impl Jit {
             segment_addrs,
             blocks: Vec::new(),
             block_map: HashMap::new(),
+            valid,
             jump_cache,
             page_blocks: HashMap::new(),
             incoming: HashMap::new(),
@@ -217,6 +244,11 @@ impl Jit {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn stats(&self) -> JitStats {
         self.stats
+    }
+
+    #[cfg(test)]
+    fn block_is_valid(&self, index: usize) -> bool {
+        self.valid[index].load(Ordering::Acquire) != 0
     }
 
     #[cfg(test)]
@@ -249,13 +281,9 @@ impl Jit {
     pub fn invalidate_page(&mut self, ppn: u64) {
         if let Some(indices) = self.page_blocks.remove(&ppn) {
             for index in indices {
-                let block = &mut self.blocks[index as usize];
-                block.valid = false;
-                self.block_map.remove(&(block.rip, block.phys_addr));
-                let slot = &mut self.jump_cache[jump_cache_hash(block.rip)];
-                if slot.block == index as u64 + 1 {
-                    *slot = JumpEntry::default();
-                }
+                let block = &self.blocks[index as usize];
+                self.valid[index as usize].store(0, Ordering::Release);
+                self.block_map.remove(&block.key);
                 // A direct jump into the block would skip every lookup, so it goes back to
                 // falling through to the chain stub, and waits for the block to be translated
                 // again. The invalidated block's own slots stay patched: it never runs again.
@@ -272,24 +300,31 @@ impl Jit {
     /// Drops every block and rewinds the bump pointer, keeping the prologue. Only called from
     /// `translate`, so no generated code is running.
     pub fn reset(&mut self) {
-        self.blocks.clear();
         self.block_map.clear();
         self.page_blocks.clear();
         self.incoming.clear();
         self.pending.clear();
+        for flag in &self.valid[..self.blocks.len()] {
+            flag.store(0, Ordering::Release);
+        }
+        self.blocks.clear();
         self.jump_cache.fill(JumpEntry::default());
         self.used_bytes = self.blocks_start;
         self.stats.resets += 1;
     }
 
-    /// The block translated for this `(rip, phys_addr)`, if any. A jump cache miss falls back to
-    /// the block map and refills the slot.
+    /// The block translated for the code at this physical address, if any; `rip` only picks the
+    /// jump cache slot. A jump cache miss falls back to the block map and refills the slot.
     pub fn lookup(&mut self, rip: u64, phys_addr: u64) -> Option<u64> {
         let slot = &self.jump_cache[jump_cache_hash(rip)];
-        if slot.code_addr != 0 && slot.rip == rip && slot.phys_addr == phys_addr {
+        if slot.code_addr != 0
+            && slot.rip == rip
+            && slot.phys_addr == phys_addr
+            && self.valid[slot.block as usize - 1].load(Ordering::Acquire) != 0
+        {
             return Some(slot.code_addr);
         }
-        let index = *self.block_map.get(&(rip, phys_addr))?;
+        let index = *self.block_map.get(&(phys_addr, NO_SECOND_PAGE))?;
         let code_addr = self.blocks[index as usize].code_addr;
         self.jump_cache[jump_cache_hash(rip)] = JumpEntry {
             rip,
@@ -303,11 +338,14 @@ impl Jit {
     /// Decodes up to `MAX_INSNS` instructions at `rip` (physical `phys_addr`), compiles them and
     /// returns the host address of the block. A block never spans a page boundary, except the
     /// single-instruction block for an instruction that itself straddles one. `rip` must be
-    /// `cpu.rip`: that case decodes through `Cpu::fetch_decode`, which reads it.
+    /// `cpu.rip`: that case decodes through `Cpu::fetch_decode`, which reads it. Only the offset
+    /// of `rip` in its page matters to the code that comes out (see `BlockKey`).
     pub fn translate(&mut self, cpu: &mut Cpu, rip: u64, phys_addr: u64) -> Result<u64, Exception> {
         let mut segment = self.used_bytes / SEGMENT_SIZE;
-        if self.used_bytes + CODE_HEADROOM > (segment + 1) * SEGMENT_SIZE {
-            if segment + 1 < SEGMENT_COUNT {
+        if self.used_bytes + CODE_HEADROOM > (segment + 1) * SEGMENT_SIZE
+            || self.blocks.len() >= MAX_BLOCKS
+        {
+            if segment + 1 < SEGMENT_COUNT && self.blocks.len() < MAX_BLOCKS {
                 segment += 1;
                 self.used_bytes = segment * SEGMENT_SIZE + self.blocks_start;
             } else {
@@ -326,11 +364,13 @@ impl Jit {
         cpu.mark_code(phys_addr);
         let bytes_left_in_page = (PAGE_SIZE - (phys_addr & PAGE_MASK)) as usize;
         let mut insns: Vec<Insn> = Vec::new();
-        // Guest rip of each entry in `insns`.
+        // Offset in the block's page of each entry in `insns`: the code works in offsets from the
+        // page start, never in guest addresses.
         let mut insn_rips: Vec<u64> = Vec::new();
+        let entry_rip = rip & PAGE_MASK;
         let mut offset = 0usize;
         let mut crosses_page = false;
-        let mut end_rip = rip;
+        let mut end_rip = entry_rip;
         while insns.len() < MAX_INSNS {
             let window = (bytes_left_in_page - offset).min(MAX_INSN_LEN);
             if window == 0 {
@@ -339,9 +379,9 @@ impl Jit {
             let ram_offset = phys_addr as usize + offset;
             match decode::decode(&cpu.ram[ram_offset..ram_offset + window]) {
                 Ok(insn) => {
-                    insn_rips.push(rip + offset as u64);
+                    insn_rips.push(entry_rip + offset as u64);
                     offset += insn.len as usize;
-                    end_rip = rip + offset as u64;
+                    end_rip = entry_rip + offset as u64;
                     insns.push(insn);
                     if helpers::ends_block(insns.last().unwrap()) {
                         break;
@@ -353,8 +393,8 @@ impl Jit {
                 Err(DecodeErr::Truncated) => {
                     if insns.is_empty() {
                         let insn = cpu.fetch_decode()?;
-                        insn_rips.push(rip);
-                        end_rip = rip + insn.len as u64;
+                        insn_rips.push(entry_rip);
+                        end_rip = entry_rip + insn.len as u64;
                         insns.push(insn);
                         crosses_page = true;
                     }
@@ -368,8 +408,8 @@ impl Jit {
                         len: 1,
                         ..Default::default()
                     };
-                    insn_rips.push(rip + offset as u64);
-                    end_rip = rip + offset as u64 + 1;
+                    insn_rips.push(entry_rip + offset as u64);
+                    end_rip = entry_rip + offset as u64 + 1;
                     insns.push(marker);
                     break;
                 }
@@ -380,6 +420,7 @@ impl Jit {
         // arm, so a block is never empty. An empty one would compile to "jump to `rip`" and spin.
         debug_assert!(!insns.is_empty());
         let mut pages = vec![phys_addr >> PAGE_SHIFT];
+        let mut second_page = NO_SECOND_PAGE;
         if crosses_page {
             let next_page_phys = cpu.translate(
                 (rip & !PAGE_MASK).wrapping_add(PAGE_SIZE),
@@ -387,6 +428,12 @@ impl Jit {
                 false,
             )?;
             pages.push(next_page_phys >> PAGE_SHIFT);
+            second_page = next_page_phys & !PAGE_MASK;
+            // Decoding this block was the expensive part of a lookup that can never hit the jump
+            // cache (below), so it is looked up here.
+            if let Some(&index) = self.block_map.get(&(phys_addr, second_page)) {
+                return Ok(self.blocks[index as usize].code_addr);
+            }
         }
         let insns: Box<[Insn]> = insns.into_boxed_slice();
         self.used_bytes = (self.used_bytes + BLOCK_ALIGN - 1) & !(BLOCK_ALIGN - 1);
@@ -408,31 +455,31 @@ impl Jit {
         let link_addr = code_addr;
         let code_addr = link_addr + compiled.body_offset as u64;
         let index = self.blocks.len() as u32;
-        self.block_map.insert((rip, phys_addr), index);
+        let key = (phys_addr, second_page);
+        self.block_map.insert(key, index);
         self.blocks.push(Block {
-            rip,
-            phys_addr,
+            key,
             code_addr,
             link_addr,
-            valid: true,
             _insns: insns,
         });
-        // Blocks waiting for this one, then this block's own exits. Only same-page targets are
-        // linked: the block was entered through a validated mapping of its page, which is all
-        // the chain stub's TLB probe re-establishes, and a page-straddling block's exit is not
-        // in the page its key assumes.
-        for site in self.pending.remove(&(rip, phys_addr)).unwrap_or_default() {
-            self.patch_link(&site, index);
-        }
+        self.valid[index as usize].store(1, Ordering::Release);
+        // Only same-page blocks are linked, in either direction. A direct jump skips the chain
+        // stub's TLB probe and key check, which is sound when the destination is in the page the
+        // jumping block was entered through; a block that straddles a page is keyed by a second
+        // page that only the translating address space is known to map there.
         if !crosses_page {
+            for site in self.pending.remove(&phys_addr).unwrap_or_default() {
+                self.patch_link(&site, index);
+            }
             let page_base = phys_addr & !PAGE_MASK;
             for link in compiled.links {
-                let destination = (link.target_rip, page_base | (link.target_rip & PAGE_MASK));
+                let destination = page_base | (link.target_rip & PAGE_MASK);
                 let site = LinkedSite {
                     exec_offset: block_offset + link.code_offset as usize,
                     destination,
                 };
-                match self.block_map.get(&destination).copied() {
+                match self.block_map.get(&(destination, NO_SECOND_PAGE)).copied() {
                     Some(target) => {
                         self.patch_link(&site, target);
                     }
@@ -443,12 +490,17 @@ impl Jit {
         for page in pages {
             self.page_blocks.entry(page).or_default().push(index);
         }
-        self.jump_cache[jump_cache_hash(rip)] = JumpEntry {
-            rip,
-            phys_addr,
-            code_addr,
-            block: index as u64 + 1,
-        };
+        // A straddling block stays out of the jump cache: the chain stub validates only the first
+        // page, and `lookup` (which does not know the second) never finds it either, so each
+        // entry goes through `translate`, which does check the second page.
+        if !crosses_page {
+            self.jump_cache[jump_cache_hash(rip)] = JumpEntry {
+                rip,
+                phys_addr,
+                code_addr,
+                block: index as u64 + 1,
+            };
+        }
         self.stats.translated += 1;
         Ok(code_addr)
     }
@@ -618,13 +670,18 @@ mod tests {
     }
 
     #[test]
-    fn lookup_requires_the_same_rip() {
+    fn lookup_finds_the_block_at_any_virtual_alias_of_its_physical_address() {
         let _guard = serialize_jit_tests();
         let mut cpu = cpu_running(&ADD_THEN_HLT);
         let mut jit = new_jit();
-        translate_at_code_base(&mut jit, &mut cpu);
-        assert_eq!(jit.lookup(CODE_BASE + 1, CODE_BASE), None);
-        assert_eq!(jit.lookup(CODE_BASE ^ (1 << 40), CODE_BASE), None);
+        let code = translate_at_code_base(&mut jit, &mut cpu);
+        // ASLR maps the same physical page at another virtual address in every process: one
+        // translation serves all of them.
+        let alias = CODE_BASE ^ (1 << 40);
+        assert_eq!(jit.lookup(alias, CODE_BASE), Some(code));
+        assert_eq!(jit.stats().translated, 1);
+        // The alias now has its own jump cache slot, so the first mapping still hits its own.
+        assert_eq!(jit.lookup(CODE_BASE, CODE_BASE), Some(code));
     }
 
     #[test]
@@ -681,7 +738,7 @@ mod tests {
         assert!(jit.page_blocks.contains_key(&page));
         jit.invalidate_page(page);
         assert_eq!(jit.lookup(CODE_BASE, CODE_BASE), None);
-        assert!(!jit.blocks[0].valid);
+        assert!(!jit.block_is_valid(0));
         assert_eq!(jit.blocks.len(), 1, "indices held elsewhere stay valid");
         assert!(!jit.page_blocks.contains_key(&page));
     }
@@ -695,7 +752,7 @@ mod tests {
         jit.invalidate_page((CODE_BASE >> PAGE_SHIFT) + 1);
         jit.invalidate_page(0);
         assert_eq!(jit.lookup(CODE_BASE, CODE_BASE), Some(code));
-        assert!(jit.blocks[0].valid);
+        assert!(jit.block_is_valid(0));
     }
 
     #[test]
@@ -880,13 +937,15 @@ mod tests {
         let body_addr = translate_at_code_base(&mut jit, &mut cpu);
         let block = &jit.blocks[0];
         let code_addr = block.link_addr;
-        let rips = [CODE_BASE, CODE_BASE + 3];
+        // Blocks are compiled against offsets in their page, not guest addresses.
+        let start = CODE_BASE & PAGE_MASK;
+        let rips = [start, start + 3];
         let expected = arch::compile_block(
             code_addr,
             &jit.segment_addrs[0],
             &block._insns,
             &rips,
-            CODE_BASE + 4,
+            start + 4,
             false,
         );
         let written =

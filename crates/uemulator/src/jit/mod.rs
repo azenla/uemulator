@@ -86,6 +86,8 @@ impl Drop for JitTestGuard {
 }
 
 #[cfg(test)]
+mod diff_alias;
+#[cfg(test)]
 mod diff_alu;
 #[cfg(test)]
 mod diff_bmi;

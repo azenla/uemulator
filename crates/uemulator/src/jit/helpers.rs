@@ -60,14 +60,15 @@ pub(crate) extern "C" fn helper_exec(cpu: &mut Cpu, insn: &Insn, rip: u64) -> u6
     }
 }
 
-/// `helper_exec` as the aarch64 blocks call it: `pair` is the `[*const Insn, rip]` constant pair
-/// the block keeps next to its code, so the call site is one `adr` instead of two 64-bit
-/// immediates.
+/// `helper_exec` as the aarch64 blocks call it: `pair` is the `[*const Insn, page offset]`
+/// constant pair the block keeps next to its code, so the call site is one `adr` instead of two
+/// 64-bit immediates. The block is position independent, so the instruction's `rip` is the page
+/// offset on top of `page_base` (`emit::PAGE_BASE`).
 #[cfg(target_arch = "aarch64")]
-pub(crate) extern "C" fn helper_exec_pair(cpu: &mut Cpu, pair: &[u64; 2]) -> u64 {
+pub(crate) extern "C" fn helper_exec_pair(cpu: &mut Cpu, pair: &[u64; 2], page_base: u64) -> u64 {
     // SAFETY: the block that made the pair keeps its `Insn` slice alive (`Block::_insns`).
     let insn = unsafe { &*(pair[0] as *const Insn) };
-    helper_exec(cpu, insn, pair[1])
+    helper_exec(cpu, insn, page_base.wrapping_add(pair[1]))
 }
 
 /// Finishes an inlined `rol`/`ror`: they replace CF and OF and leave SF/ZF/PF/AF as the

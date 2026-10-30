@@ -10,6 +10,9 @@
 //! - `CPU` (x19): `*mut Cpu`.
 //! - `TLB_BASE` (x20): `Cpu::tlb_active_base`, latched once on entry. A block therefore never
 //!   runs across a CPL change; every instruction that changes CPL ends the block.
+//! - `PAGE_BASE` (x21): guest address of the block's page. Blocks are position independent: every
+//!   guest rip they use is `PAGE_BASE` plus an offset known when the block is translated (see
+//!   `Gen::rip_to`), and the `rip`s in `compile` and below are such offsets, not addresses.
 //! - `SAVED_ADDRESS` (x22) and `SAVED_NZCV` (x23): hold the access address and the host flags
 //!   across a slow-path helper call. Together with x19/x20 these are the only callee-saved
 //!   registers the code touches, so they are the only ones the prologue saves.
@@ -81,6 +84,14 @@ const PAGE_MASK: u64 = (1 << PAGE_SHIFT) - 1;
 
 pub(super) const CPU: u32 = 19;
 pub(super) const TLB_BASE: u32 = 20;
+/// Guest virtual address of the page the block runs from (`rip & !0xfff`), latched on entry like
+/// `TLB_BASE`: the trampoline sets it from `Cpu::rip`, the chain stub from its target, and a direct
+/// link keeps it because links stay within a page. Blocks are keyed by physical address alone
+/// (`Jit::translate`), so the same translation runs at whatever virtual address the page is
+/// mapped at (ASLR gives every process its own address for the same libc page), and every guest
+/// address a block needs is this plus a translation-time offset. Callee-saved, so helper calls
+/// keep it.
+pub(super) const PAGE_BASE: u32 = 21;
 pub(super) const SAVED_ADDRESS: u32 = 22;
 pub(super) const SAVED_NZCV: u32 = 23;
 /// Callee-saved homes for values that must outlive a slow-path helper call: the result and
@@ -394,7 +405,9 @@ pub(crate) struct Gen<'a> {
     prepaid_insns: u32,
     /// Number of instructions lowered inline (not via `helper_exec`), for `Jit::inlined` statistics.
     pub inlined: u32,
-    /// Guest address of the block's first instruction.
+    /// Offset of the block's first instruction in its page. Every `rip` in this file is such an
+    /// offset from the page start (`PAGE_BASE` holds the start), compared and combined with
+    /// wrapping arithmetic.
     entry_rip: u64,
     /// Byte offset of the body entry; the bytes before it are the link entry's checks (none
     /// without chaining).
@@ -450,8 +463,23 @@ impl<'a> Gen<'a> {
         self.asm.bl_abs(stub);
     }
 
+    /// `rd = PAGE_BASE + rip`, where `rip` is the page-relative offset a block carries around
+    /// (wrapping: a jump to a lower page is a negative offset). Plain `add`, so host flags stay
+    /// live across it.
+    fn rip_to(&mut self, rd: u32, rip: u64) {
+        let offset = rip as i64;
+        if (0..IMM12_LIMIT_I64).contains(&offset) {
+            self.asm.add_imm(rd, PAGE_BASE, offset as u32, true);
+        } else if offset < 0 && offset > -IMM12_LIMIT_I64 {
+            self.asm.sub_imm(rd, PAGE_BASE, (-offset) as u32, true);
+        } else {
+            self.asm.mov_imm(rd, rip);
+            self.asm.add(rd, rd, PAGE_BASE, true);
+        }
+    }
+
     fn set_rip(&mut self, rip: u64) {
-        self.asm.mov_imm(1, rip);
+        self.rip_to(1, rip);
         self.asm.str(1, CPU, RIP_OFFSET);
     }
 
@@ -492,7 +520,7 @@ impl<'a> Gen<'a> {
 
     /// `chain_exit` to a fixed guest address.
     fn chain_to(&mut self, rip: u64, retired: u32) {
-        self.asm.mov_imm(1, rip);
+        self.rip_to(1, rip);
         if self.addrs.chain == 0 {
             self.chain_exit(retired);
             return;
@@ -583,8 +611,7 @@ impl<'a> Gen<'a> {
     /// (see `memory_inlinable`).
     fn effective_address(&mut self, insn: &Insn, next_rip: u64, dest: u32) {
         if insn.rip_rel {
-            self.asm
-                .mov_imm(dest, next_rip.wrapping_add(insn.disp as u64));
+            self.rip_to(dest, next_rip.wrapping_add(insn.disp as u64));
         } else {
             let mut have = false;
             if insn.base != NO_REG {
@@ -1658,11 +1685,11 @@ impl<'a> Gen<'a> {
         }
         if chaining {
             self.link_slot(next_rip);
-            self.asm.mov_imm(1, next_rip);
+            self.rip_to(1, next_rip);
             self.asm.b_abs(self.addrs.chain);
             self.asm.bind(taken);
             self.link_slot(target);
-            self.asm.mov_imm(1, target);
+            self.rip_to(1, target);
             self.asm.b_abs(self.addrs.chain);
         } else {
             self.chain_to(next_rip, retired);
@@ -1978,7 +2005,7 @@ impl<'a> Gen<'a> {
                         self.asm.mov(SAVED_OPERAND, VALUE);
                         self.load_gpr(ADDRESS, RSP);
                         self.asm.sub_imm(ADDRESS, ADDRESS, PUSH_POP_SIZE, true);
-                        self.asm.mov_imm(VALUE, next_rip);
+                        self.rip_to(VALUE, next_rip);
                         self.stack_store(insn_index, rip);
                         self.store_gpr(RSP, ADDRESS);
                         self.asm.mov(1, SAVED_OPERAND);
@@ -2161,7 +2188,7 @@ impl<'a> Gen<'a> {
             0xe8 => {
                 self.load_gpr(ADDRESS, RSP);
                 self.asm.sub_imm(ADDRESS, ADDRESS, PUSH_POP_SIZE, true);
-                self.asm.mov_imm(VALUE, next_rip);
+                self.rip_to(VALUE, next_rip);
                 self.stack_store(insn_index, rip);
                 self.store_gpr(RSP, ADDRESS);
                 self.chain_to(next_rip.wrapping_add(insn.imm as u64), retired);
@@ -2188,8 +2215,9 @@ impl<'a> Gen<'a> {
         true
     }
 
-    /// Compiles the whole block. `rips[k]` is the guest address of instruction `k` and
-    /// `end_rip` the address after the last one. A block ends after a terminator (see
+    /// Compiles the whole block. `rips[k]` is the offset in the block's page of instruction `k`
+    /// and `end_rip` the offset after the last one (past 4096 for an instruction that straddles
+    /// the page end). A block ends after a terminator (see
     /// `ends_block`), or by falling off the end (instruction limit or page boundary), in which case
     /// it exits to `end_rip`.
     pub fn compile(&mut self, rips: &[u64], end_rip: u64) {

@@ -5,13 +5,13 @@ use std::mem::offset_of;
 
 use super::a64::{self, Asm, NOP_WORD};
 use super::emit::{
-    CALL_TARGET, CPU, Gen, SAVED_ADDRESS, SAVED_INFO, SAVED_LR, SAVED_NZCV, SAVED_OPERAND,
-    SAVED_RESULT, TLB_BASE, VALUE,
+    CALL_TARGET, CPU, Gen, PAGE_BASE, SAVED_ADDRESS, SAVED_INFO, SAVED_LR, SAVED_NZCV,
+    SAVED_OPERAND, SAVED_RESULT, TLB_BASE, VALUE,
 };
 use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
 use super::native::{
-    CompiledBlock, JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET, JUMP_ENTRY_SHIFT,
-    jump_cache_mask,
+    CompiledBlock, JUMP_ENTRY_BLOCK_OFFSET, JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET,
+    JUMP_ENTRY_SHIFT, jump_cache_mask,
 };
 use crate::cpu::decode::Insn;
 use crate::cpu::{Cpu, TLB_ENTRIES_PER_MODE, TlbEntry};
@@ -29,13 +29,16 @@ fn bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
+const PAGE_SHIFT: u32 = 12;
+const PAGE_OFFSET_MASK: u64 = (1 << PAGE_SHIFT) - 1;
 const FRAME_POINTER: u32 = 29;
 const LINK_REGISTER: u32 = 30;
 /// 16-byte aligned frame: fp/lr, then the callee-saved registers the blocks use. Those are x19 and
-/// x20 (`CPU`, `TLB_BASE`), x22 and x23 (slow-path state), x24..x26 (values that must survive a
-/// slow-path helper call) and x27/x28 (the memory thunks' info pointer and return address, see
-/// `emit.rs`); nothing uses x21, so it is left alone.
+/// x20 (`CPU`, `TLB_BASE`), x21 (`PAGE_BASE`), x22 and x23 (slow-path state), x24..x26 (values
+/// that must survive a slow-path helper call) and x27/x28 (the memory thunks' info pointer and
+/// return address, see `emit.rs`).
 const FRAME_SIZE: i32 = 96;
+const SAVE_X21: u32 = 88;
 const SAVE_X19_X20: i32 = 16;
 const SAVE_X22_X23: i32 = 32;
 const SAVE_X24_X25: i32 = 48;
@@ -46,7 +49,7 @@ const SAVE_X28: i32 = 80;
 /// It saves the callee-saved registers the blocks use, latches `CPU` and `TLB_BASE`, and jumps
 /// into the block. Blocks call helpers with `blr`, which overwrites x30, so the return address
 /// is saved in the frame and the stubs return through the restored x30.
-pub(crate) fn prologue(base: u64, jump_cache_base: u64) -> Prologue {
+pub(crate) fn prologue(base: u64, jump_cache_base: u64, valid_base: u64) -> Prologue {
     let mut asm = Asm::new(base);
     asm.stp_pre(FRAME_POINTER, LINK_REGISTER, a64::SP, -FRAME_SIZE);
     asm.stp_off(19, 20, a64::SP, SAVE_X19_X20);
@@ -54,12 +57,16 @@ pub(crate) fn prologue(base: u64, jump_cache_base: u64) -> Prologue {
     asm.stp_off(24, 25, a64::SP, SAVE_X24_X25);
     asm.stp_off(26, 27, a64::SP, SAVE_X26_X27);
     asm.str(28, a64::SP, SAVE_X28 as u32);
+    asm.str(PAGE_BASE, a64::SP, SAVE_X21);
     asm.mov(CPU, 0);
     asm.ldr(
         TLB_BASE,
         CPU,
         std::mem::offset_of!(Cpu, tlb_active_base) as u32,
     );
+    // The run loop enters at `Cpu::rip`, so that is the page the block runs from.
+    asm.ldr(PAGE_BASE, CPU, offset_of!(Cpu, rip) as u32);
+    assert!(asm.and_imm(PAGE_BASE, PAGE_BASE, !PAGE_OFFSET_MASK, true));
     asm.br(1);
     // Block exit with a helper status in x0 and the stopping instruction's index in x1: the
     // exit code is `status | retired << EXIT_COUNT_SHIFT`, where an instruction that
@@ -71,6 +78,7 @@ pub(crate) fn prologue(base: u64, jump_cache_base: u64) -> Prologue {
     asm.orr(0, 0, 1, true);
     // Normal block exit: x0 already holds the finished exit code.
     let exit_ok = asm.here();
+    asm.ldr(PAGE_BASE, a64::SP, SAVE_X21);
     asm.ldr(28, a64::SP, SAVE_X28 as u32);
     asm.ldp_off(26, 27, a64::SP, SAVE_X26_X27);
     asm.ldp_off(24, 25, a64::SP, SAVE_X24_X25);
@@ -78,12 +86,9 @@ pub(crate) fn prologue(base: u64, jump_cache_base: u64) -> Prologue {
     asm.ldp_off(19, 20, a64::SP, SAVE_X19_X20);
     asm.ldp_post(FRAME_POINTER, LINK_REGISTER, a64::SP, FRAME_SIZE);
     asm.ret();
-    let chain = chain_stub(&mut asm, jump_cache_base, exit_ok);
+    let chain = chain_stub(&mut asm, jump_cache_base, valid_base, exit_ok);
     let addrs = Addrs {
-        exec: tail_call_stub(
-            &mut asm,
-            helpers::helper_exec_pair as *const () as usize as u64,
-        ),
+        exec: exec_stub(&mut asm),
         cond: tail_call_stub(&mut asm, helpers::helper_cond as *const () as usize as u64),
         rotate_flags: tail_call_stub(
             &mut asm,
@@ -129,6 +134,20 @@ fn tail_call_stub(asm: &mut Asm, helper: u64) -> u64 {
     start
 }
 
+/// `helper_exec_pair(cpu, pair, page_base)`: the pair holds the instruction's page offset, and the
+/// helper needs the page base to turn it into its `rip` (see `PAGE_BASE`).
+fn exec_stub(asm: &mut Asm) -> u64 {
+    const PAGE_BASE_ARGUMENT: u32 = 2;
+    let start = asm.here();
+    asm.mov(PAGE_BASE_ARGUMENT, PAGE_BASE);
+    asm.mov_imm(
+        CALL_TARGET,
+        helpers::helper_exec_pair as *const () as usize as u64,
+    );
+    asm.br(CALL_TARGET);
+    start
+}
+
 #[derive(Clone, Copy)]
 enum Access {
     Load { size: u8, signed: bool },
@@ -139,7 +158,7 @@ enum Access {
 
 /// The out-of-line half of an inline memory access, shared by every block: what a block's slow
 /// path does is `adr x7, info; bl thunk; mov dst, x0; b resume`, where `info` is the
-/// instruction's `[rip, block index]` pair next to the block. The thunk calls the Rust helper
+/// instruction's `[page offset, block index]` pair next to the block (the thunk adds `PAGE_BASE` to get the rip). The thunk calls the Rust helper
 /// with the address in x2 (and the value in `VALUE` for stores), preserving the host flags,
 /// the address and (for read-modify-write stores, `keep`) x0 and x1 across the call, and
 /// returns to the block with the loaded value in x0. If the helper reports an exception the
@@ -196,6 +215,7 @@ fn thunk(asm: &mut Asm, access: Access, exit_fail: u64) -> u64 {
         asm.mov(0, CPU);
         asm.mov_imm(2, size as u64);
         asm.ldr(3, INFO, 0);
+        asm.add(3, 3, PAGE_BASE, true);
         asm.mov_imm(CALL_TARGET, helper);
         asm.blr(CALL_TARGET);
         asm.cbnz(LOAD_STATUS, fail, true);
@@ -212,6 +232,7 @@ fn thunk(asm: &mut Asm, access: Access, exit_fail: u64) -> u64 {
         asm.mov(1, ADDRESS);
         asm.mov_imm(2, size as u64);
         asm.ldr(4, INFO, 0);
+        asm.add(4, 4, PAGE_BASE, true);
         asm.mov(0, CPU);
         asm.mov_imm(CALL_TARGET, helper);
         asm.blr(CALL_TARGET);
@@ -253,13 +274,11 @@ const CHAIN_RIP: u32 = 1;
 /// - the exec TLB (the half `TLB_BASE` selects, which a block never leaves) has the page, so the
 ///   physical address is known without a walk and permissions were already checked;
 /// - the jump cache has a block for exactly this rip and physical address, the same key as
-///   `Jit::lookup`. Invalidation clears slots, so a hit is never stale.
+///   `Jit::lookup`, and the block was not invalidated since (`Jit::valid`).
 ///
 /// The miss path gives back the successor's pre-charge: the loop adds it again.
-fn chain_stub(asm: &mut Asm, jump_cache_base: u64, exit_ok: u64) -> u64 {
+fn chain_stub(asm: &mut Asm, jump_cache_base: u64, valid_base: u64, exit_ok: u64) -> u64 {
     const TLB_SLOT_MASK: u64 = (TLB_ENTRIES_PER_MODE - 1) as u64;
-    const PAGE_SHIFT: u32 = 12;
-    const PAGE_OFFSET_MASK: u64 = (1 << PAGE_SHIFT) - 1;
     const TLB_ENTRY_SHIFT: u32 = std::mem::size_of::<TlbEntry>().trailing_zeros();
     // `jump_cache_hash` in `native.rs`: rip ^ (rip >> bits), masked.
     const JUMP_HASH_FOLD_SHIFT: u32 = 16;
@@ -296,6 +315,15 @@ fn chain_stub(asm: &mut Asm, jump_cache_base: u64, exit_ok: u64) -> u64 {
     asm.b_cond(a64::NE, miss);
     asm.ldr(key, slot, JUMP_ENTRY_CODE_OFFSET);
     asm.cbz(key, miss, true);
+    // The slot may name a block whose page was written since (`Jit::valid`).
+    asm.ldr(phys, slot, JUMP_ENTRY_BLOCK_OFFSET);
+    asm.sub_imm(phys, phys, 1, true);
+    asm.mov_imm(slot, valid_base);
+    asm.add(slot, slot, phys, true);
+    asm.ldrb(slot, slot, 0);
+    asm.cbz(slot, miss, false);
+    // The successor is entered with its own page as `PAGE_BASE`; `page` still holds it.
+    asm.mov(PAGE_BASE, page);
     asm.br(key);
     asm.bind(miss);
     asm.sub_imm(CHAIN_ICOUNT, CHAIN_ICOUNT, 1, true);

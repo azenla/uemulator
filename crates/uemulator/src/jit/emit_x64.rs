@@ -130,6 +130,13 @@ const CONDITION_BELOW: u64 = 2;
 /// ABIs require it). It also has to hold the 32 bytes of Win64 shadow space at the bottom, with
 /// the slow-path load result slot (`OUT`) above it. Shared with `arch_x64`.
 pub(crate) const FRAME: i32 = 56;
+/// Offset from rsp of the 8-byte slot holding the guest address of the page the running block
+/// belongs to (`rip & !0xfff`), where aarch64 keeps it in a register (`PAGE_BASE` in `emit.rs`;
+/// every host register here has a role). The trampoline sets it from `Cpu::rip`, the chain stub
+/// from its target; a direct link keeps it because links stay within a page. Above `OUT`, in the
+/// frame's spare 16 bytes, which no callee touches.
+pub(crate) const PAGE_BASE_SLOT: i32 = 40;
+const _: () = assert!(PAGE_BASE_SLOT >= OUT + 8 && PAGE_BASE_SLOT + 8 <= FRAME);
 /// Offset from rsp of the 8-byte slot `helper_load_via_out` writes its result to. Above the shadow space so the
 /// callee cannot spill its register arguments over it.
 const OUT: i32 = 32;
@@ -263,7 +270,8 @@ pub(crate) struct Gen<'a> {
     prepaid_insns: u32,
     /// Number of guest instructions lowered inline (not through `helper_exec`), for statistics.
     pub inlined: u32,
-    /// Guest address of the block's first instruction.
+    /// Offset of the block's first instruction in its page; every `rip` here is such an offset
+    /// (see `rip_to`).
     entry_rip: u64,
     /// Byte offset of the body entry; the bytes before it are the link entry's checks (none
     /// without chaining). See `emit.rs`.
@@ -331,8 +339,23 @@ impl<'a> Gen<'a> {
         self.a.call_reg(CALL_TARGET);
     }
 
+    /// `dest = page base + rip`, where `rip` is the offset in the block's page that blocks carry
+    /// around instead of guest addresses (wrapping: a jump to a lower page is negative). Blocks
+    /// are position independent, see `PAGE_BASE_SLOT`. Leaves host flags alone.
+    fn rip_to(&mut self, dest: u8, rip: u64) {
+        self.a.ld(dest, mem(RSP, PAGE_BASE_SLOT));
+        match i32::try_from(rip as i64) {
+            Ok(0) => {}
+            Ok(offset) => self.a.lea(dest, mem(dest, offset)),
+            Err(_) => {
+                self.a.mov_imm(CALL_TARGET, rip);
+                self.a.lea(dest, mem_idx(dest, CALL_TARGET, 0, 0));
+            }
+        }
+    }
+
     fn set_rip(&mut self, rip: u64) {
-        self.a.mov_imm(SCRATCH_D, rip);
+        self.rip_to(SCRATCH_D, rip);
         self.a.st(mem(CPU, RIP), SCRATCH_D, 8);
     }
 
@@ -403,7 +426,7 @@ impl<'a> Gen<'a> {
 
     /// `chain_exit` to a fixed guest address.
     fn chain_to(&mut self, rip: u64, retired: u32) {
-        self.a.mov_imm(OPERAND, rip);
+        self.rip_to(OPERAND, rip);
         self.chain_exit_to(retired, Some(rip));
     }
 
@@ -434,7 +457,7 @@ impl<'a> Gen<'a> {
         }
         self.a.mov_rr(ARGS[0], CPU, true);
         self.a.mov_imm(ARGS[1], insn);
-        self.a.mov_imm(ARGS[2], rip);
+        self.rip_to(ARGS[2], rip);
         self.call(self.addrs.exec);
         let ok = self.a.label();
         self.a.test_rr(ACC, ACC, true);
@@ -452,8 +475,7 @@ impl<'a> Gen<'a> {
     fn ea(&mut self, insn: &Insn, next: u64) {
         let disp = insn.disp as i32;
         if insn.rip_rel {
-            // Blocks are keyed by guest rip, so this is a translation-time constant.
-            self.a.mov_imm(ADDR, next.wrapping_add(insn.disp as u64));
+            self.rip_to(ADDR, next.wrapping_add(insn.disp as u64));
         } else if insn.index != NO_REG {
             if insn.base != NO_REG {
                 self.ld_gpr(ADDR, insn.base);
@@ -1536,7 +1558,7 @@ impl<'a> Gen<'a> {
                         self.a.mov_rr(SAVED_OPERAND, VALUE, true);
                         self.ld_gpr(ADDR, GUEST_RSP);
                         self.a.lea(ADDR, mem(ADDR, -PUSH_POP_SIZE));
-                        self.a.mov_imm(VALUE, next);
+                        self.rip_to(VALUE, next);
                         self.stack_store(insn_index, rip);
                         self.st_gpr(GUEST_RSP, ADDR);
                         self.a.mov_rr(OPERAND, SAVED_OPERAND, true);
@@ -1705,7 +1727,7 @@ impl<'a> Gen<'a> {
             0xe8 => {
                 self.ld_gpr(ADDR, GUEST_RSP);
                 self.a.lea(ADDR, mem(ADDR, -PUSH_POP_SIZE));
-                self.a.mov_imm(VALUE, next);
+                self.rip_to(VALUE, next);
                 self.stack_store(insn_index, rip);
                 self.st_gpr(GUEST_RSP, ADDR);
                 self.chain_to(next.wrapping_add(insn.imm as u64), retired);
