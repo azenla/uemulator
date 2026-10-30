@@ -57,11 +57,26 @@ jobs:
     - name: install firmware target
       run: rustup target add x86_64-unknown-none
 
-    - name: cargo test
-      run: cargo test --release --workspace
+    - name: cache nextest
+      id: nextest-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cargo/bin/cargo-nextest
+        key: nextest-${{ runner.os }}-${{ hashFiles('hack/ci/Cargo.lock') }}
 
-    - name: cargo test without default features
-      run: cargo test --release -p uemulator --no-default-features
+    - name: install nextest
+      if: steps.nextest-cache.outputs.cache-hit != 'true'
+      # The version comes from hack/ci/Cargo.lock, which Dependabot keeps current.
+      run: |
+        version=$(awk '/^name = "cargo-nextest"$/ { getline; gsub(/[^0-9.]/, "", $3); print $3 }' hack/ci/Cargo.lock)
+        test -n "${version}"
+        cargo install --locked cargo-nextest --version "${version}"
+
+    - name: cargo nextest
+      run: cargo nextest run --release --workspace
+
+    - name: cargo nextest without default features
+      run: cargo nextest run --release -p uemulator --no-default-features
 
   clippy:
     name: clippy

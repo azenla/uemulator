@@ -1,0 +1,14 @@
+# Exists only so Dependabot tracks the tool versions CI installs; nothing here
+# builds (cargo-nextest's lib refuses to compile outside `cargo install --locked`).
+# The workflow reads the version from Cargo.lock.
+[package]
+name = "ci-tools"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cargo-nextest = "=0.9.150"
+
+# Keeps this out of the root workspace.
+[workspace]

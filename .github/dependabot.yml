@@ -26,3 +26,9 @@ updates:
     cargo-dev-updates:
       dependency-type: development
       applies-to: version-updates
+- package-ecosystem: cargo
+  directory: /hack/ci
+  schedule:
+    interval: weekly
+  cooldown:
+    default-days: 7
