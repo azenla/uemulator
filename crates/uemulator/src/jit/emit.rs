@@ -47,7 +47,7 @@ use super::a64::*;
 use super::helpers::*;
 use super::native::LinkSite;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
-use crate::cpu::flags::LazyFlagsOp;
+use crate::cpu::flags::{CF, LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT};
 use crate::cpu::xsave::{XCR0_AVX, XCR0_AVX512, XCR0_SSE};
 use crate::cpu::{CR0_EM, CR0_TS, CR4_OSFXSR, CR4_OSXSAVE};
 use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TlbEntry};
@@ -69,6 +69,7 @@ const LAZY_OP_OFFSET: u32 = offset_of!(Cpu, lazy_op) as u32;
 const LAZY_SIZE_SHIFT: u32 = 8;
 const LAZY_DST_OFFSET: u32 = offset_of!(Cpu, lazy_dst) as u32;
 const LAZY_SRC_OFFSET: u32 = offset_of!(Cpu, lazy_src) as u32;
+const EFLAGS_OFFSET: u32 = offset_of!(Cpu, eflags) as u32;
 const LAZY_SRC2_OFFSET: u32 = offset_of!(Cpu, lazy_src2) as u32;
 const CR0_OFFSET: u32 = offset_of!(Cpu, cr0) as u32;
 const CR4_OFFSET: u32 = offset_of!(Cpu, cr4) as u32;
@@ -1164,10 +1165,7 @@ impl<'a> Gen<'a> {
         let carry_in = matches!(alu_op, ALU_ADC | ALU_SBB);
         debug_assert!(!carry_in || size >= 4);
         if carry_in && self.live.is_none() {
-            self.asm.mov(0, CPU);
-            self.asm.mov_imm(1, CONDITION_BELOW);
-            self.call(self.addrs.cond);
-            self.asm.mov(SAVED_EXTRA, 0);
+            self.carry_from_lazy_record();
         }
         match (dst, src) {
             (Dst::Mem, Src::Reg(reg, high)) => {
@@ -1261,6 +1259,71 @@ impl<'a> Gen<'a> {
         stored
     }
 
+    /// Leaves the guest CF (0 or 1) in `SAVED_EXTRA` when no host flags are live (the carry-in of
+    /// `adc`/`sbb`, and what `inc`/`dec` must preserve), from the record the last flag writer
+    /// left in `Cpu`. Add, sub, logic and the kinds that carry CF in `lazy_src` are worked out
+    /// inline, the way `Cpu::condition_holds` would after `flags::compute`; the rest call
+    /// `helper_cond`. Clobbers x0..x3 and, on that path, every caller-saved register.
+    fn carry_from_lazy_record(&mut self) {
+        let (generic, done) = (self.asm.label(), self.asm.label());
+        let (subtract, add, source_bit, logic, eflags) = (
+            self.asm.label(),
+            self.asm.label(),
+            self.asm.label(),
+            self.asm.label(),
+            self.asm.label(),
+        );
+        self.asm.ldrh(0, CPU, LAZY_OP_OFFSET);
+        assert!(self.asm.and_imm(1, 0, 0xff, false));
+        self.asm.lsr_imm(0, 0, LAZY_SIZE_SHIFT);
+        // The shift that aligns the operand width to the top of 64 bits: 64 - 8 * size
+        self.asm.mov_imm(2, 8);
+        self.asm.sub(2, 2, 0, false);
+        self.asm.lsl_imm(2, 2, 3);
+        self.asm.ldr(0, CPU, LAZY_DST_OFFSET);
+        self.asm.ldr(3, CPU, LAZY_SRC_OFFSET);
+        for (op, label) in [
+            (LazyFlagsOp::Sub, subtract),
+            (LazyFlagsOp::Add, add),
+            (LazyFlagsOp::Logic, logic),
+            (LazyFlagsOp::Inc, source_bit),
+            (LazyFlagsOp::Dec, source_bit),
+            (LazyFlagsOp::SzpCfOf, source_bit),
+            (LazyFlagsOp::Eflags, eflags),
+        ] {
+            self.asm.cmp_imm(1, op as u32, false);
+            self.asm.b_cond(EQ, label);
+        }
+        self.asm.bind(generic);
+        self.asm.mov(0, CPU);
+        self.asm.mov_imm(1, CONDITION_BELOW);
+        self.call(self.addrs.cond);
+        self.asm.mov(SAVED_EXTRA, 0);
+        self.asm.b(done);
+        // CF = (result + src) < src for a sub (a < b), result < src for an add, at the width
+        self.asm.bind(subtract);
+        self.asm.add(0, 0, 3, true);
+        self.asm.bind(add);
+        self.asm.lslv(0, 0, 2, true);
+        self.asm.lslv(3, 3, 2, true);
+        self.asm.cmp(0, 3, true);
+        self.asm.cset(SAVED_EXTRA, CC);
+        self.asm.b(done);
+        self.asm.bind(logic);
+        self.asm.mov_imm(SAVED_EXTRA, 0);
+        self.asm.b(done);
+        self.asm.bind(source_bit);
+        assert!(
+            self.asm
+                .and_imm(SAVED_EXTRA, 3, 1 << SZP_CF_OF_SRC_CF_BIT, true)
+        );
+        self.asm.b(done);
+        self.asm.bind(eflags);
+        self.asm.ldr(0, CPU, EFLAGS_OFFSET);
+        assert!(self.asm.and_imm(SAVED_EXTRA, 0, CF, true));
+        self.asm.bind(done);
+    }
+
     /// Puts the current CF (0 or 1) into `rd`. Needs the host flags (`live`); `inc`/`dec`
     /// leave CF alone, so after one the carry is the one they recorded in `lazy_src`.
     fn carry_from_live_flags(&mut self, rd: u32, live: LiveFlags) {
@@ -1289,10 +1352,7 @@ impl<'a> Gen<'a> {
     ) -> bool {
         let live = self.live;
         if live.is_none() {
-            self.asm.mov(0, CPU);
-            self.asm.mov_imm(1, CONDITION_BELOW);
-            self.call(self.addrs.cond);
-            self.asm.mov(SAVED_EXTRA, 0);
+            self.carry_from_lazy_record();
         }
         self.load_dst(insn, dst, 0, size, next_rip, insn_index, rip);
         match live {
@@ -1852,6 +1912,29 @@ impl<'a> Gen<'a> {
         stored
     }
 
+    /// With no live host flags, sets them from the record the previous flag writer left in `Cpu`
+    /// when it was a `sub` or `cmp`: `lazy_dst` is the result and `lazy_src` the subtrahend, so
+    /// `(dst + src) << s` and `src << s`, with `s` aligning the operand width to 64 bits, compare
+    /// exactly as the guest did. Any other record jumps to `generic`. A conditional branch that
+    /// starts a block (the second of two on one compare) would otherwise call `helper_cond`.
+    /// Clobbers x0..x3.
+    fn rebuild_flags_from_sub(&mut self, generic: Label) {
+        self.asm.ldrh(0, CPU, LAZY_OP_OFFSET);
+        assert!(self.asm.and_imm(1, 0, 0xff, false));
+        self.asm.cmp_imm(1, LazyFlagsOp::Sub as u32, false);
+        self.asm.b_cond(NE, generic);
+        self.asm.lsr_imm(0, 0, LAZY_SIZE_SHIFT);
+        self.asm.mov_imm(1, 8);
+        self.asm.sub(0, 1, 0, false);
+        self.asm.lsl_imm(0, 0, 3);
+        self.asm.ldr(2, CPU, LAZY_DST_OFFSET);
+        self.asm.ldr(3, CPU, LAZY_SRC_OFFSET);
+        self.asm.add(2, 2, 3, true);
+        self.asm.lslv(2, 2, 0, true);
+        self.asm.lslv(3, 3, 0, true);
+        self.asm.cmp(2, 3, true);
+    }
+
     /// Branch condition for x86 condition code `cc` from the host flags: the live ones when
     /// they can express it, otherwise `helper_cond` over the lazy flags and a compare of its
     /// result. Either way the host flags afterwards are not the guest's any more only in the
@@ -1861,9 +1944,18 @@ impl<'a> Gen<'a> {
         if let Some(map) = self.live.and_then(|live| cond_map(live.kind, cc)) {
             return map;
         }
+        let merged = self.asm.label();
+        if let Some(CondMap::Cond(condition)) = cond_map(FlagKind::Sub, cc) {
+            let generic = self.asm.label();
+            self.rebuild_flags_from_sub(generic);
+            self.asm.cset(0, condition);
+            self.asm.b(merged);
+            self.asm.bind(generic);
+        }
         self.asm.mov(0, CPU);
         self.asm.mov_imm(1, cc as u64);
         self.call(self.addrs.cond);
+        self.asm.bind(merged);
         self.asm.cmp_imm(0, 0, true);
         self.live = None;
         CondMap::Cond(NE)
@@ -1882,11 +1974,20 @@ impl<'a> Gen<'a> {
             Some(CondMap::Always) => self.asm.b(taken),
             Some(CondMap::Never) => {}
             None => {
+                let resume = self.asm.label();
+                if let Some(CondMap::Cond(host_condition)) = cond_map(FlagKind::Sub, condition) {
+                    let generic = self.asm.label();
+                    self.rebuild_flags_from_sub(generic);
+                    self.asm.b_cond(host_condition, taken);
+                    self.asm.b(resume);
+                    self.asm.bind(generic);
+                }
                 // helper_cond(cpu, cc) -> 0 or 1, from the lazy flags in `Cpu`
                 self.asm.mov(0, CPU);
                 self.asm.mov_imm(1, condition as u64);
                 self.call(self.addrs.cond);
                 self.asm.cbnz(0, taken, true);
+                self.asm.bind(resume);
             }
         }
         if chaining {

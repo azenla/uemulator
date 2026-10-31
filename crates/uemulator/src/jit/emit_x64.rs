@@ -70,6 +70,8 @@ const XCR0_EVEX_STATE: u64 = XCR0_SSE | XCR0_AVX | XCR0_AVX512;
 const OPMASK_REGISTER_MASK: u8 = 7;
 /// 128-bit lanes of a 512-bit vector register.
 const VECTOR_LANES: u32 = 4;
+/// Condition codes 0xa (p) and 0xb (np) are the parity pair: `cc >> 1`.
+const CONDITION_PARITY: u8 = 5;
 /// The vpcmp immediate's predicates (SDM table of VPCMP).
 const VPCMP_EQUAL: u8 = 0;
 const VPCMP_LESS: u8 = 1;
@@ -1034,10 +1036,20 @@ impl<'a> Gen<'a> {
             self.a.mov_imm(rd, 0);
             self.a.setcc(cc & 15, rd);
         } else {
+            let done = self.a.label();
+            let generic = self.a.label();
+            if cc >> 1 != CONDITION_PARITY {
+                self.rebuild_flags_from_sub(generic);
+                self.a.mov_imm(rd, 0);
+                self.a.setcc(cc & 15, rd);
+                self.a.jmp(done);
+            }
+            self.a.bind(generic);
             self.a.mov_rr(ARGS[0], CPU, true);
             self.a.mov_imm(ARGS[1], cc as u64);
             self.call(self.addrs.cond);
             self.a.mov_rr(rd, ACC, true);
+            self.a.bind(done);
         }
     }
 
@@ -1466,6 +1478,35 @@ impl<'a> Gen<'a> {
         self.live = false;
     }
 
+    /// With no live host flags, sets them from the record the previous flag writer left in `Cpu`
+    /// when it was a `sub` or `cmp`: `lazy_dst` is the result and `lazy_src` the subtrahend, so
+    /// `(dst + src) << s` and `src << s`, with `s` aligning the operand width to 64 bits, compare
+    /// exactly as the guest did. Any other record jumps to `generic`. A conditional branch that
+    /// starts a block (the second of two on one compare) would otherwise call `helper_cond`.
+    /// Only SF, ZF, CF and OF come out right: the operands are shifted up, so the low byte the
+    /// parity flag reads is always zero, which is why the parity conditions use the helper
+    /// (`CONDITION_PARITY`). Clobbers `ACC`, `OPERAND`, `SCRATCH_C` and `SCRATCH_D`.
+    fn rebuild_flags_from_sub(&mut self, generic: Label) {
+        let (difference, subtrahend) = (SCRATCH_C, SCRATCH_D);
+        self.a.ld_ext(ACC, mem(CPU, LAZY_OP), 2, false);
+        self.a.mov_rr(OPERAND, ACC, false);
+        self.a.alu_ri(AND, OPERAND, 0xff, false);
+        self.a.alu_ri(CMP, OPERAND, LazyFlagsOp::Sub as i32, false);
+        self.a.jcc(NE, generic);
+        self.a.shift_ri(SHR, ACC, LAZY_SIZE_SHIFT as u8, false);
+        // The count the shifts below take from cl: 64 - 8 * size
+        self.a.mov_imm(OPERAND, 8);
+        self.a.alu_rr(SUB, OPERAND, ACC, false);
+        self.a.shift_ri(SHL, OPERAND, 3, false);
+        self.a.ld(difference, mem(CPU, LAZY_DST));
+        self.a.ld(subtrahend, mem(CPU, LAZY_SRC));
+        self.a
+            .lea(difference, mem_idx(difference, subtrahend, 0, 0));
+        self.a.shift_cl(SHL, difference, true);
+        self.a.shift_cl(SHL, subtrahend, true);
+        self.a.alu_rr(CMP, difference, subtrahend, true);
+    }
+
     /// Conditional branch ending the block. With `live` host flags the guest condition code is
     /// also the host one; otherwise `helper_cond` evaluates it from the lazy flags. Both exits
     /// run `chain_exit` after the branch, which clobbers the flags the branch has already used.
@@ -1474,11 +1515,21 @@ impl<'a> Gen<'a> {
         if self.live {
             self.a.jcc(cc & 15, taken);
         } else {
+            let resume = self.a.label();
+            let generic = self.a.label();
+            let rebuild = cc >> 1 != CONDITION_PARITY;
+            if rebuild {
+                self.rebuild_flags_from_sub(generic);
+                self.a.jcc(cc & 15, taken);
+                self.a.jmp(resume);
+            }
+            self.a.bind(generic);
             self.a.mov_rr(ARGS[0], CPU, true);
             self.a.mov_imm(ARGS[1], cc as u64);
             self.call(self.addrs.cond);
             self.a.test_rr(ACC, ACC, true);
             self.a.jcc(NE, taken);
+            self.a.bind(resume);
         }
         self.chain_to(next, retired);
         self.a.bind(taken);

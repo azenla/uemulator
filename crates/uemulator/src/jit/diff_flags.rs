@@ -8,7 +8,9 @@
 //! host flags directly and each of the 16 conditions maps differently. The rest go through
 //! `helper_exec` and the interpreter's flag code, so a smaller consumer set suffices.
 
-use super::diff_tests::{HOT_RAM, difference_in, run_serialized, seed_registers_and_memory};
+use super::diff_tests::{
+    HOT_RAM, check_with, difference_in, run_serialized, seed_registers_and_memory,
+};
 use crate::testkit::*;
 
 /// `(rax, rbx, rcx)` start values, most informative first: zero, carry and signed overflow at
@@ -674,5 +676,129 @@ mod dead_flag_records {
     fn skipped_flag_records_do_not_change_what_a_plain_run_computes() {
         // The default seeded state, in case `carry_setup` hides a difference.
         check(&[&ADD_RAX_RBX[..], &ADD_RDX_RCX, &PUSHFQ_POP_R8, &HLT].concat());
+    }
+}
+
+/// A conditional branch that starts a block sees only the previous block's record in `Cpu`: a
+/// `jmp +0` ends the block with the flags untouched. Every condition after every kind of
+/// flag writer and operand width, over operands around the sign and carry boundaries.
+#[test]
+fn a_condition_at_the_start_of_a_block_reads_the_previous_blocks_flags() {
+    #[rustfmt::skip]
+    let writers: &[&[u8]] = &[
+        &[0x48, 0x39, 0xc8], // cmp rax, rcx
+        &[0x39, 0xc8],       // cmp eax, ecx
+        &[0x66, 0x39, 0xc8], // cmp ax, cx
+        &[0x38, 0xc8],       // cmp al, cl
+        &[0x48, 0x29, 0xc8], // sub rax, rcx
+        &[0x48, 0x01, 0xc8], // add rax, rcx
+        &[0x48, 0x21, 0xc8], // and rax, rcx
+        &[0xff, 0xc0],       // inc eax
+        &[0x48, 0xd1, 0xe0], // shl rax, 1
+        &[0x48, 0x0f, 0xbc, 0xc1], // bsf rax, rcx
+        &[0x48, 0x19, 0xc8], // sbb rax, rcx
+    ];
+    let operands = [
+        0u64,
+        1,
+        0x80,
+        0x7fff_ffff,
+        0x8000_0000,
+        u64::MAX,
+        0x8000_0000_0000_0000,
+    ];
+    for writer in writers {
+        for condition in 0..16u8 {
+            // writer; jmp +0; jcc over `mov edx, 1; hlt`; mov edx, 2; hlt
+            let mut code = writer.to_vec();
+            code.extend_from_slice(&[0xeb, 0x00, 0x70 | condition, 0x06]);
+            code.extend_from_slice(&[0xba, 1, 0, 0, 0, 0xf4, 0xba, 2, 0, 0, 0, 0xf4]);
+            for &first in &operands {
+                for &second in &operands {
+                    let outcome = std::panic::catch_unwind(|| {
+                        check_with(&code, |harness| {
+                            seed_registers_and_memory(harness);
+                            harness.cpu.gpr[0] = first;
+                            harness.cpu.gpr[1] = second;
+                        })
+                    });
+                    if let Err(panic) = outcome {
+                        eprintln!(
+                            "writer {writer:02x?} condition {condition:#x} rax={first:#x} rcx={second:#x}"
+                        );
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// adc, sbb, inc and dec read the guest CF as their carry-in, which with no host flags comes from
+/// the previous block's record: every kind of writer, then a `jmp +0` ending the block, then each
+/// consumer, over operands around the carry boundaries.
+#[test]
+fn a_carry_in_at_the_start_of_a_block_reads_the_previous_blocks_flags() {
+    #[rustfmt::skip]
+    let writers: &[&[u8]] = &[
+        &[0x48, 0x39, 0xc8],       // cmp rax, rcx
+        &[0x39, 0xc8],             // cmp eax, ecx
+        &[0x66, 0x39, 0xc8],       // cmp ax, cx
+        &[0x38, 0xc8],             // cmp al, cl
+        &[0x48, 0x29, 0xc8],       // sub rax, rcx
+        &[0x48, 0x01, 0xc8],       // add rax, rcx
+        &[0x01, 0xc8],             // add eax, ecx
+        &[0x66, 0x01, 0xc8],       // add ax, cx
+        &[0x48, 0x21, 0xc8],       // and rax, rcx
+        &[0xff, 0xc0],             // inc eax
+        &[0x48, 0xff, 0xc8],       // dec rax
+        &[0x48, 0xd1, 0xe0],       // shl rax, 1
+        &[0x48, 0xd1, 0xe8],       // shr rax, 1
+        &[0x48, 0x0f, 0xbc, 0xc1], // bsf rax, rcx
+        &[0x48, 0x11, 0xc8],       // adc rax, rcx
+        &[0x48, 0x19, 0xc8],       // sbb rax, rcx
+        &[0xf9],                   // stc
+        &[0xf8],                   // clc
+        &[0xb4, 0x01, 0x9e],       // mov ah, 1; sahf
+    ];
+    #[rustfmt::skip]
+    let consumers: &[&[u8]] = &[
+        &[0x48, 0x11, 0xd2],       // adc rdx, rdx
+        &[0x19, 0xd2],             // sbb edx, edx
+        &[0x48, 0x83, 0xd2, 0x00], // adc rdx, 0
+        &[0x48, 0xff, 0xc2],       // inc rdx
+        &[0xff, 0xca],             // dec edx
+        &[0xff, 0x03],             // inc dword ptr [rbx]
+        &[0x48, 0xff, 0x0b],       // dec qword ptr [rbx]
+        &[0x48, 0x13, 0x13],       // adc rdx, qword ptr [rbx]
+    ];
+    let operands = [0u64, 1, 0x80, 0x8000_0000, u64::MAX, 0x8000_0000_0000_0000];
+    for writer in writers {
+        for consumer in consumers {
+            // writer; jmp +0; consumer; setc cl... the consumer's own flags and registers
+            // carry the result, so hlt follows directly
+            let mut code = writer.to_vec();
+            code.extend_from_slice(&[0xeb, 0x00]);
+            code.extend_from_slice(consumer);
+            code.push(0xf4);
+            for &first in &operands {
+                for &second in &operands {
+                    let outcome = std::panic::catch_unwind(|| {
+                        check_with(&code, |harness| {
+                            seed_registers_and_memory(harness);
+                            harness.cpu.gpr[0] = first;
+                            harness.cpu.gpr[1] = second;
+                            harness.cpu.gpr[2] = second.rotate_left(7);
+                        })
+                    });
+                    if let Err(panic) = outcome {
+                        eprintln!(
+                            "writer {writer:02x?} consumer {consumer:02x?} rax={first:#x} rcx={second:#x}"
+                        );
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+            }
+        }
     }
 }
