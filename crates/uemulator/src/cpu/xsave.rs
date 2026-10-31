@@ -8,10 +8,10 @@ use super::fpu::{FXSAVE_AREA_SIZE, LegacyRestore};
 use super::sys::{CR0_TS, CR4_OSXSAVE, RAX, RCX, RDX};
 use super::{Cpu, ExecResult, FCW_RESET, MXCSR_RESET, mem};
 
-pub(super) const XCR0_X87: u64 = 1 << 0;
-pub(super) const XCR0_SSE: u64 = 1 << 1;
+pub(crate) const XCR0_X87: u64 = 1 << 0;
+pub(crate) const XCR0_SSE: u64 = 1 << 1;
 /// YMM_Hi128: the upper halves of YMM0-15 (`Cpu::ymm_hi`).
-pub(super) const XCR0_AVX: u64 = 1 << 2;
+pub(crate) const XCR0_AVX: u64 = 1 << 2;
 /// Opmask: k0-k7 (`Cpu::opmask`).
 pub(super) const XCR0_OPMASK: u64 = 1 << 5;
 /// ZMM_Hi256: bits 511:256 of ZMM0-15 (`Cpu::zmm_hi`).
@@ -19,10 +19,10 @@ pub(super) const XCR0_ZMM_HI256: u64 = 1 << 6;
 /// Hi16_ZMM: ZMM16-31 (`Cpu::zmm_extra`).
 pub(super) const XCR0_HI16_ZMM: u64 = 1 << 7;
 /// The three AVX-512 components; xsetbv accepts all of them or none.
-pub(super) const XCR0_AVX512: u64 = XCR0_OPMASK | XCR0_ZMM_HI256 | XCR0_HI16_ZMM;
+pub(crate) const XCR0_AVX512: u64 = XCR0_OPMASK | XCR0_ZMM_HI256 | XCR0_HI16_ZMM;
 /// Components xsetbv accepts. Extending this also means extending CPUID leaf 0xD and the save
 /// area layout below, or the kernel will size its buffers for state the instructions skip.
-pub(super) const XCR0_SUPPORTED: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX | XCR0_AVX512;
+pub(crate) const XCR0_SUPPORTED: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX | XCR0_AVX512;
 
 /// The XSAVE area is the legacy image plus a 64-byte header: XSTATE_BV (8 bytes), XCOMP_BV (8)
 /// and 48 reserved bytes, all of which xrstor requires to be zero except XSTATE_BV.

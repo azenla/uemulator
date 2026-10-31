@@ -48,7 +48,8 @@ use super::helpers::*;
 use super::native::LinkSite;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
 use crate::cpu::flags::LazyFlagsOp;
-use crate::cpu::{CR0_EM, CR0_TS, CR4_OSFXSR};
+use crate::cpu::xsave::{XCR0_AVX, XCR0_AVX512, XCR0_SSE};
+use crate::cpu::{CR0_EM, CR0_TS, CR4_OSFXSR, CR4_OSXSAVE};
 use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TlbEntry};
 
 // Byte offsets into the `#[repr(C)]` `Cpu` and `TlbEntry`, burned into the generated code.
@@ -72,6 +73,20 @@ const LAZY_SRC2_OFFSET: u32 = offset_of!(Cpu, lazy_src2) as u32;
 const CR0_OFFSET: u32 = offset_of!(Cpu, cr0) as u32;
 const CR4_OFFSET: u32 = offset_of!(Cpu, cr4) as u32;
 const XMM_OFFSET: u32 = offset_of!(Cpu, xmm) as u32;
+const OPMASK_OFFSET: u32 = offset_of!(Cpu, opmask) as u32;
+const OPMASK_SIZE: u32 = size_of::<u64>() as u32;
+/// An opmask register number is the low three bits of its ModRM field.
+const OPMASK_REGISTER_MASK: u8 = 7;
+/// 128-bit lanes of a 512-bit vector register.
+const VECTOR_LANES: u32 = 4;
+const XCR0_OFFSET: u32 = offset_of!(Cpu, xcr0) as u32;
+/// What `Cpu::evex_gate` requires of XCR0: the SSE, AVX and AVX-512 state components.
+const XCR0_EVEX_STATE: u64 = XCR0_SSE | XCR0_AVX | XCR0_AVX512;
+/// Every 128-bit lane `ldr_q`/`str_q` of a vector register reaches must be within the 12-bit
+/// scaled offset of the instruction (the highest lane of zmm31).
+const _: () =
+    assert!(offset_of!(Cpu, zmm_extra) + size_of::<[[u128; 4]; 16]>() <= 4096 * size_of::<u128>());
+const _: () = assert!(offset_of!(Cpu, opmask) + size_of::<[u64; 8]>() < 4096 * size_of::<u64>());
 const XMM_SIZE: u32 = size_of::<u128>() as u32;
 const XMM_HALF: u32 = XMM_SIZE / 2;
 /// Legacy-SSE 128-bit memory operands of movaps/movdqa and friends must be aligned to this.
@@ -428,6 +443,8 @@ pub(crate) struct Gen<'a> {
     /// that changes them (mov to cr, clts, lmsw, vmrun...) ends a block, so one check at the first
     /// such instruction covers the rest.
     sse_gated: bool,
+    /// The block already checked the AVX-512 state gate (CR4.OSXSAVE, XCR0, CR0.TS).
+    evex_gated: bool,
     /// Instructions of this block already added to `Cpu::icount` ahead of an interpreter helper
     /// (the block index of the last one). Exact at translation time because a block is
     /// straight-line code: every instruction before a reachable one has executed.
@@ -467,6 +484,7 @@ impl<'a> Gen<'a> {
             smc_exits: Vec::new(),
             live: None,
             sse_gated: false,
+            evex_gated: false,
             prepaid_insns: 0,
             inlined: 0,
             entry_rip: 0,
@@ -2442,6 +2460,18 @@ impl<'a> Gen<'a> {
                 }
                 is_store = self.vector_alu(&insn, form, next_rip, insn_index, rip);
             }
+            // AVX-512 data movement, integer logic and arithmetic, byte compares into an opmask
+            // register, and kmov of an opmask register (see `evex_form`)
+            _ if insn.evex || insn.vex => {
+                let Some(form) = evex_form(&insn) else {
+                    return false;
+                };
+                // A memory operand needs the inline access path (no 67 prefix, no LOCK)
+                if is_memory && !plain {
+                    return false;
+                }
+                is_store = self.evex(&insn, form, next_rip, insn_index, rip);
+            }
             _ => return false,
         }
         if is_store {
@@ -2475,6 +2505,247 @@ impl<'a> Gen<'a> {
             self.asm.cbz(SCRATCH_A, entry, true);
         }
         (entry, resume)
+    }
+
+    /// Starts an inline AVX-512 instruction: registers its out-of-line interpreter fallback and,
+    /// for the first one of the block, checks `Cpu::evex_gate` (#UD without CR4.OSXSAVE or the
+    /// SSE, AVX and AVX-512 state in XCR0, #NM under CR0.TS), jumping to the fallback so the
+    /// interpreter raises the exception. Like the SSE gate it holds for the whole block: whatever
+    /// changes CR0, CR4 or XCR0 ends it.
+    fn evex_entry(&mut self, insn_index: u32, rip: u64) -> (Label, Label) {
+        let entry = self.asm.label();
+        let resume = self.asm.label();
+        self.slow_paths.push(SlowPath {
+            entry,
+            resume,
+            access: SlowAccess::Exec,
+            insn_index,
+            rip,
+        });
+        if !self.evex_gated {
+            self.evex_gated = true;
+            self.asm.ldr(SCRATCH_A, CPU, CR4_OFFSET);
+            self.and_constant(SCRATCH_A, SCRATCH_A, CR4_OSXSAVE);
+            self.asm.cbz(SCRATCH_A, entry, true);
+            self.asm.ldr(SCRATCH_A, CPU, XCR0_OFFSET);
+            self.and_constant(SCRATCH_A, SCRATCH_A, XCR0_EVEX_STATE);
+            self.asm
+                .sub_imm(SCRATCH_A, SCRATCH_A, XCR0_EVEX_STATE as u32, true);
+            self.asm.cbnz(SCRATCH_A, entry, true);
+            self.asm.ldr(SCRATCH_A, CPU, CR0_OFFSET);
+            self.and_constant(SCRATCH_A, SCRATCH_A, CR0_TS);
+            self.asm.cbnz(SCRATCH_A, entry, true);
+        }
+        (entry, resume)
+    }
+
+    /// Zeroes the 128-bit lanes `from..4` of vector register `register`: every VEX or EVEX write
+    /// of a vector shorter than 512 bits clears the rest of the register.
+    fn zero_vector_lanes(&mut self, register: u8, from: u32) {
+        for lane in from..VECTOR_LANES {
+            let offset = vector_lane_offset(register, lane) as u32;
+            self.asm.str(XZR, CPU, offset);
+            self.asm.str(XZR, CPU, offset + XMM_HALF);
+        }
+    }
+
+    /// Points `SCRATCH_B` at the host address of the memory operand, `bytes` long and inside one
+    /// page, for a read or a write; anything else (an `aligned` operand off a `bytes` boundary,
+    /// a TLB miss, a page crossing) jumps to `slow`, the interpreter. The operand's compressed
+    /// disp8 is scaled by the vector length, as in `Cpu::evex_address`.
+    fn evex_memory(
+        &mut self,
+        insn: &Insn,
+        bytes: u32,
+        aligned: bool,
+        write: bool,
+        next_rip: u64,
+        slow: Label,
+    ) {
+        let mut insn = *insn;
+        if insn.evex_disp8 {
+            insn.disp *= bytes as i64;
+        }
+        self.effective_address(&insn, next_rip, ADDRESS);
+        if aligned {
+            self.and_constant(SCRATCH_A, ADDRESS, bytes as u64 - 1);
+            self.asm.cbnz(SCRATCH_A, slow, true);
+        }
+        let tag = if write {
+            TLB_TAG_WRITE_OFFSET
+        } else {
+            TLB_TAG_READ_OFFSET
+        };
+        self.tlb_probe(bytes as u8, tag, slow);
+        self.asm.ldr(SCRATCH_B, SCRATCH_A, TLB_ADDEND_OFFSET);
+        self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
+    }
+
+    /// An inline AVX-512 instruction (`EvexForm`): whole 128, 256 or 512-bit vectors processed
+    /// one 128-bit lane at a time through v0 and v1, loaded from and stored to `Cpu` per lane, so
+    /// nothing lives in host vector registers across instructions. A memory operand that is
+    /// misaligned (for the aligned moves), misses the TLB or crosses a page, and a failing gate,
+    /// run the instruction in the interpreter, which also owns every fault and the partial-write
+    /// rules. Returns whether the instruction stores to memory.
+    fn evex(
+        &mut self,
+        insn: &Insn,
+        form: EvexForm,
+        next_rip: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let (slow, resume) = self.evex_entry(insn_index, rip);
+        let lanes = form.bytes / XMM_SIZE;
+        let lane_offset = |register: u8, lane: u32| vector_lane_offset(register, lane) as u32;
+        let mut is_store = false;
+        match form.kind {
+            EvexKind::MaskToGeneral { wide } => {
+                self.asm.ldr(
+                    VALUE,
+                    CPU,
+                    OPMASK_OFFSET + OPMASK_SIZE * (insn.rm & OPMASK_REGISTER_MASK) as u32,
+                );
+                if !wide {
+                    self.asm.uxtw(VALUE, VALUE);
+                }
+                self.write_reg(insn.reg, false, if wide { 8 } else { 4 }, VALUE);
+            }
+            EvexKind::Move { load, aligned } => {
+                if insn.md == MODRM_MOD_REGISTER {
+                    let (from, to) = if load {
+                        (insn.rm, insn.reg)
+                    } else {
+                        (insn.reg, insn.rm)
+                    };
+                    for lane in 0..lanes {
+                        self.asm.ldr_q(VECTOR_DST, CPU, lane_offset(from, lane));
+                        self.asm.str_q(VECTOR_DST, CPU, lane_offset(to, lane));
+                    }
+                    self.zero_vector_lanes(to, lanes);
+                } else if load {
+                    self.evex_memory(insn, form.bytes, aligned, false, next_rip, slow);
+                    for lane in 0..lanes {
+                        self.asm.ldr_q(VECTOR_DST, SCRATCH_B, lane * XMM_SIZE);
+                        self.asm.str_q(VECTOR_DST, CPU, lane_offset(insn.reg, lane));
+                    }
+                    if self.ordered_memory {
+                        // Loads are acquires (see `ordered_memory`); `ldar` has no 128-bit form.
+                        self.asm.dmb_ishld();
+                    }
+                    self.zero_vector_lanes(insn.reg, lanes);
+                } else {
+                    self.evex_memory(insn, form.bytes, aligned, true, next_rip, slow);
+                    for lane in 0..lanes {
+                        let register = lane_offset(insn.reg, lane);
+                        self.asm.ldr(VALUE, CPU, register);
+                        self.asm.ldr(SCRATCH_A, CPU, register + XMM_HALF);
+                        if self.ordered_memory {
+                            self.asm.stlr(VALUE, SCRATCH_B, 8);
+                            self.asm.add_imm(SCRATCH_B, SCRATCH_B, XMM_HALF, true);
+                            self.asm.stlr(SCRATCH_A, SCRATCH_B, 8);
+                            self.asm.add_imm(SCRATCH_B, SCRATCH_B, XMM_HALF, true);
+                        } else {
+                            self.asm
+                                .stp_off(VALUE, SCRATCH_A, SCRATCH_B, (lane * XMM_SIZE) as i32);
+                        }
+                    }
+                    is_store = true;
+                }
+            }
+            EvexKind::Alu { .. }
+            | EvexKind::CompareEqualBytes
+            | EvexKind::TestBytes
+            | EvexKind::TestNotBytes => {
+                let memory = insn.md != MODRM_MOD_REGISTER;
+                if memory {
+                    self.evex_memory(insn, form.bytes, false, false, next_rip, slow);
+                }
+                for lane in 0..lanes {
+                    // v0 = vvvv, v1 = r/m, as the guest names them
+                    self.asm
+                        .ldr_q(VECTOR_DST, CPU, lane_offset(insn.vex_v, lane));
+                    if memory {
+                        self.asm.ldr_q(VECTOR_SRC, SCRATCH_B, lane * XMM_SIZE);
+                    } else {
+                        self.asm.ldr_q(VECTOR_SRC, CPU, lane_offset(insn.rm, lane));
+                    }
+                    match form.kind {
+                        EvexKind::Alu { op, lane_log2 } => {
+                            let (base, size, first, second) = match op {
+                                VectorOp::And => (VEC_AND, 0, VECTOR_DST, VECTOR_SRC),
+                                // bic computes its first operand & !second: rm & !vvvv
+                                VectorOp::AndNot => (VEC_BIC, 0, VECTOR_SRC, VECTOR_DST),
+                                VectorOp::Or => (VEC_ORR, 0, VECTOR_DST, VECTOR_SRC),
+                                VectorOp::Xor => (VEC_EOR, 0, VECTOR_DST, VECTOR_SRC),
+                                VectorOp::MinUnsigned8 => (VEC_UMIN, 0, VECTOR_DST, VECTOR_SRC),
+                                VectorOp::MaxUnsigned8 => (VEC_UMAX, 0, VECTOR_DST, VECTOR_SRC),
+                                VectorOp::Add => (VEC_ADD, lane_log2, VECTOR_DST, VECTOR_SRC),
+                                VectorOp::Subtract => (VEC_SUB, lane_log2, VECTOR_DST, VECTOR_SRC),
+                                VectorOp::CompareEqual | VectorOp::MoveMask => {
+                                    unreachable!("not an EvexKind::Alu operation")
+                                }
+                            };
+                            self.asm.vec_op(base, size, VECTOR_DST, first, second);
+                            self.asm.str_q(VECTOR_DST, CPU, lane_offset(insn.reg, lane));
+                        }
+                        _ => {
+                            match form.kind {
+                                EvexKind::CompareEqualBytes => self
+                                    .asm
+                                    .vec_op(VEC_CMEQ, 0, VECTOR_DST, VECTOR_DST, VECTOR_SRC),
+                                EvexKind::TestBytes => self
+                                    .asm
+                                    .vec_op(VEC_CMTST, 0, VECTOR_DST, VECTOR_DST, VECTOR_SRC),
+                                _ => {
+                                    self.asm
+                                        .vec_op(VEC_CMTST, 0, VECTOR_DST, VECTOR_DST, VECTOR_SRC);
+                                    self.asm.vec_op(VEC_NOT, 0, VECTOR_DST, VECTOR_DST, 0);
+                                }
+                            }
+                            // The sign bit of every byte, gathered as for pmovmskb (see
+                            // `vector_alu`), into bits 16 * lane.. of x0.
+                            self.asm.vec_ushr(VECTOR_DST, VECTOR_DST, 8, 7);
+                            self.asm.vec_usra(VECTOR_DST, VECTOR_DST, 16, 7);
+                            self.asm.vec_usra(VECTOR_DST, VECTOR_DST, 32, 14);
+                            self.asm.vec_usra(VECTOR_DST, VECTOR_DST, 64, 28);
+                            self.asm.umov_byte(VALUE, VECTOR_DST, 0);
+                            self.asm.umov_byte(SCRATCH_A, VECTOR_DST, XMM_HALF);
+                            self.asm.add_lsl(VALUE, VALUE, SCRATCH_A, u8::BITS);
+                            if lane == 0 {
+                                self.asm.mov(0, VALUE);
+                            } else {
+                                self.asm.add_lsl(0, 0, VALUE, 16 * lane);
+                            }
+                        }
+                    }
+                }
+                if memory && self.ordered_memory {
+                    self.asm.dmb_ishld();
+                }
+                if matches!(form.kind, EvexKind::Alu { .. }) {
+                    self.zero_vector_lanes(insn.reg, lanes);
+                } else {
+                    if insn.evex_mask != 0 {
+                        self.asm.ldr(
+                            SCRATCH_A,
+                            CPU,
+                            OPMASK_OFFSET + OPMASK_SIZE * insn.evex_mask as u32,
+                        );
+                        self.asm.and(0, 0, SCRATCH_A, true);
+                    }
+                    self.asm.str(
+                        0,
+                        CPU,
+                        OPMASK_OFFSET + OPMASK_SIZE * (insn.reg & OPMASK_REGISTER_MASK) as u32,
+                    );
+                }
+            }
+        }
+        self.asm.bind(resume);
+        // The slow path's call clobbered host NZCV.
+        self.live = None;
+        is_store
     }
 
     /// A 128-bit whole-register move (`VectorMove`). The fast path needs the memory operand

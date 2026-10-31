@@ -53,6 +53,10 @@ pub const VEC_UMIN: u32 = 0x6e20_6c00;
 pub const VEC_UMAX: u32 = 0x6e20_6400;
 pub const VEC_ADD: u32 = 0x4e20_8400;
 pub const VEC_SUB: u32 = 0x6e20_8400;
+/// Lanes become all ones where `vn & vm` is not zero.
+pub const VEC_CMTST: u32 = 0x4e20_8c00;
+/// `not vd.16b, vn.16b`: `vm` is zero.
+pub const VEC_NOT: u32 = 0x6e20_5800;
 /// Shift amount of the shifted-register add.
 const IMM6_SHIFT: u32 = 10;
 /// MOVZ/MOVK/MOVN: 16-bit immediate, and which halfword it replaces (`hw` * 16 bits).
@@ -818,6 +822,8 @@ mod tests {
                 a.vec_op(VEC_SUB, 1, 0, 0, 1);
                 a.vec_op(VEC_SUB, 2, 0, 0, 1);
                 a.vec_op(VEC_SUB, 3, 0, 0, 1);
+                a.vec_op(VEC_CMTST, 0, 0, 1, 2); // cmtst v0.16b, v1.16b, v2.16b
+                a.vec_op(VEC_NOT, 0, 0, 1, 0); // not v0.16b, v1.16b
             }),
             [
                 0x4e21_1c00,
@@ -837,6 +843,8 @@ mod tests {
                 0x6e61_8400,
                 0x6ea1_8400,
                 0x6ee1_8400,
+                0x4e22_8c20,
+                0x6e20_5820,
             ]
         );
         assert_eq!(

@@ -67,6 +67,10 @@ const TWO_BYTE_OPCODE: u8 = 0x0f;
 const OPCODE_MOVDQU_LOAD: u8 = 0x6f;
 const OPCODE_MOVDQU_STORE: u8 = 0x7f;
 const OPCODE_PMOVMSKB: u8 = 0xd7;
+/// `66 0f xx` integer SSE2 opcodes for `xmm_op`.
+pub const OPCODE_PCMPEQB: u8 = 0x74;
+pub const OPCODE_PAND: u8 = 0xdb;
+pub const OPCODE_PXOR: u8 = 0xef;
 const OPERAND_SIZE_PREFIX: u8 = 0x66;
 
 /// ModRM.mod values.

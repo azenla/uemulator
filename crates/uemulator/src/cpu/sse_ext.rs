@@ -1560,18 +1560,21 @@ mod tests {
 
         #[test]
         fn lzcnt_flags_and_zero_source() {
+            // Only CF and ZF are defined for lzcnt; SF and PF follow the count (as the JIT's
+            // `LazyFlagsOp::SzpCfOf` record has them), so they are masked out here.
+            let defined = CF | ZF;
             let mut rig = Rig::new();
             regs(&mut rig, "lzcnt rax, rbx", 0, 9);
             assert_eq!(rig.gpr(RAX), 64, "unlike bsr, the destination is written");
-            assert_eq!(rig.flags(), CF);
+            assert_eq!(rig.flags() & defined, CF);
             regs(&mut rig, "lzcnt ax, bx", 0x1_0000, 9);
             assert_eq!(rig.gpr(RAX) & 0xffff, 16);
-            assert_eq!(rig.flags(), CF);
+            assert_eq!(rig.flags() & defined, CF);
             regs(&mut rig, "lzcnt rax, rbx", 1 << 63, 9);
             assert_eq!(rig.gpr(RAX), 0);
-            assert_eq!(rig.flags(), ZF, "ZF reports a zero result");
+            assert_eq!(rig.flags() & defined, ZF, "ZF reports a zero result");
             regs(&mut rig, "lzcnt rax, rbx", 1, 9);
-            assert_eq!(rig.flags(), 0);
+            assert_eq!(rig.flags() & defined, 0);
             rig.h.write(DATA, &0x80u64.to_le_bytes());
             rig.run_ok("lzcnt rax, [rsi]");
             assert_eq!(rig.gpr(RAX), 56);

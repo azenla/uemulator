@@ -498,6 +498,149 @@ pub(crate) fn vector_alu(insn: &Insn) -> Option<VectorAlu> {
     Some(VectorAlu { op, lane_log2 })
 }
 
+/// What an inline AVX-512 instruction does. Only unmasked data movement and integer logic and
+/// arithmetic on whole vectors (the shapes of glibc's EVEX string and copy loops), byte compares
+/// into an opmask register, and `kmov` of an opmask register to a general register are lowered;
+/// masking, broadcast, rounding and the rest stay in the interpreter, which also raises every
+/// #UD, so a form that could be one is not accepted here.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum EvexKind {
+    /// vmovdqu8/16/32/64, vmovdqa32/64, vmovups/vmovupd, vmovaps/vmovapd between a register and
+    /// a register or memory. The aligned forms need an operand aligned to the vector length.
+    Move { load: bool, aligned: bool },
+    /// `reg = vvvv op rm`, lane by lane (`VectorOp` as for the legacy forms, without `MoveMask`).
+    Alu { op: VectorOp, lane_log2: u32 },
+    /// `k[reg] = (vvvv == rm)` per byte, ANDed with the write mask when there is one.
+    CompareEqualBytes,
+    /// `k[reg] = ((vvvv & rm) != 0)` per byte (vptestmb), ANDed with the write mask.
+    TestBytes,
+    /// `k[reg] = ((vvvv & rm) == 0)` per byte (vptestnmb), ANDed with the write mask.
+    TestNotBytes,
+    /// VEX `kmovd`/`kmovq r, k`: the opmask register `rm` into general register `reg`.
+    MaskToGeneral { wide: bool },
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EvexForm {
+    pub kind: EvexKind,
+    /// Vector length in bytes: 16, 32 or 64.
+    pub bytes: u32,
+}
+
+/// `Some` for the instructions `EvexKind` lists, with the encodings the interpreter accepts as
+/// valid (see `Cpu::exec_evex`): no broadcast or rounding (EVEX.b), no reserved length, and for
+/// moves and arithmetic no write mask and no zeroing.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) fn evex_form(insn: &Insn) -> Option<EvexForm> {
+    use crate::cpu::decode::{EVEX_OP_FLAG, VEX_OP_FLAG};
+    const MAP_0F: u16 = 1;
+    const MAP_0F38: u16 = 2;
+    const OPCODE_KMOV_TO_GENERAL: u16 = 0x93;
+    const VECTOR_LENGTH_RESERVED: u8 = 3;
+    const OPMASK_REGISTERS: u8 = 8;
+    if insn.vex && insn.op == VEX_OP_FLAG | (MAP_0F << 8) | OPCODE_KMOV_TO_GENERAL {
+        // F2 0F 93: kmovd (W0) / kmovq (W1) r32/r64, k. Register source only, L0, no vvvv.
+        return (insn.rep == 2 && insn.md == 3 && !insn.vex_l && insn.vex_v == 0).then_some(
+            EvexForm {
+                kind: EvexKind::MaskToGeneral {
+                    wide: insn.opsize == 8,
+                },
+                bytes: 0,
+            },
+        );
+    }
+    if !insn.evex || insn.evex_b || insn.evex_ll == VECTOR_LENGTH_RESERVED {
+        return None;
+    }
+    let bytes = 16u32 << insn.evex_ll;
+    let op = insn.op & !EVEX_OP_FLAG;
+    let (map, opcode) = (op >> 8, (op & 0xff) as u8);
+    let unmasked = insn.evex_mask == 0 && !insn.evex_zeroing;
+    // The implied prefix, as `Cpu::exec_evex` reads it: F3 and F2 win over 66.
+    let (no_prefix, p66, f3, f2) = (
+        insn.rep == 0 && !insn.p66,
+        insn.rep == 0 && insn.p66,
+        insn.rep == 1,
+        insn.rep == 2,
+    );
+    let alu = |op, lane_log2| Some(EvexKind::Alu { op, lane_log2 });
+    let kind = match (map, opcode) {
+        (MAP_0F, 0x6f | 0x7f) if unmasked && insn.vex_v == 0 && (p66 || f3 || f2) => {
+            Some(EvexKind::Move {
+                load: opcode == 0x6f,
+                aligned: p66,
+            })
+        }
+        (MAP_0F, 0x10 | 0x11 | 0x28 | 0x29)
+            if unmasked && insn.vex_v == 0 && (no_prefix || p66) =>
+        {
+            Some(EvexKind::Move {
+                load: matches!(opcode, 0x10 | 0x28),
+                aligned: opcode >= 0x28,
+            })
+        }
+        (MAP_0F, 0xdb | 0xdf | 0xeb | 0xef | 0xda | 0xde | 0xfc..=0xfe | 0xd4 | 0xf8..=0xfb)
+            if unmasked && p66 =>
+        {
+            match opcode {
+                0xdb => alu(VectorOp::And, 0),
+                0xdf => alu(VectorOp::AndNot, 0),
+                0xeb => alu(VectorOp::Or, 0),
+                0xef => alu(VectorOp::Xor, 0),
+                0xda => alu(VectorOp::MinUnsigned8, 0),
+                0xde => alu(VectorOp::MaxUnsigned8, 0),
+                0xfc..=0xfe => alu(VectorOp::Add, (opcode - 0xfc) as u32),
+                0xd4 => alu(VectorOp::Add, 3),
+                0xf8..=0xfa => alu(VectorOp::Subtract, (opcode - 0xf8) as u32),
+                _ => alu(VectorOp::Subtract, 3),
+            }
+        }
+        // The destination is an opmask register, so the register field must name one, and EVEX.z
+        // is reserved.
+        (MAP_0F, 0x74) if p66 && !insn.evex_zeroing && insn.reg < OPMASK_REGISTERS => {
+            Some(EvexKind::CompareEqualBytes)
+        }
+        (MAP_0F38, 0x26)
+            if (p66 || f3)
+                && insn.opsize == 4
+                && !insn.evex_zeroing
+                && insn.reg < OPMASK_REGISTERS =>
+        {
+            Some(if p66 {
+                EvexKind::TestBytes
+            } else {
+                EvexKind::TestNotBytes
+            })
+        }
+        _ => None,
+    }?;
+    Some(EvexForm { kind, bytes })
+}
+
+/// Offset in `Cpu` of 128-bit lane `lane` (0 least significant) of vector register `register`
+/// (0..=31). zmm0-15 are split across `xmm`, `ymm_hi` and `zmm_hi`, zmm16-31 sit in `zmm_extra`
+/// (`cpu/evex.rs`).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) fn vector_lane_offset(register: u8, lane: u32) -> usize {
+    use core::mem::offset_of;
+    const LANE_BYTES: usize = size_of::<u128>();
+    const LEGACY_REGISTERS: usize = 16;
+    const LANES_PER_REGISTER: usize = 4;
+    let (register, lane) = (register as usize, lane as usize);
+    if register >= LEGACY_REGISTERS {
+        return offset_of!(Cpu, zmm_extra)
+            + (register - LEGACY_REGISTERS) * LANES_PER_REGISTER * LANE_BYTES
+            + lane * LANE_BYTES;
+    }
+    match lane {
+        0 => offset_of!(Cpu, xmm) + register * LANE_BYTES,
+        1 => offset_of!(Cpu, ymm_hi) + register * LANE_BYTES,
+        _ => offset_of!(Cpu, zmm_hi) + register * 2 * LANE_BYTES + (lane - 2) * LANE_BYTES,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The block-ending set, the clock-reading set, the exit-code layout and the helper ABI that

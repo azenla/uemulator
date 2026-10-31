@@ -137,6 +137,8 @@ mod diff_alu;
 #[cfg(test)]
 mod diff_bmi;
 #[cfg(test)]
+mod diff_evex;
+#[cfg(test)]
 mod diff_flags;
 #[cfg(test)]
 mod diff_flow;

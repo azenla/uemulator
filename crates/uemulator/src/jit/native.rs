@@ -1759,6 +1759,65 @@ mod tests {
     }
 
     #[test]
+    fn avx512_string_loop_instructions_are_lowered_inline_only_in_their_plain_forms() {
+        let _guard = serialize_jit_tests();
+        for (code, inlined) in [
+            // vmovdqu64 zmm1, [rbx] | vmovdqu64 [rbx+64], zmm2 | vmovdqa32 ymm17, ymm18
+            (&[0x62, 0xf1, 0xfe, 0x48, 0x6f, 0x0b][..], 1),
+            (&[0x62, 0xf1, 0xfe, 0x48, 0x7f, 0x53, 0x01], 1),
+            (&[0x62, 0xa1, 0x7d, 0x28, 0x6f, 0xca], 1),
+            // vpxord zmm1, zmm2, [rbx] | vpcmpeqb k1, ymm16, [rbx] | vptestnmb k2, zmm3, [rbx]
+            (&[0x62, 0xf1, 0x6d, 0x48, 0xef, 0x0b], 1),
+            (&[0x62, 0xf1, 0x7d, 0x20, 0x74, 0x0b], 1),
+            (&[0x62, 0xf2, 0x66, 0x48, 0x26, 0x13], 1),
+            // kmovd eax, k1
+            (&[0xc5, 0xfb, 0x93, 0xc1], 1),
+            // masked, zeroing, broadcast, other widths and elements, kmovw
+            (&[0x62, 0xf1, 0x6d, 0x49, 0xef, 0xcb], 0),
+            (&[0x62, 0xf1, 0x6d, 0xc9, 0xef, 0xcb], 0),
+            (&[0x62, 0xf1, 0x6d, 0x58, 0xef, 0x0b], 0),
+            (&[0x62, 0xf1, 0x75, 0x48, 0x75, 0xca], 0),
+            (&[0x62, 0xf3, 0x75, 0x48, 0x3e, 0xca, 0x04], 0),
+            (&[0xc5, 0xf8, 0x93, 0xc1], 0),
+        ] {
+            assert_eq!(inlined_in(&[code, &[0xf4]].concat()), inlined, "{code:x?}");
+        }
+    }
+
+    /// The fast path of an inline instruction with a memory operand only runs once the TLB holds
+    /// the page, which the first (interpreted) access fills: the diff corpus cannot tell a fast
+    /// path that is never taken from one that is, so count the interpreter's calls.
+    #[test]
+    fn avx512_memory_forms_run_inline_once_the_tlb_is_warm() {
+        use crate::cpu::CR4_OSXSAVE;
+        use crate::cpu::xsave::XCR0_SUPPORTED;
+        let _guard = serialize_jit_tests();
+        // vmovdqu64 zmm1, [rsi] | vpxord zmm2, zmm1, [rsi] | vpcmpeqb k1, zmm1, [rsi]
+        for instruction in [
+            &[0x62, 0xf1, 0xfe, 0x48, 0x6f, 0x0e][..],
+            &[0x62, 0xf1, 0x75, 0x48, 0xef, 0x16],
+            &[0x62, 0xf1, 0x75, 0x48, 0x74, 0x0e],
+        ] {
+            let code = [instruction, instruction, instruction, &[0xf4]].concat();
+            let mut cpu = cpu_running(&code);
+            cpu.cr4 |= CR4_OSXSAVE;
+            cpu.xcr0 = XCR0_SUPPORTED;
+            cpu.gpr[RSI] = SCRATCH;
+            cpu.jit = Some(Box::new(new_jit()));
+            cpu.helper_histogram = Some(Default::default());
+            cpu.next_event = u64::MAX;
+            steps_to_halt(&mut cpu);
+            let key = decode::decode(instruction).unwrap().histogram_key();
+            let interpreted = cpu.helper_histogram.as_ref().unwrap().get(&key).copied();
+            assert_eq!(
+                interpreted,
+                Some(1),
+                "only the first, TLB-cold access runs in the interpreter: {instruction:x?}"
+            );
+        }
+    }
+
+    #[test]
     fn adc_and_sbb_are_lowered_inline_at_32_and_64_bits_only() {
         let _guard = serialize_jit_tests();
         for (code, inlined) in [
