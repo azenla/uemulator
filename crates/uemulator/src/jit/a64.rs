@@ -57,6 +57,14 @@ pub const VEC_SUB: u32 = 0x6e20_8400;
 pub const VEC_CMTST: u32 = 0x4e20_8c00;
 /// `not vd.16b, vn.16b`: `vm` is zero.
 pub const VEC_NOT: u32 = 0x6e20_5800;
+/// `bsl vd, vn, vm`: vd = (vd & vn) | (!vd & vm), so vd is the select mask.
+pub const VEC_BSL: u32 = 0x6e60_1c00;
+/// Unsigned and signed byte or wider lane compares: vn > vm (`CMHI`, `CMGT`) and vn >= vm
+/// (`CMHS`, `CMGE`).
+pub const VEC_CMHI: u32 = 0x6e20_3400;
+pub const VEC_CMHS: u32 = 0x6e20_3c00;
+pub const VEC_CMGT: u32 = 0x4e20_3400;
+pub const VEC_CMGE: u32 = 0x4e20_3c00;
 /// Shift amount of the shifted-register add.
 const IMM6_SHIFT: u32 = 10;
 /// MOVZ/MOVK/MOVN: 16-bit immediate, and which halfword it replaces (`hw` * 16 bits).
@@ -755,6 +763,15 @@ impl Asm {
     }
 
     /// `umov wd, vn.b[index]`.
+    /// `fmov dd, xn`: the low 64 bits of vector register `vd` from a general register, the rest
+    /// zeroed.
+    pub fn fmov_d_x(&mut self, vd: u32, xn: u32) {
+        self.emit(0x9e67_0000 | xn << RN_SHIFT | vd);
+    }
+    /// `mov vd.d[1], xn`: the high 64 bits of `vd` from a general register.
+    pub fn ins_d1(&mut self, vd: u32, xn: u32) {
+        self.emit(0x4e18_1c00 | xn << RN_SHIFT | vd);
+    }
     pub fn umov_byte(&mut self, rd: u32, vn: u32, index: u32) {
         assert!(index < VECTOR_BYTES);
         self.emit(
@@ -824,6 +841,13 @@ mod tests {
                 a.vec_op(VEC_SUB, 3, 0, 0, 1);
                 a.vec_op(VEC_CMTST, 0, 0, 1, 2); // cmtst v0.16b, v1.16b, v2.16b
                 a.vec_op(VEC_NOT, 0, 0, 1, 0); // not v0.16b, v1.16b
+                a.fmov_d_x(2, 5); // fmov d2, x5
+                a.ins_d1(2, 7); // mov v2.d[1], x7
+                a.vec_op(VEC_BSL, 0, 2, 0, 3); // bsl v2.16b, v0.16b, v3.16b
+                a.vec_op(VEC_CMHI, 0, 0, 1, 2); // cmhi v0.16b, v1.16b, v2.16b
+                a.vec_op(VEC_CMHS, 0, 0, 1, 2);
+                a.vec_op(VEC_CMGT, 0, 0, 1, 2);
+                a.vec_op(VEC_CMGE, 0, 0, 1, 2);
             }),
             [
                 0x4e21_1c00,
@@ -845,6 +869,13 @@ mod tests {
                 0x6ee1_8400,
                 0x4e22_8c20,
                 0x6e20_5820,
+                0x9e67_00a2,
+                0x4e18_1ce2,
+                0x6e63_1c02,
+                0x6e22_3420,
+                0x6e22_3c20,
+                0x4e22_3420,
+                0x4e22_3c20,
             ]
         );
         assert_eq!(

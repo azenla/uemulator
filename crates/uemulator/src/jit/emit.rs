@@ -79,6 +79,17 @@ const OPMASK_SIZE: u32 = size_of::<u64>() as u32;
 const OPMASK_REGISTER_MASK: u8 = 7;
 /// 128-bit lanes of a 512-bit vector register.
 const VECTOR_LANES: u32 = 4;
+/// `OPMASK_EXPANSION` rows are 256 `u64`s apart: the shift that turns a table row index into
+/// the byte offset.
+const OPMASK_EXPANSION_SHIFT: u32 = 3;
+/// The vpcmp immediate's predicates (SDM table of VPCMP).
+const VPCMP_EQUAL: u8 = 0;
+const VPCMP_LESS: u8 = 1;
+const VPCMP_LESS_EQUAL: u8 = 2;
+const VPCMP_FALSE: u8 = 3;
+const VPCMP_NOT_EQUAL: u8 = 4;
+const VPCMP_NOT_LESS: u8 = 5;
+const VPCMP_NOT_LESS_EQUAL: u8 = 6;
 const XCR0_OFFSET: u32 = offset_of!(Cpu, xcr0) as u32;
 /// What `Cpu::evex_gate` requires of XCR0: the SSE, AVX and AVX-512 state components.
 const XCR0_EVEX_STATE: u64 = XCR0_SSE | XCR0_AVX | XCR0_AVX512;
@@ -2581,12 +2592,81 @@ impl<'a> Gen<'a> {
         self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
     }
 
+    /// Per byte, `predicate` (the vpcmp immediate: eq, lt, le, false, ne, nlt, nle, true) of v0
+    /// against v1 into v0, all ones where it holds.
+    fn compare_bytes(&mut self, signed: bool, predicate: u8) {
+        let (greater, greater_equal) = if signed {
+            (VEC_CMGT, VEC_CMGE)
+        } else {
+            (VEC_CMHI, VEC_CMHS)
+        };
+        let (a, b) = (VECTOR_DST, VECTOR_SRC);
+        match predicate {
+            VPCMP_EQUAL => self.asm.vec_op(VEC_CMEQ, 0, a, a, b),
+            // a < b is b > a
+            VPCMP_LESS => self.asm.vec_op(greater, 0, a, b, a),
+            VPCMP_LESS_EQUAL => self.asm.vec_op(greater_equal, 0, a, b, a),
+            VPCMP_FALSE => self.asm.vec_op(VEC_EOR, 0, a, a, a),
+            VPCMP_NOT_EQUAL => {
+                self.asm.vec_op(VEC_CMEQ, 0, a, a, b);
+                self.asm.vec_op(VEC_NOT, 0, a, a, 0);
+            }
+            VPCMP_NOT_LESS => self.asm.vec_op(greater_equal, 0, a, a, b),
+            VPCMP_NOT_LESS_EQUAL => self.asm.vec_op(greater, 0, a, a, b),
+            _ => self.asm.vec_op(VEC_CMEQ, 0, a, a, a),
+        }
+    }
+
+    /// Loads the write mask register of `insn` into x0 and the address of the expansion table for
+    /// `element_log2` into x1, for `commit_vector_lane`.
+    fn begin_masked_write(&mut self, insn: &Insn, element_log2: u32) {
+        self.asm
+            .ldr(0, CPU, OPMASK_OFFSET + OPMASK_SIZE * insn.evex_mask as u32);
+        let table = OPMASK_EXPANSION[element_log2 as usize].as_ptr() as u64;
+        self.asm.mov_imm(1, table);
+    }
+
+    /// Stores the lane in v0 to lane `lane` of vector register `register`, under the write mask
+    /// when the instruction has one (`begin_masked_write` came first): elements whose mask bit is
+    /// clear keep the old value, or become zero with EVEX.z. The mask bits of the lane are turned
+    /// into an all-ones-or-zero vector half by half through `OPMASK_EXPANSION`.
+    fn commit_vector_lane(&mut self, insn: &Insn, element_log2: u32, register: u8, lane: u32) {
+        let offset = vector_lane_offset(register, lane) as u32;
+        if insn.evex_mask == 0 {
+            self.asm.str_q(VECTOR_DST, CPU, offset);
+            return;
+        }
+        let (select, old) = (2, 3);
+        let bits_per_half = 8 >> element_log2;
+        let elements_per_lane = 16 >> element_log2;
+        let halves = [VALUE, SCRATCH_C];
+        for (half, register) in halves.into_iter().enumerate() {
+            let shift = lane * elements_per_lane + half as u32 * bits_per_half;
+            self.asm.ubfx(SCRATCH_A, 0, shift, bits_per_half, true);
+            self.asm
+                .add_lsl(SCRATCH_A, 1, SCRATCH_A, OPMASK_EXPANSION_SHIFT);
+            self.asm.ldr(register, SCRATCH_A, 0);
+        }
+        self.asm.fmov_d_x(select, VALUE);
+        self.asm.ins_d1(select, SCRATCH_C);
+        if insn.evex_zeroing {
+            self.asm.vec_op(VEC_AND, 0, VECTOR_DST, VECTOR_DST, select);
+            self.asm.str_q(VECTOR_DST, CPU, offset);
+        } else {
+            self.asm.ldr_q(old, CPU, offset);
+            self.asm.vec_op(VEC_BSL, 0, select, VECTOR_DST, old);
+            self.asm.str_q(select, CPU, offset);
+        }
+    }
+
     /// An inline AVX-512 instruction (`EvexForm`): whole 128, 256 or 512-bit vectors processed
     /// one 128-bit lane at a time through v0 and v1, loaded from and stored to `Cpu` per lane, so
     /// nothing lives in host vector registers across instructions. A memory operand that is
     /// misaligned (for the aligned moves), misses the TLB or crosses a page, and a failing gate,
     /// run the instruction in the interpreter, which also owns every fault and the partial-write
-    /// rules. Returns whether the instruction stores to memory.
+    /// rules. A masked load reads the whole vector inside the page the TLB vouches for, which
+    /// cannot fault, so the elements the mask drops are read and discarded. Returns whether the
+    /// instruction stores to memory.
     fn evex(
         &mut self,
         insn: &Insn,
@@ -2599,6 +2679,12 @@ impl<'a> Gen<'a> {
         let lanes = form.bytes / XMM_SIZE;
         let lane_offset = |register: u8, lane: u32| vector_lane_offset(register, lane) as u32;
         let mut is_store = false;
+        let writes_vector = matches!(form.kind, EvexKind::Alu { .. } | EvexKind::Move { .. });
+        let memory_store = matches!(form.kind, EvexKind::Move { load: false, .. })
+            && insn.md != MODRM_MOD_REGISTER;
+        if writes_vector && !memory_store && insn.evex_mask != 0 {
+            self.begin_masked_write(insn, form.element_log2);
+        }
         match form.kind {
             EvexKind::MaskToGeneral { wide } => {
                 self.asm.ldr(
@@ -2620,14 +2706,14 @@ impl<'a> Gen<'a> {
                     };
                     for lane in 0..lanes {
                         self.asm.ldr_q(VECTOR_DST, CPU, lane_offset(from, lane));
-                        self.asm.str_q(VECTOR_DST, CPU, lane_offset(to, lane));
+                        self.commit_vector_lane(insn, form.element_log2, to, lane);
                     }
                     self.zero_vector_lanes(to, lanes);
                 } else if load {
                     self.evex_memory(insn, form.bytes, aligned, false, next_rip, slow);
                     for lane in 0..lanes {
                         self.asm.ldr_q(VECTOR_DST, SCRATCH_B, lane * XMM_SIZE);
-                        self.asm.str_q(VECTOR_DST, CPU, lane_offset(insn.reg, lane));
+                        self.commit_vector_lane(insn, form.element_log2, insn.reg, lane);
                     }
                     if self.ordered_memory {
                         // Loads are acquires (see `ordered_memory`); `ldar` has no 128-bit form.
@@ -2656,7 +2742,8 @@ impl<'a> Gen<'a> {
             EvexKind::Alu { .. }
             | EvexKind::CompareEqualBytes
             | EvexKind::TestBytes
-            | EvexKind::TestNotBytes => {
+            | EvexKind::TestNotBytes
+            | EvexKind::CompareBytes { .. } => {
                 let memory = insn.md != MODRM_MOD_REGISTER;
                 if memory {
                     self.evex_memory(insn, form.bytes, false, false, next_rip, slow);
@@ -2687,13 +2774,16 @@ impl<'a> Gen<'a> {
                                 }
                             };
                             self.asm.vec_op(base, size, VECTOR_DST, first, second);
-                            self.asm.str_q(VECTOR_DST, CPU, lane_offset(insn.reg, lane));
+                            self.commit_vector_lane(insn, form.element_log2, insn.reg, lane);
                         }
                         _ => {
                             match form.kind {
                                 EvexKind::CompareEqualBytes => self
                                     .asm
                                     .vec_op(VEC_CMEQ, 0, VECTOR_DST, VECTOR_DST, VECTOR_SRC),
+                                EvexKind::CompareBytes { signed, predicate } => {
+                                    self.compare_bytes(signed, predicate)
+                                }
                                 EvexKind::TestBytes => self
                                     .asm
                                     .vec_op(VEC_CMTST, 0, VECTOR_DST, VECTOR_DST, VECTOR_SRC),

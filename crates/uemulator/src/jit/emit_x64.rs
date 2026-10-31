@@ -70,6 +70,18 @@ const XCR0_EVEX_STATE: u64 = XCR0_SSE | XCR0_AVX | XCR0_AVX512;
 const OPMASK_REGISTER_MASK: u8 = 7;
 /// 128-bit lanes of a 512-bit vector register.
 const VECTOR_LANES: u32 = 4;
+/// The vpcmp immediate's predicates (SDM table of VPCMP).
+const VPCMP_EQUAL: u8 = 0;
+const VPCMP_LESS: u8 = 1;
+const VPCMP_LESS_EQUAL: u8 = 2;
+const VPCMP_FALSE: u8 = 3;
+const VPCMP_NOT_EQUAL: u8 = 4;
+const VPCMP_NOT_LESS: u8 = 5;
+const VPCMP_NOT_LESS_EQUAL: u8 = 6;
+/// Host xmm registers for the write mask of a masked write and the old destination it merges
+/// with; xmm2 is also `HOST_XMM_ZERO`, which a masked write never needs.
+const HOST_XMM_SELECT: u8 = 2;
+const HOST_XMM_OLD: u8 = 3;
 const XMM_SIZE: i32 = size_of::<u128>() as i32;
 const XMM_HALF: i32 = XMM_SIZE / 2;
 /// Legacy-SSE 128-bit memory operands of movaps/movdqa and friends must be aligned to this.
@@ -2112,15 +2124,126 @@ impl<'a> Gen<'a> {
         self.a.ld(SCRATCH_B, mem(SCRATCH_A, TLB_ADDEND));
     }
 
+    /// Per byte, `predicate` (the vpcmp immediate) of xmm0 against xmm1 into xmm0, all ones where
+    /// it holds. SSE2 has only signed greater-than and equality, so the unsigned orders go
+    /// through min/max and the rest through inversion; xmm3 is the scratch.
+    fn compare_bytes(&mut self, signed: bool, predicate: u8) {
+        let (a, b, temporary) = (HOST_XMM_DST, HOST_XMM_SRC, HOST_XMM_OLD);
+        // a >= b / a <= b unsigned: min or max of the pair equals a
+        let bounded = |this: &mut Self, opcode: u8| {
+            this.a.xmm_op(OPCODE_MOVDQA, temporary, a);
+            this.a.xmm_op(opcode, temporary, b);
+            this.a.xmm_op(OPCODE_PCMPEQB, temporary, a);
+            this.a.xmm_op(OPCODE_MOVDQA, a, temporary);
+        };
+        let greater_signed = |this: &mut Self| this.a.xmm_op(OPCODE_PCMPGTB, a, b);
+        let less_signed = |this: &mut Self| {
+            this.a.xmm_op(OPCODE_MOVDQA, temporary, b);
+            this.a.xmm_op(OPCODE_PCMPGTB, temporary, a);
+            this.a.xmm_op(OPCODE_MOVDQA, a, temporary);
+        };
+        let invert = |this: &mut Self| {
+            this.a.xmm_op(OPCODE_PCMPEQB, temporary, temporary);
+            this.a.xmm_op(OPCODE_PXOR, a, temporary);
+        };
+        match (predicate, signed) {
+            (VPCMP_EQUAL, _) => self.a.xmm_op(OPCODE_PCMPEQB, a, b),
+            (VPCMP_NOT_EQUAL, _) => {
+                self.a.xmm_op(OPCODE_PCMPEQB, a, b);
+                invert(self);
+            }
+            (VPCMP_FALSE, _) => self.a.xmm_op(OPCODE_PXOR, a, a),
+            (VPCMP_LESS, false) => {
+                bounded(self, OPCODE_PMAXUB);
+                invert(self);
+            }
+            (VPCMP_LESS_EQUAL, false) => bounded(self, OPCODE_PMINUB),
+            (VPCMP_NOT_LESS, false) => bounded(self, OPCODE_PMAXUB),
+            (VPCMP_NOT_LESS_EQUAL, false) => {
+                bounded(self, OPCODE_PMINUB);
+                invert(self);
+            }
+            (VPCMP_LESS, true) => less_signed(self),
+            (VPCMP_LESS_EQUAL, true) => {
+                greater_signed(self);
+                invert(self);
+            }
+            (VPCMP_NOT_LESS, true) => {
+                less_signed(self);
+                invert(self);
+            }
+            (VPCMP_NOT_LESS_EQUAL, true) => greater_signed(self),
+            _ => self.a.xmm_op(OPCODE_PCMPEQB, a, a),
+        }
+    }
+
+    /// Loads the write mask register of `insn` into `ACC` and the address of the expansion table
+    /// for `element_log2` into `OPERAND`, for `commit_vector_lane`.
+    fn begin_masked_write(&mut self, insn: &Insn, element_log2: u32) {
+        self.a
+            .ld(ACC, mem(CPU, OPMASK + OPMASK_SIZE * insn.evex_mask as i32));
+        let table = OPMASK_EXPANSION[element_log2 as usize].as_ptr() as u64;
+        self.a.mov_imm(OPERAND, table);
+    }
+
+    /// Stores the lane in xmm0 to lane `lane` of vector register `register`, under the write mask
+    /// when the instruction has one (`begin_masked_write` came first): elements whose mask bit is
+    /// clear keep the old value, or become zero with EVEX.z. The mask bits of the lane become an
+    /// all-ones-or-zero vector half by half through `OPMASK_EXPANSION`.
+    fn commit_vector_lane(&mut self, insn: &Insn, element_log2: u32, register: u8, lane: u32) {
+        let offset = vector_lane_offset(register, lane) as i32;
+        if insn.evex_mask == 0 {
+            self.a.xmm_st(mem(CPU, offset), HOST_XMM_DST);
+            return;
+        }
+        let bits_per_half = 8 >> element_log2;
+        let elements_per_lane = 16 >> element_log2;
+        for half in 0..2u32 {
+            let shift = lane * elements_per_lane + half * bits_per_half;
+            self.a.mov_rr(SCRATCH_A, ACC, true);
+            if shift != 0 {
+                self.a.shift_ri(SHR, SCRATCH_A, shift as u8, true);
+            }
+            self.a
+                .alu_ri(AND, SCRATCH_A, (1 << bits_per_half) - 1, false);
+            self.a.ld(VALUE, mem_idx(OPERAND, SCRATCH_A, 3, 0));
+            let target = if half == 0 {
+                HOST_XMM_SELECT
+            } else {
+                HOST_XMM_OLD
+            };
+            self.a.movq_xmm_gpr(target, VALUE);
+        }
+        self.a
+            .xmm_op(OPCODE_PUNPCKLQDQ, HOST_XMM_SELECT, HOST_XMM_OLD);
+        // xmm0 = new & select, then merged with the old & !select unless zeroing
+        self.a.xmm_op(OPCODE_PAND, HOST_XMM_DST, HOST_XMM_SELECT);
+        if !insn.evex_zeroing {
+            self.a.xmm_ld(HOST_XMM_OLD, mem(CPU, offset));
+            self.a.xmm_op(OPCODE_PANDN, HOST_XMM_SELECT, HOST_XMM_OLD);
+            self.a.xmm_op(OPCODE_POR, HOST_XMM_DST, HOST_XMM_SELECT);
+        }
+        self.a.xmm_st(mem(CPU, offset), HOST_XMM_DST);
+    }
+
     /// An inline AVX-512 instruction (`EvexForm`), as on aarch64: one 128-bit lane at a time
     /// through host xmm0 and xmm1, loaded from and stored to `Cpu` per lane. Anything but the
-    /// plain forms and a clean fast path runs in the interpreter. Returns whether the
-    /// instruction stores to memory.
+    /// plain forms and a clean fast path runs in the interpreter. A masked load reads the whole
+    /// vector inside the page the TLB vouches for, which cannot fault, so the elements the mask
+    /// drops are read and discarded. Returns whether the instruction stores to memory.
     fn evex(&mut self, insn: &Insn, form: EvexForm, next: u64, insn_index: u32, rip: u64) -> bool {
         let (slow, resume) = self.evex_entry(insn_index, rip);
         let lanes = form.bytes / XMM_SIZE as u32;
         let lane_offset = |register: u8, lane: u32| vector_lane_offset(register, lane) as i32;
+        let lane_in_memory =
+            |lane: u32| mem_idx(ADDR, SCRATCH_B, 0, (lane * XMM_SIZE as u32) as i32);
         let mut store = false;
+        let writes_vector = matches!(form.kind, EvexKind::Alu { .. } | EvexKind::Move { .. });
+        let memory_store = matches!(form.kind, EvexKind::Move { load: false, .. })
+            && insn.md != MODRM_MOD_REGISTER;
+        if writes_vector && !memory_store && insn.evex_mask != 0 {
+            self.begin_masked_write(insn, form.element_log2);
+        }
         match form.kind {
             EvexKind::MaskToGeneral { wide } => {
                 self.a.ld(
@@ -2145,18 +2268,14 @@ impl<'a> Gen<'a> {
                     for lane in 0..lanes {
                         self.a
                             .xmm_ld(HOST_XMM_DST, mem(CPU, lane_offset(from, lane)));
-                        self.a.xmm_st(mem(CPU, lane_offset(to, lane)), HOST_XMM_DST);
+                        self.commit_vector_lane(insn, form.element_log2, to, lane);
                     }
                     self.zero_vector_lanes(to, lanes);
                 } else if load {
                     self.evex_memory(insn, form.bytes, aligned, false, next, slow);
                     for lane in 0..lanes {
-                        self.a.xmm_ld(
-                            HOST_XMM_DST,
-                            mem_idx(ADDR, SCRATCH_B, 0, (lane * XMM_SIZE as u32) as i32),
-                        );
-                        self.a
-                            .xmm_st(mem(CPU, lane_offset(insn.reg, lane)), HOST_XMM_DST);
+                        self.a.xmm_ld(HOST_XMM_DST, lane_in_memory(lane));
+                        self.commit_vector_lane(insn, form.element_log2, insn.reg, lane);
                     }
                     self.zero_vector_lanes(insn.reg, lanes);
                 } else {
@@ -2164,10 +2283,7 @@ impl<'a> Gen<'a> {
                     for lane in 0..lanes {
                         self.a
                             .xmm_ld(HOST_XMM_DST, mem(CPU, lane_offset(insn.reg, lane)));
-                        self.a.xmm_st(
-                            mem_idx(ADDR, SCRATCH_B, 0, (lane * XMM_SIZE as u32) as i32),
-                            HOST_XMM_DST,
-                        );
+                        self.a.xmm_st(lane_in_memory(lane), HOST_XMM_DST);
                     }
                     store = true;
                 }
@@ -2175,7 +2291,8 @@ impl<'a> Gen<'a> {
             EvexKind::Alu { .. }
             | EvexKind::CompareEqualBytes
             | EvexKind::TestBytes
-            | EvexKind::TestNotBytes => {
+            | EvexKind::TestNotBytes
+            | EvexKind::CompareBytes { .. } => {
                 let memory = insn.md != MODRM_MOD_REGISTER;
                 if memory {
                     self.evex_memory(insn, form.bytes, false, false, next, slow);
@@ -2188,10 +2305,7 @@ impl<'a> Gen<'a> {
                     self.a
                         .xmm_ld(HOST_XMM_DST, mem(CPU, lane_offset(insn.vex_v, lane)));
                     if memory {
-                        self.a.xmm_ld(
-                            HOST_XMM_SRC,
-                            mem_idx(ADDR, SCRATCH_B, 0, (lane * XMM_SIZE as u32) as i32),
-                        );
+                        self.a.xmm_ld(HOST_XMM_SRC, lane_in_memory(lane));
                     } else {
                         self.a
                             .xmm_ld(HOST_XMM_SRC, mem(CPU, lane_offset(insn.rm, lane)));
@@ -2201,13 +2315,15 @@ impl<'a> Gen<'a> {
                         // byte carries over (pandn included: both compute `!dst & src`).
                         self.a
                             .xmm_op((insn.op & 0xff) as u8, HOST_XMM_DST, HOST_XMM_SRC);
-                        self.a
-                            .xmm_st(mem(CPU, lane_offset(insn.reg, lane)), HOST_XMM_DST);
+                        self.commit_vector_lane(insn, form.element_log2, insn.reg, lane);
                         continue;
                     }
                     match form.kind {
                         EvexKind::CompareEqualBytes => {
                             self.a.xmm_op(OPCODE_PCMPEQB, HOST_XMM_DST, HOST_XMM_SRC);
+                        }
+                        EvexKind::CompareBytes { signed, predicate } => {
+                            self.compare_bytes(signed, predicate);
                         }
                         _ => {
                             // (a & b) == 0 per byte

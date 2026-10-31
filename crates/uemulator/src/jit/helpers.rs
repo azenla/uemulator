@@ -498,11 +498,11 @@ pub(crate) fn vector_alu(insn: &Insn) -> Option<VectorAlu> {
     Some(VectorAlu { op, lane_log2 })
 }
 
-/// What an inline AVX-512 instruction does. Only unmasked data movement and integer logic and
-/// arithmetic on whole vectors (the shapes of glibc's EVEX string and copy loops), byte compares
-/// into an opmask register, and `kmov` of an opmask register to a general register are lowered;
-/// masking, broadcast, rounding and the rest stay in the interpreter, which also raises every
-/// #UD, so a form that could be one is not accepted here.
+/// What an inline AVX-512 instruction does. Whole-vector data movement and integer logic and
+/// arithmetic (the shapes of glibc's EVEX string and copy loops, with merge or zero masking
+/// except for stores to memory), byte compares into an opmask register, and `kmov` of an opmask
+/// register to a general register are lowered; broadcast, rounding and the rest stay in the
+/// interpreter, which also raises every #UD, so a form that could be one is not accepted here.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum EvexKind {
@@ -517,6 +517,9 @@ pub(crate) enum EvexKind {
     TestBytes,
     /// `k[reg] = ((vvvv & rm) == 0)` per byte (vptestnmb), ANDed with the write mask.
     TestNotBytes,
+    /// vpcmpub/vpcmpb `k[reg] = predicate(vvvv, rm)` per byte, ANDed with the write mask. The
+    /// predicate is the low three bits of the immediate (`PREDICATE_*` order of the SDM table).
+    CompareBytes { signed: bool, predicate: u8 },
     /// VEX `kmovd`/`kmovq r, k`: the opmask register `rm` into general register `reg`.
     MaskToGeneral { wide: bool },
 }
@@ -527,19 +530,23 @@ pub(crate) struct EvexForm {
     pub kind: EvexKind,
     /// Vector length in bytes: 16, 32 or 64.
     pub bytes: u32,
+    /// log2 of the element size the write mask applies to (0 = bytes .. 3 = quadwords).
+    pub element_log2: u32,
 }
 
 /// `Some` for the instructions `EvexKind` lists, with the encodings the interpreter accepts as
-/// valid (see `Cpu::exec_evex`): no broadcast or rounding (EVEX.b), no reserved length, and for
-/// moves and arithmetic no write mask and no zeroing.
+/// valid (see `Cpu::exec_evex`): no broadcast or rounding (EVEX.b), no reserved length, and no
+/// EVEX.z without a write mask.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) fn evex_form(insn: &Insn) -> Option<EvexForm> {
     use crate::cpu::decode::{EVEX_OP_FLAG, VEX_OP_FLAG};
     const MAP_0F: u16 = 1;
     const MAP_0F38: u16 = 2;
+    const MAP_0F3A: u16 = 3;
     const OPCODE_KMOV_TO_GENERAL: u16 = 0x93;
     const VECTOR_LENGTH_RESERVED: u8 = 3;
     const OPMASK_REGISTERS: u8 = 8;
+    const PREDICATE_MASK: i64 = 7;
     if insn.vex && insn.op == VEX_OP_FLAG | (MAP_0F << 8) | OPCODE_KMOV_TO_GENERAL {
         // F2 0F 93: kmovd (W0) / kmovq (W1) r32/r64, k. Register source only, L0, no vvvv.
         return (insn.rep == 2 && insn.md == 3 && !insn.vex_l && insn.vex_v == 0).then_some(
@@ -548,6 +555,7 @@ pub(crate) fn evex_form(insn: &Insn) -> Option<EvexForm> {
                     wide: insn.opsize == 8,
                 },
                 bytes: 0,
+                element_log2: 0,
             },
         );
     }
@@ -557,7 +565,10 @@ pub(crate) fn evex_form(insn: &Insn) -> Option<EvexForm> {
     let bytes = 16u32 << insn.evex_ll;
     let op = insn.op & !EVEX_OP_FLAG;
     let (map, opcode) = (op >> 8, (op & 0xff) as u8);
-    let unmasked = insn.evex_mask == 0 && !insn.evex_zeroing;
+    let masked = insn.evex_mask != 0;
+    // EVEX.z with no write mask: the interpreter ignores it; not worth a lowering.
+    let zeroing_ok = masked || !insn.evex_zeroing;
+    let wide = insn.opsize == 8;
     // The implied prefix, as `Cpu::exec_evex` reads it: F3 and F2 win over 66.
     let (no_prefix, p66, f3, f2) = (
         insn.rep == 0 && !insn.p66,
@@ -565,59 +576,133 @@ pub(crate) fn evex_form(insn: &Insn) -> Option<EvexForm> {
         insn.rep == 1,
         insn.rep == 2,
     );
-    let alu = |op, lane_log2| Some(EvexKind::Alu { op, lane_log2 });
-    let kind = match (map, opcode) {
-        (MAP_0F, 0x6f | 0x7f) if unmasked && insn.vex_v == 0 && (p66 || f3 || f2) => {
-            Some(EvexKind::Move {
-                load: opcode == 0x6f,
-                aligned: p66,
-            })
+    let alu = |op, lane_log2| Some((EvexKind::Alu { op, lane_log2 }, lane_log2));
+    let logic_element = if wide { 3 } else { 2 };
+    let (kind, element_log2) = match (map, opcode) {
+        // A masked store to memory writes only the selected elements, which the inline path
+        // could only do as a read-modify-write of the whole vector: left to the interpreter.
+        (MAP_0F, 0x6f | 0x7f)
+            if zeroing_ok
+                && insn.vex_v == 0
+                && (p66 || f3 || f2)
+                && !(masked && opcode == 0x7f && insn.md != 3) =>
+        {
+            let element_log2 = match (f2, wide) {
+                (true, false) => 0,
+                (true, true) => 1,
+                (false, false) => 2,
+                (false, true) => 3,
+            };
+            (
+                EvexKind::Move {
+                    load: opcode == 0x6f,
+                    aligned: p66,
+                },
+                element_log2,
+            )
         }
         (MAP_0F, 0x10 | 0x11 | 0x28 | 0x29)
-            if unmasked && insn.vex_v == 0 && (no_prefix || p66) =>
+            if zeroing_ok
+                && insn.vex_v == 0
+                && (no_prefix || p66)
+                && !(masked && matches!(opcode, 0x11 | 0x29) && insn.md != 3) =>
         {
-            Some(EvexKind::Move {
-                load: matches!(opcode, 0x10 | 0x28),
-                aligned: opcode >= 0x28,
-            })
+            (
+                EvexKind::Move {
+                    load: matches!(opcode, 0x10 | 0x28),
+                    aligned: opcode >= 0x28,
+                },
+                if p66 { 3 } else { 2 },
+            )
         }
         (MAP_0F, 0xdb | 0xdf | 0xeb | 0xef | 0xda | 0xde | 0xfc..=0xfe | 0xd4 | 0xf8..=0xfb)
-            if unmasked && p66 =>
+            if zeroing_ok && p66 =>
         {
             match opcode {
-                0xdb => alu(VectorOp::And, 0),
-                0xdf => alu(VectorOp::AndNot, 0),
-                0xeb => alu(VectorOp::Or, 0),
-                0xef => alu(VectorOp::Xor, 0),
+                0xdb => alu(VectorOp::And, 0).map(|(kind, _)| (kind, logic_element)),
+                0xdf => alu(VectorOp::AndNot, 0).map(|(kind, _)| (kind, logic_element)),
+                0xeb => alu(VectorOp::Or, 0).map(|(kind, _)| (kind, logic_element)),
+                0xef => alu(VectorOp::Xor, 0).map(|(kind, _)| (kind, logic_element)),
                 0xda => alu(VectorOp::MinUnsigned8, 0),
                 0xde => alu(VectorOp::MaxUnsigned8, 0),
                 0xfc..=0xfe => alu(VectorOp::Add, (opcode - 0xfc) as u32),
                 0xd4 => alu(VectorOp::Add, 3),
                 0xf8..=0xfa => alu(VectorOp::Subtract, (opcode - 0xf8) as u32),
                 _ => alu(VectorOp::Subtract, 3),
-            }
+            }?
         }
         // The destination is an opmask register, so the register field must name one, and EVEX.z
         // is reserved.
         (MAP_0F, 0x74) if p66 && !insn.evex_zeroing && insn.reg < OPMASK_REGISTERS => {
-            Some(EvexKind::CompareEqualBytes)
+            (EvexKind::CompareEqualBytes, 0)
         }
         (MAP_0F38, 0x26)
-            if (p66 || f3)
-                && insn.opsize == 4
-                && !insn.evex_zeroing
-                && insn.reg < OPMASK_REGISTERS =>
+            if (p66 || f3) && !wide && !insn.evex_zeroing && insn.reg < OPMASK_REGISTERS =>
         {
-            Some(if p66 {
-                EvexKind::TestBytes
-            } else {
-                EvexKind::TestNotBytes
-            })
+            (
+                if p66 {
+                    EvexKind::TestBytes
+                } else {
+                    EvexKind::TestNotBytes
+                },
+                0,
+            )
         }
-        _ => None,
-    }?;
-    Some(EvexForm { kind, bytes })
+        // vpcmpub (3e) and vpcmpb (3f) with byte elements (W0)
+        (MAP_0F3A, 0x3e | 0x3f)
+            if p66 && !wide && !insn.evex_zeroing && insn.reg < OPMASK_REGISTERS =>
+        {
+            (
+                EvexKind::CompareBytes {
+                    signed: opcode == 0x3f,
+                    predicate: (insn.imm & PREDICATE_MASK) as u8,
+                },
+                0,
+            )
+        }
+        _ => return None,
+    };
+    Some(EvexForm {
+        kind,
+        bytes,
+        element_log2,
+    })
 }
+
+/// `OPMASK_EXPANSION[log2][bits]`: eight bytes of a vector register whose `8 >> log2` elements of
+/// `1 << log2` bytes are all ones where the matching bit of `bits` is set, zero elsewhere.
+/// The generators turn the write mask of an element size into a vector mask half by half.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) static OPMASK_EXPANSION: [[u64; OPMASK_EXPANSION_ENTRIES]; 4] = {
+    let mut table = [[0u64; OPMASK_EXPANSION_ENTRIES]; 4];
+    let mut log2 = 0;
+    while log2 < 4 {
+        let element_bytes = 1usize << log2;
+        let elements = 8 / element_bytes;
+        let element_ones = if element_bytes == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * element_bytes)) - 1
+        };
+        let mut bits = 0;
+        while bits < 1usize << elements {
+            let mut value = 0u64;
+            let mut element = 0;
+            while element < elements {
+                if bits >> element & 1 == 1 {
+                    value |= element_ones << (8 * element_bytes * element);
+                }
+                element += 1;
+            }
+            table[log2][bits] = value;
+            bits += 1;
+        }
+        log2 += 1;
+    }
+    table
+};
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) const OPMASK_EXPANSION_ENTRIES: usize = 256;
 
 /// Offset in `Cpu` of 128-bit lane `lane` (0 least significant) of vector register `register`
 /// (0..=31). zmm0-15 are split across `xmm`, `ymm_hi` and `zmm_hi`, zmm16-31 sit in `zmm_extra`

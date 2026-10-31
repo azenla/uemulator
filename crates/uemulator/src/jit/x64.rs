@@ -67,10 +67,19 @@ const TWO_BYTE_OPCODE: u8 = 0x0f;
 const OPCODE_MOVDQU_LOAD: u8 = 0x6f;
 const OPCODE_MOVDQU_STORE: u8 = 0x7f;
 const OPCODE_PMOVMSKB: u8 = 0xd7;
+const OPCODE_MOVQ_XMM_GPR: u8 = 0x6e;
 /// `66 0f xx` integer SSE2 opcodes for `xmm_op`.
 pub const OPCODE_PCMPEQB: u8 = 0x74;
 pub const OPCODE_PAND: u8 = 0xdb;
 pub const OPCODE_PXOR: u8 = 0xef;
+pub const OPCODE_PANDN: u8 = 0xdf;
+pub const OPCODE_POR: u8 = 0xeb;
+pub const OPCODE_PCMPGTB: u8 = 0x64;
+pub const OPCODE_PMINUB: u8 = 0xda;
+pub const OPCODE_PMAXUB: u8 = 0xde;
+/// `66 0f 6f` between two registers is `movdqa`.
+pub const OPCODE_MOVDQA: u8 = 0x6f;
+pub const OPCODE_PUNPCKLQDQ: u8 = 0x6c;
 const OPERAND_SIZE_PREFIX: u8 = 0x66;
 
 /// ModRM.mod values.
@@ -357,6 +366,15 @@ impl Asm {
     /// paddq and the like, named by the `0f` opcode byte, which the guest instruction shares.
     pub fn xmm_op(&mut self, opcode: u8, d: u8, s: u8) {
         self.sse_rr(OPERAND_SIZE_PREFIX, opcode, d, s);
+    }
+
+    /// `movq xmm, r64`: the low 64 bits of `x` from a general register, the rest zeroed.
+    pub fn movq_xmm_gpr(&mut self, x: u8, r: u8) {
+        self.code.push(OPERAND_SIZE_PREFIX);
+        self.rex(true, x, 0, r, false);
+        self.code
+            .extend_from_slice(&[TWO_BYTE_OPCODE, OPCODE_MOVQ_XMM_GPR]);
+        self.code.push(MOD_REGISTER << 6 | (x & 7) << 3 | (r & 7));
     }
 
     /// `pmovmskb r32, xmm`.
@@ -6204,6 +6222,11 @@ fn sized_unary_and_conditional_forms_match_the_assembler() {
         ("shrd rax, rcx, 5", |a| a.double_shift_ri(false, RAX, RCX, 5, true), &[0x48, 0x0f, 0xac, 0xc8, 0x05]),
         ("shld eax, ecx, 5", |a| a.double_shift_ri(true, RAX, RCX, 5, false), &[0x0f, 0xa4, 0xc8, 0x05]),
         ("shld r9, r10, 5", |a| a.double_shift_ri(true, R9, R10, 5, true), &[0x4d, 0x0f, 0xa4, 0xd1, 0x05]),
+        ("movq xmm2, r9", |a| a.movq_xmm_gpr(2, R9), &[0x66, 0x49, 0x0f, 0x6e, 0xd1]),
+        ("movq xmm0, rax", |a| a.movq_xmm_gpr(0, RAX), &[0x66, 0x48, 0x0f, 0x6e, 0xc0]),
+        ("punpcklqdq xmm0, xmm2", |a| a.xmm_op(OPCODE_PUNPCKLQDQ, 0, 2), &[0x66, 0x0f, 0x6c, 0xc2]),
+        ("pandn xmm2, xmm3", |a| a.xmm_op(OPCODE_PANDN, 2, 3), &[0x66, 0x0f, 0xdf, 0xd3]),
+        ("por xmm0, xmm2", |a| a.xmm_op(OPCODE_POR, 0, 2), &[0x66, 0x0f, 0xeb, 0xc2]),
         ("mul rcx", |a| a.mul_r(RCX, true), &[0x48, 0xf7, 0xe1]),
         ("imul ecx", |a| a.imul_r(RCX, false), &[0xf7, 0xe9]),
         ("mul r9", |a| a.mul_r(R9, true), &[0x49, 0xf7, 0xe1]),
