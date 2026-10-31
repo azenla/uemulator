@@ -4,6 +4,7 @@
 use std::mem::offset_of;
 
 use super::a64::{self, Asm, NOP_WORD};
+use super::blocks::JUMP_CACHE_BITS;
 use super::emit::{
     CALL_TARGET, CPU, Gen, PAGE_BASE, SAVED_ADDRESS, SAVED_INFO, SAVED_LR, SAVED_NZCV,
     SAVED_OPERAND, SAVED_RESULT, TLB_BASE, VALUE,
@@ -291,7 +292,7 @@ fn chain_stub(asm: &mut Asm, exit_ok: u64) -> u64 {
     const TLB_SLOT_MASK: u64 = (TLB_ENTRIES_PER_MODE - 1) as u64;
     const TLB_ENTRY_SHIFT: u32 = std::mem::size_of::<TlbEntry>().trailing_zeros();
     // `jump_cache_hash` in `native.rs`: rip ^ (rip >> bits), masked.
-    const JUMP_HASH_FOLD_SHIFT: u32 = 16;
+    const JUMP_HASH_FOLD_SHIFT: u32 = JUMP_CACHE_BITS as u32;
     let (entry, page, tag, phys, slot, key, miss) = (2, 3, 4, 5, 2, 4, asm.label());
     let start = asm.here();
     asm.ldr(CHAIN_ICOUNT, CPU, offset_of!(Cpu, icount) as u32);

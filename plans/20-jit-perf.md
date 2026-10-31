@@ -213,3 +213,24 @@ Total: 22.1 s -> 14.7 s, about 1.5x. The x86_64 backend has every lowering excep
 - Measured but not built: dropping the link entry's two checks would save about 3% (they could stay only on exits that follow a store); keeping `icount` in a host register across blocks removes a store-to-load chain per block.
 - What bounds the rest: guest registers live in `Cpu` memory, so every instruction loads and stores them, and every block pays an `icount` read-modify-write, a link-entry check and a TLB probe per access. Roughly two thirds of the host instructions in a hot block were that bookkeeping. Getting to the next factor means pinning hot guest registers in host registers across blocks (with spills at helper calls and exits) and `icount` in a register: a redesign of the emitters, not another lowering.
 - Seen on the way: the CLI's terminal-size polling thread wakes about every millisecond (an `ioctl` each time); it is off the emulator thread, so it does not slow the guest, but it burns a core fraction. A workspace `cargo build --release` fails in `uemulator-web` on a macOS host (the crate is wasm32-only; not looked into, `-p uemulator-cli` builds).
+
+## Round 2: the installer's userspace (Debian netboot)
+
+The Fedora initramfs of round 1 is gone from `~/.uemulator`, and its unpack was already nearly all JIT. Round 2 measures the Debian netboot kernel and initrd (`linux`, `initrd.gz` from `quick create --install debian`, copied somewhere stable) from process start to the installer's first curses box (the `lqqqqqqq` of its frame on the serial console), CPU seconds and wall seconds agreeing to 0.01 s because the emulator thread never idles. `--debug --timeout 8` gave 121M instructions through the interpreter at the start, almost all of them glibc's AVX-512 string loops (`kmovd`, `vpcmpeqb` into a mask, `bsf`, `vmovdqu64`, `vptestmb`, `mul`).
+
+| step | boot to installer, s | interpreter calls in 8 s |
+|------|---------------------:|-------------------------:|
+| round 1 | 11.3 | 121M |
+| bsf/bsr/tzcnt/lzcnt, one-operand mul/imul, shld/shrd by immediate | (not timed alone) | |
+| AVX-512 moves, ALU, byte compares into opmasks, kmov | 6.6 | 41M |
+| write masks and `vpcmpub`/`vpcmpb` predicates | 5.1 | 27M |
+| carry-in and condition at a block start from the previous record | 5.0 | |
+
+What the lowerings rest on:
+
+- Flag records. `bsf`/`bsr` record `SzpCfOf` of the source with CF clear (the undefined flags are what QEMU leaves, and the interpreter now leaves the same so it stays the oracle); `tzcnt`/`lzcnt` record the count with CF for a zero source. `mul`/`imul` record CF = OF from the high half.
+- AVX-512. Vectors are processed a 128-bit lane at a time through `v0`/`v1` (`xmm0`/`xmm1`), loaded from and stored to `Cpu` per lane; `helpers::vector_lane_offset` maps zmm0-31 to the split register file. One gate per block (CR4.OSXSAVE, XCR0, CR0.TS) sends the first instruction to the interpreter to raise #UD/#NM. A write mask becomes a vector mask through `OPMASK_EXPANSION` and is applied with `bsl` / `pand`-`pandn`-`por`; a masked load reads the whole vector inside the TLB-vouched page (it cannot fault). Masked stores to memory, broadcasts and wider compares stay in the interpreter.
+- Diff tests of anything with a memory operand must warm the TLB first (`diff_evex::WARM_TLB`): the first access of a block always runs in the interpreter, and an idempotent instruction run twice hides a fast path that is never taken.
+- `rebuild_flags_from_sub` (both backends) and `carry_from_lazy_record` (aarch64): `helper_cond` plus `flags::compute` were a fifth of the emulator thread's samples; a conditional branch that starts a block is the second of two on one compare. The operands are shifted to the top of 64 bits, so SF/ZF/CF/OF come out right and the parity condition keeps the helper on x86-64.
+
+What is left, from a `sample` of the emulator thread at the installer (a third of it outside generated code: page walks in `translate`, `Jit::lookup`, the interpreter for `rep stos`, `cmpxchg`, `pushf`, `cli`, `div`, `bt*`, VEX `vmovdqu`, `kortest`, `vpbroadcastb`): more than half of the samples inside generated code are the shared chain stub (`arch_a64::chain_stub`), the lookup every `ret`, indirect branch and cross-page jump pays: a budget check, a TLB probe of the target page, a jump-cache probe and a validity byte, four dependent loads in different cache lines. The jump cache's size does not matter (14, 16 and 18 bits all give 5.0 s). Two ways to shrink it, neither tried: link cross-page direct jumps and calls with an inline TLB check instead of the stub (same-page ones are linked already), and an inline cache of the last target at each `ret`. Pinning guest registers across blocks (round 1's conclusion) is still the structural item; it was not attempted because every emitter assumes the register file lives in `Cpu`.

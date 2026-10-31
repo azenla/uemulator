@@ -1,3 +1,4 @@
+use super::blocks::JUMP_CACHE_BITS;
 pub(crate) use super::emit_x64::Addrs;
 use super::emit_x64::{CPU, FRAME, Gen, JUMP_CACHE_SLOT, PAGE_BASE_SLOT, TLB_BASE, VALID_SLOT};
 use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
@@ -107,7 +108,7 @@ fn chain_stub(a: &mut Asm, exit_ok: u64) -> u64 {
     const TLB_SLOT_MASK: i32 = (TLB_ENTRIES_PER_MODE - 1) as i32;
     const TLB_ENTRY_SHIFT: u8 = size_of::<TlbEntry>().trailing_zeros() as u8;
     // `jump_cache_hash` in `native.rs`: rip ^ (rip >> bits), masked.
-    const JUMP_HASH_FOLD_SHIFT: u8 = 16;
+    const JUMP_HASH_FOLD_SHIFT: u8 = JUMP_CACHE_BITS as u8;
     let (entry, page, phys, slot, key) = (RDX, RSI, RDX, RSI, RDI);
     let miss = a.label();
     let start = a.here();
